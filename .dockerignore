@@ -1,0 +1,11 @@
+.git
+data
+cache
+backend/server
+backend/server.exe
+frontend/dist
+frontend/node_modules
+frontend/tsconfig.tsbuildinfo
+*.db
+*.db-shm
+*.db-wal
