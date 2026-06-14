@@ -1,0 +1,30 @@
+services:
+  lpicto:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - C:/Users/BROCCOLI/Downloads/666:/photos/C666:ro
+      - D:/666:/photos/D666:ro
+      - ./data:/data
+    environment:
+      - PHOTO_ROOT=/photos
+      - DATA_ROOT=/data
+      - HTTP_ADDR=:8080
+      - SCAN_INTERVAL_MINUTES=30
+      - THUMB_WORKERS=8
+      - VIDEO_WORKERS=3
+      - VIPS_CONCURRENCY=4
+      - PAGE_SIZE_DEFAULT=100
+      - PAGE_SIZE_MAX=500
+      - ENABLE_FS_WATCH=true
+      - THUMB_LONG_EDGE=320
+      - PREVIEW_LONG_EDGE=2560
+      - PREVIEW_QUALITY=82
+      - VIDEO_PROXY_ENABLED=true
+      - VIDEO_PROXY_MAX_HEIGHT=1080
+      - VIDEO_PROXY_CRF=23
+      - FFMPEG_HWACCEL=none
+      - FFMPEG_HWACCEL_DEVICE=
+      - FFMPEG_HWACCEL_FALLBACK=true
+    restart: unless-stopped

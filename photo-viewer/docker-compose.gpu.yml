@@ -1,0 +1,9 @@
+services:
+  lpicto:
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - FFMPEG_HWACCEL=cuda
+      - FFMPEG_HWACCEL_DEVICE=
+      - FFMPEG_HWACCEL_FALLBACK=true
