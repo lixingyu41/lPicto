@@ -17,7 +17,18 @@ COPY backend/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/lpicto ./cmd/server
 
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update \
+ARG APT_MIRROR=http://deb.debian.org/debian
+ARG APT_SECURITY_MIRROR=http://deb.debian.org/debian-security
+ARG APT_HTTP_PROXY=
+ARG APT_HTTPS_PROXY=
+RUN set -eux; \
+  if [ -n "${APT_HTTP_PROXY}" ]; then echo "Acquire::http::Proxy \"${APT_HTTP_PROXY}\";" > /etc/apt/apt.conf.d/01proxy; fi; \
+  if [ -n "${APT_HTTPS_PROXY}" ]; then echo "Acquire::https::Proxy \"${APT_HTTPS_PROXY}\";" >> /etc/apt/apt.conf.d/01proxy; fi; \
+  sed -i \
+    -e "s|http://deb.debian.org/debian-security|${APT_SECURITY_MIRROR}|g" \
+    -e "s|http://deb.debian.org/debian|${APT_MIRROR}|g" \
+    /etc/apt/sources.list.d/debian.sources \
+  && apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
     ffmpeg \
