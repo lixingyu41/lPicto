@@ -1,4 +1,6 @@
 FROM node:20-bookworm AS frontend
+ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org/
+ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 WORKDIR /src/frontend
 COPY frontend/package.json ./
 RUN npm install
@@ -6,6 +8,8 @@ COPY frontend/ ./
 RUN npm run build
 
 FROM golang:1.25-bookworm AS backend
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 WORKDIR /src/backend
 COPY backend/go.mod ./
 RUN go mod download
