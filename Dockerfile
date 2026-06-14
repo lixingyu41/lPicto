@@ -42,9 +42,10 @@ RUN useradd --system --uid 10001 --create-home --home-dir /nonexistent --shell /
   && chown -R lpicto:lpicto /app /data
 
 WORKDIR /app
-COPY --from=backend /out/lpicto /app/lpicto
-COPY --from=frontend /src/frontend/dist /app/frontend/dist
-COPY backend/migrations /app/migrations
+COPY --from=backend --chown=lpicto:lpicto /out/lpicto /app/lpicto
+COPY --from=frontend --chown=lpicto:lpicto /src/frontend/dist /app/frontend/dist
+COPY --chown=lpicto:lpicto backend/migrations /app/migrations
+RUN chmod -R a+rX /app
 
 ENV PHOTO_ROOT=/photos \
     DATA_ROOT=/data \
