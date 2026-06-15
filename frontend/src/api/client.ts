@@ -14,6 +14,7 @@ import type {
   PublicConfig,
   ProcessingProgress,
   ScanRun,
+  SearchAssetsParams,
   ScanFolder,
   ScanLibrariesResponse,
   SettingsActivity,
@@ -132,6 +133,8 @@ export const api = {
     request<Page<Asset>>(`/api/library/assets${qs({ page, pageSize, type, sort, q })}`),
   libraryAnchors: (pageSize: number, type: AssetKind, sort: SortKey, q: string) =>
     request<LibraryAnchorsResponse>(`/api/library/anchors${qs({ pageSize, type, sort, q })}`),
+  searchAssets: (page: number, pageSize: number, params: SearchAssetsParams) =>
+    request<Page<Asset>>(`/api/search/assets${qs({ page, pageSize, ...params })}`),
   folders: (parentId: number) => request<{ items: Folder[] }>(`/api/folders${qs({ parentId })}`),
   folderTree: () => request<{ items: Folder[] }>('/api/folders/tree'),
   folder: (id: number) => request<Folder>(`/api/folders/${id}`),

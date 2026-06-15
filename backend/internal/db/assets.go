@@ -38,6 +38,9 @@ type AssetUpsert struct {
 	VideoPosterStatus string
 	VideoProxyStatus  string
 	MetadataJSON      *string
+	NFOJSON           *string
+	NFOSearchText     *string
+	NFOScanned        bool
 	Error             *string
 }
 
@@ -53,19 +56,39 @@ type AssetListOptions struct {
 	FolderRel   *string
 	Recursive   bool
 	VisibleOnly bool
+	NFOQuery    string
+	MinWidth    *int
+	MaxWidth    *int
+	MinHeight   *int
+	MaxHeight   *int
+	MinDuration *float64
+	MaxDuration *float64
+	MinSize     *int64
+	MaxSize     *int64
+	Orientation string
 }
 
 type NeighborOptions struct {
-	Context   string
-	AssetID   int64
-	Type      string
-	Sort      string
-	Query     string
-	FolderID  *int64
-	From      *int64
-	To        *int64
-	Limit     int
-	Recursive bool
+	Context     string
+	AssetID     int64
+	Type        string
+	Sort        string
+	Query       string
+	FolderID    *int64
+	From        *int64
+	To          *int64
+	Limit       int
+	Recursive   bool
+	NFOQuery    string
+	MinWidth    *int
+	MaxWidth    *int
+	MinHeight   *int
+	MaxHeight   *int
+	MinDuration *float64
+	MaxDuration *float64
+	MinSize     *int64
+	MaxSize     *int64
+	Orientation string
 }
 
 type Neighbors struct {
@@ -132,19 +155,21 @@ func (d *DB) UpsertAssetDetailed(ctx context.Context, p AssetUpsert) (AssetUpser
 	var existingMtime int64
 	var existingCacheKey string
 	var deletedAt sql.NullInt64
-	err := d.conn.QueryRowContext(ctx, `SELECT id, size, mtime, cache_key, deleted_at FROM assets WHERE rel_path = ?`, p.RelPath).Scan(&existingID, &existingSize, &existingMtime, &existingCacheKey, &deletedAt)
+	var existingNFOJSON sql.NullString
+	var existingNFOSearchText sql.NullString
+	err := d.conn.QueryRowContext(ctx, `SELECT id, size, mtime, cache_key, deleted_at, nfo_json, nfo_search_text FROM assets WHERE rel_path = ?`, p.RelPath).Scan(&existingID, &existingSize, &existingMtime, &existingCacheKey, &deletedAt, &existingNFOJSON, &existingNFOSearchText)
 	if errors.Is(err, sql.ErrNoRows) {
 		result, err := d.conn.ExecContext(ctx, `
 INSERT INTO assets (
   rel_path, parent_rel_path, filename, ext, media_type, mime_type, size, mtime,
   width, height, duration, taken_at, imported_at, timeline_at, cache_key,
   browser_playable, scan_status, thumb_status, preview_status, video_poster_status,
-  video_proxy_status, metadata_json, error, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  video_proxy_status, metadata_json, nfo_json, nfo_search_text, error, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			p.RelPath, p.ParentRelPath, p.Filename, p.Ext, p.MediaType, nullString(p.MimeType), p.Size, p.Mtime,
 			nullInt(p.Width), nullInt(p.Height), nullFloat(p.Duration), nullInt64(p.TakenAt), p.ImportedAt, p.TimelineAt, p.CacheKey,
 			boolInt(p.BrowserPlayable), model.StatusOK, p.ThumbStatus, p.PreviewStatus, p.VideoPosterStatus,
-			p.VideoProxyStatus, nullString(p.MetadataJSON), nullString(p.Error), now, now)
+			p.VideoProxyStatus, nullString(p.MetadataJSON), nullString(p.NFOJSON), nullString(p.NFOSearchText), nullString(p.Error), now, now)
 		if err != nil {
 			return AssetUpsertResult{}, err
 		}
@@ -158,9 +183,35 @@ INSERT INTO assets (
 		return AssetUpsertResult{}, err
 	}
 	if existingSize == p.Size && existingMtime == p.Mtime && !deletedAt.Valid {
+		if p.NFOScanned {
+			if nfoColumnsEqual(existingNFOJSON, p.NFOJSON) && nfoColumnsEqual(existingNFOSearchText, p.NFOSearchText) {
+				return AssetUpsertResult{ID: existingID}, nil
+			}
+			_, err = d.conn.ExecContext(ctx, `UPDATE assets SET nfo_json = ?, nfo_search_text = ?, updated_at = ? WHERE id = ?`,
+				nullString(p.NFOJSON), nullString(p.NFOSearchText), now, existingID)
+			if err != nil {
+				return AssetUpsertResult{}, err
+			}
+			return AssetUpsertResult{ID: existingID, Updated: true}, nil
+		}
 		return AssetUpsertResult{ID: existingID}, nil
 	}
-	_, err = d.conn.ExecContext(ctx, `
+	if p.NFOScanned {
+		_, err = d.conn.ExecContext(ctx, `
+UPDATE assets SET
+  parent_rel_path = ?, filename = ?, ext = ?, media_type = ?, mime_type = ?,
+  size = ?, mtime = ?, width = ?, height = ?, duration = ?, taken_at = ?,
+  timeline_at = ?, cache_key = ?, browser_playable = ?, scan_status = ?,
+  thumb_status = ?, preview_status = ?, video_poster_status = ?, video_proxy_status = ?,
+  metadata_json = ?, nfo_json = ?, nfo_search_text = ?, error = ?, deleted_at = NULL, updated_at = ?
+WHERE id = ?`,
+			p.ParentRelPath, p.Filename, p.Ext, p.MediaType, nullString(p.MimeType),
+			p.Size, p.Mtime, nullInt(p.Width), nullInt(p.Height), nullFloat(p.Duration), nullInt64(p.TakenAt),
+			p.TimelineAt, p.CacheKey, boolInt(p.BrowserPlayable), model.StatusOK,
+			p.ThumbStatus, p.PreviewStatus, p.VideoPosterStatus, p.VideoProxyStatus,
+			nullString(p.MetadataJSON), nullString(p.NFOJSON), nullString(p.NFOSearchText), nullString(p.Error), now, existingID)
+	} else {
+		_, err = d.conn.ExecContext(ctx, `
 UPDATE assets SET
   parent_rel_path = ?, filename = ?, ext = ?, media_type = ?, mime_type = ?,
   size = ?, mtime = ?, width = ?, height = ?, duration = ?, taken_at = ?,
@@ -168,11 +219,12 @@ UPDATE assets SET
   thumb_status = ?, preview_status = ?, video_poster_status = ?, video_proxy_status = ?,
   metadata_json = ?, error = ?, deleted_at = NULL, updated_at = ?
 WHERE id = ?`,
-		p.ParentRelPath, p.Filename, p.Ext, p.MediaType, nullString(p.MimeType),
-		p.Size, p.Mtime, nullInt(p.Width), nullInt(p.Height), nullFloat(p.Duration), nullInt64(p.TakenAt),
-		p.TimelineAt, p.CacheKey, boolInt(p.BrowserPlayable), model.StatusOK,
-		p.ThumbStatus, p.PreviewStatus, p.VideoPosterStatus, p.VideoProxyStatus,
-		nullString(p.MetadataJSON), nullString(p.Error), now, existingID)
+			p.ParentRelPath, p.Filename, p.Ext, p.MediaType, nullString(p.MimeType),
+			p.Size, p.Mtime, nullInt(p.Width), nullInt(p.Height), nullFloat(p.Duration), nullInt64(p.TakenAt),
+			p.TimelineAt, p.CacheKey, boolInt(p.BrowserPlayable), model.StatusOK,
+			p.ThumbStatus, p.PreviewStatus, p.VideoPosterStatus, p.VideoProxyStatus,
+			nullString(p.MetadataJSON), nullString(p.Error), now, existingID)
+	}
 	if err != nil {
 		return AssetUpsertResult{}, err
 	}
@@ -181,6 +233,18 @@ WHERE id = ?`,
 		result.OldCacheKey = existingCacheKey
 	}
 	return result, nil
+}
+
+func (d *DB) AssetHasNFO(ctx context.Context, relPath string) (bool, error) {
+	var value sql.NullString
+	err := d.conn.QueryRowContext(ctx, `SELECT nfo_json FROM assets WHERE rel_path = ?`, relPath).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return value.Valid && strings.TrimSpace(value.String) != "", nil
 }
 
 func (d *DB) GetAsset(ctx context.Context, id int64) (model.Asset, error) {
@@ -195,6 +259,10 @@ func (d *DB) GetAssetIncludingDeleted(ctx context.Context, id int64) (model.Asse
 
 func (d *DB) ListLibraryAssets(ctx context.Context, opts AssetListOptions) (model.Page[model.Asset], error) {
 	return d.listAssets(ctx, opts, false)
+}
+
+func (d *DB) SearchAssets(ctx context.Context, opts AssetListOptions) (model.Page[model.Asset], error) {
+	return d.listAssets(ctx, opts, true)
 }
 
 func (d *DB) LibraryAnchors(ctx context.Context, opts AssetListOptions) (LibraryAnchorResult, error) {
@@ -547,6 +615,8 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 	}
 	filterOpts := AssetListOptions{
 		Type: opts.Type, Sort: opts.Sort, Query: opts.Query, From: opts.From, To: opts.To, VisibleOnly: true,
+		NFOQuery: opts.NFOQuery, MinWidth: opts.MinWidth, MaxWidth: opts.MaxWidth, MinHeight: opts.MinHeight, MaxHeight: opts.MaxHeight,
+		MinDuration: opts.MinDuration, MaxDuration: opts.MaxDuration, MinSize: opts.MinSize, MaxSize: opts.MaxSize, Orientation: opts.Orientation,
 	}
 	if opts.Context == "folder" {
 		if opts.FolderID == nil {
@@ -562,7 +632,7 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 	if opts.Context == "timeline" {
 		filterOpts.Sort = "timeline_desc"
 	}
-	where, args := assetFilterSQL(filterOpts, opts.Context == "timeline")
+	where, args := assetFilterSQL(filterOpts, opts.Context == "timeline" || opts.Context == "search")
 	prevCond, prevArgs, prevOrder := neighborCondition(current, filterOpts.Sort, true)
 	nextCond, nextArgs, nextOrder := neighborCondition(current, filterOpts.Sort, false)
 	previous, err := d.neighborSide(ctx, where, args, prevCond, prevArgs, prevOrder, opts.Limit)
@@ -603,6 +673,48 @@ func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 	if opts.Query != "" {
 		where = append(where, "lower(filename) LIKE ? ESCAPE '\\'")
 		args = append(args, "%"+escapeLike(strings.ToLower(opts.Query))+"%")
+	}
+	if opts.NFOQuery != "" {
+		where = append(where, "nfo_search_text IS NOT NULL AND lower(nfo_search_text) LIKE ? ESCAPE '\\'")
+		args = append(args, "%"+escapeLike(strings.ToLower(opts.NFOQuery))+"%")
+	}
+	if opts.MinWidth != nil {
+		where = append(where, "width IS NOT NULL AND width >= ?")
+		args = append(args, *opts.MinWidth)
+	}
+	if opts.MaxWidth != nil {
+		where = append(where, "width IS NOT NULL AND width <= ?")
+		args = append(args, *opts.MaxWidth)
+	}
+	if opts.MinHeight != nil {
+		where = append(where, "height IS NOT NULL AND height >= ?")
+		args = append(args, *opts.MinHeight)
+	}
+	if opts.MaxHeight != nil {
+		where = append(where, "height IS NOT NULL AND height <= ?")
+		args = append(args, *opts.MaxHeight)
+	}
+	if opts.MinDuration != nil {
+		where = append(where, "duration IS NOT NULL AND duration >= ?")
+		args = append(args, *opts.MinDuration)
+	}
+	if opts.MaxDuration != nil {
+		where = append(where, "duration IS NOT NULL AND duration <= ?")
+		args = append(args, *opts.MaxDuration)
+	}
+	if opts.MinSize != nil {
+		where = append(where, "size >= ?")
+		args = append(args, *opts.MinSize)
+	}
+	if opts.MaxSize != nil {
+		where = append(where, "size <= ?")
+		args = append(args, *opts.MaxSize)
+	}
+	switch opts.Orientation {
+	case "landscape":
+		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND width > height")
+	case "portrait":
+		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND height > width")
 	}
 	if opts.FolderRel != nil {
 		if opts.Recursive {
@@ -794,19 +906,19 @@ func assetSelectSQL() string {
 width, height, duration, taken_at, imported_at, timeline_at, cache_key, browser_playable,
 scan_status, thumb_status, preview_status, video_poster_status, video_proxy_status,
 COALESCE((SELECT rotation FROM asset_preferences WHERE asset_id = assets.id), 0) AS rotation,
-metadata_json, error, deleted_at, created_at, updated_at FROM assets`
+metadata_json, nfo_json, nfo_search_text, error, deleted_at, created_at, updated_at FROM assets`
 }
 
 func scanAsset(row interface{ Scan(dest ...any) error }) (model.Asset, error) {
 	var asset model.Asset
-	var mime, metadata, errorText sql.NullString
+	var mime, metadata, nfoJSON, nfoSearchText, errorText sql.NullString
 	var width, height, takenAt, deletedAt sql.NullInt64
 	var duration sql.NullFloat64
 	var browserPlayable int
 	err := row.Scan(&asset.ID, &asset.RelPath, &asset.ParentRelPath, &asset.Filename, &asset.Ext, &asset.MediaType, &mime, &asset.Size, &asset.Mtime,
 		&width, &height, &duration, &takenAt, &asset.ImportedAt, &asset.TimelineAt, &asset.CacheKey, &browserPlayable,
 		&asset.ScanStatus, &asset.ThumbStatus, &asset.PreviewStatus, &asset.VideoPosterStatus, &asset.VideoProxyStatus,
-		&asset.Rotation, &metadata, &errorText, &deletedAt, &asset.CreatedAt, &asset.UpdatedAt)
+		&asset.Rotation, &metadata, &nfoJSON, &nfoSearchText, &errorText, &deletedAt, &asset.CreatedAt, &asset.UpdatedAt)
 	if err != nil {
 		return model.Asset{}, err
 	}
@@ -816,6 +928,8 @@ func scanAsset(row interface{ Scan(dest ...any) error }) (model.Asset, error) {
 	asset.Duration = floatPtr(duration)
 	asset.TakenAt = int64Ptr(takenAt)
 	asset.MetadataJSON = stringPtr(metadata)
+	asset.NFOJSON = stringPtr(nfoJSON)
+	asset.NFOSearchText = stringPtr(nfoSearchText)
 	asset.Error = stringPtr(errorText)
 	asset.DeletedAt = int64Ptr(deletedAt)
 	asset.BrowserPlayable = browserPlayable == 1
@@ -840,6 +954,13 @@ func boolInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func nfoColumnsEqual(existing sql.NullString, next *string) bool {
+	if next == nil {
+		return !existing.Valid
+	}
+	return existing.Valid && existing.String == *next
 }
 
 func escapeLike(value string) string {

@@ -1,7 +1,8 @@
 import { type PointerEvent, type ReactNode, useCallback, useEffect } from 'react';
-import { FolderTree, Images, Library, Settings } from 'lucide-react';
+import { FolderTree, Images, Library, Search, Settings } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { useSidebarPanelValue, type SidebarPanelTarget } from './SidebarContext';
+import { isPrimarySidebarPanelTarget, primaryTargetForPath, type PrimarySidebarPanelTarget } from '../utils/sidebarPrefs';
 
 interface Props {
   collapsed: boolean;
@@ -13,6 +14,18 @@ interface Props {
   onToggleCollapsed: () => void;
   onToggleExpanded: (target: SidebarPanelTarget | null) => void;
 }
+
+const navItems: Array<{
+  Icon: typeof Library;
+  label: string;
+  target: PrimarySidebarPanelTarget;
+  to: string;
+}> = [
+  { Icon: Library, label: '图库', target: 'library', to: '/library' },
+  { Icon: Search, label: '搜索', target: 'search', to: '/search' },
+  { Icon: Images, label: '相册', target: 'albums', to: '/albums' },
+  { Icon: FolderTree, label: '文件夹', target: 'folders', to: '/folders' },
+];
 
 export default function Sidebar({
   collapsed,
@@ -29,14 +42,14 @@ export default function Sidebar({
   const routeTarget = primaryTargetForPath(location.pathname);
 
   useEffect(() => {
-    if (expanded && !isPrimaryPanelTarget(expanded) && !panels[expanded]) {
+    if (expanded && !isPrimarySidebarPanelTarget(expanded) && !panels[expanded]) {
       onToggleExpanded(null);
     }
   }, [expanded, onToggleExpanded, panels]);
 
   const renderBottomPanel = (target: SidebarPanelTarget) =>
     panels[target] ? <div className={`sidebar-panel sidebar-panel-${target}`}>{panels[target]}</div> : null;
-  const activeSecondaryTarget = expanded && expanded === routeTarget && isPrimaryPanelTarget(expanded) ? expanded : null;
+  const activeSecondaryTarget = routeTarget && expanded === routeTarget ? routeTarget : null;
   const secondaryPanel = activeSecondaryTarget ? panels[activeSecondaryTarget] : null;
   const startResize = useCallback(
     (kind: 'primary' | 'secondary', event: PointerEvent<HTMLButtonElement>) => {
@@ -71,7 +84,7 @@ export default function Sidebar({
   }
 
   return (
-    <div className={activeSecondaryTarget ? 'sidebar-layout has-secondary' : 'sidebar-layout'}>
+    <>
       <nav className="nav">
         <div className="brand-row">
           <button className="brand" type="button" onClick={onToggleCollapsed} aria-label="折叠侧栏">
@@ -87,33 +100,18 @@ export default function Sidebar({
           </NavLink>
         </div>
         <div className="nav-main">
-          <SidebarItem
-            expanded={expanded === 'library'}
-            icon={<Library size={18} />}
-            label="图库"
-            target="library"
-            to="/library"
-            onToggle={onToggleExpanded}
-            routeTarget={routeTarget}
-          />
-          <SidebarItem
-            expanded={expanded === 'albums'}
-            icon={<Images size={18} />}
-            label="相册"
-            target="albums"
-            to="/albums"
-            onToggle={onToggleExpanded}
-            routeTarget={routeTarget}
-          />
-          <SidebarItem
-            expanded={expanded === 'folders'}
-            icon={<FolderTree size={18} />}
-            label="文件夹"
-            target="folders"
-            to="/folders"
-            onToggle={onToggleExpanded}
-            routeTarget={routeTarget}
-          />
+          {navItems.map(({ Icon, label, target, to }) => (
+            <SidebarItem
+              expanded={expanded === target}
+              icon={<Icon size={18} />}
+              key={target}
+              label={label}
+              target={target}
+              to={to}
+              onToggle={onToggleExpanded}
+              routeTarget={routeTarget}
+            />
+          ))}
         </div>
         <div className="nav-bottom">
           <div className="nav-bottom-panels">{renderBottomPanel('viewer')}</div>
@@ -140,19 +138,8 @@ export default function Sidebar({
           onPointerDown={(event) => startResize('secondary', event)}
         />
       )}
-    </div>
+    </>
   );
-}
-
-function isPrimaryPanelTarget(target: SidebarPanelTarget) {
-  return target === 'library' || target === 'albums' || target === 'folders';
-}
-
-function primaryTargetForPath(pathname: string): SidebarPanelTarget | null {
-  if (pathname === '/library' || pathname.startsWith('/library/')) return 'library';
-  if (pathname === '/albums' || pathname.startsWith('/albums/')) return 'albums';
-  if (pathname === '/folders' || pathname.startsWith('/folders/')) return 'folders';
-  return null;
 }
 
 function SidebarItem({

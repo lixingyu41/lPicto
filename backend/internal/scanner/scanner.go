@@ -742,6 +742,7 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 	if meta.RawJSON != "" {
 		metadataJSON = &meta.RawJSON
 	}
+	nfoJSON, nfoSearchText, nfoScanned := st.nfoMetadata(absPath, rel)
 	var errorText *string
 	if meta.Err != nil {
 		if ctx.Err() != nil {
@@ -779,6 +780,9 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 		VideoPosterStatus: posterStatus,
 		VideoProxyStatus:  proxyStatus,
 		MetadataJSON:      metadataJSON,
+		NFOJSON:           nfoJSON,
+		NFOSearchText:     nfoSearchText,
+		NFOScanned:        nfoScanned,
 		Error:             errorText,
 	}
 	result, err := s.DB.UpsertAssetDetailed(ctx, params)
@@ -818,6 +822,45 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 	if asset, err := s.DB.GetAsset(ctx, result.ID); err == nil {
 		s.enqueuePendingWork(asset)
 	}
+}
+
+func (st *scanState) nfoMetadata(absPath string, rel string) (*string, *string, bool) {
+	scanNFO := st.rebuild
+	if !scanNFO {
+		hasNFO, err := st.scanner.DB.AssetHasNFO(st.ctx, rel)
+		if err != nil {
+			st.recordError("读取NFO状态失败", err)
+			st.scanner.Logger.Warn("read nfo state failed", "relPath", rel, "error", err)
+			return nil, nil, false
+		}
+		scanNFO = !hasNFO
+	}
+	if !scanNFO {
+		return nil, nil, false
+	}
+	root, err := st.scanner.Store.RootForPath(absPath)
+	if err != nil {
+		st.recordError("NFO路径不安全", err)
+		st.scanner.Logger.Warn("nfo root lookup failed", "relPath", rel, "error", err)
+		return nil, nil, false
+	}
+	info, err := media.ReadNFOForAsset(absPath, root.Path, media.MaxNFOBytes)
+	if err != nil {
+		st.recordError("读取NFO失败", err)
+		st.scanner.Logger.Warn("read nfo failed", "relPath", rel, "error", err)
+		return nil, nil, false
+	}
+	if info == nil {
+		return nil, nil, st.rebuild
+	}
+	nfoJSON, err := media.NFOJSON(*info)
+	if err != nil {
+		st.recordError("解析NFO失败", err)
+		st.scanner.Logger.Warn("marshal nfo failed", "relPath", rel, "error", err)
+		return nil, nil, false
+	}
+	nfoSearchText := media.NFOSearchText(*info)
+	return &nfoJSON, &nfoSearchText, true
 }
 
 func (s *Scanner) updateProgressRoot(rootRel string) {

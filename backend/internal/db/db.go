@@ -42,6 +42,10 @@ func Open(ctx context.Context, path string, migrationsDir string) (*DB, error) {
 		_ = conn.Close()
 		return nil, err
 	}
+	if err := database.MarkInterruptedScanRuns(ctx); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	return database, nil
 }
 

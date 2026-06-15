@@ -41,6 +41,30 @@ func int64QueryPtr(r *http.Request, key string) *int64 {
 	return &parsed
 }
 
+func intQueryPtr(r *http.Request, key string) *int {
+	value := strings.TrimSpace(r.URL.Query().Get(key))
+	if value == "" {
+		return nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return nil
+	}
+	return &parsed
+}
+
+func float64QueryPtr(r *http.Request, key string) *float64 {
+	value := strings.TrimSpace(r.URL.Query().Get(key))
+	if value == "" {
+		return nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return nil
+	}
+	return &parsed
+}
+
 func ClampPage(page int, pageSize int, defaultPageSize int, maxPageSize int) (int, int) {
 	if page < 1 {
 		page = 1
@@ -66,6 +90,15 @@ func safeSort(value string) string {
 func safeType(value string) string {
 	switch value {
 	case "image", "video":
+		return value
+	default:
+		return "all"
+	}
+}
+
+func safeOrientation(value string) string {
+	switch value {
+	case "landscape", "portrait":
 		return value
 	default:
 		return "all"

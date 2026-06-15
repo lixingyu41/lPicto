@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, ChevronRight, FolderPlus, Pencil, RotateCw, Trash2, X } from 'lucide-react';
+import { Check, ChevronRight, FolderPlus, Pencil, RotateCw, Square, Trash2, X } from 'lucide-react';
 import Toolbar from '../components/Toolbar';
 import { api } from '../api/client';
 import type { CleanupStatus, ProcessingProgress, ScanLibrary, ScanLibraryProgress, ScanStatus, SourceFolder, WorkStatusCounts } from '../types/api';
@@ -28,18 +28,31 @@ export default function SettingsPage() {
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => loadThemeMode());
   const [viewerPrefs, setViewerPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
   const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSectionId>('libraries');
+  const [stoppingScan, setStoppingScan] = useState(false);
+  const [optimisticScanLibraryId, setOptimisticScanLibraryId] = useState<string | null>(null);
 
   const refreshLibraries = useCallback(async () => {
     const librariesResult = await api.scanLibraries();
     setLibraries(librariesResult.items);
   }, []);
 
+  const applyScanStatus = useCallback((scan: ScanStatus) => {
+    setStatus(scan);
+    if (!scan.running) {
+      setOptimisticScanLibraryId(null);
+    }
+  }, []);
+
+  const refreshScanStatus = useCallback(async () => {
+    applyScanStatus(await api.scanStatus());
+  }, [applyScanStatus]);
+
   const refreshActivity = useCallback(async () => {
     const activity = await api.settingsActivity();
-    setStatus(activity.scan);
+    applyScanStatus(activity.scan);
     setProgress(activity.progress);
     setCleanup(activity.cleanup);
-  }, []);
+  }, [applyScanStatus]);
 
   const refreshInitial = useCallback(async () => {
     try {
@@ -56,12 +69,15 @@ export default function SettingsPage() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
+      void refreshScanStatus().catch((err) => {
+        setError(err instanceof Error ? err.message : '刷新扫描状态失败');
+      });
       void Promise.all([refreshActivity(), refreshLibraries()]).catch((err) => {
         setError(err instanceof Error ? err.message : '刷新进度失败');
       });
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [refreshActivity, refreshLibraries]);
+  }, [refreshActivity, refreshLibraries, refreshScanStatus]);
 
   async function createLibrary(name: string, relPaths: string[]) {
     const tempId = `pending-${Date.now()}`;
@@ -118,11 +134,68 @@ export default function SettingsPage() {
   }
 
   async function rescanLibrary(id: string) {
+    if (status?.running || optimisticScanLibraryId) {
+      setError('已有扫描正在运行');
+      return;
+    }
+    const library = libraries.find((item) => item.id === id);
+    if (!library) return;
+    setError(null);
+    setOptimisticScanLibraryId(id);
+    setStatus((current) => ({
+      running: true,
+      lastStart: current?.lastStart ?? Math.floor(Date.now() / 1000),
+      lastRun: current?.lastRun ?? null,
+      progress: {
+        reason: `library:${library.name}`,
+        phase: 'queued',
+        roots: library.folders.map((folder) => folder.relPath),
+        currentRoot: library.folders[0]?.relPath ?? '',
+        currentRelPath: '',
+        totalFiles: library.progress.assetTotal,
+        scannedFiles: 0,
+        totalSeen: 0,
+        assetsAdded: 0,
+        assetsUpdated: 0,
+        assetsDeleted: 0,
+        errors: 0,
+      },
+    }));
     try {
-      await api.scanLibrary(id);
-      await Promise.all([refreshActivity(), refreshLibraries()]);
+      const result = await api.scanLibrary(id);
+      if (!result.started) {
+        setError('已有扫描正在运行');
+        setOptimisticScanLibraryId(null);
+      }
+      await refreshScanStatus();
+      void refreshLibraries().catch((err) => {
+        setError(err instanceof Error ? err.message : '刷新图库失败');
+      });
     } catch (err) {
+      setOptimisticScanLibraryId(null);
+      await refreshScanStatus().catch(() => undefined);
       setError(err instanceof Error ? err.message : '扫描来源失败');
+    }
+  }
+
+  async function stopScan() {
+    if ((!status?.running && !optimisticScanLibraryId) || stoppingScan) return;
+    setStoppingScan(true);
+    setError(null);
+    setStatus((current) =>
+      current ? { ...current, progress: { ...current.progress, phase: 'pausing' } } : current,
+    );
+    try {
+      await api.pauseScan();
+      setOptimisticScanLibraryId(null);
+      await refreshScanStatus();
+      void refreshLibraries().catch((err) => {
+        setError(err instanceof Error ? err.message : '刷新图库失败');
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '停止扫描失败');
+    } finally {
+      setStoppingScan(false);
     }
   }
 
@@ -143,7 +216,8 @@ export default function SettingsPage() {
 
   const liveProgress = status?.progress;
   const totalMedia = progress?.assetTotal ?? libraries.reduce((sum, library) => sum + library.progress.assetTotal, 0);
-  const statusLabel = cleanup?.running ? '清理中' : status?.running ? scanPhaseLabel(liveProgress?.phase) : '空闲';
+  const scanRunning = Boolean(status?.running || optimisticScanLibraryId);
+  const statusLabel = cleanup?.running ? '清理中' : scanRunning ? scanPhaseLabel(liveProgress?.phase) : '空闲';
 
   return (
     <section className="page settings-page">
@@ -168,7 +242,20 @@ export default function SettingsPage() {
             {activeSettingsSection === 'libraries' && (
               <section className="settings-section library-scan-section">
                 <div className="settings-panel">
-                  <div className="settings-panel-title">总扫描</div>
+                  <div className="settings-panel-heading">
+                    <div className="settings-panel-title">总扫描</div>
+                    <button
+                      aria-label="停止当前扫描"
+                      className="command-button scan-stop-button"
+                      disabled={!scanRunning || stoppingScan}
+                      title={scanRunning ? '停止当前扫描' : '当前没有运行中的扫描'}
+                      type="button"
+                      onClick={() => void stopScan()}
+                    >
+                      <Square size={14} />
+                      {stoppingScan ? '停止中' : '停止'}
+                    </button>
+                  </div>
                   <div className="metric-grid scan-summary-grid">
                     <Metric label="状态" value={statusLabel} />
                     <Metric label="总媒体" value={String(totalMedia)} />
@@ -179,8 +266,10 @@ export default function SettingsPage() {
                 <div className="settings-panel">
                   <div className="settings-panel-title">图库</div>
                   <div className="library-list">
-                    {libraries.map((library) => (
-                      <div className={library.progress.active ? 'library-row active-scan' : 'library-row'} key={library.id}>
+                    {libraries.map((library) => {
+                      const libraryActive = library.progress.active || optimisticScanLibraryId === library.id;
+                      return (
+                      <div className={libraryActive ? 'library-row active-scan' : 'library-row'} key={library.id}>
                         <div className="library-info">
                           <strong>{displayLibraryName(library.name)}</strong>
                           <small>{library.exists ? '已连接' : '不可访问'} · {library.folders.length} 个文件夹</small>
@@ -191,9 +280,15 @@ export default function SettingsPage() {
                           </div>
                           <LibraryProgress progress={library.progress} />
                         </div>
-                        <button className="library-scan-button" type="button" title="扫描此图库" onClick={() => void rescanLibrary(library.id)}>
-                          <RotateCw size={15} />
-                          <span>扫描</span>
+                        <button
+                          className="library-scan-button"
+                          disabled={Boolean(scanRunning && !libraryActive) || stoppingScan}
+                          type="button"
+                          title={libraryActive ? '停止当前扫描' : scanRunning ? '已有扫描正在运行' : '扫描此图库'}
+                          onClick={() => void (libraryActive ? stopScan() : rescanLibrary(library.id))}
+                        >
+                          {libraryActive ? <Square size={15} /> : <RotateCw size={15} />}
+                          <span>{libraryActive ? (stoppingScan ? '停止中' : '停止') : '扫描'}</span>
                         </button>
                         <button type="button" title="编辑" onClick={() => setEditingLibrary(library)}>
                           <Pencil size={15} />
@@ -202,7 +297,8 @@ export default function SettingsPage() {
                           <Trash2 size={15} />
                         </button>
                       </div>
-                    ))}
+                      );
+                    })}
                     {libraries.length === 0 && <div className="muted-line">默认扫描全部存储</div>}
                   </div>
                   <div className="selected-folder-actions">

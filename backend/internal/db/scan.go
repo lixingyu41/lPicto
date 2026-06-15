@@ -37,6 +37,17 @@ assets_deleted = ?, errors = ?, last_error = ? WHERE id = ?`,
 	return err
 }
 
+func (d *DB) MarkInterruptedScanRuns(ctx context.Context) error {
+	_, err := d.conn.ExecContext(ctx, `
+UPDATE scan_runs
+SET status = 'interrupted',
+    finished_at = ?,
+    last_error = '扫描已中断'
+WHERE status = 'running'`,
+		util.UnixNow())
+	return err
+}
+
 func (d *DB) RecentScanRuns(ctx context.Context, page int, pageSize int) (model.Page[model.ScanRun], error) {
 	limit := pageSize + 1
 	offset := (page - 1) * pageSize

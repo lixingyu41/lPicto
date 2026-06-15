@@ -25,6 +25,8 @@ type Asset struct {
 	VideoProxyStatus  string
 	Rotation          int
 	MetadataJSON      *string
+	NFOJSON           *string
+	NFOSearchText     *string
 	Error             *string
 	DeletedAt         *int64
 	CreatedAt         int64

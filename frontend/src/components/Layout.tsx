@@ -7,10 +7,10 @@ import {
   loadSidebarSecondaryExpanded,
   loadSidebarWidths,
   normalizeSidebarWidths,
+  primaryTargetForPath,
   saveSidebarSecondaryExpanded,
   saveSidebarWidths,
   type SidebarWidths,
-  type PrimarySidebarPanelTarget,
 } from '../utils/sidebarPrefs';
 
 interface Props {
@@ -85,11 +85,4 @@ export default function Layout({ children }: Props) {
       </div>
     </SidebarPanelProvider>
   );
-}
-
-function primaryTargetForPath(pathname: string): PrimarySidebarPanelTarget | null {
-  if (pathname === '/library' || pathname.startsWith('/library/')) return 'library';
-  if (pathname === '/albums' || pathname.startsWith('/albums/')) return 'albums';
-  if (pathname === '/folders' || pathname.startsWith('/folders/')) return 'folders';
-  return null;
 }

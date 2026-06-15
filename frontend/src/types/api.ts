@@ -1,5 +1,6 @@
 export type MediaType = 'image' | 'video';
 export type AssetKind = 'all' | MediaType;
+export type OrientationFilter = 'all' | 'landscape' | 'portrait';
 export type SortKey =
   | 'timeline_desc'
   | 'timeline_asc'
@@ -34,6 +35,24 @@ export interface Asset {
   videoPosterStatus: string;
   videoProxyStatus: string;
   rotation: number;
+}
+
+export interface SearchAssetsParams {
+  q?: string;
+  nfo?: string;
+  type?: AssetKind;
+  sort?: SortKey;
+  from?: number;
+  to?: number;
+  widthMin?: number;
+  widthMax?: number;
+  heightMin?: number;
+  heightMax?: number;
+  durationMin?: number;
+  durationMax?: number;
+  sizeMin?: number;
+  sizeMax?: number;
+  orientation?: OrientationFilter;
 }
 
 export interface Folder {

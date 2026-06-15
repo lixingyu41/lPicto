@@ -88,6 +88,7 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan *sc
 	r.Get("/api/albums/{id}/assets", s.albumAssets)
 	r.Get("/api/library/assets", s.libraryAssets)
 	r.Get("/api/library/anchors", s.libraryAnchors)
+	r.Get("/api/search/assets", s.searchAssets)
 	r.Get("/api/folders", s.folders)
 	r.Get("/api/folders/tree", s.folderTree)
 	r.Get("/api/folders/{id}", s.folder)
@@ -124,6 +125,7 @@ func foregroundActivity(next http.Handler) http.Handler {
 func isForegroundRequest(path string) bool {
 	return strings.HasPrefix(path, "/api/library/") ||
 		strings.HasPrefix(path, "/api/albums") ||
+		strings.HasPrefix(path, "/api/search/") ||
 		strings.HasPrefix(path, "/api/folders") ||
 		strings.HasPrefix(path, "/api/assets/") ||
 		strings.HasPrefix(path, "/api/cache/")
@@ -292,6 +294,19 @@ func (s *Server) libraryAnchors(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": libraryAnchorDTOs(anchorResult.Items), "total": anchorResult.Total})
 }
 
+func (s *Server) searchAssets(w http.ResponseWriter, r *http.Request) {
+	page, pageSize := s.page(r, s.cfg.PageSizeDefault)
+	opts := s.searchAssetOptions(r, page, pageSize)
+	assets, err := s.db.SearchAssets(r.Context(), opts)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "search_assets_failed", "搜索资源失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{
+		Items: assetDTOs(assets.Items), Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore,
+	})
+}
+
 func (s *Server) folders(w http.ResponseWriter, r *http.Request) {
 	parentID := int64(intQuery(r, "parentId", 0))
 	folders, err := s.db.ListFolders(r.Context(), parentID)
@@ -375,7 +390,7 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contextName := r.URL.Query().Get("context")
-	if contextName != "folder" && contextName != "album" {
+	if contextName != "folder" && contextName != "album" && contextName != "search" {
 		contextName = "library"
 	}
 	typeFilter := safeType(r.URL.Query().Get("type"))
@@ -390,6 +405,12 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		Context: contextName, AssetID: id, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), FolderID: folderID,
 		From: int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: 5, Recursive: boolQuery(r, "recursive", false),
+		NFOQuery: strings.TrimSpace(r.URL.Query().Get("nfo")),
+		MinWidth: intQueryPtr(r, "widthMin"), MaxWidth: intQueryPtr(r, "widthMax"),
+		MinHeight: intQueryPtr(r, "heightMin"), MaxHeight: intQueryPtr(r, "heightMax"),
+		MinDuration: float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
+		MinSize: int64QueryPtr(r, "sizeMin"), MaxSize: int64QueryPtr(r, "sizeMax"),
+		Orientation: searchOrientation(r),
 	}
 	var result db.Neighbors
 	var err error
@@ -586,6 +607,31 @@ func boolQuery(r *http.Request, key string, fallback bool) bool {
 
 func visibleOnly(r *http.Request) bool {
 	return strings.ToLower(strings.TrimSpace(r.URL.Query().Get("visible"))) != "all"
+}
+
+func (s *Server) searchAssetOptions(r *http.Request, page int, pageSize int) db.AssetListOptions {
+	typeFilter := safeType(r.URL.Query().Get("type"))
+	if typeFilter == "all" {
+		typeFilter = ""
+	}
+	return db.AssetListOptions{
+		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")),
+		Query: strings.TrimSpace(r.URL.Query().Get("q")), NFOQuery: strings.TrimSpace(r.URL.Query().Get("nfo")),
+		From: int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), VisibleOnly: visibleOnly(r),
+		MinWidth: intQueryPtr(r, "widthMin"), MaxWidth: intQueryPtr(r, "widthMax"),
+		MinHeight: intQueryPtr(r, "heightMin"), MaxHeight: intQueryPtr(r, "heightMax"),
+		MinDuration: float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
+		MinSize: int64QueryPtr(r, "sizeMin"), MaxSize: int64QueryPtr(r, "sizeMax"),
+		Orientation: searchOrientation(r),
+	}
+}
+
+func searchOrientation(r *http.Request) string {
+	orientation := safeOrientation(r.URL.Query().Get("orientation"))
+	if orientation == "all" {
+		return ""
+	}
+	return orientation
 }
 
 func validCacheKey(value string) bool {

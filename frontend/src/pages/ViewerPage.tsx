@@ -236,7 +236,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       return;
     }
     const context = searchParams.get('context');
-    const fallback = context === 'folder' ? '/folders' : context === 'album' ? '/albums' : '/library';
+    const fallback = context === 'folder' ? '/folders' : context === 'album' ? '/albums' : context === 'search' ? '/search' : '/library';
     const returnPath = searchParams.get('returnPath');
     const returnState = searchParams.get('returnState');
     if (returnPath === fallback && returnState) {
