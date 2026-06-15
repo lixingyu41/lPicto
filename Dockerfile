@@ -38,7 +38,7 @@ RUN set -eux; \
   && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --system --uid 10001 --create-home --home-dir /nonexistent --shell /usr/sbin/nologin lpicto \
-  && mkdir -p /app/frontend/dist /app/migrations /photos /data/cache/thumbs /data/cache/previews /data/cache/video-posters /data/cache/video-proxies \
+  && mkdir -p /app/frontend/dist /app/migrations /photos /storage /data/cache/thumbs /data/cache/previews /data/cache/video-posters /data/cache/video-proxies \
   && chown -R lpicto:lpicto /app /data
 
 WORKDIR /app

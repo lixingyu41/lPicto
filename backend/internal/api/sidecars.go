@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -31,7 +32,20 @@ type AssetSidecarsDTO struct {
 type NFODTO struct {
 	Filename string            `json:"filename"`
 	Fields   map[string]string `json:"fields"`
+	Groups   []NFOGroupDTO     `json:"groups"`
 	Text     string            `json:"text"`
+}
+
+type NFOGroupDTO struct {
+	Title string        `json:"title"`
+	Items []NFOFieldDTO `json:"items"`
+}
+
+type NFOFieldDTO struct {
+	Key      string `json:"key"`
+	Label    string `json:"label"`
+	Value    string `json:"value"`
+	Copyable bool   `json:"copyable"`
 }
 
 type SubtitleDTO struct {
@@ -97,6 +111,10 @@ func (s *Server) assetSubtitle(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(srtToVTT(string(data))))
 		return
 	}
+	if strings.EqualFold(selected.Format, "ass") || strings.EqualFold(selected.Format, "ssa") {
+		_, _ = w.Write([]byte(assToVTT(string(data))))
+		return
+	}
 	_, _ = w.Write(data)
 }
 
@@ -128,9 +146,13 @@ func (s *Server) nfoForAsset(asset model.Asset) (*NFODTO, error) {
 	if err != nil {
 		return nil, err
 	}
+	root, err := s.store.RootForPath(assetPath)
+	if err != nil {
+		return nil, err
+	}
 	dir := filepath.Dir(assetPath)
 	base := strings.TrimSuffix(filepath.Base(assetPath), filepath.Ext(assetPath))
-	path, ok := findSidecarPath(s.store.PhotoRoot, dir, base, []string{".nfo"})
+	path, ok := findSidecarPath(root.Path, dir, base, []string{".nfo"})
 	if !ok {
 		return nil, nil
 	}
@@ -142,7 +164,8 @@ func (s *Server) nfoForAsset(asset model.Asset) (*NFODTO, error) {
 		return nil, err
 	}
 	text := strings.TrimSpace(string(data))
-	return &NFODTO{Filename: filepath.Base(path), Fields: parseNFOFields(text), Text: text}, nil
+	fields, groups := parseNFOFields(text)
+	return &NFODTO{Filename: filepath.Base(path), Fields: fields, Groups: groups, Text: text}, nil
 }
 
 func (s *Server) subtitleFiles(asset model.Asset) ([]sidecarFile, error) {
@@ -153,27 +176,77 @@ func (s *Server) subtitleFiles(asset model.Asset) ([]sidecarFile, error) {
 	if err != nil {
 		return nil, err
 	}
+	root, err := s.store.RootForPath(assetPath)
+	if err != nil {
+		return nil, err
+	}
 	dir := filepath.Dir(assetPath)
 	base := strings.TrimSuffix(filepath.Base(assetPath), filepath.Ext(assetPath))
-	extensions := []string{".vtt", ".srt"}
-	files := make([]sidecarFile, 0, len(extensions))
-	for _, ext := range extensions {
-		path, ok := findSidecarPath(s.store.PhotoRoot, dir, base, []string{ext})
+	extensions := map[string]string{
+		".ass": "ass",
+		".srt": "srt",
+		".ssa": "ssa",
+		".vtt": "vtt",
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil
+	}
+	files := make([]sidecarFile, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		format, ok := extensions[ext]
 		if !ok {
 			continue
 		}
-		id := sidecarID(asset.ID, filepath.Base(path))
+		path := filepath.Join(dir, entry.Name())
+		if !safeReadableSidecar(root.Path, path) {
+			continue
+		}
+		stem := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		matched := subtitleStemMatches(base, stem)
+		id := sidecarID(asset.ID, entry.Name())
 		files = append(files, sidecarFile{
-			ID: id, AbsPath: path, Filename: filepath.Base(path), Format: strings.TrimPrefix(ext, "."), Default: true,
+			ID: id, AbsPath: path, Filename: entry.Name(), Format: format, Default: matched,
 		})
 	}
 	sort.Slice(files, func(i, j int) bool {
-		if files[i].Format == files[j].Format {
-			return files[i].Filename < files[j].Filename
+		if files[i].Default != files[j].Default {
+			return files[i].Default
 		}
-		return files[i].Format < files[j].Format
+		if files[i].Filename == files[j].Filename {
+			return files[i].Format < files[j].Format
+		}
+		return strings.ToLower(files[i].Filename) < strings.ToLower(files[j].Filename)
 	})
+	if len(files) > 0 && !hasDefaultSubtitle(files) {
+		files[0].Default = true
+	}
 	return files, nil
+}
+
+func subtitleStemMatches(assetBase string, subtitleStem string) bool {
+	base := strings.ToLower(strings.TrimSpace(assetBase))
+	stem := strings.ToLower(strings.TrimSpace(subtitleStem))
+	if stem == base {
+		return true
+	}
+	return strings.HasPrefix(stem, base+".") ||
+		strings.HasPrefix(stem, base+" ") ||
+		strings.HasPrefix(stem, base+"-") ||
+		strings.HasPrefix(stem, base+"_")
+}
+
+func hasDefaultSubtitle(files []sidecarFile) bool {
+	for _, file := range files {
+		if file.Default {
+			return true
+		}
+	}
+	return false
 }
 
 func findSidecarPath(root string, dir string, base string, extensions []string) (string, bool) {
@@ -232,28 +305,69 @@ func sidecarID(assetID int64, filename string) string {
 	return hex.EncodeToString(sum[:])[:12]
 }
 
-func parseNFOFields(text string) map[string]string {
-	fields := map[string]string{}
+func parseNFOFields(text string) (map[string]string, []NFOGroupDTO) {
+	flatFields := map[string]string{}
 	if text == "" || !strings.Contains(text, "<") {
-		return fields
+		return flatFields, nil
 	}
-	labels := map[string]string{
-		"title":         "标题",
-		"originaltitle": "原名",
-		"year":          "年份",
-		"premiered":     "首映",
-		"releasedate":   "发布日期",
-		"runtime":       "片长",
-		"genre":         "类型",
-		"studio":        "制作方",
-		"director":      "导演",
-		"credits":       "编剧",
-		"rating":        "评分",
-		"plot":          "简介",
-		"outline":       "概述",
+	type nfoFieldMeta struct {
+		label    string
+		group    string
+		copyable bool
+	}
+	labels := map[string]nfoFieldMeta{
+		"country":       {label: "地区", group: "基本"},
+		"credits":       {label: "编剧", group: "创作", copyable: true},
+		"director":      {label: "导演", group: "创作", copyable: true},
+		"edition":       {label: "版本", group: "基本"},
+		"genre":         {label: "类型", group: "标记"},
+		"mpaa":          {label: "分级", group: "基本"},
+		"originaltitle": {label: "原名", group: "基本"},
+		"outline":       {label: "概述", group: "简介"},
+		"plot":          {label: "简介", group: "简介"},
+		"premiered":     {label: "首映", group: "基本"},
+		"rating":        {label: "评分", group: "基本"},
+		"releasedate":   {label: "发布日期", group: "基本"},
+		"runtime":       {label: "片长", group: "基本"},
+		"sorttitle":     {label: "排序", group: "基本"},
+		"studio":        {label: "制作方", group: "创作", copyable: true},
+		"tag":           {label: "标签", group: "标记"},
+		"tagline":       {label: "标语", group: "简介"},
+		"title":         {label: "标题", group: "基本"},
+		"writer":        {label: "作者", group: "创作", copyable: true},
+		"year":          {label: "年份", group: "基本"},
+	}
+	groupOrder := []string{"基本", "创作", "演员", "ID", "标记", "简介"}
+	grouped := make(map[string][]NFOFieldDTO, len(groupOrder))
+	addItem := func(group string, item NFOFieldDTO) {
+		value := cleanNFOValue(item.Value)
+		if value == "" {
+			return
+		}
+		item.Value = value
+		for _, existing := range grouped[group] {
+			if existing.Key == item.Key && existing.Value == item.Value {
+				return
+			}
+		}
+		grouped[group] = append(grouped[group], item)
+		label := item.Label
+		if label == "" {
+			label = item.Key
+		}
+		if existing := flatFields[label]; existing != "" {
+			if !strings.Contains(existing, value) {
+				flatFields[label] = existing + " / " + value
+			}
+		} else {
+			flatFields[label] = value
+		}
 	}
 	decoder := xml.NewDecoder(strings.NewReader(text))
-	current := ""
+	stack := []string{}
+	var content strings.Builder
+	uniqueIDType := ""
+	actor := map[string]string(nil)
 	for {
 		token, err := decoder.Token()
 		if err != nil {
@@ -261,28 +375,75 @@ func parseNFOFields(text string) map[string]string {
 		}
 		switch value := token.(type) {
 		case xml.StartElement:
-			current = strings.ToLower(value.Name.Local)
-		case xml.CharData:
-			label, ok := labels[current]
-			if !ok {
-				continue
+			name := strings.ToLower(value.Name.Local)
+			stack = append(stack, name)
+			content.Reset()
+			if name == "actor" {
+				actor = map[string]string{}
 			}
-			content := strings.TrimSpace(string(value))
-			if content == "" {
-				continue
-			}
-			if existing := fields[label]; existing != "" {
-				if !strings.Contains(existing, content) {
-					fields[label] = existing + " / " + content
+			if name == "uniqueid" {
+				uniqueIDType = ""
+				for _, attr := range value.Attr {
+					if strings.EqualFold(attr.Name.Local, "type") {
+						uniqueIDType = strings.TrimSpace(attr.Value)
+					}
 				}
-			} else {
-				fields[label] = content
 			}
+		case xml.CharData:
+			content.Write(value)
 		case xml.EndElement:
-			current = ""
+			name := strings.ToLower(value.Name.Local)
+			parent := ""
+			if len(stack) >= 2 {
+				parent = stack[len(stack)-2]
+			}
+			textContent := content.String()
+			if parent == "actor" && actor != nil {
+				switch name {
+				case "name", "role", "type":
+					actor[name] = textContent
+				}
+			} else if name == "actor" && actor != nil {
+				actorValue := actor["name"]
+				if role := cleanNFOValue(actor["role"]); role != "" {
+					actorValue += " / " + role
+				}
+				if actorType := cleanNFOValue(actor["type"]); actorType != "" {
+					actorValue += " / " + actorType
+				}
+				addItem("演员", NFOFieldDTO{Key: "actor", Label: "演员", Value: actorValue, Copyable: true})
+				actor = nil
+			} else if name == "uniqueid" {
+				label := "ID"
+				key := "uniqueid"
+				if uniqueIDType != "" {
+					label = strings.ToUpper(uniqueIDType)
+					key += ":" + strings.ToLower(uniqueIDType)
+				}
+				addItem("ID", NFOFieldDTO{Key: key, Label: label, Value: textContent, Copyable: true})
+				uniqueIDType = ""
+			} else if meta, ok := labels[name]; ok && parent != "actor" {
+				addItem(meta.group, NFOFieldDTO{Key: name, Label: meta.label, Value: textContent, Copyable: meta.copyable})
+			}
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			content.Reset()
 		}
 	}
-	return fields
+	groups := make([]NFOGroupDTO, 0, len(groupOrder))
+	for _, title := range groupOrder {
+		items := grouped[title]
+		if len(items) == 0 {
+			continue
+		}
+		groups = append(groups, NFOGroupDTO{Title: title, Items: items})
+	}
+	return flatFields, groups
+}
+
+func cleanNFOValue(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
 }
 
 func srtToVTT(text string) string {
@@ -295,4 +456,109 @@ func srtToVTT(text string) string {
 		}
 	}
 	return "WEBVTT\n\n" + strings.Join(lines, "\n")
+}
+
+func assToVTT(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	lines := strings.Split(text, "\n")
+	inEvents := false
+	format := []string{"layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"}
+	cues := make([]string, 0)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inEvents = strings.EqualFold(trimmed, "[Events]")
+			continue
+		}
+		if !inEvents {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "format:") {
+			format = parseASSFormat(trimmed[len("format:"):])
+			continue
+		}
+		if !strings.HasPrefix(lower, "dialogue:") {
+			continue
+		}
+		payload := strings.TrimSpace(trimmed[len("dialogue:"):])
+		fields := strings.SplitN(payload, ",", len(format))
+		startIndex := assFormatIndex(format, "start")
+		endIndex := assFormatIndex(format, "end")
+		textIndex := assFormatIndex(format, "text")
+		if startIndex < 0 || endIndex < 0 || textIndex < 0 || startIndex >= len(fields) || endIndex >= len(fields) || textIndex >= len(fields) {
+			continue
+		}
+		body := cleanASSText(fields[textIndex])
+		if body == "" {
+			continue
+		}
+		cues = append(cues, assTimeToVTT(fields[startIndex])+" --> "+assTimeToVTT(fields[endIndex])+"\n"+body)
+	}
+	return "WEBVTT\n\n" + strings.Join(cues, "\n\n")
+}
+
+func parseASSFormat(value string) []string {
+	parts := strings.Split(value, ",")
+	fields := make([]string, 0, len(parts))
+	for _, part := range parts {
+		name := strings.ToLower(strings.TrimSpace(part))
+		if name != "" {
+			fields = append(fields, name)
+		}
+	}
+	return fields
+}
+
+func assFormatIndex(format []string, name string) int {
+	for index, field := range format {
+		if field == name {
+			return index
+		}
+	}
+	return -1
+}
+
+func assTimeToVTT(value string) string {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 3 {
+		return strings.TrimSpace(value)
+	}
+	hours, _ := strconv.Atoi(parts[0])
+	minutes, _ := strconv.Atoi(parts[1])
+	secondsPart := strings.SplitN(parts[2], ".", 2)
+	seconds, _ := strconv.Atoi(secondsPart[0])
+	milliseconds := 0
+	if len(secondsPart) == 2 {
+		fraction := secondsPart[1]
+		if len(fraction) > 3 {
+			fraction = fraction[:3]
+		}
+		for len(fraction) < 3 {
+			fraction += "0"
+		}
+		milliseconds, _ = strconv.Atoi(fraction)
+	}
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", hours, minutes, seconds, milliseconds)
+}
+
+func cleanASSText(value string) string {
+	replacer := strings.NewReplacer(`\N`, "\n", `\n`, "\n", `\h`, " ")
+	text := replacer.Replace(strings.TrimSpace(value))
+	var builder strings.Builder
+	inOverride := false
+	for _, r := range text {
+		switch r {
+		case '{':
+			inOverride = true
+		case '}':
+			inOverride = false
+		default:
+			if !inOverride {
+				builder.WriteRune(r)
+			}
+		}
+	}
+	return strings.TrimSpace(builder.String())
 }

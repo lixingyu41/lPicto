@@ -6,11 +6,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"lpicto/backend/internal/api"
 	"lpicto/backend/internal/config"
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/events"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/media"
 	"lpicto/backend/internal/scanner"
@@ -30,7 +30,7 @@ func main() {
 	}
 	cfg.Log(logger)
 
-	store, err := storage.New(cfg.PhotoRoot, cfg.DataRoot)
+	store, err := storage.NewWithRoots(cfg.PhotoRoots, cfg.DataRoot)
 	if err != nil {
 		logger.Error("storage init failed", "error", err)
 		os.Exit(1)
@@ -46,47 +46,36 @@ func main() {
 	}
 	defer database.Close()
 
+	eventBus := events.NewBus()
 	thumbProcessor := thumb.Processor{
 		DB: database, Store: store, ThumbLongEdge: cfg.ThumbLongEdge, PreviewLongEdge: cfg.PreviewLongEdge,
-		PreviewQuality: cfg.PreviewQuality, Logger: logger,
+		PreviewQuality: cfg.PreviewQuality, Events: eventBus, Logger: logger,
 	}
 	videoProcessor := video.Processor{
 		DB: database, Store: store, ProxyEnabled: cfg.VideoProxyEnabled, ProxyMaxHeight: cfg.VideoProxyMaxHeight,
-		ProxyCRF: cfg.VideoProxyCRF, HWAccel: cfg.FFmpegHWAccel, HWDevice: cfg.FFmpegHWDevice,
+		ProxyCRF: cfg.VideoProxyCRF, HWAccel: video.ResolveHWAccel(rootCtx, cfg.FFmpegHWAccel, logger), HWDevice: cfg.FFmpegHWDevice,
 		HWFallback: cfg.FFmpegHWFallback, Logger: logger,
 	}
-	queue := jobs.New(logger, thumbProcessor.Handle, videoProcessor.Handle)
-	queue.Start(rootCtx, cfg.ThumbWorkers, cfg.VideoWorkers)
+	queue := jobs.New(logger, thumbProcessor.Handle, videoProcessor.Handle, jobs.ResourcePolicy{
+		MaxActive:          cfg.BackgroundMaxActive,
+		LoadTarget:         cfg.BackgroundLoadTarget,
+		MinFreeMemoryBytes: uint64(cfg.BackgroundMinFreeMB) * 1024 * 1024,
+		StartSpacing:       cfg.BackgroundStartGap,
+	})
+	queue.Start(rootCtx, jobs.WorkerConfig{
+		Image:       cfg.ThumbWorkers,
+		VideoPoster: cfg.VideoPosterWorkers,
+		VideoProxy:  cfg.VideoProxyWorkers,
+	})
 
 	scan := &scanner.Scanner{
 		DB: database, Store: store, Extractor: media.NewExtractor(), Jobs: queue,
-		VideoProxyEnabled: cfg.VideoProxyEnabled, Logger: logger,
-	}
-	recoverPending(rootCtx, database, queue, cfg.VideoProxyEnabled, logger)
-	scan.StartPeriodic(rootCtx, cfg.ScanInterval)
-	if cfg.EnableFSWatch {
-		scan.StartWatcher(rootCtx, 2*time.Second)
+		VideoProxyEnabled: cfg.VideoProxyEnabled, ScanWorkers: cfg.ScanWorkers, Logger: logger,
 	}
 
-	handler := api.NewServer(cfg, database, store, scan, queue, logger)
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		scan.Trigger("startup")
-	}()
+	handler := api.NewServer(cfg, database, store, scan, queue, eventBus, logger)
 	if err := api.Start(rootCtx, cfg.HTTPAddr, handler, logger); err != nil {
 		logger.Error("server stopped with error", "error", err)
 		os.Exit(1)
 	}
-}
-
-func recoverPending(ctx context.Context, database *db.DB, queue *jobs.Manager, proxyEnabled bool, logger *slog.Logger) {
-	items, err := database.PendingWork(ctx, proxyEnabled)
-	if err != nil {
-		logger.Warn("recover pending jobs failed", "error", err)
-		return
-	}
-	for _, item := range items {
-		queue.Enqueue(jobs.Task{Type: item.Type, AssetID: item.AssetID})
-	}
-	logger.Info("recovered pending jobs", "count", len(items))
 }

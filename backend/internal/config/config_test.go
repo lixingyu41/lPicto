@@ -31,3 +31,23 @@ func TestHWAccelEnvInvalidFallsBack(t *testing.T) {
 		t.Fatalf("FFmpegHWAccel = %q, want none", cfg.FFmpegHWAccel)
 	}
 }
+
+func TestPhotoRootsEnv(t *testing.T) {
+	first := t.TempDir()
+	second := t.TempDir()
+	t.Setenv("PHOTO_ROOTS", "C666="+first+";D666="+second)
+	t.Setenv("DATA_ROOT", t.TempDir())
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.PhotoRoots) != 2 {
+		t.Fatalf("len = %d, want 2", len(cfg.PhotoRoots))
+	}
+	if cfg.PhotoRoots[0].ID != "C666" || cfg.PhotoRoots[0].Path != first {
+		t.Fatalf("first root = %#v", cfg.PhotoRoots[0])
+	}
+	if cfg.PhotoRoots[1].ID != "D666" || cfg.PhotoRoots[1].Path != second {
+		t.Fatalf("second root = %#v", cfg.PhotoRoots[1])
+	}
+}

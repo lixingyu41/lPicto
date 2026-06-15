@@ -1,6 +1,6 @@
 # LPicto
 
-LPicto 是一个运行在 NAS Docker 上的 Web 图片/视频相册：只读扫描 `/photos`，在 `/data` 保存 SQLite 数据库、相册设置与媒体缓存，通过浏览器提供图库、相册、文件夹和快速 Viewer。
+LPicto 是一个运行在 NAS Docker 上的 Web 图片/视频相册：只读扫描一个或多个照片存储根，在 `/data` 保存 SQLite 数据库、相册设置与媒体缓存，通过浏览器提供图库、相册、文件夹和快速 Viewer。
 
 ## 功能列表
 
@@ -48,18 +48,22 @@ docker compose up --build
 
 ## NAS 目录挂载说明
 
-默认 compose 将 `/mnt/photos` 只读挂载到容器 `/photos`，将 `/mnt/lpicto-data` 挂载到 `/data`。容器内进程使用非 root 用户 `10001`，宿主机 `/mnt/lpicto-data` 需要允许该 UID 写入。
+默认 compose 将两个示例照片目录只读挂载到容器 `/storage/C666`、`/storage/D666`，通过 `PHOTO_ROOTS=C666=/storage/C666;D666=/storage/D666` 注册为两个存储根，并将本项目 `./data` 挂载到 `/data`。容器内进程使用非 root 用户 `10001`，宿主机数据目录需要允许该 UID 写入。
 
 ## 环境变量
 
 | 变量 | 默认值 |
 | --- | --- |
 | `PHOTO_ROOT` | `/photos` |
+| `PHOTO_ROOTS` | 空，设置后覆盖 `PHOTO_ROOT`，格式 `ID=/path;ID2=/path2` |
 | `DATA_ROOT` | `/data` |
 | `HTTP_ADDR` | `:8080` |
 | `SCAN_INTERVAL_MINUTES` | `30` |
 | `THUMB_WORKERS` | `2` |
 | `VIDEO_WORKERS` | `1` |
+| `BACKGROUND_MAX_ACTIVE` | CPU 核心数 - 1，最小 1 |
+| `BACKGROUND_LOAD_TARGET` | `BACKGROUND_MAX_ACTIVE` |
+| `BACKGROUND_MIN_FREE_MB` | `512` |
 | `PAGE_SIZE_DEFAULT` | `100` |
 | `PAGE_SIZE_MAX` | `500` |
 | `ENABLE_FS_WATCH` | `true` |
@@ -75,7 +79,7 @@ docker compose up --build
 
 ## 首次扫描说明
 
-容器启动后 HTTP 服务先可用，然后后台扫描 `/photos`；扫描不会阻塞页面和 API。
+容器启动后 HTTP 服务先可用，然后后台扫描全部已配置存储根；扫描不会阻塞页面和 API。
 
 ## 手动扫描说明
 
@@ -93,7 +97,7 @@ curl http://localhost:8080/api/scan/status
 
 ## LIB 设置
 
-左下角“设置”页可以管理加入应用的 LIB。LIB 由一个或多个相对 `/photos` 的文件夹组成，空路径表示整个 `/photos`；移除所有 LIB 后资源列表会清空，原文件不会被删除。
+左下角“设置”页可以管理加入应用的 LIB。LIB 由一个或多个相对存储根的文件夹组成；多存储模式下第一段是存储 ID，例如 `/C666/2024`。空路径表示全部存储；移除所有 LIB 后资源列表会清空，原文件不会被删除。
 
 ## 相册说明
 
@@ -101,7 +105,7 @@ curl http://localhost:8080/api/scan/status
 
 ## 缩略图/预览图/视频代理说明
 
-图片使用 `vipsthumbnail` 生成 WebP thumb 和 preview；视频使用 FFmpeg 生成 JPG poster；浏览器不稳定或不支持的视频生成 H.264/AAC MP4 proxy。`FFMPEG_HWACCEL` 可设为 `auto`、`cuda`、`vaapi`、`qsv` 等，让视频抽帧和 proxy 先尝试硬件解码；失败时默认回退 CPU。缓存写入 `/data/cache`，URL 带 `cacheKey` 并使用 immutable 缓存。
+图片使用 `vipsthumbnail` 生成 WebP thumb 和 preview；视频使用 FFmpeg 生成 JPG poster；浏览器不稳定或不支持的视频生成 H.264/AAC MP4 proxy。后台媒体任务由 `BACKGROUND_MAX_ACTIVE` 限制同时运行数量，Linux 容器内启动外部处理命令时使用 `nice -n 10` 和可用时的 `ionice -c 3` 降低 CPU/I/O 优先级；`BACKGROUND_LOAD_TARGET` 和 `BACKGROUND_MIN_FREE_MB` 用于高负载或低内存时延后启动新任务。`FFMPEG_HWACCEL` 可设为 `auto`、`cuda`、`vaapi`、`qsv` 等，让视频抽帧和 proxy 先尝试硬件解码；失败时默认回退 CPU。缓存写入 `/data/cache`，URL 带 `cacheKey` 并使用 immutable 缓存。
 
 ## GPU 视频抽帧
 
@@ -174,7 +178,7 @@ make docker-build
 
 ## 常见问题
 
-- 页面没有资源：确认 `/photos` 挂载路径正确，并查看 `/api/scan/status`。
+- 页面没有资源：确认 `PHOTO_ROOTS` 或 `PHOTO_ROOT` 指向的容器内路径可读，并查看 `/api/scan/status`。
 - 缩略图一直处理中：确认 runtime 镜像内存在 `vipsthumbnail`、`ffmpeg`、`ffprobe`、`exiftool`。
 - 开 GPU 后仍走 CPU：查看容器日志里的 `ffmpeg hardware acceleration failed`，驱动或设备不可用时会自动回退 CPU。
 - `/data` 写入失败：确认宿主机数据目录允许 UID `10001` 写入。

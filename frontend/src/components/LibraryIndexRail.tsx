@@ -1,10 +1,12 @@
-import { useMemo, useRef, useState } from 'react';
+import { useMemo, useRef, useState, type CSSProperties } from 'react';
 import type { LibraryAnchor, SortKey } from '../types/api';
 
 interface Props {
   anchors: LibraryAnchor[];
   sort: SortKey;
   scrollRatio: number;
+  totalCount: number;
+  pageSize: number;
   onSeek: (anchor: LibraryAnchor, page: number, ratio: number) => void;
 }
 
@@ -19,7 +21,7 @@ interface PickResult {
   position: number;
 }
 
-export default function LibraryIndexRail({ anchors, sort, scrollRatio, onSeek }: Props) {
+export default function LibraryIndexRail({ anchors, sort, scrollRatio, totalCount, pageSize, onSeek }: Props) {
   const railRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
   const [active, setActive] = useState<ActiveBubble | null>(null);
@@ -27,7 +29,7 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, onSeek }:
   const visibleAnchors = useMemo(() => anchors.filter((anchor) => anchor.position >= 0 && anchor.position <= 1), [anchors]);
 
   if (visibleAnchors.length === 0) return null;
-  const thumbPosition = active?.position ?? scrollRatio;
+  const thumbPosition = clampRatio(active?.position ?? scrollRatio);
 
   function pick(clientY: number): PickResult | null {
     const rect = railRef.current?.getBoundingClientRect();
@@ -42,7 +44,7 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, onSeek }:
         bestDistance = distance;
       }
     }
-    return { anchor: best, page: pageForRatio(visibleAnchors, ratio), position: ratio };
+    return { anchor: best, page: pageForRatio(visibleAnchors, ratio, totalCount, pageSize), position: ratio };
   }
 
   function activate(clientY: number) {
@@ -83,12 +85,12 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, onSeek }:
       }}
     >
       <div className="library-index-track" />
-      <div className="library-index-scroll-thumb" style={{ top: `${Math.min(1, Math.max(0, thumbPosition)) * 100}%` }} />
+      <div className="library-index-scroll-thumb" style={railPositionStyle(thumbPosition)} />
       {visibleAnchors.map((anchor) => (
         <button
           className={`library-index-mark ${anchor.kind}`}
           key={anchor.key}
-          style={{ top: `${anchor.position * 100}%` }}
+          style={railPositionStyle(anchor.position)}
           title={anchor.label}
           type="button"
           onMouseEnter={() => setActive({ label: anchor.label, position: anchor.position })}
@@ -97,7 +99,7 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, onSeek }:
         </button>
       ))}
       {active && (
-        <div className="library-index-bubble" style={{ top: `${active.position * 100}%` }}>
+        <div className="library-index-bubble" style={railPositionStyle(active.position)}>
           {active.label}
         </div>
       )}
@@ -105,7 +107,22 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, onSeek }:
   );
 }
 
-function pageForRatio(anchors: LibraryAnchor[], ratio: number) {
+function railPositionStyle(position: number): CSSProperties {
+  const ratio = clampRatio(position);
+  return {
+    top: `${ratio * 100}%`,
+    transform: `translateY(-${ratio * 100}%)`,
+  };
+}
+
+function clampRatio(value: number) {
+  return Math.min(1, Math.max(0, value));
+}
+
+function pageForRatio(anchors: LibraryAnchor[], ratio: number, totalCount: number, pageSize: number) {
+  if (totalCount > 0 && pageSize > 0) {
+    return Math.max(1, Math.floor((Math.min(1, Math.max(0, ratio)) * Math.max(0, totalCount - 1)) / pageSize) + 1);
+  }
   if (anchors.length === 0) return 1;
   const sorted = [...anchors].sort((a, b) => a.position - b.position);
   if (ratio <= sorted[0].position) return sorted[0].page;
@@ -122,5 +139,5 @@ function pageForRatio(anchors: LibraryAnchor[], ratio: number) {
 }
 
 function showInlineLabel(sort: SortKey) {
-  return sort === 'filename' || sort === 'size';
+  return sort === 'filename' || sort === 'filename_asc' || sort === 'filename_desc' || sort === 'size' || sort === 'size_asc' || sort === 'size_desc';
 }

@@ -5,7 +5,7 @@
 - Docker 单容器部署。
 - Go 后端服务 API 和前端静态文件。
 - SQLite migration 自动初始化。
-- `/photos` 只读扫描、删除标记、定时扫描、fsnotify 触发。
+- 照片存储根只读扫描、删除标记、定时扫描、fsnotify 触发。
 - 图片 thumb/preview、视频 poster/proxy 后台生成。
 - Timeline、Library、Folders 三入口。
 - Viewer 图片缩放/拖拽和视频播放。

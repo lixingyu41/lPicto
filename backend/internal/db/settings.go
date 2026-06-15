@@ -46,12 +46,12 @@ func (d *DB) GetScanLibraries(ctx context.Context) ([]ScanLibrary, bool, error) 
 		return nil, configured, err
 	}
 	if !configured {
-		return []ScanLibrary{{ID: "default", Name: "默认 LIB", Roots: []string{""}}}, false, nil
+		return []ScanLibrary{{ID: "default", Name: "默认来源", Roots: []string{""}}}, false, nil
 	}
 	if len(folders) == 0 {
 		return []ScanLibrary{}, true, nil
 	}
-	return []ScanLibrary{{ID: "legacy", Name: "默认 LIB", Roots: folders}}, true, nil
+	return []ScanLibrary{{ID: "legacy", Name: "默认来源", Roots: folders}}, true, nil
 }
 
 func (d *DB) SetScanLibraries(ctx context.Context, libraries []ScanLibrary) error {
@@ -100,6 +100,44 @@ func (d *DB) AddScanLibrary(ctx context.Context, name string, roots []string) ([
 		}
 	}
 	return libraries, library, d.SetScanLibraries(ctx, libraries)
+}
+
+func (d *DB) UpdateScanLibrary(ctx context.Context, id string, name string, roots []string) ([]ScanLibrary, ScanLibrary, error) {
+	libraries, _, err := d.GetScanLibraries(ctx)
+	if err != nil {
+		return nil, ScanLibrary{}, err
+	}
+	roots, err = NormalizeScanFolders(roots)
+	if err != nil {
+		return nil, ScanLibrary{}, err
+	}
+	id = strings.TrimSpace(id)
+	found := false
+	updated := ScanLibrary{}
+	for index := range libraries {
+		if libraries[index].ID != id {
+			continue
+		}
+		libraries[index].Name = strings.TrimSpace(name)
+		libraries[index].Roots = roots
+		updated = libraries[index]
+		found = true
+		break
+	}
+	if !found {
+		return nil, ScanLibrary{}, sql.ErrNoRows
+	}
+	libraries, err = NormalizeScanLibraries(libraries)
+	if err != nil {
+		return nil, ScanLibrary{}, err
+	}
+	for _, item := range libraries {
+		if item.ID == id {
+			updated = item
+			break
+		}
+	}
+	return libraries, updated, d.SetScanLibraries(ctx, libraries)
 }
 
 func (d *DB) RemoveScanLibrary(ctx context.Context, id string) ([]ScanLibrary, error) {
@@ -165,7 +203,7 @@ func (d *DB) SetScanFolders(ctx context.Context, folders []string) error {
 	if len(normalized) == 0 {
 		return d.SetScanLibraries(ctx, nil)
 	}
-	return d.SetScanLibraries(ctx, []ScanLibrary{{ID: "legacy", Name: "默认 LIB", Roots: normalized}})
+	return d.SetScanLibraries(ctx, []ScanLibrary{{ID: "legacy", Name: "默认来源", Roots: normalized}})
 }
 
 func (d *DB) setLegacyScanFolders(ctx context.Context, folders []string) error {

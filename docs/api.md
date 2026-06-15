@@ -41,7 +41,7 @@
 - `DELETE /api/settings/scan-folders?relPath=TIKTOK`
 - `GET /api/source-folders?parentRelPath=`
 
-LIB 路径是相对 `/photos` 的路径，空字符串表示 `/photos` 根目录。
+LIB 路径是相对照片存储根的路径；多存储模式下第一段是存储 ID，例如 `C666/2024`，空字符串表示全部存储。
 
 ## Library
 

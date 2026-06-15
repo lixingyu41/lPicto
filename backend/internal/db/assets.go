@@ -42,27 +42,30 @@ type AssetUpsert struct {
 }
 
 type AssetListOptions struct {
-	Page      int
-	PageSize  int
+	Page        int
+	PageSize    int
+	Type        string
+	Sort        string
+	Query       string
+	FolderID    *int64
+	From        *int64
+	To          *int64
+	FolderRel   *string
+	Recursive   bool
+	VisibleOnly bool
+}
+
+type NeighborOptions struct {
+	Context   string
+	AssetID   int64
 	Type      string
 	Sort      string
 	Query     string
 	FolderID  *int64
 	From      *int64
 	To        *int64
-	FolderRel *string
-}
-
-type NeighborOptions struct {
-	Context  string
-	AssetID  int64
-	Type     string
-	Sort     string
-	Query    string
-	FolderID *int64
-	From     *int64
-	To       *int64
-	Limit    int
+	Limit     int
+	Recursive bool
 }
 
 type Neighbors struct {
@@ -76,6 +79,20 @@ type WorkItem struct {
 	AssetID int64
 }
 
+type DeletedAsset struct {
+	ID        int64
+	RelPath   string
+	CacheKey  string
+	MediaType string
+}
+
+type AssetUpsertResult struct {
+	ID          int64
+	Added       bool
+	Updated     bool
+	OldCacheKey string
+}
+
 type LibraryAnchor struct {
 	Key      string
 	Label    string
@@ -83,6 +100,11 @@ type LibraryAnchor struct {
 	Page     int
 	Position float64
 	Value    int64
+}
+
+type LibraryAnchorResult struct {
+	Items []LibraryAnchor
+	Total int
 }
 
 type libraryAnchorRow struct {
@@ -93,6 +115,14 @@ type libraryAnchorRow struct {
 }
 
 func (d *DB) UpsertAsset(ctx context.Context, p AssetUpsert) (id int64, added bool, updated bool, err error) {
+	result, err := d.UpsertAssetDetailed(ctx, p)
+	if err != nil {
+		return 0, false, false, err
+	}
+	return result.ID, result.Added, result.Updated, nil
+}
+
+func (d *DB) UpsertAssetDetailed(ctx context.Context, p AssetUpsert) (AssetUpsertResult, error) {
 	now := util.UnixNow()
 	if p.ImportedAt == 0 {
 		p.ImportedAt = now
@@ -100,8 +130,9 @@ func (d *DB) UpsertAsset(ctx context.Context, p AssetUpsert) (id int64, added bo
 	var existingID int64
 	var existingSize int64
 	var existingMtime int64
+	var existingCacheKey string
 	var deletedAt sql.NullInt64
-	err = d.conn.QueryRowContext(ctx, `SELECT id, size, mtime, deleted_at FROM assets WHERE rel_path = ?`, p.RelPath).Scan(&existingID, &existingSize, &existingMtime, &deletedAt)
+	err := d.conn.QueryRowContext(ctx, `SELECT id, size, mtime, cache_key, deleted_at FROM assets WHERE rel_path = ?`, p.RelPath).Scan(&existingID, &existingSize, &existingMtime, &existingCacheKey, &deletedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		result, err := d.conn.ExecContext(ctx, `
 INSERT INTO assets (
@@ -115,16 +146,19 @@ INSERT INTO assets (
 			boolInt(p.BrowserPlayable), model.StatusOK, p.ThumbStatus, p.PreviewStatus, p.VideoPosterStatus,
 			p.VideoProxyStatus, nullString(p.MetadataJSON), nullString(p.Error), now, now)
 		if err != nil {
-			return 0, false, false, err
+			return AssetUpsertResult{}, err
 		}
 		id, err := result.LastInsertId()
-		return id, true, false, err
+		if err != nil {
+			return AssetUpsertResult{}, err
+		}
+		return AssetUpsertResult{ID: id, Added: true}, nil
 	}
 	if err != nil {
-		return 0, false, false, err
+		return AssetUpsertResult{}, err
 	}
 	if existingSize == p.Size && existingMtime == p.Mtime && !deletedAt.Valid {
-		return existingID, false, false, nil
+		return AssetUpsertResult{ID: existingID}, nil
 	}
 	_, err = d.conn.ExecContext(ctx, `
 UPDATE assets SET
@@ -139,7 +173,14 @@ WHERE id = ?`,
 		p.TimelineAt, p.CacheKey, boolInt(p.BrowserPlayable), model.StatusOK,
 		p.ThumbStatus, p.PreviewStatus, p.VideoPosterStatus, p.VideoProxyStatus,
 		nullString(p.MetadataJSON), nullString(p.Error), now, existingID)
-	return existingID, false, true, err
+	if err != nil {
+		return AssetUpsertResult{}, err
+	}
+	result := AssetUpsertResult{ID: existingID, Updated: true}
+	if existingCacheKey != "" && existingCacheKey != p.CacheKey {
+		result.OldCacheKey = existingCacheKey
+	}
+	return result, nil
 }
 
 func (d *DB) GetAsset(ctx context.Context, id int64) (model.Asset, error) {
@@ -156,38 +197,48 @@ func (d *DB) ListLibraryAssets(ctx context.Context, opts AssetListOptions) (mode
 	return d.listAssets(ctx, opts, false)
 }
 
-func (d *DB) LibraryAnchors(ctx context.Context, opts AssetListOptions) ([]LibraryAnchor, error) {
+func (d *DB) LibraryAnchors(ctx context.Context, opts AssetListOptions) (LibraryAnchorResult, error) {
 	if opts.PageSize <= 0 {
 		opts.PageSize = 100
 	}
 	where, args := assetFilterSQL(opts, false)
-	query := "SELECT filename, size, imported_at, timeline_at FROM assets WHERE " + where + " ORDER BY " + sortSQL(opts.Sort)
+	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.PageSize)
+}
+
+func (d *DB) anchorsForFilter(ctx context.Context, where string, args []any, sort string, pageSize int) (LibraryAnchorResult, error) {
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+	query := "SELECT filename, size, imported_at, timeline_at FROM assets WHERE " + where + " ORDER BY " + sortSQL(sort)
 	rows, err := d.conn.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return LibraryAnchorResult{}, err
 	}
 	defer rows.Close()
 	var items []libraryAnchorRow
 	for rows.Next() {
 		var item libraryAnchorRow
 		if err := rows.Scan(&item.Filename, &item.Size, &item.ImportedAt, &item.TimelineAt); err != nil {
-			return nil, err
+			return LibraryAnchorResult{}, err
 		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return LibraryAnchorResult{}, err
 	}
 	if len(items) == 0 {
-		return nil, nil
+		return LibraryAnchorResult{}, nil
+	}
+	if usesUniformAnchors(sort) {
+		return LibraryAnchorResult{Items: uniformAnchors(sort, items, pageSize), Total: len(items)}, nil
 	}
 	anchors := make([]LibraryAnchor, 0, len(items))
 	seen := make(map[string]struct{})
 	lastMonth := ""
 	lastYear := ""
 	for index, item := range items {
-		key, label, kind, value := anchorParts(opts.Sort, item)
-		if isTimeSort(opts.Sort) {
+		key, label, kind, value := anchorParts(sort, item)
+		if isTimeSort(sort) {
 			year, month := dateAnchorGroups(value)
 			if year != lastYear {
 				kind = "year"
@@ -210,12 +261,78 @@ func (d *DB) LibraryAnchors(ctx context.Context, opts AssetListOptions) ([]Libra
 			Key:      key,
 			Label:    label,
 			Kind:     kind,
-			Page:     index/opts.PageSize + 1,
+			Page:     index/pageSize + 1,
 			Position: position,
 			Value:    value,
 		})
 	}
-	return anchors, nil
+	return LibraryAnchorResult{Items: anchors, Total: len(items)}, nil
+}
+
+func usesUniformAnchors(sort string) bool {
+	return sort == "" ||
+		sort == "timeline_asc" ||
+		sort == "timeline_desc" ||
+		sort == "imported_asc" ||
+		sort == "imported_desc" ||
+		sort == "size" ||
+		sort == "size_asc" ||
+		sort == "size_desc"
+}
+
+func uniformAnchors(sort string, items []libraryAnchorRow, pageSize int) []LibraryAnchor {
+	const maxAnchors = 12
+	count := len(items)
+	if count > maxAnchors {
+		count = maxAnchors
+	}
+	if count <= 0 {
+		return nil
+	}
+	anchors := make([]LibraryAnchor, 0, count)
+	top := anchorScaleValue(sort, items[0])
+	bottom := anchorScaleValue(sort, items[len(items)-1])
+	for index := 0; index < count; index++ {
+		position := 0.0
+		if count > 1 {
+			position = float64(index) / float64(count-1)
+		}
+		value := int64(float64(top) + (float64(bottom)-float64(top))*position)
+		itemIndex := 0
+		if len(items) > 1 {
+			itemIndex = int(position * float64(len(items)-1))
+		}
+		label, kind := uniformAnchorLabel(sort, value)
+		anchors = append(anchors, LibraryAnchor{
+			Key:      fmt.Sprintf("scale:%s:%d", sort, index),
+			Label:    label,
+			Kind:     kind,
+			Page:     itemIndex/pageSize + 1,
+			Position: position,
+			Value:    value,
+		})
+	}
+	return anchors
+}
+
+func anchorScaleValue(sort string, item libraryAnchorRow) int64 {
+	switch sort {
+	case "imported_asc", "imported_desc":
+		return item.ImportedAt
+	case "size", "size_asc", "size_desc":
+		return item.Size
+	default:
+		return item.TimelineAt
+	}
+}
+
+func uniformAnchorLabel(sort string, value int64) (string, string) {
+	switch sort {
+	case "size", "size_asc", "size_desc":
+		return formatAnchorSize(value), "size"
+	default:
+		return time.Unix(value, 0).Local().Format("2006-01-02"), "day"
+	}
 }
 
 func (d *DB) ListTimelineAssets(ctx context.Context, opts AssetListOptions) (model.Page[model.Asset], error) {
@@ -224,7 +341,7 @@ func (d *DB) ListTimelineAssets(ctx context.Context, opts AssetListOptions) (mod
 }
 
 func (d *DB) ListFolderAssets(ctx context.Context, folderID int64, opts AssetListOptions) (model.Page[model.Asset], error) {
-	folder, err := d.GetFolder(ctx, folderID)
+	folder, err := d.getFolderRaw(ctx, folderID)
 	if err != nil {
 		return model.Page[model.Asset]{}, err
 	}
@@ -273,16 +390,88 @@ func (d *DB) ActiveRelPaths(ctx context.Context) (map[string]struct{}, error) {
 }
 
 func (d *DB) MarkDeleted(ctx context.Context, relPath string, deletedAt int64) error {
-	_, err := d.conn.ExecContext(ctx, `UPDATE assets SET deleted_at = ?, updated_at = ? WHERE rel_path = ? AND deleted_at IS NULL`, deletedAt, deletedAt, relPath)
+	_, err := d.MarkDeletedWithCache(ctx, relPath, deletedAt)
 	return err
 }
 
+func (d *DB) MarkDeletedWithCache(ctx context.Context, relPath string, deletedAt int64) (*DeletedAsset, error) {
+	var asset DeletedAsset
+	err := d.conn.QueryRowContext(ctx, `
+SELECT id, rel_path, cache_key, media_type
+FROM assets
+WHERE rel_path = ? AND deleted_at IS NULL`, relPath).Scan(&asset.ID, &asset.RelPath, &asset.CacheKey, &asset.MediaType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	_, err = d.conn.ExecContext(ctx, `UPDATE assets SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, deletedAt, deletedAt, asset.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &asset, nil
+}
+
+func (d *DB) MarkDeletedUnder(ctx context.Context, relPath string, deletedAt int64) ([]DeletedAsset, error) {
+	where := `deleted_at IS NULL AND rel_path = ?`
+	args := []any{relPath}
+	if relPath != "" {
+		where = `deleted_at IS NULL AND (rel_path = ? OR rel_path LIKE ? ESCAPE '\')`
+		args = []any{relPath, escapeLike(relPath) + "/%"}
+	}
+	return d.markDeletedWhere(ctx, deletedAt, where, args...)
+}
+
 func (d *DB) MarkAllDeleted(ctx context.Context, deletedAt int64) (int64, error) {
-	result, err := d.conn.ExecContext(ctx, `UPDATE assets SET deleted_at = ?, updated_at = ? WHERE deleted_at IS NULL`, deletedAt, deletedAt)
+	items, err := d.MarkAllDeletedWithCache(ctx, deletedAt)
 	if err != nil {
 		return 0, err
 	}
-	return result.RowsAffected()
+	return int64(len(items)), nil
+}
+
+func (d *DB) MarkAllDeletedWithCache(ctx context.Context, deletedAt int64) ([]DeletedAsset, error) {
+	return d.markDeletedWhere(ctx, deletedAt, `deleted_at IS NULL`)
+}
+
+func (d *DB) markDeletedWhere(ctx context.Context, deletedAt int64, where string, args ...any) ([]DeletedAsset, error) {
+	rows, err := d.conn.QueryContext(ctx, `
+SELECT id, rel_path, cache_key, media_type
+FROM assets
+WHERE `+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []DeletedAsset
+	var ids []any
+	for rows.Next() {
+		var asset DeletedAsset
+		if err := rows.Scan(&asset.ID, &asset.RelPath, &asset.CacheKey, &asset.MediaType); err != nil {
+			return nil, err
+		}
+		items = append(items, asset)
+		ids = append(ids, asset.ID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(ids))
+	updateArgs := make([]any, 0, len(ids)+2)
+	updateArgs = append(updateArgs, deletedAt, deletedAt)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		updateArgs = append(updateArgs, id)
+	}
+	_, err = d.conn.ExecContext(ctx, `UPDATE assets SET deleted_at = ?, updated_at = ? WHERE deleted_at IS NULL AND id IN (`+strings.Join(placeholders, ",")+`)`, updateArgs...)
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 func (d *DB) SetAssetWorkStatus(ctx context.Context, assetID int64, field string, status string, message *string) error {
@@ -298,6 +487,16 @@ func (d *DB) SetAssetWorkStatus(ctx context.Context, assetID int64, field string
 	return err
 }
 
+func (d *DB) ResetAssetThumbnail(ctx context.Context, assetID int64) error {
+	now := util.UnixNow()
+	_, err := d.conn.ExecContext(ctx, `
+UPDATE assets
+SET thumb_status = ?, video_poster_status = ?, error = NULL, updated_at = ?
+WHERE id = ? AND deleted_at IS NULL`,
+		model.StatusPending, model.StatusNotRequired, now, assetID)
+	return err
+}
+
 func (d *DB) PendingWork(ctx context.Context, videoProxyEnabled bool) ([]WorkItem, error) {
 	rows, err := d.conn.QueryContext(ctx, `
 SELECT id, media_type, thumb_status, preview_status, video_poster_status, video_proxy_status
@@ -305,7 +504,6 @@ FROM assets
 WHERE deleted_at IS NULL AND (
   thumb_status IN ('pending','processing','error') OR
   preview_status IN ('pending','processing','error') OR
-  video_poster_status IN ('pending','processing','error') OR
   video_proxy_status IN ('pending','processing','error')
 )`)
 	if err != nil {
@@ -319,18 +517,14 @@ WHERE deleted_at IS NULL AND (
 		if err := rows.Scan(&id, &mediaType, &thumbStatus, &previewStatus, &posterStatus, &proxyStatus); err != nil {
 			return nil, err
 		}
-		if mediaType == model.MediaTypeImage {
-			if recoverableWorkStatus(thumbStatus) {
-				items = append(items, WorkItem{Type: "thumb", AssetID: id})
-			}
-			if recoverableWorkStatus(previewStatus) {
-				items = append(items, WorkItem{Type: "preview", AssetID: id})
-			}
+		_ = posterStatus
+		if recoverableWorkStatus(thumbStatus) {
+			items = append(items, WorkItem{Type: "thumb", AssetID: id})
+		}
+		if mediaType == model.MediaTypeImage && recoverableWorkStatus(previewStatus) {
+			items = append(items, WorkItem{Type: "preview", AssetID: id})
 		}
 		if mediaType == model.MediaTypeVideo {
-			if recoverableWorkStatus(posterStatus) {
-				items = append(items, WorkItem{Type: "video_poster", AssetID: id})
-			}
 			if videoProxyEnabled && recoverableWorkStatus(proxyStatus) {
 				items = append(items, WorkItem{Type: "video_proxy", AssetID: id})
 			}
@@ -352,7 +546,7 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 		return Neighbors{}, err
 	}
 	filterOpts := AssetListOptions{
-		Type: opts.Type, Sort: opts.Sort, Query: opts.Query, From: opts.From, To: opts.To,
+		Type: opts.Type, Sort: opts.Sort, Query: opts.Query, From: opts.From, To: opts.To, VisibleOnly: true,
 	}
 	if opts.Context == "folder" {
 		if opts.FolderID == nil {
@@ -363,6 +557,7 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 			return Neighbors{}, err
 		}
 		filterOpts.FolderRel = &folder.RelPath
+		filterOpts.Recursive = opts.Recursive
 	}
 	if opts.Context == "timeline" {
 		filterOpts.Sort = "timeline_desc"
@@ -397,6 +592,9 @@ func (d *DB) neighborSide(ctx context.Context, where string, args []any, conditi
 func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 	where := []string{"deleted_at IS NULL"}
 	var args []any
+	if opts.VisibleOnly {
+		where = append(where, "thumb_status = 'ready'")
+	}
 	switch opts.Type {
 	case model.MediaTypeImage, model.MediaTypeVideo:
 		where = append(where, "media_type = ?")
@@ -407,8 +605,16 @@ func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 		args = append(args, "%"+escapeLike(strings.ToLower(opts.Query))+"%")
 	}
 	if opts.FolderRel != nil {
-		where = append(where, "parent_rel_path = ?")
-		args = append(args, *opts.FolderRel)
+		if opts.Recursive {
+			if *opts.FolderRel != "" {
+				lower, upper := descendantPathBounds(*opts.FolderRel)
+				where = append(where, "(parent_rel_path = ? OR (parent_rel_path >= ? AND parent_rel_path < ?))")
+				args = append(args, *opts.FolderRel, lower, upper)
+			}
+		} else {
+			where = append(where, "parent_rel_path = ?")
+			args = append(args, *opts.FolderRel)
+		}
 	}
 	if timeline {
 		if opts.From != nil {
@@ -427,10 +633,16 @@ func sortSQL(sort string) string {
 	switch sort {
 	case "timeline_asc":
 		return "timeline_at ASC, id ASC"
-	case "filename":
+	case "filename", "filename_asc":
 		return "lower(filename) ASC, id ASC"
-	case "size":
+	case "filename_desc":
+		return "lower(filename) DESC, id DESC"
+	case "size", "size_desc":
 		return "size DESC, id DESC"
+	case "size_asc":
+		return "size ASC, id ASC"
+	case "imported_asc":
+		return "imported_at ASC, id ASC"
 	case "imported_desc":
 		return "imported_at DESC, id DESC"
 	default:
@@ -440,13 +652,13 @@ func sortSQL(sort string) string {
 
 func anchorParts(sort string, item libraryAnchorRow) (string, string, string, int64) {
 	switch sort {
-	case "filename":
+	case "filename", "filename_asc", "filename_desc":
 		label := filenameAnchorLabel(item.Filename)
 		return "name:" + label, label, "letter", 0
-	case "size":
+	case "size", "size_asc", "size_desc":
 		label := sizeAnchorLabel(item.Size)
 		return "size:" + label, label, "size", item.Size
-	case "imported_desc":
+	case "imported_asc", "imported_desc":
 		return dateAnchorParts(item.ImportedAt)
 	case "timeline_asc", "timeline_desc":
 		return dateAnchorParts(item.TimelineAt)
@@ -467,7 +679,7 @@ func dateAnchorGroups(unix int64) (string, string) {
 }
 
 func isTimeSort(sort string) bool {
-	return sort == "timeline_asc" || sort == "timeline_desc" || sort == "imported_desc" || sort == ""
+	return sort == "timeline_asc" || sort == "timeline_desc" || sort == "imported_asc" || sort == "imported_desc" || sort == ""
 }
 
 func filenameAnchorLabel(name string) string {
@@ -503,6 +715,33 @@ func sizeAnchorLabel(size int64) string {
 	}
 }
 
+func formatAnchorSize(size int64) string {
+	if size < 0 {
+		size = 0
+	}
+	const (
+		kb = 1024
+		mb = 1024 * kb
+		gb = 1024 * mb
+	)
+	switch {
+	case size >= 10*gb:
+		return fmt.Sprintf("%dGB", size/gb)
+	case size >= gb:
+		return fmt.Sprintf("%.1fGB", float64(size)/float64(gb))
+	case size >= 10*mb:
+		return fmt.Sprintf("%dMB", size/mb)
+	case size >= mb:
+		return fmt.Sprintf("%.1fMB", float64(size)/float64(mb))
+	case size >= 10*kb:
+		return fmt.Sprintf("%dKB", size/kb)
+	case size >= kb:
+		return fmt.Sprintf("%.1fKB", float64(size)/float64(kb))
+	default:
+		return fmt.Sprintf("%dB", size)
+	}
+}
+
 func neighborCondition(current model.Asset, sort string, previous bool) (string, []any, string) {
 	switch sort {
 	case "timeline_asc":
@@ -510,17 +749,33 @@ func neighborCondition(current model.Asset, sort string, previous bool) (string,
 			return "(timeline_at < ? OR (timeline_at = ? AND id < ?))", []any{current.TimelineAt, current.TimelineAt, current.ID}, "timeline_at DESC, id DESC"
 		}
 		return "(timeline_at > ? OR (timeline_at = ? AND id > ?))", []any{current.TimelineAt, current.TimelineAt, current.ID}, "timeline_at ASC, id ASC"
-	case "filename":
+	case "filename", "filename_asc":
 		name := strings.ToLower(current.Filename)
 		if previous {
 			return "(lower(filename) < ? OR (lower(filename) = ? AND id < ?))", []any{name, name, current.ID}, "lower(filename) DESC, id DESC"
 		}
 		return "(lower(filename) > ? OR (lower(filename) = ? AND id > ?))", []any{name, name, current.ID}, "lower(filename) ASC, id ASC"
-	case "size":
+	case "filename_desc":
+		name := strings.ToLower(current.Filename)
+		if previous {
+			return "(lower(filename) > ? OR (lower(filename) = ? AND id > ?))", []any{name, name, current.ID}, "lower(filename) ASC, id ASC"
+		}
+		return "(lower(filename) < ? OR (lower(filename) = ? AND id < ?))", []any{name, name, current.ID}, "lower(filename) DESC, id DESC"
+	case "size", "size_desc":
 		if previous {
 			return "(size > ? OR (size = ? AND id > ?))", []any{current.Size, current.Size, current.ID}, "size ASC, id ASC"
 		}
 		return "(size < ? OR (size = ? AND id < ?))", []any{current.Size, current.Size, current.ID}, "size DESC, id DESC"
+	case "size_asc":
+		if previous {
+			return "(size < ? OR (size = ? AND id < ?))", []any{current.Size, current.Size, current.ID}, "size DESC, id DESC"
+		}
+		return "(size > ? OR (size = ? AND id > ?))", []any{current.Size, current.Size, current.ID}, "size ASC, id ASC"
+	case "imported_asc":
+		if previous {
+			return "(imported_at < ? OR (imported_at = ? AND id < ?))", []any{current.ImportedAt, current.ImportedAt, current.ID}, "imported_at DESC, id DESC"
+		}
+		return "(imported_at > ? OR (imported_at = ? AND id > ?))", []any{current.ImportedAt, current.ImportedAt, current.ID}, "imported_at ASC, id ASC"
 	case "imported_desc":
 		if previous {
 			return "(imported_at > ? OR (imported_at = ? AND id > ?))", []any{current.ImportedAt, current.ImportedAt, current.ID}, "imported_at ASC, id ASC"
@@ -594,6 +849,19 @@ func escapeLike(value string) string {
 	return value
 }
 
+func descendantPathBounds(rel string) (string, string) {
+	lower := rel + "/"
+	bytes := []byte(lower)
+	for i := len(bytes) - 1; i >= 0; i-- {
+		if bytes[i] == 0xff {
+			continue
+		}
+		bytes[i]++
+		return lower, string(bytes[:i+1])
+	}
+	return lower, lower + "\x00"
+}
+
 func validStatusField(field string) bool {
 	switch field {
 	case "thumb_status", "preview_status", "video_poster_status", "video_proxy_status":
@@ -613,14 +881,18 @@ func ParentFolderRel(rel string) string {
 
 func AssetStatuses(mediaType string, browserPlayable bool, proxyEnabled bool) (thumb, preview, poster, proxy string) {
 	if mediaType == model.MediaTypeImage {
-		return model.StatusPending, model.StatusPending, model.StatusNotRequired, model.StatusNotRequired
+		previewStatus := model.StatusNotRequired
+		if !browserPlayable {
+			previewStatus = model.StatusPending
+		}
+		return model.StatusPending, previewStatus, model.StatusNotRequired, model.StatusNotRequired
 	}
 	if mediaType == model.MediaTypeVideo {
 		proxyStatus := model.StatusNotRequired
 		if proxyEnabled && !browserPlayable {
 			proxyStatus = model.StatusPending
 		}
-		return model.StatusNotRequired, model.StatusNotRequired, model.StatusPending, proxyStatus
+		return model.StatusPending, model.StatusNotRequired, model.StatusNotRequired, proxyStatus
 	}
 	return model.StatusNotRequired, model.StatusNotRequired, model.StatusNotRequired, model.StatusNotRequired
 }

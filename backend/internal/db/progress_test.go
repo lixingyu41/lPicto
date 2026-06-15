@@ -25,8 +25,8 @@ func TestProcessingProgressCountsActiveAssets(t *testing.T) {
 	insertProgressAsset(t, database, AssetUpsert{
 		RelPath: "b.mp4", ParentRelPath: "", Filename: "b.mp4", Ext: "mp4", MediaType: model.MediaTypeVideo,
 		Size: 20, Mtime: 20, ImportedAt: 20, TimelineAt: 20, CacheKey: "b",
-		ThumbStatus: model.StatusNotRequired, PreviewStatus: model.StatusNotRequired,
-		VideoPosterStatus: model.StatusProcessing, VideoProxyStatus: model.StatusNotRequired,
+		ThumbStatus: model.StatusProcessing, PreviewStatus: model.StatusNotRequired,
+		VideoPosterStatus: model.StatusNotRequired, VideoProxyStatus: model.StatusPending,
 	})
 	deletedID, _, _, err := database.UpsertAsset(ctx, AssetUpsert{
 		RelPath: "deleted.jpg", ParentRelPath: "", Filename: "deleted.jpg", Ext: "jpg", MediaType: model.MediaTypeImage,
@@ -49,17 +49,82 @@ func TestProcessingProgressCountsActiveAssets(t *testing.T) {
 	if progress.AssetTotal != 2 || progress.ImageTotal != 1 || progress.VideoTotal != 1 {
 		t.Fatalf("asset totals = %#v", progress)
 	}
-	if progress.Thumb.Total != 1 || progress.Thumb.Ready != 1 {
+	if progress.Thumb.Total != 2 || progress.Thumb.Ready != 1 || progress.Thumb.Processing != 1 {
 		t.Fatalf("thumb counts = %#v", progress.Thumb)
 	}
 	if progress.Preview.Total != 1 || progress.Preview.Pending != 1 {
 		t.Fatalf("preview counts = %#v", progress.Preview)
 	}
-	if progress.VideoPoster.Total != 1 || progress.VideoPoster.Processing != 1 {
+	if progress.VideoPoster.Total != 1 || progress.VideoPoster.NotRequired != 1 {
 		t.Fatalf("poster counts = %#v", progress.VideoPoster)
 	}
-	if progress.VideoProxy.Total != 1 || progress.VideoProxy.NotRequired != 1 {
+	if progress.VideoProxy.Total != 1 || progress.VideoProxy.Pending != 1 {
 		t.Fatalf("proxy counts = %#v", progress.VideoProxy)
+	}
+	if progress.Transcode.Total != 2 || progress.Transcode.Pending != 2 {
+		t.Fatalf("transcode counts = %#v", progress.Transcode)
+	}
+}
+
+func TestProcessingProgressForRootsCountsScopedAssets(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	insertProgressAsset(t, database, AssetUpsert{
+		RelPath: "family/a.jpg", ParentRelPath: "family", Filename: "a.jpg", Ext: "jpg", MediaType: model.MediaTypeImage,
+		Size: 10, Mtime: 10, ImportedAt: 10, TimelineAt: 10, CacheKey: "family-a",
+		ThumbStatus: model.StatusReady, PreviewStatus: model.StatusPending,
+		VideoPosterStatus: model.StatusNotRequired, VideoProxyStatus: model.StatusNotRequired,
+	})
+	insertProgressAsset(t, database, AssetUpsert{
+		RelPath: "family/trip/b.mp4", ParentRelPath: "family/trip", Filename: "b.mp4", Ext: "mp4", MediaType: model.MediaTypeVideo,
+		Size: 20, Mtime: 20, ImportedAt: 20, TimelineAt: 20, CacheKey: "family-b",
+		ThumbStatus: model.StatusPending, PreviewStatus: model.StatusNotRequired,
+		VideoPosterStatus: model.StatusNotRequired, VideoProxyStatus: model.StatusProcessing,
+	})
+	insertProgressAsset(t, database, AssetUpsert{
+		RelPath: "work/c.jpg", ParentRelPath: "work", Filename: "c.jpg", Ext: "jpg", MediaType: model.MediaTypeImage,
+		Size: 30, Mtime: 30, ImportedAt: 30, TimelineAt: 30, CacheKey: "work-c",
+		ThumbStatus: model.StatusError, PreviewStatus: model.StatusError,
+		VideoPosterStatus: model.StatusNotRequired, VideoProxyStatus: model.StatusNotRequired,
+	})
+	insertProgressAsset(t, database, AssetUpsert{
+		RelPath: "special%/d.jpg", ParentRelPath: "special%", Filename: "d.jpg", Ext: "jpg", MediaType: model.MediaTypeImage,
+		Size: 40, Mtime: 40, ImportedAt: 40, TimelineAt: 40, CacheKey: "special-d",
+		ThumbStatus: model.StatusReady, PreviewStatus: model.StatusReady,
+		VideoPosterStatus: model.StatusNotRequired, VideoProxyStatus: model.StatusNotRequired,
+	})
+	insertProgressAsset(t, database, AssetUpsert{
+		RelPath: "specialx/e.jpg", ParentRelPath: "specialx", Filename: "e.jpg", Ext: "jpg", MediaType: model.MediaTypeImage,
+		Size: 50, Mtime: 50, ImportedAt: 50, TimelineAt: 50, CacheKey: "special-e",
+		ThumbStatus: model.StatusPending, PreviewStatus: model.StatusPending,
+		VideoPosterStatus: model.StatusNotRequired, VideoProxyStatus: model.StatusNotRequired,
+	})
+
+	progress, err := database.ProcessingProgressForRoots(ctx, []string{"family"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.AssetTotal != 2 || progress.ImageTotal != 1 || progress.VideoTotal != 1 {
+		t.Fatalf("family totals = %#v", progress)
+	}
+	if progress.Thumb.Total != 2 || progress.Thumb.Ready != 1 || progress.Thumb.Pending != 1 {
+		t.Fatalf("family thumb counts = %#v", progress.Thumb)
+	}
+	if progress.Transcode.Total != 2 || progress.Transcode.Pending != 1 || progress.Transcode.Processing != 1 {
+		t.Fatalf("family transcode counts = %#v", progress.Transcode)
+	}
+
+	special, err := database.ProcessingProgressForRoots(ctx, []string{"special%"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if special.AssetTotal != 1 || special.Thumb.Ready != 1 {
+		t.Fatalf("special root escaped counts = %#v", special)
 	}
 }
 

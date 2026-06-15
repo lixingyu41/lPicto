@@ -1,0 +1,13 @@
+CREATE INDEX IF NOT EXISTS idx_assets_ready_timeline_desc ON assets(timeline_at DESC, id DESC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_timeline_asc ON assets(timeline_at ASC, id ASC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_imported_desc ON assets(imported_at DESC, id DESC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_imported_asc ON assets(imported_at ASC, id ASC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_size_desc ON assets(size DESC, id DESC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_size_asc ON assets(size ASC, id ASC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_filename_asc ON assets(lower(filename) ASC, id ASC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_filename_desc ON assets(lower(filename) DESC, id DESC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_parent_timeline_desc ON assets(parent_rel_path, timeline_at DESC, id DESC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_parent_filename_asc ON assets(parent_rel_path, lower(filename) ASC, id ASC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_parent_size_desc ON assets(parent_rel_path, size DESC, id DESC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_media_timeline_desc ON assets(media_type, timeline_at DESC, id DESC) WHERE deleted_at IS NULL AND thumb_status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_assets_ready_parent_rel ON assets(parent_rel_path) WHERE deleted_at IS NULL AND thumb_status = 'ready';

@@ -64,5 +64,9 @@ export function usePagedLoader<T>(
     reset();
   }, [reset, ...deps]);
 
-  return { items, hasMore, loading, error, loadMore, reset, jumpToPage };
+  const mutateItems = useCallback((updater: (items: T[]) => T[]) => {
+    setItems((prev) => updater(prev));
+  }, []);
+
+  return { items, hasMore, loading, error, loadMore, reset, jumpToPage, mutateItems };
 }

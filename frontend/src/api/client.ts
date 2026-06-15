@@ -1,12 +1,14 @@
 import type {
   Album,
+  AlbumGroup,
   AlbumSourceInput,
+  AlbumsResponse,
   Asset,
   AssetKind,
   AssetPreference,
   AssetSidecars,
   Folder,
-  LibraryAnchor,
+  LibraryAnchorsResponse,
   Neighbors,
   Page,
   PublicConfig,
@@ -14,6 +16,7 @@ import type {
   ScanRun,
   ScanFolder,
   ScanLibrariesResponse,
+  SettingsActivity,
   ScanFoldersResponse,
   ScanStatus,
   SortKey,
@@ -60,9 +63,12 @@ export const api = {
   health: () => request<{ status: string }>('/api/health'),
   publicConfig: () => request<PublicConfig>('/api/config/public'),
   triggerScan: () => request<{ started: boolean }>('/api/scan', { method: 'POST' }),
+  pauseScan: () => request<{ paused: boolean }>('/api/scan/pause', { method: 'POST' }),
+  rebuildScan: () => request<{ started: boolean }>('/api/scan/rebuild?force=1', { method: 'POST' }),
   scanStatus: () => request<ScanStatus>('/api/scan/status'),
   scanRuns: (page = 1, pageSize = 20) => request<Page<ScanRun>>(`/api/scan/runs${qs({ page, pageSize })}`),
   settingsProgress: () => request<ProcessingProgress>('/api/settings/progress'),
+  settingsActivity: () => request<SettingsActivity>('/api/settings/activity'),
   scanLibraries: () => request<ScanLibrariesResponse>('/api/settings/libraries'),
   createScanLibrary: (name: string, relPaths: string[]) =>
     request<ScanLibrariesResponse & { started: boolean }>('/api/settings/libraries', {
@@ -70,8 +76,14 @@ export const api = {
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, relPaths }),
     }),
-  removeScanLibrary: (id: string) =>
+  updateScanLibrary: (id: string, name: string, relPaths: string[]) =>
     request<ScanLibrariesResponse & { started: boolean }>(`/api/settings/libraries/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, relPaths }),
+    }),
+  removeScanLibrary: (id: string) =>
+    request<ScanLibrariesResponse & { started: boolean; cleanupQueued?: boolean }>(`/api/settings/libraries/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
   scanLibrary: (id: string) =>
@@ -85,31 +97,46 @@ export const api = {
     }),
   removeScanFolder: (relPath: string) =>
     request<{ items: ScanFolder[] }>(`/api/settings/scan-folders${qs({ relPath })}`, { method: 'DELETE' }),
-  sourceFolders: (parentRelPath: string) =>
-    request<SourceFoldersResponse>(`/api/source-folders${qs({ parentRelPath })}`),
-  albums: () => request<{ items: Album[] }>('/api/albums'),
+  sourceFolders: (parentRelPath: string, excludeLibraryId?: string) =>
+    request<SourceFoldersResponse>(`/api/source-folders${qs({ parentRelPath, excludeLibraryId })}`),
+  albums: () => request<AlbumsResponse>('/api/albums'),
   album: (id: number) => request<Album>(`/api/albums/${id}`),
-  createAlbum: (name: string, sources: AlbumSourceInput[]) =>
+  albumGroups: () => request<{ items: AlbumGroup[] }>('/api/album-groups'),
+  createAlbumGroup: (name: string) =>
+    request<AlbumGroup>('/api/album-groups', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }),
+  createAlbum: (name: string, sources: AlbumSourceInput[], groupId: number | null) =>
     request<Album>('/api/albums', {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, sources }),
+      body: JSON.stringify({ name, groupId, sources }),
+    }),
+  updateAlbum: (id: number, name: string, sources: AlbumSourceInput[], groupId: number | null) =>
+    request<Album>(`/api/albums/${id}`, {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, groupId, sources }),
     }),
   deleteAlbum: (id: number) => request<{ deleted: boolean }>(`/api/albums/${id}`, { method: 'DELETE' }),
   refreshAlbum: (id: number) => request<{ started: boolean }>(`/api/albums/${id}/refresh`, { method: 'POST' }),
   albumAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string) =>
     request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q })}`),
+  albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string) =>
+    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, sort, q })}`),
   albumSourceFolders: (parentRelPath: string) =>
     request<SourceFoldersResponse>(`/api/albums/source-folders${qs({ parentRelPath })}`),
   libraryAssets: (page: number, pageSize: number, type: AssetKind, sort: SortKey, q: string) =>
     request<Page<Asset>>(`/api/library/assets${qs({ page, pageSize, type, sort, q })}`),
   libraryAnchors: (pageSize: number, type: AssetKind, sort: SortKey, q: string) =>
-    request<{ items: LibraryAnchor[] }>(`/api/library/anchors${qs({ pageSize, type, sort, q })}`),
+    request<LibraryAnchorsResponse>(`/api/library/anchors${qs({ pageSize, type, sort, q })}`),
   folders: (parentId: number) => request<{ items: Folder[] }>(`/api/folders${qs({ parentId })}`),
   folderTree: () => request<{ items: Folder[] }>('/api/folders/tree'),
   folder: (id: number) => request<Folder>(`/api/folders/${id}`),
-  folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string) =>
-    request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q })}`),
+  folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, recursive: boolean) =>
+    request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0 })}`),
   asset: (id: number) => request<Asset>(`/api/assets/${id}`),
   assetPreferences: (id: number) => request<AssetPreference>(`/api/assets/${id}/preferences`),
   assetSidecars: (id: number) => request<AssetSidecars>(`/api/assets/${id}/sidecars`),
@@ -119,20 +146,20 @@ export const api = {
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ rotation }),
     }),
-  neighbors: (id: number, params: Record<string, string | number | undefined | null>) =>
-    request<Neighbors>(`/api/assets/${id}/neighbors${qs(params)}`),
+  neighbors: (id: number, params: Record<string, string | number | undefined | null>, signal?: AbortSignal) =>
+    request<Neighbors>(`/api/assets/${id}/neighbors${qs(params)}`, { signal }),
 };
 
 export function assetThumbUrl(asset: Asset): string {
-  if (asset.mediaType === 'video') {
-    return `/api/assets/${asset.id}/video-poster?v=${asset.cacheKey}`;
-  }
-  return `/api/assets/${asset.id}/thumb?v=${asset.cacheKey}`;
+  return `/api/cache/thumbs/${asset.cacheKey}.webp`;
 }
 
 export function assetPreviewUrl(asset: Asset): string {
   if (asset.mediaType === 'video') {
-    return `/api/assets/${asset.id}/video-poster?v=${asset.cacheKey}`;
+    return assetThumbUrl(asset);
+  }
+  if (asset.browserPlayable) {
+    return assetOriginalUrl(asset);
   }
   return `/api/assets/${asset.id}/preview?v=${asset.cacheKey}`;
 }

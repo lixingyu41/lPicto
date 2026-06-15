@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"lpicto/backend/internal/db"
@@ -15,6 +16,30 @@ import (
 	"lpicto/backend/internal/storage"
 	"lpicto/backend/internal/util"
 )
+
+func ResolveHWAccel(ctx context.Context, requested string, logger *slog.Logger) string {
+	if requested != "auto" {
+		return requested
+	}
+	if ffmpegOutputContains(ctx, "-hwaccels", "cuda") && ffmpegOutputContains(ctx, "-encoders", "h264_nvenc") {
+		if logger != nil {
+			logger.Info("ffmpeg hardware acceleration selected", "hwAccel", "cuda", "encoder", "h264_nvenc")
+		}
+		return "cuda"
+	}
+	if logger != nil {
+		logger.Info("ffmpeg hardware acceleration unavailable, using CPU", "requested", requested)
+	}
+	return "none"
+}
+
+func ffmpegOutputContains(ctx context.Context, flag string, needle string) bool {
+	output, err := util.RunCommand(ctx, 5*time.Second, "ffmpeg", "-hide_banner", flag)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(output)), strings.ToLower(needle))
+}
 
 type Processor struct {
 	DB             *db.DB
@@ -32,54 +57,11 @@ type Processor struct {
 
 func (p Processor) Handle(ctx context.Context, task jobs.Task) error {
 	switch task.Type {
-	case "video_poster":
-		return p.poster(ctx, task.AssetID)
 	case "video_proxy":
 		return p.proxy(ctx, task.AssetID)
 	default:
 		return nil
 	}
-}
-
-func (p Processor) poster(ctx context.Context, assetID int64) error {
-	asset, err := p.DB.GetAsset(ctx, assetID)
-	if err != nil {
-		return err
-	}
-	if asset.MediaType != model.MediaTypeVideo {
-		return p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusNotRequired, nil)
-	}
-	dest, err := p.Store.CachePath("video-posters", asset.CacheKey, "jpg")
-	if err != nil {
-		return err
-	}
-	if fileExists(dest) {
-		return p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusReady, nil)
-	}
-	if err := p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusProcessing, nil); err != nil {
-		return err
-	}
-	source, err := p.Store.PhotoPath(asset.RelPath)
-	if err != nil {
-		return err
-	}
-	tmp := dest + ".tmp.jpg"
-	_ = os.Remove(tmp)
-	args := []string{"-y", "-hide_banner", "-loglevel", "error", "-ss", "1", "-i", source, "-frames:v", "1", "-q:v", "3", tmp}
-	if err := p.runFFmpeg(ctx, p.commandTimeout(), args, func() []string {
-		return []string{"-y", "-hide_banner", "-loglevel", "error", "-ss", "1", "-i", source, "-frames:v", "1", "-q:v", "3", tmp}
-	}); err != nil {
-		message := publicError(err)
-		_ = p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusError, &message)
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, dest); err != nil {
-		message := publicError(err)
-		_ = p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusError, &message)
-		return err
-	}
-	return p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusReady, nil)
 }
 
 func (p Processor) proxy(ctx context.Context, assetID int64) error {
@@ -113,6 +95,10 @@ func (p Processor) proxy(ctx context.Context, assetID int64) error {
 	}); err != nil {
 		message := publicError(err)
 		_ = p.DB.SetAssetWorkStatus(ctx, assetID, "video_proxy_status", model.StatusError, &message)
+		_ = os.Remove(tmp)
+		return err
+	}
+	if _, err := p.DB.GetAsset(ctx, assetID); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -155,7 +141,7 @@ func (p Processor) cpuProxyTail(source string, tmp string, filter string) []stri
 }
 
 func (p Processor) runFFmpeg(ctx context.Context, timeout time.Duration, args []string, cpuArgs func() []string) error {
-	_, err := util.RunCommand(ctx, timeout, "ffmpeg", args...)
+	_, err := util.RunLowPriorityCommand(ctx, timeout, "ffmpeg", args...)
 	if err == nil {
 		return nil
 	}
@@ -165,7 +151,7 @@ func (p Processor) runFFmpeg(ctx context.Context, timeout time.Duration, args []
 	if p.Logger != nil {
 		p.Logger.Warn("ffmpeg hardware acceleration failed, retrying with CPU", "hwAccel", p.HWAccel, "error", err)
 	}
-	_, retryErr := util.RunCommand(ctx, timeout, "ffmpeg", cpuArgs()...)
+	_, retryErr := util.RunLowPriorityCommand(ctx, timeout, "ffmpeg", cpuArgs()...)
 	if retryErr != nil {
 		return fmt.Errorf("hardware decode failed: %v; CPU fallback failed: %w", err, retryErr)
 	}
@@ -185,13 +171,6 @@ func (p Processor) hwAccelArgs() []string {
 		args = append(args, "-hwaccel_device", p.HWDevice)
 	}
 	return args
-}
-
-func (p Processor) commandTimeout() time.Duration {
-	if p.CommandTimeout > 0 {
-		return p.CommandTimeout
-	}
-	return 2 * time.Minute
 }
 
 func (p Processor) proxyTimeout() time.Duration {

@@ -154,6 +154,65 @@ func TestAlbumRepeatableSourceFilters(t *testing.T) {
 	}
 }
 
+func TestUpdateAlbumAndGroups(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	if _, _, _, err := database.UpsertAsset(ctx, testAlbumAsset("a/one.jpg", "a", model.MediaTypeImage, 100, 100)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := database.UpsertAsset(ctx, testAlbumAsset("b/two.jpg", "b", model.MediaTypeImage, 100, 100)); err != nil {
+		t.Fatal(err)
+	}
+	group, err := database.CreateAlbumGroup(ctx, AlbumGroupCreate{Name: "收藏"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	album, err := database.CreateAlbum(ctx, AlbumCreate{
+		Name:    "旧相册",
+		GroupID: &group.ID,
+		Sources: []AlbumSourceCreate{{
+			RelPath:           "a",
+			Recursive:         true,
+			MediaTypeFilter:   AlbumMediaAll,
+			OrientationFilter: AlbumOrientationAll,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if album.GroupID == nil || *album.GroupID != group.ID {
+		t.Fatalf("album group = %v, want %d", album.GroupID, group.ID)
+	}
+
+	updated, err := database.UpdateAlbum(ctx, album.ID, AlbumCreate{
+		Name: "新相册",
+		Sources: []AlbumSourceCreate{{
+			RelPath:           "b",
+			Recursive:         true,
+			MediaTypeFilter:   AlbumMediaAll,
+			OrientationFilter: AlbumOrientationAll,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "新相册" || updated.GroupID != nil {
+		t.Fatalf("updated album = %#v, want renamed and ungrouped", updated)
+	}
+	page, err := database.ListAlbumAssets(ctx, album.ID, AssetListOptions{Page: 1, PageSize: 10, Sort: "filename"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := relPaths(page.Items); len(got) != 1 || got[0] != "b/two.jpg" {
+		t.Fatalf("updated album assets = %#v, want b/two.jpg", got)
+	}
+}
+
 func TestPendingWorkRecoversProcessingVideoProxy(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))

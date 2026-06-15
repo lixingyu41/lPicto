@@ -1,43 +1,114 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Check, ChevronRight, Images, Plus, RefreshCw, Trash2, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { Check, ChevronRight, FolderPlus, Images, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-react';
 import AssetGrid from '../components/AssetGrid';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
+import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
-import { useSidebarPanel } from '../components/SidebarContext';
+import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { api } from '../api/client';
+import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
 import type {
   Album,
+  AlbumGroup,
   AlbumMediaFilter,
   AlbumOrientationFilter,
   AlbumSource,
   AlbumSourceInput,
   Asset,
+  LibraryAnchor,
   SortKey,
   SourceFolder,
 } from '../types/api';
+import {
+  decodeReturnState,
+  encodeReturnState,
+  loadPageState,
+  resetGridState,
+  savePageState,
+  saveViewerReturnPath,
+  type GridReturnState,
+} from '../utils/pageState';
+import { assetMatchesAlbum } from '../utils/assetFilters';
+import { mergeSortedAssets, removeAssetById } from '../utils/assetSort';
 
 const pageSize = 100;
+const albumsStateKey = 'albums';
+
+type AlbumSortField = 'timeline' | 'imported' | 'size' | 'filename';
+type AlbumSortDirection = 'asc' | 'desc';
+
+interface AlbumsPageState extends GridReturnState {
+  collapsedGroupKeys: string[];
+  query: string;
+  selectedId: number | null;
+  sort: SortKey;
+}
+
+const defaultAlbumsState: AlbumsPageState = {
+  ...resetGridState(),
+  collapsedGroupKeys: [],
+  query: '',
+  selectedId: null,
+  sort: 'timeline_desc',
+};
 
 export default function AlbumsPage() {
+  const [searchParams] = useSearchParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const initialStateRef = useRef(
+    decodeReturnState<AlbumsPageState>(searchParams.get('restore'), loadPageState<AlbumsPageState>(albumsStateKey, defaultAlbumsState)),
+  );
   const [albums, setAlbums] = useState<Album[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [sort, setSort] = useState<SortKey>('timeline_desc');
-  const [query, setQuery] = useState('');
+  const [groups, setGroups] = useState<AlbumGroup[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(initialStateRef.current.selectedId);
+  const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
+  const albumSort = albumSortFromKey(sort);
+  const [query, setQuery] = useState(initialStateRef.current.query);
   const [addOpen, setAddOpen] = useState(false);
+  const [editingAlbum, setEditingAlbum] = useState<Album | null>(null);
+  const [groupDraftOpen, setGroupDraftOpen] = useState(false);
+  const [groupName, setGroupName] = useState('');
+  const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Set<string>>(
+    () => new Set(initialStateRef.current.collapsedGroupKeys),
+  );
   const [error, setError] = useState<string | null>(null);
+  const [scrollTopTarget, setScrollTopTarget] = useState<{ scrollTop: number; signal: number } | undefined>(() =>
+    initialStateRef.current.scrollTop > 0 ? { scrollTop: initialStateRef.current.scrollTop, signal: 1 } : undefined,
+  );
+  const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [scrollTarget, setScrollTarget] = useState<{ ratio: number; signal: number } | undefined>();
+  const [scrollResetSignal, setScrollResetSignal] = useState(0);
+  const [scrollRatio, setScrollRatio] = useState(0);
+  const [loadedStartIndex, setLoadedStartIndex] = useState(0);
+  const [, setGridUrlSignal] = useState(0);
+  const gridStateRef = useRef<GridReturnState>(initialStateRef.current);
+  const sidebarState = useSidebarReturnState();
+  const restoreSidebarState = useRestoreSidebarState();
+  const restoreRef = useRef({
+    jumped: false,
+    pending: initialStateRef.current.scrollTop > 0 || initialStateRef.current.loadedItemCount > pageSize || initialStateRef.current.loadedStartIndex > 0,
+    signal: 0,
+  });
+  const indexPageRef = useRef(1);
+  const seekSignalRef = useRef(0);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
 
   const selectedAlbum = useMemo(
     () => albums.find((album) => album.id === selectedId) ?? albums[0] ?? null,
     [albums, selectedId],
   );
+  const albumBuckets = useMemo(() => buildAlbumBuckets(albums, groups), [albums, groups]);
 
   const loadAlbums = useCallback(async () => {
     try {
       const result = await api.albums();
       setAlbums(result.items);
+      setGroups(result.groups ?? []);
       setSelectedId((current) => (current && result.items.some((album) => album.id === current) ? current : result.items[0]?.id ?? null));
       setError(null);
     } catch (err) {
@@ -59,23 +130,210 @@ export default function AlbumsPage() {
     [query, selectedAlbum, sort],
   );
 
-  const { items, hasMore, loading, error: loadError, loadMore, reset } = usePagedLoader<Asset>(loadAssets, [
+  const { items, hasMore, loading, error: loadError, loadMore, reset, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     selectedAlbum?.id,
     sort,
     query,
   ]);
 
+  const mergeReadyAssets = useCallback(
+    (incoming: Asset[]) => {
+      const filtered = incoming.filter((asset) => assetMatchesAlbum(asset, selectedAlbum, query));
+      if (filtered.length === 0) return;
+      mutateItems((current) => mergeSortedAssets(current, filtered, sort, { hasMore, loadedStartIndex }));
+    },
+    [hasMore, loadedStartIndex, mutateItems, query, selectedAlbum, sort],
+  );
+
+  const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
+  const eventsConnected = useAssetReadyEvents(handleAssetReady, [handleAssetReady]);
+
+  useEffect(() => {
+    if (eventsConnected || !selectedAlbum) return undefined;
+    const timer = window.setInterval(() => {
+      void api.albumAssets(selectedAlbum.id, 1, pageSize, sort, query).then((result) => mergeReadyAssets(result.items)).catch(() => undefined);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [eventsConnected, mergeReadyAssets, query, selectedAlbum, sort]);
+
+  useEffect(() => {
+    let live = true;
+    async function loadAnchors(albumId: number) {
+      try {
+        const result = await api.albumAnchors(albumId, pageSize, sort, query);
+        if (live) {
+          setAnchors(result.items);
+          setTotalCount(result.total);
+        }
+      } catch {
+        if (live) {
+          setAnchors([]);
+          setTotalCount(0);
+        }
+      }
+    }
+    if (selectedAlbum) {
+      void loadAnchors(selectedAlbum.id);
+    } else {
+      setAnchors([]);
+      setTotalCount(0);
+    }
+    return () => {
+      live = false;
+    };
+  }, [query, selectedAlbum?.id, sort]);
+
+  const currentPageState = useCallback(
+    (): AlbumsPageState => ({
+      ...gridStateRef.current,
+      collapsedGroupKeys: Array.from(collapsedGroupKeys),
+      loadedItemCount: items.length,
+      loadedStartIndex,
+      query,
+      selectedId: selectedAlbum?.id ?? selectedId,
+      sidebarCollapsed: sidebarState.sidebarCollapsed,
+      sidebarExpanded: sidebarState.sidebarExpanded,
+      sort,
+    }),
+    [collapsedGroupKeys, items.length, loadedStartIndex, query, selectedAlbum?.id, selectedId, sidebarState.sidebarCollapsed, sidebarState.sidebarExpanded, sort],
+  );
+
+  const saveCurrentState = useCallback(() => {
+    savePageState<AlbumsPageState>(albumsStateKey, currentPageState());
+  }, [currentPageState]);
+
+  useEffect(() => {
+    indexPageRef.current = 1;
+    setLoadedStartIndex(0);
+    setScrollTarget(undefined);
+    if (restoreRef.current.pending) return;
+    gridStateRef.current = resetGridState();
+    setScrollResetSignal((value) => value + 1);
+  }, [query, selectedAlbum?.id, sort]);
+
+  useEffect(() => {
+    if (!restoreRef.current.pending || loading) return;
+    const startIndex = Math.max(0, initialStateRef.current.loadedStartIndex);
+    if (startIndex > 0 && !restoreRef.current.jumped) {
+      restoreRef.current.jumped = true;
+      const page = Math.floor(startIndex / pageSize) + 1;
+      indexPageRef.current = page;
+      setLoadedStartIndex(startIndex);
+      void jumpToPage(page);
+      return;
+    }
+    const targetCount = Math.max(pageSize, initialStateRef.current.loadedItemCount);
+    if (items.length < targetCount && hasMore) {
+      void loadMore();
+      return;
+    }
+    restoreRef.current.pending = false;
+    restoreRef.current.signal += 1;
+    setScrollTopTarget({ scrollTop: initialStateRef.current.scrollTop, signal: restoreRef.current.signal });
+  }, [hasMore, items.length, jumpToPage, loadMore, loading]);
+
+  const handleGridScrollState = useCallback(
+    (state: { ratio: number; scrollTop: number }) => {
+      gridStateRef.current = {
+        ...gridStateRef.current,
+        loadedItemCount: items.length,
+        loadedStartIndex,
+        scrollRatio: state.ratio,
+        scrollTop: state.scrollTop,
+      };
+      setGridUrlSignal((value) => value + 1);
+    },
+    [items.length, loadedStartIndex],
+  );
+
+  const handleOpenAsset = useCallback(() => {
+    saveCurrentState();
+    saveViewerReturnPath('/albums');
+  }, [saveCurrentState]);
+
+  const handleOpenViewer = useCallback(
+    (_asset: Asset, viewerUrl: string) => {
+      navigate(viewerUrl, { state: { backgroundLocation: location } });
+    },
+    [location, navigate],
+  );
+
+  const seekIndex = useCallback(
+    (_anchor: LibraryAnchor, page: number, ratio: number) => {
+      const signal = seekSignalRef.current + 1;
+      seekSignalRef.current = signal;
+      setScrollTarget({ ratio, signal });
+      if (page === indexPageRef.current) return;
+      indexPageRef.current = page;
+      setLoadedStartIndex((Math.max(1, page) - 1) * pageSize);
+      void jumpToPage(page).then(() => {
+        if (seekSignalRef.current !== signal) return;
+        const nextSignal = seekSignalRef.current + 1;
+        seekSignalRef.current = nextSignal;
+        setScrollTarget({ ratio, signal: nextSignal });
+      });
+    },
+    [jumpToPage],
+  );
+
+  const toggleAlbumGroup = useCallback((key: string) => {
+    setCollapsedGroupKeys((value) => {
+      const next = new Set(value);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
   async function createAlbum(
     name: string,
     sources: AlbumSourceInput[],
+    groupId: number | null,
   ) {
     try {
-      const album = await api.createAlbum(name, sources);
+      const album = await api.createAlbum(name, sources, groupId);
       setAddOpen(false);
       await loadAlbums();
       setSelectedId(album.id);
+      reset();
     } catch (err) {
       setError(err instanceof Error ? err.message : '创建相册失败');
+    }
+  }
+
+  async function updateAlbum(
+    id: number,
+    name: string,
+    sources: AlbumSourceInput[],
+    groupId: number | null,
+  ) {
+    try {
+      const album = await api.updateAlbum(id, name, sources, groupId);
+      setEditingAlbum(null);
+      await loadAlbums();
+      setSelectedId(album.id);
+      reset();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存相册失败');
+    }
+  }
+
+  async function createAlbumGroup() {
+    const name = groupName.trim();
+    if (!name) return;
+    try {
+      const group = await api.createAlbumGroup(name);
+      setGroups((value) => [...value, group]);
+      setGroupName('');
+      setGroupDraftOpen(false);
+      setCollapsedGroupKeys((value) => {
+        const next = new Set(value);
+        next.delete(albumGroupKey(group.id));
+        return next;
+      });
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '创建相册组失败');
     }
   }
 
@@ -100,30 +358,61 @@ export default function AlbumsPage() {
 
   useSidebarPanel(
     'albums',
-    <div className="sidebar-control-stack">
-      <div className="sidebar-control-title">相册</div>
-      <div className="album-list">
-        {albums.map((album) => (
-          <button
-            className={selectedAlbum?.id === album.id ? 'album-row active' : 'album-row'}
-            key={album.id}
-            type="button"
-            onClick={() => setSelectedId(album.id)}
-          >
-            <Images size={15} />
-            <span>{album.name}</span>
-            <small>{album.assetCount}</small>
+      <div className="sidebar-control-stack">
+        <div className="sidebar-control-title">相册</div>
+        <div className="album-toolbar">
+          <button className="sidebar-command" type="button" onClick={() => setAddOpen(true)}>
+            <Plus size={16} />
+            添加相册
           </button>
-        ))}
-        {albums.length === 0 && <div className="muted-line">暂无相册</div>}
-      </div>
-      <button className="sidebar-command" type="button" onClick={() => setAddOpen(true)}>
-        <Plus size={16} />
-        添加相册
-      </button>
+          <button className="sidebar-command" type="button" onClick={() => setGroupDraftOpen((value) => !value)}>
+            <FolderPlus size={16} />
+            新建组
+          </button>
+        </div>
+        {groupDraftOpen && (
+          <div className="album-group-create">
+            <input value={groupName} placeholder="组名称" onChange={(event) => setGroupName(event.target.value)} />
+            <button type="button" title="创建" disabled={groupName.trim().length === 0} onClick={() => void createAlbumGroup()}>
+              <Check size={15} />
+            </button>
+          </div>
+        )}
+        <div className="album-list">
+          {albumBuckets.map((bucket) => {
+            const collapsed = collapsedGroupKeys.has(bucket.key);
+            return (
+              <div className="album-group-block" key={bucket.key}>
+                <button className="album-group-row" type="button" onClick={() => toggleAlbumGroup(bucket.key)}>
+                  <span className={collapsed ? 'folder-expand-button' : 'folder-expand-button expanded'}>
+                    <ChevronRight size={15} />
+                  </span>
+                  <span>{bucket.name}</span>
+                  <small>{bucket.albums.length}</small>
+                </button>
+                {!collapsed &&
+                  bucket.albums.map((album) => (
+                    <button
+                      className={selectedAlbum?.id === album.id ? 'album-row active' : 'album-row'}
+                      key={album.id}
+                      type="button"
+                      onClick={() => setSelectedId(album.id)}
+                    >
+                      <Images size={15} />
+                      <span>{album.name}</span>
+                    </button>
+                  ))}
+              </div>
+            );
+          })}
+          {albums.length === 0 && groups.length === 0 && <div className="muted-line">暂无相册</div>}
+        </div>
       {selectedAlbum && (
         <>
           <div className="sidebar-icon-actions">
+            <button type="button" title="编辑相册" onClick={() => setEditingAlbum(selectedAlbum)}>
+              <Pencil size={15} />
+            </button>
             <button type="button" title="刷新相册" onClick={() => void refreshAlbum(selectedAlbum.id)}>
               <RefreshCw size={15} />
             </button>
@@ -134,12 +423,24 @@ export default function AlbumsPage() {
           </div>
           <label className="sidebar-field">
             <span>排序</span>
-            <select value={sort} onChange={(event) => setSort(event.target.value as SortKey)}>
-              <option value="timeline_desc">时间新到旧</option>
-              <option value="timeline_asc">时间旧到新</option>
-              <option value="filename">文件名</option>
+            <select
+              value={albumSort.field}
+              onChange={(event) => setSort(albumSortKey(event.target.value as AlbumSortField, albumSort.direction))}
+            >
+              <option value="timeline">时间</option>
+              <option value="imported">导入时间</option>
               <option value="size">大小</option>
-              <option value="imported_desc">导入时间</option>
+              <option value="filename">文件名</option>
+            </select>
+          </label>
+          <label className="sidebar-field">
+            <span>顺序</span>
+            <select
+              value={albumSort.direction}
+              onChange={(event) => setSort(albumSortKey(albumSort.field, event.target.value as AlbumSortDirection))}
+            >
+              <option value="desc">倒序</option>
+              <option value="asc">正序</option>
             </select>
           </label>
           <label className="sidebar-field">
@@ -153,8 +454,21 @@ export default function AlbumsPage() {
           </div>
         </>
       )}
-    </div>,
-    [albums, query, selectedAlbum?.id, selectedAlbum?.assetCount, selectedAlbum?.updatedAt, sort],
+      </div>,
+    [
+      albumBuckets,
+      collapsedGroupKeys,
+      groupDraftOpen,
+      groupName,
+      groups.length,
+      query,
+      albumSort.direction,
+      albumSort.field,
+      selectedAlbum?.id,
+      selectedAlbum?.updatedAt,
+      sort,
+      toggleAlbumGroup,
+    ],
   );
 
   useSidebarPanel(
@@ -162,6 +476,10 @@ export default function AlbumsPage() {
     pressPreviewAsset ? <AssetInfoPanel asset={pressPreviewAsset} title="快速预览" /> : null,
     [pressPreviewAsset?.id],
   );
+
+  useEffect(() => {
+    restoreSidebarState({ sidebarCollapsed: initialStateRef.current.sidebarCollapsed });
+  }, [restoreSidebarState]);
 
   return (
     <section className="page media-page">
@@ -171,24 +489,53 @@ export default function AlbumsPage() {
       ) : items.length === 0 && !loading ? (
         <EmptyState text="当前相册没有媒体" />
       ) : (
-        <>
+        <div className="library-grid-shell">
           <AssetGrid
             assets={items}
             loading={loading}
             hasMore={hasMore}
             onLoadMore={loadMore}
+            onOpenAsset={handleOpenAsset}
+            onOpenViewer={handleOpenViewer}
+            onAssetMissing={(asset) => mutateItems((current) => removeAssetById(current, asset.id))}
             onPressPreviewChange={setPressPreviewAsset}
+            onScrollRatioChange={setScrollRatio}
+            onScrollStateChange={handleGridScrollState}
+            totalCount={totalCount}
+            loadedStartIndex={loadedStartIndex}
+            scrollSignal={scrollResetSignal}
+            scrollTarget={scrollTarget}
+            scrollTopTarget={scrollTopTarget}
             buildViewerUrl={(asset) =>
-              `/viewer/${asset.id}?context=album&albumId=${selectedAlbum.id}&sort=${sort}&q=${encodeURIComponent(query)}`
+              `/viewer/${asset.id}?context=album&albumId=${selectedAlbum.id}&sort=${sort}&q=${encodeURIComponent(
+                query,
+              )}&returnPath=%2Falbums&returnState=${encodeReturnState(currentPageState())}`
             }
           />
+          <LibraryIndexRail
+            anchors={anchors}
+            sort={sort}
+            scrollRatio={scrollRatio}
+            totalCount={totalCount}
+            pageSize={pageSize}
+            onSeek={seekIndex}
+          />
           <PressPreviewOverlay asset={pressPreviewAsset} />
-        </>
+        </div>
       )}
       {addOpen && (
         <AlbumPickerModal
+          groups={groups}
           onClose={() => setAddOpen(false)}
-          onConfirm={(name, sources) => void createAlbum(name, sources)}
+          onConfirm={(name, sources, groupId) => void createAlbum(name, sources, groupId)}
+        />
+      )}
+      {editingAlbum && (
+        <AlbumPickerModal
+          groups={groups}
+          initialAlbum={editingAlbum}
+          onClose={() => setEditingAlbum(null)}
+          onConfirm={(name, sources, groupId) => void updateAlbum(editingAlbum.id, name, sources, groupId)}
         />
       )}
     </section>
@@ -196,23 +543,36 @@ export default function AlbumsPage() {
 }
 
 function AlbumPickerModal({
+  groups,
+  initialAlbum,
   onClose,
   onConfirm,
 }: {
+  groups: AlbumGroup[];
+  initialAlbum?: Album | null;
   onClose: () => void;
-  onConfirm: (name: string, sources: AlbumSourceInput[]) => void;
+  onConfirm: (name: string, sources: AlbumSourceInput[], groupId: number | null) => void;
 }) {
   const [children, setChildren] = useState<Record<string, SourceFolder[]>>({});
   const [rootFolder, setRootFolder] = useState<SourceFolder | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [albumName, setAlbumName] = useState('');
+  const [albumName, setAlbumName] = useState(initialAlbum?.name ?? '');
+  const [groupId, setGroupId] = useState<number | null>(initialAlbum?.groupId ?? null);
   const [mediaFilter, setMediaFilter] = useState<AlbumMediaFilter>('all');
   const [orientationFilter, setOrientationFilter] = useState<AlbumOrientationFilter>('all');
   const [recursive, setRecursive] = useState(true);
-  const [sourceRules, setSourceRules] = useState<AlbumSourceInput[]>([]);
+  const [sourceRules, setSourceRules] = useState<AlbumSourceInput[]>(() =>
+    initialAlbum?.sources.map((source) => ({
+      relPath: source.relPath,
+      recursive: source.recursive,
+      mediaTypeFilter: source.mediaTypeFilter,
+      orientationFilter: source.orientationFilter,
+    })) ?? [],
+  );
   const [loading, setLoading] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const title = initialAlbum ? '编辑相册' : '添加相册';
 
   const loadChildren = useCallback(async (relPath: string) => {
     setLoading((prev) => new Set(prev).add(relPath));
@@ -277,9 +637,9 @@ function AlbumPickerModal({
 
   return (
     <div className="modal-backdrop" role="presentation">
-      <div className="folder-picker" role="dialog" aria-modal="true" aria-label="添加相册">
+      <div className="folder-picker" role="dialog" aria-modal="true" aria-label={title}>
         <div className="modal-title">
-          <span>添加相册</span>
+          <span>{title}</span>
           <button type="button" onClick={onClose} title="关闭">
             <X size={17} />
           </button>
@@ -289,6 +649,20 @@ function AlbumPickerModal({
           <label className="settings-field">
             <span>名称</span>
             <input value={albumName} placeholder="例如：竖屏视频" onChange={(event) => setAlbumName(event.target.value)} />
+          </label>
+          <label className="settings-field">
+            <span>分组</span>
+            <select
+              value={groupId ?? ''}
+              onChange={(event) => setGroupId(event.target.value ? Number(event.target.value) : null)}
+            >
+              <option value="">未分组</option>
+              {groups.map((group) => (
+                <option key={group.id} value={group.id}>
+                  {group.name}
+                </option>
+              ))}
+            </select>
           </label>
           <label className="settings-field">
             <span>类型</span>
@@ -348,11 +722,11 @@ function AlbumPickerModal({
           )}
           {!rootFolder && loading.has('') && <div className="muted-line">读取中</div>}
           {rootFolder && children['']?.length === 0 && !rootFolder.included && (
-            <div className="muted-line">没有可选的 LIB 文件夹</div>
+            <div className="muted-line">没有可选的来源文件夹</div>
           )}
         </div>
         <div className="modal-actions">
-          <span>{allSources.length > 0 ? `将创建 ${allSources.length} 条筛选` : '未选择文件夹'}</span>
+          <span>{allSources.length > 0 ? `${allSources.length} 条筛选` : '未选择文件夹'}</span>
           <button className="text-button" type="button" onClick={onClose}>
             取消
           </button>
@@ -360,10 +734,10 @@ function AlbumPickerModal({
             className="command-button"
             type="button"
             disabled={!canFinish}
-            onClick={() => onConfirm(albumName.trim(), allSources)}
+            onClick={() => onConfirm(albumName.trim(), allSources, groupId)}
           >
             <Check size={16} />
-            完成
+            {initialAlbum ? '保存' : '完成'}
           </button>
         </div>
       </div>
@@ -395,7 +769,7 @@ function AlbumFolderTreeNode({
   const note = !folder.included
     ? '展开'
     : folder.selected
-        ? 'LIB'
+        ? '来源'
         : loading.has(folder.relPath)
           ? '读取中'
           : '';
@@ -428,6 +802,73 @@ function AlbumFolderTreeNode({
   );
 }
 
+interface AlbumBucket {
+  key: string;
+  name: string;
+  albums: Album[];
+}
+
+function buildAlbumBuckets(albums: Album[], groups: AlbumGroup[]): AlbumBucket[] {
+  const byGroup = new Map<number | null, Album[]>();
+  albums.forEach((album) => {
+    const key = album.groupId ?? null;
+    const items = byGroup.get(key) ?? [];
+    items.push(album);
+    byGroup.set(key, items);
+  });
+  const buckets = groups.map((group) => ({
+    key: albumGroupKey(group.id),
+    name: group.name,
+    albums: byGroup.get(group.id) ?? [],
+  }));
+  const knownGroupIds = new Set(groups.map((group) => group.id));
+  const orphanGroupIds = Array.from(
+    new Set(albums.map((album) => album.groupId).filter((id): id is number => id !== null && !knownGroupIds.has(id))),
+  );
+  orphanGroupIds.forEach((id) => {
+    buckets.push({ key: albumGroupKey(id), name: '未命名组', albums: byGroup.get(id) ?? [] });
+  });
+  const ungrouped = byGroup.get(null) ?? [];
+  if (ungrouped.length > 0 || groups.length === 0) {
+    buckets.push({ key: albumGroupKey(null), name: '未分组', albums: ungrouped });
+  }
+  return buckets;
+}
+
+function albumGroupKey(groupId: number | null) {
+  return groupId === null ? 'ungrouped' : `group-${groupId}`;
+}
+
+function albumSortFromKey(sort: SortKey): { field: AlbumSortField; direction: AlbumSortDirection } {
+  switch (sort) {
+    case 'timeline_asc':
+      return { field: 'timeline', direction: 'asc' };
+    case 'imported_asc':
+      return { field: 'imported', direction: 'asc' };
+    case 'imported_desc':
+      return { field: 'imported', direction: 'desc' };
+    case 'filename':
+    case 'filename_asc':
+      return { field: 'filename', direction: 'asc' };
+    case 'filename_desc':
+      return { field: 'filename', direction: 'desc' };
+    case 'size_asc':
+      return { field: 'size', direction: 'asc' };
+    case 'size':
+    case 'size_desc':
+      return { field: 'size', direction: 'desc' };
+    default:
+      return { field: 'timeline', direction: 'desc' };
+  }
+}
+
+function albumSortKey(field: AlbumSortField, direction: AlbumSortDirection): SortKey {
+  if (field === 'timeline') return direction === 'asc' ? 'timeline_asc' : 'timeline_desc';
+  if (field === 'imported') return direction === 'asc' ? 'imported_asc' : 'imported_desc';
+  if (field === 'filename') return direction === 'asc' ? 'filename_asc' : 'filename_desc';
+  return direction === 'asc' ? 'size_asc' : 'size_desc';
+}
+
 function albumFilterLabel(album: Album) {
   if (album.sources.some((source) => source.mediaTypeFilter !== 'all' || source.orientationFilter !== 'all' || !source.recursive)) {
     return `${album.sources.length} 条筛选`;
@@ -446,5 +887,5 @@ function sourceFilterLabel(source: Pick<AlbumSource, 'mediaTypeFilter' | 'orient
 }
 
 function displayRelPath(relPath: string) {
-  return relPath ? `/${relPath}` : '/photos';
+  return relPath ? `/${relPath}` : '全部存储';
 }

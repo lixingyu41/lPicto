@@ -1,98 +1,129 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, ChevronRight, FolderPlus, RotateCw, Trash2, X } from 'lucide-react';
+import { Check, ChevronRight, FolderPlus, Pencil, RotateCw, Trash2, X } from 'lucide-react';
 import Toolbar from '../components/Toolbar';
 import { api } from '../api/client';
-import type { ProcessingProgress, ScanLibrary, ScanRun, ScanStatus, SourceFolder, WorkStatusCounts } from '../types/api';
-import { formatDateTime } from '../utils/format';
-import { loadViewerPrefs, saveViewerPrefs, type ViewerPrefs } from '../utils/viewerPrefs';
+import type { CleanupStatus, ProcessingProgress, ScanLibrary, ScanLibraryProgress, ScanStatus, SourceFolder, WorkStatusCounts } from '../types/api';
+import { formatBytes } from '../utils/format';
+import { loadGridRowHeightLevel, saveGridRowHeightLevel, type GridRowHeightLevel } from '../utils/gridPrefs';
+import { loadThemeMode, saveThemeMode, type ThemeMode } from '../utils/themePrefs';
+import { loadViewerPrefs, playbackRates, saveViewerPrefs, type ViewerPrefs } from '../utils/viewerPrefs';
+
+const settingsSections = [
+  { id: 'libraries', label: '图库' },
+  { id: 'appearance', label: '外观' },
+  { id: 'viewer', label: '查看器' },
+] as const;
+
+type SettingsSectionId = (typeof settingsSections)[number]['id'];
 
 export default function SettingsPage() {
   const [status, setStatus] = useState<ScanStatus | null>(null);
   const [progress, setProgress] = useState<ProcessingProgress | null>(null);
-  const [runs, setRuns] = useState<ScanRun[]>([]);
   const [libraries, setLibraries] = useState<ScanLibrary[]>([]);
-  const [configured, setConfigured] = useState(false);
+  const [cleanup, setCleanup] = useState<CleanupStatus | null>(null);
   const [addOpen, setAddOpen] = useState(false);
+  const [editingLibrary, setEditingLibrary] = useState<ScanLibrary | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [rowHeightLevel, setRowHeightLevel] = useState<GridRowHeightLevel>(() => loadGridRowHeightLevel());
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => loadThemeMode());
   const [viewerPrefs, setViewerPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
+  const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSectionId>('libraries');
 
-  const refreshStatus = useCallback(async () => {
-    const [statusResult, runsResult, progressResult] = await Promise.all([
-      api.scanStatus(),
-      api.scanRuns(1, 8),
-      api.settingsProgress(),
-    ]);
-    setStatus(statusResult);
-    setRuns(runsResult.items);
-    setProgress(progressResult);
+  const refreshLibraries = useCallback(async () => {
+    const librariesResult = await api.scanLibraries();
+    setLibraries(librariesResult.items);
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refreshActivity = useCallback(async () => {
+    const activity = await api.settingsActivity();
+    setStatus(activity.scan);
+    setProgress(activity.progress);
+    setCleanup(activity.cleanup);
+  }, []);
+
+  const refreshInitial = useCallback(async () => {
     try {
-      const [statusResult, runsResult, progressResult, librariesResult] = await Promise.all([
-        api.scanStatus(),
-        api.scanRuns(1, 8),
-        api.settingsProgress(),
-        api.scanLibraries(),
-      ]);
-      setStatus(statusResult);
-      setRuns(runsResult.items);
-      setProgress(progressResult);
-      setLibraries(librariesResult.items);
-      setConfigured(librariesResult.configured);
+      await Promise.all([refreshActivity(), refreshLibraries()]);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : '读取设置失败');
     }
-  }, []);
+  }, [refreshActivity, refreshLibraries]);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    void refreshInitial();
+  }, [refreshInitial]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      void refreshStatus().catch((err) => {
+      void Promise.all([refreshActivity(), refreshLibraries()]).catch((err) => {
         setError(err instanceof Error ? err.message : '刷新进度失败');
       });
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [refreshStatus]);
+  }, [refreshActivity, refreshLibraries]);
 
   async function createLibrary(name: string, relPaths: string[]) {
+    const tempId = `pending-${Date.now()}`;
+    const optimistic: ScanLibrary = {
+      id: tempId,
+      name,
+      exists: true,
+      folders: relPaths.map((relPath) => ({
+        relPath,
+        name: relPath.split('/').filter(Boolean).pop() ?? '全部存储',
+        parentRelPath: relPath.includes('/') ? relPath.slice(0, relPath.lastIndexOf('/')) : relPath ? '' : null,
+        depth: relPath ? relPath.split('/').length : 0,
+        exists: true,
+      })),
+      progress: emptyLibraryProgress,
+    };
+    setLibraries((value) => [...value, optimistic]);
+    setAddOpen(false);
+    setError(null);
     try {
       const result = await api.createScanLibrary(name, relPaths);
       setLibraries(result.items);
-      setConfigured(true);
-      setAddOpen(false);
-      await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : '添加 LIB 失败');
+      setLibraries((value) => value.filter((library) => library.id !== tempId));
+      setError(err instanceof Error ? err.message : '添加来源失败');
+    }
+  }
+
+  async function updateLibrary(id: string, name: string, relPaths: string[]) {
+    setError(null);
+    try {
+      const result = await api.updateScanLibrary(id, name, relPaths);
+      setLibraries(result.items);
+      setEditingLibrary(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '更新来源失败');
     }
   }
 
   async function removeLibrary(id: string) {
+    const previous = libraries;
+    setLibraries((value) => value.filter((library) => library.id !== id));
+    setError(null);
     try {
       const result = await api.removeScanLibrary(id);
       setLibraries(result.items);
-      await refresh();
+      if (result.cleanupQueued) {
+        setCleanup({ running: true, status: 'running', lastError: '', updatedAt: Math.floor(Date.now() / 1000) });
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : '删除 LIB 失败');
+      setLibraries(previous);
+      setError(err instanceof Error ? err.message : '删除来源失败');
     }
   }
 
   async function rescanLibrary(id: string) {
     try {
       await api.scanLibrary(id);
-      await refresh();
+      await Promise.all([refreshActivity(), refreshLibraries()]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '扫描 LIB 失败');
+      setError(err instanceof Error ? err.message : '扫描来源失败');
     }
-  }
-
-  async function triggerScan() {
-    await api.triggerScan();
-    await refresh();
   }
 
   function updateViewerPrefs(next: ViewerPrefs) {
@@ -100,177 +131,243 @@ export default function SettingsPage() {
     saveViewerPrefs(next);
   }
 
-  const lastRun = status?.lastRun;
+  function updateThemeMode(next: ThemeMode) {
+    setThemeMode(next);
+    saveThemeMode(next);
+  }
+
+  function updateRowHeightLevel(next: GridRowHeightLevel) {
+    setRowHeightLevel(next);
+    saveGridRowHeightLevel(next);
+  }
+
   const liveProgress = status?.progress;
-  const scanSeen = status?.running ? liveProgress?.totalSeen : lastRun?.totalSeen;
-  const scanAdded = status?.running ? liveProgress?.assetsAdded : lastRun?.assetsAdded;
-  const scanUpdated = status?.running ? liveProgress?.assetsUpdated : lastRun?.assetsUpdated;
-  const scanDeleted = status?.running ? liveProgress?.assetsDeleted : lastRun?.assetsDeleted;
-  const scanErrors = status?.running ? liveProgress?.errors : lastRun?.errors;
+  const totalMedia = progress?.assetTotal ?? libraries.reduce((sum, library) => sum + library.progress.assetTotal, 0);
+  const statusLabel = cleanup?.running ? '清理中' : status?.running ? scanPhaseLabel(liveProgress?.phase) : '空闲';
 
   return (
     <section className="page settings-page">
-      <Toolbar title="设置" onScanStarted={() => void refresh()} />
+      <Toolbar title="设置" showScanAction={false} />
       <div className="settings-scroll">
-        {error && <div className="error-line">{error}</div>}
-        <section className="settings-grid">
-          <div className="settings-panel">
-            <div className="settings-panel-title">扫描状态</div>
-            <div className="metric-grid">
-              <Metric label="状态" value={status?.running ? '处理中' : '空闲'} />
-              <Metric label="最近开始" value={formatDateTime(status?.lastStart ?? null) || '-'} />
-              <Metric label="最近结果" value={lastRun?.status ?? '-'} />
-              <Metric label="发现资源" value={String(scanSeen ?? 0)} />
-              <Metric label="新增" value={String(scanAdded ?? 0)} />
-              <Metric label="更新" value={String(scanUpdated ?? 0)} />
-              <Metric label="删除" value={String(scanDeleted ?? 0)} />
-              <Metric label="错误" value={String(scanErrors ?? 0)} />
-            </div>
-            {status?.running && liveProgress && (
-              <div className="settings-note scan-live-line">
-                <span>当前根：{displayRelPath(liveProgress.currentRoot)}</span>
-                {liveProgress.currentRelPath && <span>当前文件：{displayRelPath(liveProgress.currentRelPath)}</span>}
-              </div>
-            )}
-            {lastRun?.lastError && <div className="settings-warning">{lastRun.lastError}</div>}
-            <button className="command-button settings-action" type="button" onClick={() => void triggerScan()}>
-              <RotateCw size={16} />
-              重新扫描全部
-            </button>
-          </div>
+        <div className="settings-layout">
+          <nav className="settings-section-nav" aria-label="设置分区">
+            {settingsSections.map((section) => (
+              <button
+                className={activeSettingsSection === section.id ? 'active' : ''}
+                key={section.id}
+                type="button"
+                onClick={() => setActiveSettingsSection(section.id)}
+              >
+                {section.label}
+              </button>
+            ))}
+          </nav>
+          <div className="settings-content">
+            {error && <div className="error-line">{error}</div>}
 
-          <div className="settings-panel">
-            <div className="settings-panel-title">处理进度</div>
-            <div className="metric-grid">
-              <Metric label="媒体总数" value={String(progress?.assetTotal ?? 0)} />
-              <Metric label="图片" value={String(progress?.imageTotal ?? 0)} />
-              <Metric label="视频" value={String(progress?.videoTotal ?? 0)} />
-              <Metric label="队列" value={`图 ${progress?.queue.thumbQueued ?? 0} / 视 ${progress?.queue.videoQueued ?? 0}`} />
-            </div>
-            <div className="progress-list">
-              <ProgressRow label="图片缩略图" counts={progress?.thumb} />
-              <ProgressRow label="图片预览图" counts={progress?.preview} />
-              <ProgressRow label="视频封面" counts={progress?.videoPoster} />
-              <ProgressRow label="视频代理" counts={progress?.videoProxy} />
-            </div>
-          </div>
-
-          <div className="settings-panel">
-            <div className="settings-panel-title">最近扫描</div>
-            <div className="run-list">
-              {runs.map((run) => (
-                <div className="run-row" key={run.id}>
-                  <span>{formatDateTime(run.startedAt)}</span>
-                  <span>{run.status}</span>
-                  <span>新增 {run.assetsAdded}</span>
-                  <span>更新 {run.assetsUpdated}</span>
-                  <span>删除 {run.assetsDeleted}</span>
-                  <span>错误 {run.errors}</span>
+            {activeSettingsSection === 'libraries' && (
+              <section className="settings-section library-scan-section">
+                <div className="settings-panel">
+                  <div className="settings-panel-title">总扫描</div>
+                  <div className="metric-grid scan-summary-grid">
+                    <Metric label="状态" value={statusLabel} />
+                    <Metric label="总媒体" value={String(totalMedia)} />
+                    <Metric label="缓存" value={cacheSizeLabel(progress)} />
+                    <Metric label="图库个数" value={String(libraries.length)} />
+                  </div>
                 </div>
-              ))}
-              {runs.length === 0 && <div className="muted-line">暂无扫描记录</div>}
-            </div>
-          </div>
-        </section>
+                <div className="settings-panel">
+                  <div className="settings-panel-title">图库</div>
+                  <div className="library-list">
+                    {libraries.map((library) => (
+                      <div className={library.progress.active ? 'library-row active-scan' : 'library-row'} key={library.id}>
+                        <div className="library-info">
+                          <strong>{displayLibraryName(library.name)}</strong>
+                          <small>{library.exists ? '已连接' : '不可访问'} · {library.folders.length} 个文件夹</small>
+                          <div className="library-paths">
+                            {library.folders.map((folder) => (
+                              <span key={folder.relPath || 'root'}>{displayRelPath(folder.relPath)}</span>
+                            ))}
+                          </div>
+                          <LibraryProgress progress={library.progress} />
+                        </div>
+                        <button className="library-scan-button" type="button" title="扫描此图库" onClick={() => void rescanLibrary(library.id)}>
+                          <RotateCw size={15} />
+                          <span>扫描</span>
+                        </button>
+                        <button type="button" title="编辑" onClick={() => setEditingLibrary(library)}>
+                          <Pencil size={15} />
+                        </button>
+                        <button type="button" title="删除" onClick={() => void removeLibrary(library.id)}>
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                    ))}
+                    {libraries.length === 0 && <div className="muted-line">默认扫描全部存储</div>}
+                  </div>
+                  <div className="selected-folder-actions">
+                    <button className="command-button" type="button" onClick={() => setAddOpen(true)}>
+                      <FolderPlus size={16} />
+                      添加来源
+                    </button>
+                  </div>
+                </div>
+              </section>
+            )}
 
-        <section className="settings-panel">
-          <div className="settings-panel-title">查看器</div>
-          <div className="viewer-settings-grid">
-            <label className="settings-check-row settings-field-wide">
-              <input
-                type="checkbox"
-                checked={viewerPrefs.videoAutoplay}
-                onChange={(event) => updateViewerPrefs({ ...viewerPrefs, videoAutoplay: event.target.checked })}
-              />
-              <span>视频自动播放</span>
-            </label>
-            <div className="settings-field settings-field-wide">
-              <span>按住放大模式</span>
-              <div className="settings-segmented">
-                <button
-                  className={viewerPrefs.zoomMode === 'scale' ? 'active' : ''}
-                  type="button"
-                  onClick={() => updateViewerPrefs({ ...viewerPrefs, zoomMode: 'scale' })}
-                >
-                  固定倍数
-                </button>
-                <button
-                  className={viewerPrefs.zoomMode === 'pixels' ? 'active' : ''}
-                  type="button"
-                  onClick={() => updateViewerPrefs({ ...viewerPrefs, zoomMode: 'pixels' })}
-                >
-                  固定显示像素
-                </button>
-              </div>
-            </div>
-            <label className="settings-field">
-              <span>固定倍数</span>
-              <input
-                disabled={viewerPrefs.zoomMode !== 'scale'}
-                max={8}
-                min={1.5}
-                step={0.1}
-                type="number"
-                value={viewerPrefs.zoomScale}
-                onChange={(event) =>
-                  updateViewerPrefs({ ...viewerPrefs, zoomScale: Number(event.target.value) })
-                }
-              />
-            </label>
-            <label className="settings-field">
-              <span>固定显示像素</span>
-              <input
-                disabled={viewerPrefs.zoomMode !== 'pixels'}
-                max={2000}
-                min={50}
-                step={50}
-                type="number"
-                value={viewerPrefs.zoomPixelArea}
-                onChange={(event) =>
-                  updateViewerPrefs({ ...viewerPrefs, zoomPixelArea: Number(event.target.value) })
-                }
-              />
-            </label>
-          </div>
-        </section>
-
-        <section className="settings-panel">
-          <div className="settings-panel-title">LIB</div>
-          <div className="library-list">
-            {libraries.map((library) => (
-              <div className="library-row" key={library.id}>
-                <div className="library-info">
-                  <strong>{library.name}</strong>
-                  <small>{library.exists ? '可访问' : '部分不可访问'} · {library.folders.length} 个文件夹</small>
-                  <div className="library-paths">
-                    {library.folders.map((folder) => (
-                      <span key={folder.relPath || 'root'}>{displayRelPath(folder.relPath)}</span>
+            {activeSettingsSection === 'appearance' && (
+              <section className="settings-panel settings-section">
+                <div className="settings-panel-title">外观</div>
+                <div className="settings-field settings-field-wide">
+                  <span>主题</span>
+                  <div className="settings-segmented three-options">
+                    <button
+                      className={themeMode === 'system' ? 'active' : ''}
+                      type="button"
+                      onClick={() => updateThemeMode('system')}
+                    >
+                      跟随系统
+                    </button>
+                    <button
+                      className={themeMode === 'light' ? 'active' : ''}
+                      type="button"
+                      onClick={() => updateThemeMode('light')}
+                    >
+                      浅色
+                    </button>
+                    <button
+                      className={themeMode === 'dark' ? 'active' : ''}
+                      type="button"
+                      onClick={() => updateThemeMode('dark')}
+                    >
+                      深色
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-field settings-field-wide settings-field-spaced">
+                  <span>单行高度</span>
+                  <div className="settings-segmented five-options">
+                    {rowHeightOptions.map((option) => (
+                      <button
+                        className={rowHeightLevel === option.value ? 'active' : ''}
+                        key={option.value}
+                        type="button"
+                        onClick={() => updateRowHeightLevel(option.value)}
+                      >
+                        {option.label}
+                      </button>
                     ))}
                   </div>
                 </div>
-                <button type="button" title="重新扫描" onClick={() => void rescanLibrary(library.id)}>
-                  <RotateCw size={15} />
-                </button>
-                <button type="button" title="删除" onClick={() => void removeLibrary(library.id)}>
-                  <Trash2 size={15} />
-                </button>
-              </div>
-            ))}
-            {libraries.length === 0 && <div className="muted-line">暂无 LIB</div>}
+              </section>
+            )}
+
+            {activeSettingsSection === 'viewer' && (
+              <section className="settings-panel settings-section">
+                <div className="settings-panel-title">查看器</div>
+                <div className="viewer-settings-grid">
+                  <label className="settings-check-row settings-field-wide">
+                    <input
+                      type="checkbox"
+                      checked={viewerPrefs.videoAutoplay}
+                      onChange={(event) => updateViewerPrefs({ ...viewerPrefs, videoAutoplay: event.target.checked })}
+                    />
+                    <span>视频自动播放</span>
+                  </label>
+                  <label className="settings-check-row settings-field-wide">
+                    <input
+                      type="checkbox"
+                      checked={viewerPrefs.subtitlesEnabled}
+                      onChange={(event) => updateViewerPrefs({ ...viewerPrefs, subtitlesEnabled: event.target.checked })}
+                    />
+                    <span>弹幕默认开启</span>
+                  </label>
+                  <div className="settings-field settings-field-wide">
+                    <span>视频倍速</span>
+                    <div className="settings-segmented five-options">
+                      {playbackRates.map((rate) => (
+                        <button
+                          className={viewerPrefs.playbackRate === rate ? 'active' : ''}
+                          key={rate}
+                          type="button"
+                          onClick={() => updateViewerPrefs({ ...viewerPrefs, playbackRate: rate })}
+                        >
+                          {rate}x
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="settings-field settings-field-wide">
+                    <span>按住放大模式</span>
+                    <div className="settings-segmented">
+                      <button
+                        className={viewerPrefs.zoomMode === 'scale' ? 'active' : ''}
+                        type="button"
+                        onClick={() => updateViewerPrefs({ ...viewerPrefs, zoomMode: 'scale' })}
+                      >
+                        固定倍数
+                      </button>
+                      <button
+                        className={viewerPrefs.zoomMode === 'pixels' ? 'active' : ''}
+                        type="button"
+                        onClick={() => updateViewerPrefs({ ...viewerPrefs, zoomMode: 'pixels' })}
+                      >
+                        固定显示像素
+                      </button>
+                    </div>
+                  </div>
+                  <label className="settings-field">
+                    <span>固定倍数</span>
+                    <input
+                      disabled={viewerPrefs.zoomMode !== 'scale'}
+                      max={8}
+                      min={1.5}
+                      step={0.1}
+                      type="number"
+                      value={viewerPrefs.zoomScale}
+                      onChange={(event) =>
+                        updateViewerPrefs({ ...viewerPrefs, zoomScale: Number(event.target.value) })
+                      }
+                    />
+                  </label>
+                  <label className="settings-field">
+                    <span>固定显示像素</span>
+                    <input
+                      disabled={viewerPrefs.zoomMode !== 'pixels'}
+                      max={2000}
+                      min={50}
+                      step={50}
+                      type="number"
+                      value={viewerPrefs.zoomPixelArea}
+                      onChange={(event) =>
+                        updateViewerPrefs({ ...viewerPrefs, zoomPixelArea: Number(event.target.value) })
+                      }
+                    />
+                  </label>
+                </div>
+              </section>
+            )}
           </div>
-          {!configured && <div className="settings-note">当前使用默认 LIB：扫描整个 /photos。</div>}
-          <div className="selected-folder-actions">
-            <button className="command-button" type="button" onClick={() => setAddOpen(true)}>
-              <FolderPlus size={16} />
-              添加
-            </button>
-          </div>
-        </section>
+        </div>
       </div>
       {addOpen && (
         <FolderPickerModal
+          confirmLabel="完成"
+          title="添加来源"
           onClose={() => setAddOpen(false)}
           onConfirm={(name, relPaths) => void createLibrary(name, relPaths)}
+        />
+      )}
+      {editingLibrary && (
+        <FolderPickerModal
+          confirmLabel="保存"
+          excludeLibraryId={editingLibrary.id}
+          initialName={editingLibrary.name}
+          initialRelPaths={editingLibrary.folders.map((folder) => folder.relPath)}
+          key={editingLibrary.id}
+          title="编辑来源"
+          onClose={() => setEditingLibrary(null)}
+          onConfirm={(name, relPaths) => void updateLibrary(editingLibrary.id, name, relPaths)}
         />
       )}
     </section>
@@ -295,6 +392,48 @@ const emptyCounts: WorkStatusCounts = {
   total: 0,
 };
 
+const emptyLibraryProgress: ScanLibraryProgress = {
+  active: false,
+  assetTotal: 0,
+  scannedFiles: 0,
+  thumb: emptyCounts,
+  transcode: emptyCounts,
+  unscannedFiles: 0,
+};
+
+const rowHeightOptions: Array<{ label: string; value: GridRowHeightLevel }> = [
+  { label: '紧凑', value: 'compact' },
+  { label: '小', value: 'small' },
+  { label: '中', value: 'medium' },
+  { label: '大', value: 'large' },
+  { label: '超大', value: 'extra' },
+];
+
+function LibraryProgress({ progress }: { progress: ScanLibraryProgress }) {
+  return (
+    <div className="library-progress">
+      <div className="library-stat-strip">
+        <span>
+          <em>已扫描</em>
+          <strong>{progress.scannedFiles}</strong>
+        </span>
+        <span>
+          <em>未扫描</em>
+          <strong>{progress.unscannedFiles}</strong>
+        </span>
+        <span>
+          <em>媒体</em>
+          <strong>{progress.assetTotal}</strong>
+        </span>
+      </div>
+      <div className="library-progress-bars">
+        <ProgressRow label="缩略图" counts={progress.thumb} />
+        <ProgressRow label="转码" counts={progress.transcode} />
+      </div>
+    </div>
+  );
+}
+
 function ProgressRow({ label, counts }: { label: string; counts: WorkStatusCounts | null | undefined }) {
   const value = counts ?? emptyCounts;
   const done = value.ready + value.notRequired;
@@ -303,42 +442,72 @@ function ProgressRow({ label, counts }: { label: string; counts: WorkStatusCount
     <div className="progress-row">
       <div className="progress-row-title">
         <span>{label}</span>
-        <strong>
-          {done}/{value.total} · {percent}%
-        </strong>
+        <strong>已完成 {done}/{value.total}</strong>
       </div>
-      <div className="progress-bar" aria-label={`${label} ${percent}%`}>
+      <div className="progress-bar" aria-label={`${label} 已完成 ${done}/${value.total}`}>
         <div className="progress-fill" style={{ width: `${percent}%` }} />
       </div>
       <div className="progress-meta">
         <span>待处理 {value.pending}</span>
         <span>处理中 {value.processing}</span>
         <span>错误 {value.error}</span>
-        {value.notRequired > 0 && <span>跳过 {value.notRequired}</span>}
       </div>
     </div>
   );
 }
 
+function scanPhaseLabel(phase: string | undefined) {
+  switch (phase) {
+    case 'counting':
+      return '统计中';
+    case 'scanning':
+      return '扫描中';
+    case 'finished':
+      return '完成';
+    case 'paused':
+      return '已暂停';
+    case 'pausing':
+      return '暂停中';
+    default:
+      return '处理中';
+  }
+}
+
+function cacheSizeLabel(progress: ProcessingProgress | null) {
+  if (!progress?.cache) return '0 B';
+  if (progress.cache.refreshing && progress.cache.updatedAt === 0) return '统计中';
+  return formatBytes(progress.cache.sizeBytes);
+}
+
 function FolderPickerModal({
+  confirmLabel,
+  excludeLibraryId,
+  initialName,
+  initialRelPaths,
   onClose,
   onConfirm,
+  title,
 }: {
+  confirmLabel: string;
+  excludeLibraryId?: string;
+  initialName?: string;
+  initialRelPaths?: string[];
   onClose: () => void;
   onConfirm: (name: string, relPaths: string[]) => void;
+  title: string;
 }) {
   const [children, setChildren] = useState<Record<string, SourceFolder[]>>({});
   const [rootFolder, setRootFolder] = useState<SourceFolder | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [libraryName, setLibraryName] = useState('');
+  const [selected, setSelected] = useState<Set<string>>(() => new Set(initialRelPaths ?? []));
+  const [libraryName, setLibraryName] = useState(initialName ?? '');
   const [loading, setLoading] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
   const loadChildren = useCallback(async (relPath: string) => {
     setLoading((prev) => new Set(prev).add(relPath));
     try {
-      const result = await api.sourceFolders(relPath);
+      const result = await api.sourceFolders(relPath, excludeLibraryId);
       if (relPath === '') {
         setRootFolder(result.current);
       }
@@ -353,11 +522,27 @@ function FolderPickerModal({
         return next;
       });
     }
-  }, []);
+  }, [excludeLibraryId]);
 
   useEffect(() => {
     void loadChildren('');
   }, [loadChildren]);
+
+  useEffect(() => {
+    const ancestors = new Set<string>();
+    for (const relPath of initialRelPaths ?? []) {
+      for (const ancestor of folderAncestorPaths(relPath)) {
+        ancestors.add(ancestor);
+      }
+    }
+    if (ancestors.size === 0) return;
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      ancestors.forEach((ancestor) => next.add(ancestor));
+      return next;
+    });
+    ancestors.forEach((ancestor) => void loadChildren(ancestor));
+  }, [initialRelPaths, loadChildren]);
 
   function toggleExpanded(relPath: string) {
     setExpanded((prev) => {
@@ -375,7 +560,14 @@ function FolderPickerModal({
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(relPath)) next.delete(relPath);
-      else next.add(relPath);
+      else {
+        next.add(relPath);
+        for (const selectedPath of Array.from(next)) {
+          if (selectedPath !== relPath && isDescendantPath(selectedPath, relPath)) {
+            next.delete(selectedPath);
+          }
+        }
+      }
       return next;
     });
   }
@@ -385,9 +577,9 @@ function FolderPickerModal({
 
   return (
     <div className="modal-backdrop" role="presentation">
-      <div className="folder-picker" role="dialog" aria-modal="true" aria-label="添加 LIB">
+      <div className="folder-picker" role="dialog" aria-modal="true" aria-label={title}>
         <div className="modal-title">
-          <span>添加 LIB</span>
+          <span>{title}</span>
           <button type="button" onClick={onClose} title="关闭">
             <X size={17} />
           </button>
@@ -410,7 +602,7 @@ function FolderPickerModal({
           {!rootFolder && children['']?.length === 0 && <div className="muted-line">没有可选择的文件夹</div>}
         </div>
         <div className="library-name-field">
-          <label htmlFor="library-name">LIB 名称</label>
+          <label htmlFor="library-name">来源名称</label>
           <input
             id="library-name"
             value={libraryName}
@@ -425,7 +617,7 @@ function FolderPickerModal({
           </button>
           <button className="command-button" type="button" disabled={!canFinish} onClick={() => onConfirm(libraryName.trim(), selectedPaths)}>
             <Check size={16} />
-            完成并扫描
+            {confirmLabel}
           </button>
         </div>
       </div>
@@ -457,7 +649,7 @@ function FolderTreeNode({
   const checked = folder.included || includedBySelectedParent || selected.has(folder.relPath);
   const note = folder.included
     ? folder.selected
-      ? '已在 LIB 中'
+      ? '已添加'
       : '已被上级包含'
     : includedBySelectedParent
       ? '已被上级选择'
@@ -498,13 +690,30 @@ function hasSelectedAncestor(relPath: string, selected: Set<string>) {
     if (selectedPath === relPath) {
       continue;
     }
-    if ((selectedPath === '' && relPath !== '') || relPath.startsWith(`${selectedPath}/`)) {
+    if (isDescendantPath(relPath, selectedPath)) {
       return true;
     }
   }
   return false;
 }
 
+function isDescendantPath(relPath: string, ancestorPath: string) {
+  return (ancestorPath === '' && relPath !== '') || relPath.startsWith(`${ancestorPath}/`);
+}
+
+function folderAncestorPaths(relPath: string) {
+  const parts = relPath.split('/').filter(Boolean);
+  const ancestors = [''];
+  for (let index = 1; index < parts.length; index += 1) {
+    ancestors.push(parts.slice(0, index).join('/'));
+  }
+  return ancestors;
+}
+
 function displayRelPath(relPath: string) {
-  return relPath ? `/${relPath}` : '/photos';
+  return relPath ? `/${relPath}` : '全部存储';
+}
+
+function displayLibraryName(name: string) {
+  return name === '默认 LIB' ? '默认来源' : name;
 }

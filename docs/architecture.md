@@ -3,7 +3,7 @@
 当前架构是单容器：Go 后端服务 `/api` 和前端静态文件，React 前端通过 `/api` 获取数据，SQLite 与缓存都在 `/data`。
 
 ```text
-/photos
+PHOTO_ROOT 或 PHOTO_ROOTS
   -> scanner
   -> SQLite assets/folders/scan_runs
   -> jobs queue
@@ -15,7 +15,7 @@
 
 ## 数据流
 
-1. scan：扫描 `/photos`，识别支持的图片/视频，按 `rel_path + size + mtime` 判断新增或修改，删除文件标记 `deleted_at`。
+1. scan：扫描已配置的照片存储根，识别支持的图片/视频，按 `rel_path + size + mtime` 判断新增或修改，删除文件标记 `deleted_at`；多存储模式下 `rel_path` 第一段是存储 ID。
 2. db：写入 assets、folders、scan_runs，folders 统计在扫描后刷新。
 3. jobs：新增或修改的资源进入内存队列，图片和视频 worker 按配置并发。
 4. cache：图片输出 WebP thumb/preview，视频输出 JPG poster 和必要的 MP4 proxy；视频处理可通过 `FFMPEG_HWACCEL` 尝试硬件解码。
@@ -32,7 +32,7 @@ Viewer URL 保存 `context`、筛选、排序、albumId 或 folderId。`/api/ass
 
 ## 缓存策略
 
-`cache_key = rel_path + size + mtime` 的 SHA1 前 20 位。文件修改后 cache key 改变，thumb/preview/poster/proxy URL 带 `?v=cacheKey`，响应使用 `Cache-Control: public, max-age=31536000, immutable`。
+`cache_key = rel_path + size + mtime` 的 SHA1 前 20 位。文件修改后 cache key 改变，thumb/preview/poster/proxy URL 带 `?v=cacheKey`，响应使用 `Cache-Control: public, max-age=31536000, immutable`。后台媒体任务共用资源闸门，并以低 CPU/I/O 优先级启动外部处理命令。
 
 ## 视频代理策略
 

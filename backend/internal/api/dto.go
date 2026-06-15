@@ -72,14 +72,18 @@ type ScanStatusDTO struct {
 }
 
 type ScanProgressDTO struct {
-	Reason         string `json:"reason"`
-	CurrentRoot    string `json:"currentRoot"`
-	CurrentRelPath string `json:"currentRelPath"`
-	TotalSeen      int    `json:"totalSeen"`
-	AssetsAdded    int    `json:"assetsAdded"`
-	AssetsUpdated  int    `json:"assetsUpdated"`
-	AssetsDeleted  int    `json:"assetsDeleted"`
-	Errors         int    `json:"errors"`
+	Reason         string   `json:"reason"`
+	Phase          string   `json:"phase"`
+	Roots          []string `json:"roots"`
+	CurrentRoot    string   `json:"currentRoot"`
+	CurrentRelPath string   `json:"currentRelPath"`
+	TotalFiles     int      `json:"totalFiles"`
+	ScannedFiles   int      `json:"scannedFiles"`
+	TotalSeen      int      `json:"totalSeen"`
+	AssetsAdded    int      `json:"assetsAdded"`
+	AssetsUpdated  int      `json:"assetsUpdated"`
+	AssetsDeleted  int      `json:"assetsDeleted"`
+	Errors         int      `json:"errors"`
 }
 
 type WorkStatusCountsDTO struct {
@@ -92,10 +96,27 @@ type WorkStatusCountsDTO struct {
 }
 
 type QueueStatsDTO struct {
-	ThumbQueued int `json:"thumbQueued"`
-	ThumbCap    int `json:"thumbCap"`
-	VideoQueued int `json:"videoQueued"`
-	VideoCap    int `json:"videoCap"`
+	ImageQueued       int `json:"imageQueued"`
+	ImageCap          int `json:"imageCap"`
+	ThumbQueued       int `json:"thumbQueued"`
+	ThumbCap          int `json:"thumbCap"`
+	PreviewQueued     int `json:"previewQueued"`
+	PreviewCap        int `json:"previewCap"`
+	VideoPosterQueued int `json:"videoPosterQueued"`
+	VideoPosterCap    int `json:"videoPosterCap"`
+	VideoProxyQueued  int `json:"videoProxyQueued"`
+	VideoProxyCap     int `json:"videoProxyCap"`
+	VideoQueued       int `json:"videoQueued"`
+	VideoCap          int `json:"videoCap"`
+	ActiveThumb       int `json:"activeThumb"`
+	ActiveTranscode   int `json:"activeTranscode"`
+}
+
+type CacheStatsDTO struct {
+	SizeBytes  int64 `json:"sizeBytes"`
+	FileCount  int   `json:"fileCount"`
+	UpdatedAt  int64 `json:"updatedAt"`
+	Refreshing bool  `json:"refreshing"`
 }
 
 type ProcessingProgressDTO struct {
@@ -103,10 +124,22 @@ type ProcessingProgressDTO struct {
 	ImageTotal  int                 `json:"imageTotal"`
 	VideoTotal  int                 `json:"videoTotal"`
 	Thumb       WorkStatusCountsDTO `json:"thumb"`
+	Transcode   WorkStatusCountsDTO `json:"transcode"`
 	Preview     WorkStatusCountsDTO `json:"preview"`
 	VideoPoster WorkStatusCountsDTO `json:"videoPoster"`
 	VideoProxy  WorkStatusCountsDTO `json:"videoProxy"`
 	Queue       QueueStatsDTO       `json:"queue"`
+	Cache       CacheStatsDTO       `json:"cache"`
+	Active      bool                `json:"active"`
+	UpdatedAt   int64               `json:"updatedAt"`
+	Refreshing  bool                `json:"refreshing"`
+}
+
+type CleanupStatusDTO struct {
+	Running   bool   `json:"running"`
+	Status    string `json:"status"`
+	LastError string `json:"lastError"`
+	UpdatedAt int64  `json:"updatedAt"`
 }
 
 type ScanFolderDTO struct {
@@ -118,10 +151,20 @@ type ScanFolderDTO struct {
 }
 
 type ScanLibraryDTO struct {
-	ID      string          `json:"id"`
-	Name    string          `json:"name"`
-	Folders []ScanFolderDTO `json:"folders"`
-	Exists  bool            `json:"exists"`
+	ID       string                 `json:"id"`
+	Name     string                 `json:"name"`
+	Folders  []ScanFolderDTO        `json:"folders"`
+	Exists   bool                   `json:"exists"`
+	Progress ScanLibraryProgressDTO `json:"progress"`
+}
+
+type ScanLibraryProgressDTO struct {
+	AssetTotal     int                 `json:"assetTotal"`
+	ScannedFiles   int                 `json:"scannedFiles"`
+	UnscannedFiles int                 `json:"unscannedFiles"`
+	Thumb          WorkStatusCountsDTO `json:"thumb"`
+	Transcode      WorkStatusCountsDTO `json:"transcode"`
+	Active         bool                `json:"active"`
 }
 
 type SourceFolderDTO struct {
@@ -173,6 +216,7 @@ type AssetPreferenceDTO struct {
 type AlbumDTO struct {
 	ID                int64            `json:"id"`
 	Name              string           `json:"name"`
+	GroupID           *int64           `json:"groupId"`
 	MediaTypeFilter   string           `json:"mediaTypeFilter"`
 	OrientationFilter string           `json:"orientationFilter"`
 	AssetCount        int              `json:"assetCount"`
@@ -180,6 +224,13 @@ type AlbumDTO struct {
 	CreatedAt         int64            `json:"createdAt"`
 	UpdatedAt         int64            `json:"updatedAt"`
 	Sources           []AlbumSourceDTO `json:"sources"`
+}
+
+type AlbumGroupDTO struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt int64  `json:"createdAt"`
+	UpdatedAt int64  `json:"updatedAt"`
 }
 
 type AlbumSourceDTO struct {
@@ -270,10 +321,18 @@ func scanRunDTOs(runs []model.ScanRun) []ScanRunDTO {
 }
 
 func scanProgressDTO(progress scanner.Progress) ScanProgressDTO {
+	roots := progress.Roots
+	if roots == nil {
+		roots = []string{}
+	}
 	return ScanProgressDTO{
 		Reason:         progress.Reason,
+		Phase:          progress.Phase,
+		Roots:          roots,
 		CurrentRoot:    progress.CurrentRoot,
 		CurrentRelPath: progress.CurrentRelPath,
+		TotalFiles:     progress.TotalFiles,
+		ScannedFiles:   progress.ScannedFiles,
 		TotalSeen:      progress.TotalSeen,
 		AssetsAdded:    progress.AssetsAdded,
 		AssetsUpdated:  progress.AssetsUpdated,
@@ -293,21 +352,37 @@ func workStatusCountsDTO(counts db.WorkStatusCounts) WorkStatusCountsDTO {
 	}
 }
 
-func processingProgressDTO(progress db.ProcessingProgress, queue jobs.QueueStats) ProcessingProgressDTO {
+func processingProgressDTO(progress db.ProcessingProgress, queue jobs.QueueStats, cache CacheStatsDTO, updatedAt int64, refreshing bool) ProcessingProgressDTO {
+	active := queue.ActiveThumb+queue.ActiveTranscode+queue.ThumbQueued+queue.PreviewQueued+queue.VideoProxyQueued > 0
 	return ProcessingProgressDTO{
 		AssetTotal:  progress.AssetTotal,
 		ImageTotal:  progress.ImageTotal,
 		VideoTotal:  progress.VideoTotal,
 		Thumb:       workStatusCountsDTO(progress.Thumb),
+		Transcode:   workStatusCountsDTO(progress.Transcode),
 		Preview:     workStatusCountsDTO(progress.Preview),
 		VideoPoster: workStatusCountsDTO(progress.VideoPoster),
 		VideoProxy:  workStatusCountsDTO(progress.VideoProxy),
 		Queue: QueueStatsDTO{
-			ThumbQueued: queue.ThumbQueued,
-			ThumbCap:    queue.ThumbCap,
-			VideoQueued: queue.VideoQueued,
-			VideoCap:    queue.VideoCap,
+			ImageQueued:       queue.ImageQueued,
+			ImageCap:          queue.ImageCap,
+			ThumbQueued:       queue.ThumbQueued,
+			ThumbCap:          queue.ThumbCap,
+			PreviewQueued:     queue.PreviewQueued,
+			PreviewCap:        queue.PreviewCap,
+			VideoPosterQueued: queue.VideoPosterQueued,
+			VideoPosterCap:    queue.VideoPosterCap,
+			VideoProxyQueued:  queue.VideoProxyQueued,
+			VideoProxyCap:     queue.VideoProxyCap,
+			VideoQueued:       queue.VideoQueued,
+			VideoCap:          queue.VideoCap,
+			ActiveThumb:       queue.ActiveThumb,
+			ActiveTranscode:   queue.ActiveTranscode,
 		},
+		Cache:      cache,
+		Active:     active,
+		UpdatedAt:  updatedAt,
+		Refreshing: refreshing,
 	}
 }
 
@@ -353,6 +428,7 @@ func albumDTO(album model.Album) AlbumDTO {
 	return AlbumDTO{
 		ID:                album.ID,
 		Name:              album.Name,
+		GroupID:           album.GroupID,
 		MediaTypeFilter:   album.MediaTypeFilter,
 		OrientationFilter: album.OrientationFilter,
 		AssetCount:        album.AssetCount,
@@ -367,6 +443,18 @@ func albumDTOs(albums []model.Album) []AlbumDTO {
 	result := make([]AlbumDTO, 0, len(albums))
 	for _, album := range albums {
 		result = append(result, albumDTO(album))
+	}
+	return result
+}
+
+func albumGroupDTO(group model.AlbumGroup) AlbumGroupDTO {
+	return AlbumGroupDTO{ID: group.ID, Name: group.Name, CreatedAt: group.CreatedAt, UpdatedAt: group.UpdatedAt}
+}
+
+func albumGroupDTOs(groups []model.AlbumGroup) []AlbumGroupDTO {
+	result := make([]AlbumGroupDTO, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, albumGroupDTO(group))
 	}
 	return result
 }

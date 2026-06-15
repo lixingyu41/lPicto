@@ -1,20 +1,32 @@
 services:
   lpicto:
     build: .
+    gpus: all
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
-      - C:/Users/BROCCOLI/Downloads/666:/photos/C666:ro
-      - D:/666:/photos/D666:ro
+      - y_storage:/storage/Y:ro
+      - z_storage:/storage/Z:ro
       - ./data:/data
     environment:
       - PHOTO_ROOT=/photos
+      - PHOTO_ROOTS=Y=/storage/Y;Z=/storage/Z
       - DATA_ROOT=/data
       - HTTP_ADDR=:8080
       - SCAN_INTERVAL_MINUTES=30
-      - THUMB_WORKERS=8
-      - VIDEO_WORKERS=3
-      - VIPS_CONCURRENCY=4
+      - SCAN_WORKERS=12
+      - THUMB_WORKERS=12
+      - VIDEO_WORKERS=6
+      - VIDEO_POSTER_WORKERS=4
+      - VIDEO_PROXY_WORKERS=2
+      - BACKGROUND_MAX_ACTIVE=18
+      - BACKGROUND_LOAD_TARGET=18
+      - BACKGROUND_MIN_FREE_MB=512
+      - BACKGROUND_START_SPACING_MS=25
+      - BACKGROUND_NICE=5
+      - BACKGROUND_IONICE_CLASS=2
+      - BACKGROUND_IONICE_LEVEL=6
+      - VIPS_CONCURRENCY=2
       - PAGE_SIZE_DEFAULT=100
       - PAGE_SIZE_MAX=500
       - ENABLE_FS_WATCH=true
@@ -24,7 +36,23 @@ services:
       - VIDEO_PROXY_ENABLED=true
       - VIDEO_PROXY_MAX_HEIGHT=1080
       - VIDEO_PROXY_CRF=23
-      - FFMPEG_HWACCEL=none
+      - FFMPEG_HWACCEL=auto
       - FFMPEG_HWACCEL_DEVICE=
       - FFMPEG_HWACCEL_FALLBACK=true
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
     restart: unless-stopped
+
+volumes:
+  y_storage:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: //Truenas/pic
+      o: username=${SMB_USER},password=${SMB_PASSWORD},iocharset=utf8,vers=3.0,ro,uid=10001,gid=999,file_mode=0444,dir_mode=0555
+  z_storage:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: //Truenas/vid
+      o: username=${SMB_USER},password=${SMB_PASSWORD},iocharset=utf8,vers=3.0,ro,uid=10001,gid=999,file_mode=0444,dir_mode=0555

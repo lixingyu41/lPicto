@@ -56,7 +56,7 @@ func ClampPage(page int, pageSize int, defaultPageSize int, maxPageSize int) (in
 
 func safeSort(value string) string {
 	switch value {
-	case "timeline_asc", "filename", "size", "imported_desc":
+	case "timeline_asc", "timeline_desc", "filename", "filename_asc", "filename_desc", "size", "size_asc", "size_desc", "imported_asc", "imported_desc":
 		return value
 	default:
 		return "timeline_desc"

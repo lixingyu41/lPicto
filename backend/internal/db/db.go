@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,11 +22,12 @@ func Open(ctx context.Context, path string, migrationsDir string) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	conn, err := sql.Open("sqlite", path)
+	conn, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, err
 	}
-	conn.SetMaxOpenConns(1)
+	conn.SetMaxOpenConns(8)
+	conn.SetMaxIdleConns(8)
 	database := &DB{conn: conn}
 	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;`); err != nil {
 		_ = conn.Close()
@@ -41,6 +43,17 @@ func Open(ctx context.Context, path string, migrationsDir string) (*DB, error) {
 		return nil, err
 	}
 	return database, nil
+}
+
+func sqliteDSN(path string) string {
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return path
+	}
+	q := url.Values{}
+	q.Add("_pragma", "busy_timeout=5000")
+	q.Add("_pragma", "foreign_keys=ON")
+	q.Add("_pragma", "journal_mode(WAL)")
+	return "file:" + filepath.ToSlash(path) + "?" + q.Encode()
 }
 
 func (d *DB) Close() error {

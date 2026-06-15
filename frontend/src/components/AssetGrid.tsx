@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Play } from 'lucide-react';
 import type { Asset, SortKey } from '../types/api';
 import { assetThumbUrl } from '../api/client';
 import { effectiveAspect, rotatedCoverStyle } from '../utils/rotation';
 import { assetGroupLabel, type AssetGroupMode } from '../utils/assetGrouping';
+import { gridRowHeightChanged, gridRowHeightForLevel, loadGridRowHeightLevel } from '../utils/gridPrefs';
 
 interface Props {
   assets: Asset[];
@@ -12,16 +13,24 @@ interface Props {
   hasMore: boolean;
   onLoadMore: () => void;
   buildViewerUrl: (asset: Asset) => string;
+  onOpenAsset?: (asset: Asset) => void;
+  onOpenViewer?: (asset: Asset, viewerUrl: string) => void;
+  onAssetMissing?: (asset: Asset) => void;
   onPressPreviewChange?: (asset: Asset | null) => void;
   onScrollRatioChange?: (ratio: number) => void;
+  onScrollStateChange?: (state: { ratio: number; scrollTop: number }) => void;
+  totalCount?: number;
+  loadedStartIndex?: number;
   groupMode?: AssetGroupMode;
   sort?: SortKey;
   scrollSignal?: number;
   scrollTarget?: { ratio: number; signal: number };
+  scrollTopTarget?: { scrollTop: number; signal: number };
 }
 
 interface RowItem {
   asset: Asset;
+  index: number;
   width: number;
 }
 
@@ -30,6 +39,8 @@ interface AssetGridRow {
   type: 'assets';
   items: RowItem[];
   height: number;
+  startAssetIndex: number;
+  endAssetIndex: number;
 }
 
 interface GroupGridRow {
@@ -37,17 +48,19 @@ interface GroupGridRow {
   type: 'group';
   label: string;
   height: number;
+  assetIndex: number;
 }
 
 type GridRow = AssetGridRow | GroupGridRow;
 
-const rowHeight = 176;
 const groupHeaderHeight = 34;
 const minTileWidth = 84;
 const maxAspect = 2.8;
 const minAspect = 0.42;
 const gap = 10;
-const pressPreviewDelayMs = 120;
+const pressPreviewDelayMs = 220;
+const pressPreviewDragSlopPx = 6;
+const pressPreviewClickSuppressMs = 180;
 
 export default function AssetGrid({
   assets,
@@ -55,32 +68,63 @@ export default function AssetGrid({
   hasMore,
   onLoadMore,
   buildViewerUrl,
+  onOpenAsset,
+  onOpenViewer,
+  onAssetMissing,
   onPressPreviewChange,
   onScrollRatioChange,
+  onScrollStateChange,
+  totalCount = assets.length,
+  loadedStartIndex = 0,
   groupMode = 'none',
   sort = 'timeline_desc',
   scrollSignal = 0,
   scrollTarget,
+  scrollTopTarget,
 }: Props) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const assetsByID = useRef<Map<number, Asset>>(new Map());
   const pressState = useRef({
     active: false,
+    moved: false,
     pending: false,
     pointerX: 0,
     pointerY: 0,
+    previewStartedAt: 0,
+    startX: 0,
+    startY: 0,
     timer: 0,
   });
   const previewFrame = useRef(0);
   const lastPreviewID = useRef<number | null>(null);
+  const gridRowsRef = useRef<GridRow[]>([]);
+  const scrollMetaRef = useRef({ loadedStartIndex: 0, totalCount: assets.length });
   const onPressPreviewChangeRef = useRef(onPressPreviewChange);
+  const onOpenAssetRef = useRef(onOpenAsset);
+  const onOpenViewerRef = useRef(onOpenViewer);
+  const onAssetMissingRef = useRef(onAssetMissing);
   const onScrollRatioChangeRef = useRef(onScrollRatioChange);
+  const onScrollStateChangeRef = useRef(onScrollStateChange);
   const suppressClickUntil = useRef(0);
   const [width, setWidth] = useState(0);
+  const [rowHeight, setRowHeight] = useState(() => gridRowHeightForLevel(loadGridRowHeightLevel()));
+  const visibleAssets = useMemo(() => assets.filter(assetReadyForThumb), [assets]);
 
   useEffect(() => {
-    assetsByID.current = new Map(assets.map((asset) => [asset.id, asset]));
-  }, [assets]);
+    assetsByID.current = new Map(visibleAssets.map((asset) => [asset.id, asset]));
+  }, [visibleAssets]);
+
+  useEffect(() => {
+    onOpenAssetRef.current = onOpenAsset;
+  }, [onOpenAsset]);
+
+  useEffect(() => {
+    onOpenViewerRef.current = onOpenViewer;
+  }, [onOpenViewer]);
+
+  useEffect(() => {
+    onAssetMissingRef.current = onAssetMissing;
+  }, [onAssetMissing]);
 
   useEffect(() => {
     onPressPreviewChangeRef.current = onPressPreviewChange;
@@ -89,6 +133,14 @@ export default function AssetGrid({
   useEffect(() => {
     onScrollRatioChangeRef.current = onScrollRatioChange;
   }, [onScrollRatioChange]);
+
+  useEffect(() => {
+    onScrollStateChangeRef.current = onScrollStateChange;
+  }, [onScrollStateChange]);
+
+  useEffect(() => {
+    scrollMetaRef.current = { loadedStartIndex, totalCount: totalCount === assets.length ? visibleAssets.length : totalCount };
+  }, [assets.length, loadedStartIndex, totalCount, visibleAssets.length]);
 
   useEffect(() => {
     if (!parentRef.current) return;
@@ -101,25 +153,33 @@ export default function AssetGrid({
   }, []);
 
   useEffect(() => {
+    const updateRowHeight = () => setRowHeight(gridRowHeightForLevel(loadGridRowHeightLevel()));
+    window.addEventListener(gridRowHeightChanged, updateRowHeight);
+    window.addEventListener('storage', updateRowHeight);
+    return () => {
+      window.removeEventListener(gridRowHeightChanged, updateRowHeight);
+      window.removeEventListener('storage', updateRowHeight);
+    };
+  }, []);
+
+  useEffect(() => {
     if (parentRef.current) {
       parentRef.current.scrollTop = 0;
-      emitScrollRatio();
+      emitScrollState();
     }
   }, [scrollSignal]);
 
   useEffect(() => {
     if (!parentRef.current || !scrollTarget) return;
     const element = parentRef.current;
-    const maxScroll = element.scrollHeight - element.clientHeight;
-    element.scrollTop = maxScroll > 0 ? maxScroll * clampRatio(scrollTarget.ratio) : 0;
-    emitScrollRatio();
+    element.scrollTop = scrollTopForGlobalRatio(element, gridRowsRef.current, scrollTarget.ratio, scrollMetaRef.current);
+    emitScrollState();
   }, [scrollTarget?.signal]);
 
   useEffect(() => {
     function handleMouseMove(event: MouseEvent) {
       if (!pressState.current.pending && !pressState.current.active) return;
-      pressState.current.pointerX = event.clientX;
-      pressState.current.pointerY = event.clientY;
+      trackPressPointer(event.clientX, event.clientY);
       if (!pressState.current.active) return;
       updatePreviewFromPoint();
     }
@@ -147,19 +207,28 @@ export default function AssetGrid({
     if (!element) return;
     function handleScroll() {
       schedulePreviewUpdate();
-      emitScrollRatio();
+      emitScrollState();
     }
     element.addEventListener('scroll', handleScroll, { passive: true });
     return () => element.removeEventListener('scroll', handleScroll);
   }, []);
 
-  const gridRows = useMemo(() => buildRows(assets, width, groupMode, sort), [assets, groupMode, sort, width]);
+  const gridRows = useMemo(() => buildRows(visibleAssets, width, groupMode, sort, rowHeight), [groupMode, rowHeight, sort, visibleAssets, width]);
+  gridRowsRef.current = gridRows;
   const virtualizer = useVirtualizer({
     count: gridRows.length,
     getScrollElement: () => parentRef.current,
     estimateSize: (index) => (gridRows[index]?.height ?? rowHeight) + gap,
     overscan: 5,
   });
+
+  useEffect(() => {
+    virtualizer.measure();
+  }, [rowHeight, virtualizer]);
+
+  useEffect(() => {
+    emitScrollState();
+  }, [gridRows, loadedStartIndex, totalCount]);
 
   const rows = virtualizer.getVirtualItems();
   const lastRow = rows[rows.length - 1];
@@ -171,6 +240,16 @@ export default function AssetGrid({
   }, [gridRows.length, hasMore, lastRow, loading, onLoadMore]);
 
   const totalHeight = virtualizer.getTotalSize();
+
+  useEffect(() => {
+    if (!parentRef.current || !scrollTopTarget) return;
+    const element = parentRef.current;
+    window.requestAnimationFrame(() => {
+      const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
+      element.scrollTop = Math.min(maxScroll, Math.max(0, scrollTopTarget.scrollTop));
+      emitScrollState();
+    });
+  }, [scrollTopTarget?.scrollTop, scrollTopTarget?.signal, totalHeight]);
 
   return (
     <div className="grid-scroll" ref={parentRef}>
@@ -208,24 +287,27 @@ export default function AssetGrid({
                     onMouseDown={(event) => startPressPreview(event, asset)}
                     onDragStart={(event) => event.preventDefault()}
                     onClick={(event) => {
-                      if (Date.now() > suppressClickUntil.current) return;
-                      event.preventDefault();
-                      event.stopPropagation();
-                      suppressClickUntil.current = 0;
+                      if (Date.now() <= suppressClickUntil.current) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        suppressClickUntil.current = 0;
+                        return;
+                      }
+                      const viewerUrl = buildViewerUrl(asset);
+                      event.currentTarget.href = viewerUrl;
+                      onOpenAssetRef.current?.(asset);
+                      if (onOpenViewerRef.current && !usesNativeNavigation(event)) {
+                        event.preventDefault();
+                        onOpenViewerRef.current(asset, viewerUrl);
+                      }
                     }}
                   >
-                    {assetReadyForThumb(asset) ? (
-                      <img
-                        className="asset-media"
-                        src={assetThumbUrl(asset)}
-                        alt={asset.filename}
-                        loading="lazy"
-                        draggable={false}
-                        style={rotatedCoverStyle(asset, { width: tileWidth, height: rowHeight })}
-                      />
-                    ) : (
-                      <div className="thumb-placeholder">{assetProcessingText(asset)}</div>
-                    )}
+                    <AssetTileMedia
+                      asset={asset}
+                      rowHeight={rowHeight}
+                      tileWidth={tileWidth}
+                      onMissing={() => onAssetMissingRef.current?.(asset)}
+                    />
                     {asset.mediaType === 'video' && (
                       <span className="asset-video-chip" title="视频">
                         <Play size={12} fill="currentColor" />
@@ -238,7 +320,7 @@ export default function AssetGrid({
           );
         })}
       </div>
-      {loading && <div className="loading-line">加载中</div>}
+      {loading && <div className="grid-loading-dot" aria-label="加载中" />}
     </div>
   );
 
@@ -246,16 +328,22 @@ export default function AssetGrid({
     if (!onPressPreviewChangeRef.current || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey) {
       return;
     }
+    event.currentTarget.href = buildViewerUrl(asset);
+    onOpenAssetRef.current?.(asset);
     event.preventDefault();
     clearPressTimer();
     pressState.current.pending = true;
     pressState.current.active = false;
+    pressState.current.moved = false;
     pressState.current.pointerX = event.clientX;
     pressState.current.pointerY = event.clientY;
+    pressState.current.previewStartedAt = 0;
+    pressState.current.startX = event.clientX;
+    pressState.current.startY = event.clientY;
     pressState.current.timer = window.setTimeout(() => {
       pressState.current.pending = false;
       pressState.current.active = true;
-      suppressClickUntil.current = Date.now() + 1000;
+      pressState.current.previewStartedAt = Date.now();
       emitPreviewAsset(assetFromPoint() ?? asset);
     }, pressPreviewDelayMs);
   }
@@ -270,9 +358,22 @@ export default function AssetGrid({
     clearPressTimer();
     pressState.current.pending = false;
     if (!pressState.current.active) return;
+    const previewDuration = Date.now() - pressState.current.previewStartedAt;
+    const shouldSuppressClick = pressState.current.moved || previewDuration >= pressPreviewClickSuppressMs;
     pressState.current.active = false;
-    suppressClickUntil.current = Date.now() + 350;
+    pressState.current.previewStartedAt = 0;
+    suppressClickUntil.current = shouldSuppressClick ? Date.now() + 350 : 0;
     emitPreviewAsset(null);
+  }
+
+  function trackPressPointer(clientX: number, clientY: number) {
+    pressState.current.pointerX = clientX;
+    pressState.current.pointerY = clientY;
+    const dx = clientX - pressState.current.startX;
+    const dy = clientY - pressState.current.startY;
+    if (dx * dx + dy * dy >= pressPreviewDragSlopPx * pressPreviewDragSlopPx) {
+      pressState.current.moved = true;
+    }
   }
 
   function schedulePreviewUpdate() {
@@ -308,13 +409,68 @@ export default function AssetGrid({
     onPressPreviewChangeRef.current?.(asset);
   }
 
-  function emitScrollRatio() {
+  function emitScrollState() {
     const element = parentRef.current;
-    if (!element || !onScrollRatioChangeRef.current) return;
-    const maxScroll = element.scrollHeight - element.clientHeight;
-    const ratio = maxScroll > 0 ? element.scrollTop / maxScroll : 0;
-    onScrollRatioChangeRef.current(Math.min(1, Math.max(0, ratio)));
+    if (!element) return;
+    const ratio = fullScrollRatio(element);
+    const clamped = Math.min(1, Math.max(0, ratio));
+    onScrollRatioChangeRef.current?.(clamped);
+    onScrollStateChangeRef.current?.({ ratio: clamped, scrollTop: element.scrollTop });
   }
+
+  function fullScrollRatio(element: HTMLDivElement) {
+    const { loadedStartIndex: startIndex, totalCount: fullCount } = scrollMetaRef.current;
+    const rowsForRatio = gridRowsRef.current;
+    if (fullCount <= 1 || rowsForRatio.length === 0) {
+      const maxScroll = element.scrollHeight - element.clientHeight;
+      return maxScroll > 0 ? element.scrollTop / maxScroll : 0;
+    }
+    const localIndex = localAssetIndexAtScrollTop(rowsForRatio, element.scrollTop);
+    return clampRatio((startIndex + localIndex) / Math.max(1, fullCount - 1));
+  }
+}
+
+function usesNativeNavigation(event: ReactMouseEvent<HTMLAnchorElement>) {
+  return event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0;
+}
+
+function AssetTileMedia({
+  asset,
+  rowHeight,
+  tileWidth,
+  onMissing,
+}: {
+  asset: Asset;
+  rowHeight: number;
+  tileWidth: number;
+  onMissing: () => void;
+}) {
+  const [sourceFailed, setSourceFailed] = useState(false);
+
+  useEffect(() => {
+    setSourceFailed(false);
+  }, [asset.id, asset.cacheKey]);
+
+  const thumbReady = assetReadyForThumb(asset);
+  if (!thumbReady || sourceFailed) {
+    return null;
+  }
+
+  return (
+    <img
+      className="asset-media"
+      src={assetThumbUrl(asset)}
+      alt={asset.filename}
+      loading="lazy"
+      decoding="async"
+      draggable={false}
+      style={rotatedCoverStyle(asset, { width: tileWidth, height: rowHeight })}
+      onError={() => {
+        setSourceFailed(true);
+        onMissing();
+      }}
+    />
+  );
 }
 
 function clampRatio(value: number) {
@@ -322,7 +478,55 @@ function clampRatio(value: number) {
   return Math.min(1, Math.max(0, value));
 }
 
-function buildRows(assets: Asset[], containerWidth: number, groupMode: AssetGroupMode, sort: SortKey): GridRow[] {
+function localAssetIndexAtScrollTop(rows: GridRow[], scrollTop: number) {
+  let offset = 0;
+  let lastIndex = 0;
+  for (const row of rows) {
+    const rowExtent = row.height + gap;
+    if (scrollTop <= offset + rowExtent) {
+      if (row.type === 'group') return row.assetIndex;
+      const rowProgress = row.height > 0 ? clampRatio((scrollTop - offset) / row.height) : 0;
+      const span = Math.max(1, row.items.length);
+      return Math.min(row.endAssetIndex, row.startAssetIndex + rowProgress * span);
+    }
+    if (row.type === 'group') {
+      lastIndex = row.assetIndex;
+    } else {
+      lastIndex = row.endAssetIndex;
+    }
+    offset += rowExtent;
+  }
+  return lastIndex;
+}
+
+function scrollTopForGlobalRatio(
+  element: HTMLDivElement,
+  rows: GridRow[],
+  ratio: number,
+  meta: { loadedStartIndex: number; totalCount: number },
+) {
+  if (meta.totalCount <= 1 || rows.length === 0) {
+    const maxScroll = element.scrollHeight - element.clientHeight;
+    return maxScroll > 0 ? maxScroll * clampRatio(ratio) : 0;
+  }
+  const targetLocalIndex = clampRatio(ratio) * (meta.totalCount - 1) - meta.loadedStartIndex;
+  let offset = 0;
+  for (const row of rows) {
+    if (row.type === 'assets' && targetLocalIndex <= row.endAssetIndex) {
+      return offset;
+    }
+    offset += row.height + gap;
+  }
+  return Math.max(0, element.scrollHeight - element.clientHeight);
+}
+
+function buildRows(
+  assets: Asset[],
+  containerWidth: number,
+  groupMode: AssetGroupMode,
+  sort: SortKey,
+  rowHeight: number,
+): GridRow[] {
   if (containerWidth <= 0) return [];
   const rows: GridRow[] = [];
   let items: RowItem[] = [];
@@ -331,24 +535,31 @@ function buildRows(assets: Asset[], containerWidth: number, groupMode: AssetGrou
   let rowIndex = 0;
   function flushRow(stretch: boolean) {
     if (items.length === 0) return;
-    rows.push({ key: `row-${rowIndex}`, type: 'assets', items: stretch ? stretchRow(items, containerWidth) : items, height: rowHeight });
+    rows.push({
+      key: `row-${rowIndex}`,
+      type: 'assets',
+      items: stretch ? stretchRow(items, containerWidth) : items,
+      height: rowHeight,
+      startAssetIndex: items[0].index,
+      endAssetIndex: items[items.length - 1].index,
+    });
     rowIndex += 1;
     items = [];
     usedWidth = 0;
   }
-  for (const asset of assets) {
+  for (const [assetIndex, asset] of assets.entries()) {
     const groupLabel = assetGroupLabel(asset, groupMode, sort);
     if (groupLabel && groupLabel !== currentGroup) {
       flushRow(false);
       currentGroup = groupLabel;
-      rows.push({ key: `group-${groupLabel}-${asset.id}`, type: 'group', label: groupLabel, height: groupHeaderHeight });
+      rows.push({ key: `group-${groupLabel}-${asset.id}`, type: 'group', label: groupLabel, height: groupHeaderHeight, assetIndex });
     }
     const tileWidth = Math.min(containerWidth, Math.max(minTileWidth, Math.round(rowHeight * assetAspect(asset))));
     const nextWidth = usedWidth + (items.length > 0 ? gap : 0) + tileWidth;
     if (items.length > 0 && nextWidth > containerWidth) {
       flushRow(true);
     }
-    items.push({ asset, width: tileWidth });
+    items.push({ asset, index: assetIndex, width: tileWidth });
     usedWidth += (items.length > 1 ? gap : 0) + tileWidth;
   }
   flushRow(false);
@@ -378,11 +589,5 @@ function assetAspect(asset: Asset): number {
 }
 
 function assetReadyForThumb(asset: Asset): boolean {
-  if (asset.mediaType === 'video') return asset.videoPosterStatus === 'ready';
   return asset.thumbStatus === 'ready';
-}
-
-function assetProcessingText(asset: Asset): string {
-  if (asset.mediaType === 'video') return asset.videoPosterStatus === 'error' ? '封面失败' : '预览生成中';
-  return asset.thumbStatus === 'error' ? '缩略图失败' : '处理中';
 }

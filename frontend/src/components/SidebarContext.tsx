@@ -4,14 +4,34 @@ export type SidebarPanelTarget = 'library' | 'albums' | 'folders' | 'viewer' | '
 
 type SidebarPanels = Partial<Record<SidebarPanelTarget, ReactNode>>;
 
+export interface SidebarReturnState {
+  sidebarCollapsed: boolean;
+  sidebarExpanded: SidebarPanelTarget | null;
+}
+
 interface SidebarPanelContextValue {
   panels: SidebarPanels;
+  sidebarState: SidebarReturnState;
   setPanel: (target: SidebarPanelTarget, content: ReactNode | null) => void;
+  setSidebarCollapsed: (collapsed: boolean) => void;
+  setSidebarExpanded: (target: SidebarPanelTarget | null) => void;
 }
 
 const SidebarPanelContext = createContext<SidebarPanelContextValue | null>(null);
 
-export function SidebarPanelProvider({ children }: { children: ReactNode }) {
+export function SidebarPanelProvider({
+  children,
+  sidebarCollapsed,
+  sidebarExpanded,
+  setSidebarCollapsed,
+  setSidebarExpanded,
+}: {
+  children: ReactNode;
+  sidebarCollapsed: boolean;
+  sidebarExpanded: SidebarPanelTarget | null;
+  setSidebarCollapsed: (collapsed: boolean) => void;
+  setSidebarExpanded: (target: SidebarPanelTarget | null) => void;
+}) {
   const [panels, setPanels] = useState<SidebarPanels>({});
   const setPanel = useCallback((target: SidebarPanelTarget, content: ReactNode | null) => {
     setPanels((current) => {
@@ -24,7 +44,14 @@ export function SidebarPanelProvider({ children }: { children: ReactNode }) {
       return next;
     });
   }, []);
-  const value = useMemo(() => ({ panels, setPanel }), [panels, setPanel]);
+  const sidebarState = useMemo(
+    () => ({ sidebarCollapsed, sidebarExpanded }),
+    [sidebarCollapsed, sidebarExpanded],
+  );
+  const value = useMemo(
+    () => ({ panels, setPanel, setSidebarCollapsed, setSidebarExpanded, sidebarState }),
+    [panels, setPanel, setSidebarCollapsed, setSidebarExpanded, sidebarState],
+  );
   return <SidebarPanelContext.Provider value={value}>{children}</SidebarPanelContext.Provider>;
 }
 
@@ -34,6 +61,33 @@ export function useSidebarPanelValue() {
     throw new Error('useSidebarPanelValue must be used inside SidebarPanelProvider');
   }
   return context.panels;
+}
+
+export function useSidebarReturnState() {
+  const context = useContext(SidebarPanelContext);
+  if (!context) {
+    throw new Error('useSidebarReturnState must be used inside SidebarPanelProvider');
+  }
+  return context.sidebarState;
+}
+
+export function useRestoreSidebarState() {
+  const context = useContext(SidebarPanelContext);
+  if (!context) {
+    throw new Error('useRestoreSidebarState must be used inside SidebarPanelProvider');
+  }
+  const { setSidebarCollapsed, setSidebarExpanded } = context;
+  return useCallback(
+    (state: Partial<SidebarReturnState>) => {
+      if (typeof state.sidebarCollapsed === 'boolean') {
+        setSidebarCollapsed(state.sidebarCollapsed);
+      }
+      if (state.sidebarExpanded === null || isSidebarPanelTarget(state.sidebarExpanded)) {
+        setSidebarExpanded(state.sidebarExpanded);
+      }
+    },
+    [setSidebarCollapsed, setSidebarExpanded],
+  );
 }
 
 export function useSidebarPanel(target: SidebarPanelTarget, content: ReactNode, deps: readonly unknown[]) {
@@ -48,4 +102,8 @@ export function useSidebarPanel(target: SidebarPanelTarget, content: ReactNode, 
       setPanel(target, null);
     };
   }, [setPanel, target, ...deps]);
+}
+
+function isSidebarPanelTarget(value: unknown): value is SidebarPanelTarget {
+  return value === 'library' || value === 'albums' || value === 'folders' || value === 'viewer' || value === 'settings';
 }

@@ -74,6 +74,7 @@ type AssetPreference struct {
 type Album struct {
 	ID                int64
 	Name              string
+	GroupID           *int64
 	MediaTypeFilter   string
 	OrientationFilter string
 	AssetCount        int
@@ -81,6 +82,13 @@ type Album struct {
 	CreatedAt         int64
 	UpdatedAt         int64
 	Sources           []AlbumSource
+}
+
+type AlbumGroup struct {
+	ID        int64
+	Name      string
+	CreatedAt int64
+	UpdatedAt int64
 }
 
 type AlbumSource struct {

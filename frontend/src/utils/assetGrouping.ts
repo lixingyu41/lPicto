@@ -3,7 +3,7 @@ import type { Asset, SortKey } from '../types/api';
 export type AssetGroupMode = 'none' | 'day' | 'month' | 'year' | 'size' | 'letter';
 
 export function assetGroupLabel(asset: Asset, mode: AssetGroupMode, sort: SortKey): string {
-  const time = sort === 'imported_desc' ? asset.importedAt : asset.timelineAt;
+  const time = sort === 'imported_desc' || sort === 'imported_asc' ? asset.importedAt : asset.timelineAt;
   switch (mode) {
     case 'day':
       return formatDateGroup(time, 'day');

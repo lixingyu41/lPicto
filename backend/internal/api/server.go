@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,14 +12,17 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"lpicto/backend/internal/config"
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/events"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/model"
 	"lpicto/backend/internal/scanner"
@@ -31,32 +35,56 @@ type Server struct {
 	store   storage.Store
 	scanner *scanner.Scanner
 	jobs    *jobs.Manager
+	events  *events.Bus
 	logger  *slog.Logger
+
+	cacheMu         sync.Mutex
+	cacheStats      CacheStatsDTO
+	cacheStatsAt    time.Time
+	cacheRefreshing bool
+
+	progressMu         sync.Mutex
+	progressStats      db.ProcessingProgress
+	progressStatsAt    time.Time
+	progressRefreshing bool
+
+	cleanupMu     sync.Mutex
+	cleanupStatus CleanupStatusDTO
 }
 
-func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan *scanner.Scanner, queue *jobs.Manager, logger *slog.Logger) http.Handler {
-	s := &Server{cfg: cfg, db: database, store: store, scanner: scan, jobs: queue, logger: logger}
+func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan *scanner.Scanner, queue *jobs.Manager, bus *events.Bus, logger *slog.Logger) http.Handler {
+	s := &Server{cfg: cfg, db: database, store: store, scanner: scan, jobs: queue, events: bus, logger: logger}
 	r := chi.NewRouter()
+	r.Use(foregroundActivity)
 	r.Get("/api/health", s.health)
 	r.Get("/api/config/public", s.publicConfig)
+	r.Get("/api/events", s.eventStream)
 	r.Post("/api/scan", s.triggerScan)
+	r.Post("/api/scan/pause", s.pauseScan)
+	r.Post("/api/scan/rebuild", s.rebuildScan)
 	r.Get("/api/scan/status", s.scanStatus)
 	r.Get("/api/scan/runs", s.scanRuns)
 	r.Get("/api/settings/progress", s.settingsProgress)
+	r.Get("/api/settings/activity", s.settingsActivity)
 	r.Get("/api/settings/libraries", s.scanLibraries)
 	r.Post("/api/settings/libraries", s.addScanLibrary)
+	r.Put("/api/settings/libraries/{id}", s.updateScanLibrary)
 	r.Delete("/api/settings/libraries/{id}", s.removeScanLibrary)
 	r.Post("/api/settings/libraries/{id}/scan", s.scanLibrary)
 	r.Get("/api/settings/scan-folders", s.scanFolders)
 	r.Post("/api/settings/scan-folders", s.addScanFolder)
 	r.Delete("/api/settings/scan-folders", s.removeScanFolder)
 	r.Get("/api/source-folders", s.sourceFolders)
+	r.Get("/api/album-groups", s.albumGroups)
+	r.Post("/api/album-groups", s.createAlbumGroup)
 	r.Get("/api/albums", s.albums)
 	r.Post("/api/albums", s.createAlbum)
 	r.Get("/api/albums/source-folders", s.albumSourceFolders)
 	r.Get("/api/albums/{id}", s.album)
+	r.Put("/api/albums/{id}", s.updateAlbum)
 	r.Delete("/api/albums/{id}", s.deleteAlbum)
 	r.Post("/api/albums/{id}/refresh", s.refreshAlbum)
+	r.Get("/api/albums/{id}/anchors", s.albumAnchors)
 	r.Get("/api/albums/{id}/assets", s.albumAssets)
 	r.Get("/api/library/assets", s.libraryAssets)
 	r.Get("/api/library/anchors", s.libraryAnchors)
@@ -76,8 +104,29 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan *sc
 	r.Get("/api/assets/{id}/video", s.video)
 	r.Get("/api/assets/{id}/video-poster", s.videoPoster)
 	r.Get("/api/assets/{id}/video-proxy", s.videoProxy)
+	r.Get("/api/cache/thumbs/{name}", s.cacheThumb)
 	r.NotFound(s.static)
 	return r
+}
+
+func foregroundActivity(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isForegroundRequest(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		done := jobs.EnterForeground()
+		defer done()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isForegroundRequest(path string) bool {
+	return strings.HasPrefix(path, "/api/library/") ||
+		strings.HasPrefix(path, "/api/albums") ||
+		strings.HasPrefix(path, "/api/folders") ||
+		strings.HasPrefix(path, "/api/assets/") ||
+		strings.HasPrefix(path, "/api/cache/")
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -95,9 +144,55 @@ func (s *Server) publicConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) eventStream(w http.ResponseWriter, r *http.Request) {
+	if s.events == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "events_unsupported", "事件流不可用")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	ch := s.events.Subscribe(r.Context())
+	for event := range ch {
+		if event.Type != "asset_ready" {
+			continue
+		}
+		asset, ok := event.Payload.(model.Asset)
+		if !ok {
+			continue
+		}
+		data, err := json.Marshal(assetDTO(asset))
+		if err != nil {
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "event: %s\n", event.Type)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+}
+
 func (s *Server) triggerScan(w http.ResponseWriter, r *http.Request) {
 	started := s.scanner.Trigger("manual")
 	writeJSON(w, http.StatusAccepted, map[string]bool{"started": started})
+}
+
+func (s *Server) rebuildScan(w http.ResponseWriter, r *http.Request) {
+	if !boolQuery(r, "force", false) {
+		writeError(w, http.StatusBadRequest, "confirm_required", "强制重建需要确认")
+		return
+	}
+	started := s.scanner.TriggerRebuild("rebuild")
+	writeJSON(w, http.StatusAccepted, map[string]bool{"started": started})
+}
+
+func (s *Server) pauseScan(w http.ResponseWriter, r *http.Request) {
+	paused := s.scanner.Pause()
+	writeJSON(w, http.StatusOK, map[string]bool{"paused": paused})
 }
 
 func (s *Server) scanStatus(w http.ResponseWriter, r *http.Request) {
@@ -165,7 +260,7 @@ func (s *Server) libraryAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	opts := db.AssetListOptions{
 		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")),
-		Query: strings.TrimSpace(r.URL.Query().Get("q")),
+		Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r),
 	}
 	assets, err := s.db.ListLibraryAssets(r.Context(), opts)
 	if err != nil {
@@ -183,17 +278,18 @@ func (s *Server) libraryAnchors(w http.ResponseWriter, r *http.Request) {
 	if typeFilter == "all" {
 		typeFilter = ""
 	}
-	anchors, err := s.db.LibraryAnchors(r.Context(), db.AssetListOptions{
-		PageSize: pageSize,
-		Type:     typeFilter,
-		Sort:     safeSort(r.URL.Query().Get("sort")),
-		Query:    strings.TrimSpace(r.URL.Query().Get("q")),
+	anchorResult, err := s.db.LibraryAnchors(r.Context(), db.AssetListOptions{
+		PageSize:    pageSize,
+		Type:        typeFilter,
+		Sort:        safeSort(r.URL.Query().Get("sort")),
+		Query:       strings.TrimSpace(r.URL.Query().Get("q")),
+		VisibleOnly: visibleOnly(r),
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "library_anchors_failed", "读取图库索引失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": libraryAnchorDTOs(anchors)})
+	writeJSON(w, http.StatusOK, map[string]any{"items": libraryAnchorDTOs(anchorResult.Items), "total": anchorResult.Total})
 }
 
 func (s *Server) folders(w http.ResponseWriter, r *http.Request) {
@@ -207,7 +303,16 @@ func (s *Server) folders(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) folderTree(w http.ResponseWriter, r *http.Request) {
-	folders, err := s.db.FolderTree(r.Context())
+	roots, _, err := s.db.GetScanFolders(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "folder_tree_failed", "读取文件夹树失败")
+		return
+	}
+	if err := s.ensureFolderRoots(r.Context(), roots); err != nil {
+		writeError(w, http.StatusInternalServerError, "folder_tree_failed", "读取文件夹树失败")
+		return
+	}
+	folders, err := s.db.FolderTreeWithRoots(r.Context(), roots)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "folder_tree_failed", "读取文件夹树失败")
 		return
@@ -238,7 +343,10 @@ func (s *Server) folderAssets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, pageSize := s.page(r, s.cfg.PageSizeDefault)
-	opts := db.AssetListOptions{Page: page, PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Query: strings.TrimSpace(r.URL.Query().Get("q"))}
+	opts := db.AssetListOptions{
+		Page: page, PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")),
+		Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r),
+	}
 	assets, err := s.db.ListFolderAssets(r.Context(), id, opts)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "folder_not_found", "文件夹不存在")
@@ -281,7 +389,7 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 	opts := db.NeighborOptions{
 		Context: contextName, AssetID: id, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), FolderID: folderID,
-		From: int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: 5,
+		From: int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: 5, Recursive: boolQuery(r, "recursive", false),
 	}
 	var result db.Neighbors
 	var err error
@@ -313,11 +421,40 @@ func (s *Server) thumb(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if asset.MediaType == model.MediaTypeVideo {
-		s.serveCacheAsset(w, r, asset, "video-posters", "jpg", "image/jpeg", "video_poster")
+	s.serveCacheAsset(w, r, asset, "thumbs", "webp", "image/webp", "thumb")
+}
+
+func (s *Server) cacheThumb(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	if !strings.HasSuffix(name, ".webp") {
+		http.NotFound(w, r)
 		return
 	}
-	s.serveCacheAsset(w, r, asset, "thumbs", "webp", "image/webp", "thumb")
+	cacheKey := strings.TrimSuffix(name, ".webp")
+	if !validCacheKey(cacheKey) {
+		http.NotFound(w, r)
+		return
+	}
+	path, err := s.store.CacheFilePath("thumbs", cacheKey, "webp")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer file.Close()
+	w.Header().Set("Content-Type", "image/webp")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("ETag", `"`+cacheKey+`"`)
+	http.ServeContent(w, r, name, info.ModTime(), file)
 }
 
 func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
@@ -325,7 +462,7 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) videoPoster(w http.ResponseWriter, r *http.Request) {
-	s.serveCache(w, r, "video-posters", "jpg", "image/jpeg", "video_poster")
+	s.serveCache(w, r, "thumbs", "webp", "image/webp", "thumb")
 }
 
 func (s *Server) videoProxy(w http.ResponseWriter, r *http.Request) {
@@ -368,7 +505,7 @@ func (s *Server) serveCacheAsset(w http.ResponseWriter, r *http.Request, asset m
 	}
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
-		s.jobs.Enqueue(jobs.Task{Type: taskType, AssetID: asset.ID})
+		_ = taskType
 		writeError(w, http.StatusNotFound, "cache_not_ready", "缓存尚未生成")
 		return
 	}
@@ -408,7 +545,7 @@ func (s *Server) serveOriginalAsset(w http.ResponseWriter, r *http.Request, asse
 	}
 	w.Header().Set("ETag", fmt.Sprintf(`W/"asset-%d-%s"`, asset.ID, asset.CacheKey))
 	w.Header().Set("Content-Disposition", contentDisposition(asset.Filename))
-	w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	http.ServeContent(w, r, asset.Filename, info.ModTime(), file)
 }
 
@@ -433,6 +570,54 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) page(r *http.Request, fallback int) (int, int) {
 	return ClampPage(intQuery(r, "page", 1), intQuery(r, "pageSize", fallback), fallback, s.cfg.PageSizeMax)
+}
+
+func boolQuery(r *http.Request, key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key)))
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func visibleOnly(r *http.Request) bool {
+	return strings.ToLower(strings.TrimSpace(r.URL.Query().Get("visible"))) != "all"
+}
+
+func validCacheKey(value string) bool {
+	if len(value) != 20 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (s *Server) ensureFolderRoots(ctx context.Context, roots []string) error {
+	for _, root := range roots {
+		if root == "" {
+			if err := s.db.EnsureFolder(ctx, ""); err != nil {
+				return err
+			}
+			continue
+		}
+		ancestors := storage.AncestorFolders(root + "/.scan-root")
+		sort.Slice(ancestors, func(i, j int) bool { return storage.FolderDepth(ancestors[i]) < storage.FolderDepth(ancestors[j]) })
+		for _, rel := range ancestors {
+			if err := s.db.EnsureFolder(ctx, rel); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Server) idParam(w http.ResponseWriter, r *http.Request) (int64, bool) {

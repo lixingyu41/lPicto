@@ -1,6 +1,16 @@
 export type MediaType = 'image' | 'video';
 export type AssetKind = 'all' | MediaType;
-export type SortKey = 'timeline_desc' | 'timeline_asc' | 'filename' | 'size' | 'imported_desc';
+export type SortKey =
+  | 'timeline_desc'
+  | 'timeline_asc'
+  | 'imported_desc'
+  | 'imported_asc'
+  | 'filename'
+  | 'filename_asc'
+  | 'filename_desc'
+  | 'size'
+  | 'size_desc'
+  | 'size_asc';
 
 export interface Asset {
   id: number;
@@ -66,8 +76,12 @@ export interface ScanStatus {
 
 export interface ScanProgress {
   reason: string;
+  phase: string;
+  roots: string[];
   currentRoot: string;
   currentRelPath: string;
+  totalFiles: number;
+  scannedFiles: number;
   totalSeen: number;
   assetsAdded: number;
   assetsUpdated: number;
@@ -85,10 +99,27 @@ export interface WorkStatusCounts {
 }
 
 export interface QueueStats {
+  imageQueued: number;
+  imageCap: number;
   thumbQueued: number;
   thumbCap: number;
+  previewQueued: number;
+  previewCap: number;
+  videoPosterQueued: number;
+  videoPosterCap: number;
+  videoProxyQueued: number;
+  videoProxyCap: number;
   videoQueued: number;
   videoCap: number;
+  activeThumb: number;
+  activeTranscode: number;
+}
+
+export interface CacheStats {
+  sizeBytes: number;
+  fileCount: number;
+  updatedAt: number;
+  refreshing: boolean;
 }
 
 export interface ProcessingProgress {
@@ -96,10 +127,28 @@ export interface ProcessingProgress {
   imageTotal: number;
   videoTotal: number;
   thumb: WorkStatusCounts;
+  transcode: WorkStatusCounts;
   preview: WorkStatusCounts;
   videoPoster: WorkStatusCounts;
   videoProxy: WorkStatusCounts;
   queue: QueueStats;
+  cache: CacheStats;
+  active: boolean;
+  updatedAt: number;
+  refreshing: boolean;
+}
+
+export interface CleanupStatus {
+  running: boolean;
+  status: string;
+  lastError: string;
+  updatedAt: number;
+}
+
+export interface SettingsActivity {
+  scan: ScanStatus;
+  progress: ProcessingProgress;
+  cleanup: CleanupStatus;
 }
 
 export interface ScanFolder {
@@ -115,6 +164,16 @@ export interface ScanLibrary {
   name: string;
   folders: ScanFolder[];
   exists: boolean;
+  progress: ScanLibraryProgress;
+}
+
+export interface ScanLibraryProgress {
+  assetTotal: number;
+  scannedFiles: number;
+  unscannedFiles: number;
+  thumb: WorkStatusCounts;
+  transcode: WorkStatusCounts;
+  active: boolean;
 }
 
 export interface ScanFoldersResponse {
@@ -156,6 +215,11 @@ export interface LibraryAnchor {
   value: number;
 }
 
+export interface LibraryAnchorsResponse {
+  items: LibraryAnchor[];
+  total: number;
+}
+
 export type AlbumMediaFilter = 'all' | MediaType;
 export type AlbumOrientationFilter = 'all' | 'landscape' | 'portrait';
 
@@ -174,9 +238,17 @@ export interface AlbumSource {
   orientationFilter: AlbumOrientationFilter;
 }
 
+export interface AlbumGroup {
+  id: number;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface Album {
   id: number;
   name: string;
+  groupId: number | null;
   mediaTypeFilter: AlbumMediaFilter;
   orientationFilter: AlbumOrientationFilter;
   assetCount: number;
@@ -193,6 +265,11 @@ export interface AlbumSourceInput {
   orientationFilter: AlbumOrientationFilter;
 }
 
+export interface AlbumsResponse {
+  items: Album[];
+  groups: AlbumGroup[];
+}
+
 export interface AssetSidecars {
   nfo: NFOInfo | null;
   subtitles: SubtitleInfo[];
@@ -202,7 +279,20 @@ export interface AssetSidecars {
 export interface NFOInfo {
   filename: string;
   fields: Record<string, string>;
+  groups: NFOGroup[];
   text: string;
+}
+
+export interface NFOGroup {
+  title: string;
+  items: NFOField[];
+}
+
+export interface NFOField {
+  key: string;
+  label: string;
+  value: string;
+  copyable: boolean;
 }
 
 export interface SubtitleInfo {

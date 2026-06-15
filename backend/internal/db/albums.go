@@ -58,14 +58,19 @@ type AlbumSourceCreate struct {
 
 type AlbumCreate struct {
 	Name              string
+	GroupID           *int64
 	FolderRelPaths    []string
 	Sources           []AlbumSourceCreate
 	MediaTypeFilter   string
 	OrientationFilter string
 }
 
+type AlbumGroupCreate struct {
+	Name string
+}
+
 func (d *DB) ListAlbums(ctx context.Context) ([]model.Album, error) {
-	rows, err := d.conn.QueryContext(ctx, albumSelectSQL()+` ORDER BY updated_at DESC, id DESC`)
+	rows, err := d.conn.QueryContext(ctx, albumSelectSQL()+` ORDER BY group_id IS NULL, group_id, updated_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -75,22 +80,80 @@ func (d *DB) ListAlbums(ctx context.Context) ([]model.Album, error) {
 		return nil, err
 	}
 	for i := range albums {
-		if err := d.loadAlbumDetails(ctx, &albums[i]); err != nil {
+		sources, err := d.albumSources(ctx, albums[i].ID)
+		if err != nil {
 			return nil, err
 		}
+		albums[i].Sources = sources
 	}
 	return albums, nil
 }
 
+func (d *DB) ListAlbumGroups(ctx context.Context) ([]model.AlbumGroup, error) {
+	rows, err := d.conn.QueryContext(ctx, `SELECT id, name, created_at, updated_at FROM album_groups ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	groups := []model.AlbumGroup{}
+	for rows.Next() {
+		var group model.AlbumGroup
+		if err := rows.Scan(&group.ID, &group.Name, &group.CreatedAt, &group.UpdatedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
+}
+
+func (d *DB) CreateAlbumGroup(ctx context.Context, p AlbumGroupCreate) (model.AlbumGroup, error) {
+	name := strings.TrimSpace(p.Name)
+	if name == "" {
+		return model.AlbumGroup{}, errors.New("album group name is required")
+	}
+	now := util.UnixNow()
+	result, err := d.conn.ExecContext(ctx, `
+INSERT INTO album_groups (name, created_at, updated_at)
+VALUES (?, ?, ?)`, name, now, now)
+	if err != nil {
+		return model.AlbumGroup{}, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return model.AlbumGroup{}, err
+	}
+	return d.GetAlbumGroup(ctx, id)
+}
+
+func (d *DB) GetAlbumGroup(ctx context.Context, id int64) (model.AlbumGroup, error) {
+	var group model.AlbumGroup
+	err := d.conn.QueryRowContext(ctx, `SELECT id, name, created_at, updated_at FROM album_groups WHERE id = ?`, id).
+		Scan(&group.ID, &group.Name, &group.CreatedAt, &group.UpdatedAt)
+	return group, err
+}
+
 func (d *DB) GetAlbum(ctx context.Context, id int64) (model.Album, error) {
+	album, err := d.getAlbumWithSources(ctx, id)
+	if err != nil {
+		return model.Album{}, err
+	}
+	if err := d.loadAlbumStats(ctx, &album); err != nil {
+		return model.Album{}, err
+	}
+	return album, nil
+}
+
+func (d *DB) getAlbumWithSources(ctx context.Context, id int64) (model.Album, error) {
 	row := d.conn.QueryRowContext(ctx, albumSelectSQL()+` WHERE id = ?`, id)
 	album, err := scanAlbum(row)
 	if err != nil {
 		return model.Album{}, err
 	}
-	if err := d.loadAlbumDetails(ctx, &album); err != nil {
+	sources, err := d.albumSources(ctx, album.ID)
+	if err != nil {
 		return model.Album{}, err
 	}
+	album.Sources = sources
 	return album, nil
 }
 
@@ -98,6 +161,9 @@ func (d *DB) CreateAlbum(ctx context.Context, p AlbumCreate) (model.Album, error
 	name := strings.TrimSpace(p.Name)
 	if name == "" {
 		return model.Album{}, errors.New("album name is required")
+	}
+	if err := d.validateAlbumGroup(ctx, p.GroupID); err != nil {
+		return model.Album{}, err
 	}
 	sources, err := normalizeAlbumSourceCreates(p)
 	if err != nil {
@@ -118,8 +184,8 @@ func (d *DB) CreateAlbum(ctx context.Context, p AlbumCreate) (model.Album, error
 		return model.Album{}, err
 	}
 	result, err := tx.ExecContext(ctx, `
-INSERT INTO albums (name, media_type_filter, orientation_filter, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?)`, name, mediaFilter, orientationFilter, now, now)
+INSERT INTO albums (name, group_id, media_type_filter, orientation_filter, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)`, name, nullableInt64(p.GroupID), mediaFilter, orientationFilter, now, now)
 	if err != nil {
 		_ = tx.Rollback()
 		return model.Album{}, err
@@ -144,6 +210,68 @@ VALUES (?, 'folder', ?, ?, ?, ?, ?)`,
 	return d.GetAlbum(ctx, albumID)
 }
 
+func (d *DB) UpdateAlbum(ctx context.Context, id int64, p AlbumCreate) (model.Album, error) {
+	name := strings.TrimSpace(p.Name)
+	if name == "" {
+		return model.Album{}, errors.New("album name is required")
+	}
+	if err := d.validateAlbumGroup(ctx, p.GroupID); err != nil {
+		return model.Album{}, err
+	}
+	sources, err := normalizeAlbumSourceCreates(p)
+	if err != nil {
+		return model.Album{}, err
+	}
+	if len(sources) == 0 {
+		return model.Album{}, errors.New("album source folder is required")
+	}
+	mediaFilter := AlbumMediaAll
+	orientationFilter := AlbumOrientationAll
+	if len(p.Sources) == 0 {
+		mediaFilter = normalizeAlbumMediaFilter(p.MediaTypeFilter)
+		orientationFilter = normalizeAlbumOrientationFilter(p.OrientationFilter)
+	}
+	now := util.UnixNow()
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Album{}, err
+	}
+	result, err := tx.ExecContext(ctx, `
+UPDATE albums
+SET name = ?, group_id = ?, media_type_filter = ?, orientation_filter = ?, updated_at = ?
+WHERE id = ?`, name, nullableInt64(p.GroupID), mediaFilter, orientationFilter, now, id)
+	if err != nil {
+		_ = tx.Rollback()
+		return model.Album{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return model.Album{}, err
+	}
+	if affected == 0 {
+		_ = tx.Rollback()
+		return model.Album{}, sql.ErrNoRows
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM album_sources WHERE album_id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return model.Album{}, err
+	}
+	for _, source := range sources {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO album_sources (album_id, source_type, rel_path, recursive, media_type_filter, orientation_filter, created_at)
+VALUES (?, 'folder', ?, ?, ?, ?, ?)`,
+			id, source.RelPath, boolInt(source.Recursive), source.MediaTypeFilter, source.OrientationFilter, now); err != nil {
+			_ = tx.Rollback()
+			return model.Album{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return model.Album{}, err
+	}
+	return d.GetAlbum(ctx, id)
+}
+
 func (d *DB) DeleteAlbum(ctx context.Context, id int64) error {
 	_, err := d.conn.ExecContext(ctx, `DELETE FROM albums WHERE id = ?`, id)
 	return err
@@ -155,7 +283,7 @@ func (d *DB) TouchAlbum(ctx context.Context, id int64) error {
 }
 
 func (d *DB) ListAlbumAssets(ctx context.Context, albumID int64, opts AssetListOptions) (model.Page[model.Asset], error) {
-	album, err := d.GetAlbum(ctx, albumID)
+	album, err := d.getAlbumWithSources(ctx, albumID)
 	if err != nil {
 		return model.Page[model.Asset]{}, err
 	}
@@ -180,6 +308,15 @@ func (d *DB) ListAlbumAssets(ctx context.Context, albumID int64, opts AssetListO
 	return model.Page[model.Asset]{Items: items, Page: opts.Page, PageSize: opts.PageSize, HasMore: hasMore}, nil
 }
 
+func (d *DB) AlbumAnchors(ctx context.Context, albumID int64, opts AssetListOptions) (LibraryAnchorResult, error) {
+	album, err := d.getAlbumWithSources(ctx, albumID)
+	if err != nil {
+		return LibraryAnchorResult{}, err
+	}
+	where, args := albumAssetFilterSQL(album, opts)
+	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.PageSize)
+}
+
 func (d *DB) AlbumNeighbors(ctx context.Context, albumID int64, opts NeighborOptions) (Neighbors, error) {
 	if opts.Limit <= 0 {
 		opts.Limit = 5
@@ -188,11 +325,11 @@ func (d *DB) AlbumNeighbors(ctx context.Context, albumID int64, opts NeighborOpt
 	if err != nil {
 		return Neighbors{}, err
 	}
-	album, err := d.GetAlbum(ctx, albumID)
+	album, err := d.getAlbumWithSources(ctx, albumID)
 	if err != nil {
 		return Neighbors{}, err
 	}
-	filterOpts := AssetListOptions{Sort: opts.Sort, Query: opts.Query}
+	filterOpts := AssetListOptions{Sort: opts.Sort, Query: opts.Query, VisibleOnly: true}
 	where, args := albumAssetFilterSQL(album, filterOpts)
 	prevCond, prevArgs, prevOrder := neighborCondition(current, filterOpts.Sort, true)
 	nextCond, nextArgs, nextOrder := neighborCondition(current, filterOpts.Sort, false)
@@ -208,7 +345,7 @@ func (d *DB) AlbumNeighbors(ctx context.Context, albumID int64, opts NeighborOpt
 }
 
 func (d *DB) AlbumScanRoots(ctx context.Context, id int64) ([]string, error) {
-	album, err := d.GetAlbum(ctx, id)
+	album, err := d.getAlbumWithSources(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -227,6 +364,10 @@ func (d *DB) loadAlbumDetails(ctx context.Context, album *model.Album) error {
 		return err
 	}
 	album.Sources = sources
+	return d.loadAlbumStats(ctx, album)
+}
+
+func (d *DB) loadAlbumStats(ctx context.Context, album *model.Album) error {
 	count, cover, err := d.albumCountCover(ctx, *album)
 	if err != nil {
 		return err
@@ -269,7 +410,7 @@ ORDER BY id ASC`, albumID)
 }
 
 func (d *DB) albumCountCover(ctx context.Context, album model.Album) (int, *int64, error) {
-	where, args := albumAssetFilterSQL(album, AssetListOptions{})
+	where, args := albumAssetFilterSQL(album, AssetListOptions{VisibleOnly: true})
 	var count int
 	if err := d.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM assets WHERE "+where, args...).Scan(&count); err != nil {
 		return 0, nil, err
@@ -287,8 +428,15 @@ func (d *DB) albumCountCover(ctx context.Context, album model.Album) (int, *int6
 }
 
 func albumAssetFilterSQL(album model.Album, opts AssetListOptions) (string, []any) {
-	where := []string{"deleted_at IS NULL", albumSourceRuleExists}
-	args := []any{album.ID}
+	sourceWhere, sourceArgs := albumSourceFilterSQL(album.Sources)
+	if sourceWhere == "" {
+		return "0 = 1", nil
+	}
+	where := []string{"deleted_at IS NULL", "(" + sourceWhere + ")"}
+	args := append([]any{}, sourceArgs...)
+	if opts.VisibleOnly {
+		where = append(where, "thumb_status = 'ready'")
+	}
 	mediaFilter := normalizeAlbumMediaFilter(album.MediaTypeFilter)
 	if opts.Type == model.MediaTypeImage || opts.Type == model.MediaTypeVideo {
 		mediaFilter = opts.Type
@@ -308,6 +456,44 @@ func albumAssetFilterSQL(album model.Album, opts AssetListOptions) (string, []an
 		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveHeightSQL()+" > "+effectiveWidthSQL())
 	}
 	return strings.Join(where, " AND "), args
+}
+
+func albumSourceFilterSQL(sources []model.AlbumSource) (string, []any) {
+	var rules []string
+	var args []any
+	for _, source := range sources {
+		if source.SourceType != AlbumSourceTypeFolder {
+			continue
+		}
+		var parts []string
+		if source.Recursive {
+			if source.RelPath != "" {
+				lower, upper := descendantPathBounds(source.RelPath)
+				parts = append(parts, `(assets.parent_rel_path = ? OR (assets.parent_rel_path >= ? AND assets.parent_rel_path < ?))`)
+				args = append(args, source.RelPath, lower, upper)
+			}
+		} else {
+			parts = append(parts, `assets.parent_rel_path = ?`)
+			args = append(args, source.RelPath)
+		}
+		switch normalizeAlbumMediaFilter(source.MediaTypeFilter) {
+		case model.MediaTypeImage, model.MediaTypeVideo:
+			parts = append(parts, `assets.media_type = ?`)
+			args = append(args, normalizeAlbumMediaFilter(source.MediaTypeFilter))
+		}
+		switch normalizeAlbumOrientationFilter(source.OrientationFilter) {
+		case AlbumOrientationWide:
+			parts = append(parts, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveWidthSQL()+" >= "+effectiveHeightSQL())
+		case AlbumOrientationTall:
+			parts = append(parts, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveHeightSQL()+" > "+effectiveWidthSQL())
+		}
+		if len(parts) == 0 {
+			rules = append(rules, "1 = 1")
+			continue
+		}
+		rules = append(rules, "("+strings.Join(parts, " AND ")+")")
+	}
+	return strings.Join(rules, " OR "), args
 }
 
 func normalizeAlbumSourceCreates(p AlbumCreate) ([]AlbumSourceCreate, error) {
@@ -377,14 +563,18 @@ func normalizeAlbumOrientationFilter(value string) string {
 }
 
 func albumSelectSQL() string {
-	return `SELECT id, name, media_type_filter, orientation_filter, created_at, updated_at FROM albums`
+	return `SELECT id, name, group_id, media_type_filter, orientation_filter, created_at, updated_at FROM albums`
 }
 
 func scanAlbum(row interface{ Scan(dest ...any) error }) (model.Album, error) {
 	var album model.Album
-	err := row.Scan(&album.ID, &album.Name, &album.MediaTypeFilter, &album.OrientationFilter, &album.CreatedAt, &album.UpdatedAt)
+	var groupID sql.NullInt64
+	err := row.Scan(&album.ID, &album.Name, &groupID, &album.MediaTypeFilter, &album.OrientationFilter, &album.CreatedAt, &album.UpdatedAt)
 	if err != nil {
 		return model.Album{}, err
+	}
+	if groupID.Valid {
+		album.GroupID = int64Ptr(groupID)
 	}
 	return album, nil
 }
@@ -410,4 +600,25 @@ func ValidateAlbumFolderInScanRoots(rel string, scanRoots []string) error {
 		return fmt.Errorf("folder is outside scan libraries")
 	}
 	return nil
+}
+
+func (d *DB) validateAlbumGroup(ctx context.Context, groupID *int64) error {
+	if groupID == nil {
+		return nil
+	}
+	var exists int
+	if err := d.conn.QueryRowContext(ctx, `SELECT 1 FROM album_groups WHERE id = ?`, *groupID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("album group not found")
+		}
+		return err
+	}
+	return nil
+}
+
+func nullableInt64(value *int64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }

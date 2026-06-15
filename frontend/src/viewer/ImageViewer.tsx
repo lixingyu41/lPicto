@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Asset } from '../types/api';
-import { assetOriginalUrl, assetPreviewUrl } from '../api/client';
+import { assetOriginalUrl, assetPreviewUrl, assetThumbUrl } from '../api/client';
 import { loadViewerPrefs, viewerPrefsChanged, type ViewerPrefs } from '../utils/viewerPrefs';
 import { rotatedContainStyle } from '../utils/rotation';
 
@@ -19,7 +19,11 @@ interface ZoomState {
 export default function ImageViewer({ asset }: Props) {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const animatedPressTimer = useRef(0);
+  const animatedPressActive = useRef(false);
   const [prefs, setPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
+  const animated = isAnimatedImage(asset);
+  const [animatedPlaying, setAnimatedPlaying] = useState(() => !animated || loadViewerPrefs().videoAutoplay);
   const [zoom, setZoom] = useState<ZoomState>({
     active: false,
     backgroundHeight: 0,
@@ -28,7 +32,13 @@ export default function ImageViewer({ asset }: Props) {
     backgroundY: 0,
   });
   const [stageSize, setStageSize] = useState({ height: 0, width: 0 });
-  const src = asset.browserPlayable ? assetOriginalUrl(asset) : assetPreviewUrl(asset);
+  const [mainImageReady, setMainImageReady] = useState(false);
+  const originalSrc = asset.browserPlayable ? assetOriginalUrl(asset) : assetPreviewUrl(asset);
+  const thumbSrc = asset.thumbStatus === 'ready' ? assetThumbUrl(asset) : '';
+  const pausedSrc = thumbSrc || originalSrc;
+  const src = animated && !animatedPlaying ? pausedSrc : originalSrc;
+  const placeholderSrc = thumbSrc && thumbSrc !== src ? thumbSrc : '';
+  const zoomSrc = animated && asset.browserPlayable ? assetOriginalUrl(asset) : src;
   const imageStyle = useMemo(
     () => rotatedContainStyle(asset, stageSize),
     [asset, stageSize.height, stageSize.width],
@@ -47,6 +57,22 @@ export default function ImageViewer({ asset }: Props) {
   }, []);
 
   useEffect(() => {
+    if (!animated) {
+      setAnimatedPlaying(true);
+      return;
+    }
+    setAnimatedPlaying(prefs.videoAutoplay);
+  }, [animated, asset.id, prefs.videoAutoplay]);
+
+  useEffect(() => {
+    return () => {
+      if (animatedPressTimer.current) {
+        window.clearTimeout(animatedPressTimer.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!zoom.active) return;
     function endZoom() {
       setZoom((current) => ({ ...current, active: false }));
@@ -56,6 +82,7 @@ export default function ImageViewer({ asset }: Props) {
   }, [zoom.active]);
 
   useEffect(() => {
+    setMainImageReady(false);
     setZoom({
       active: false,
       backgroundHeight: 0,
@@ -77,6 +104,12 @@ export default function ImageViewer({ asset }: Props) {
     observer.observe(stage);
     return () => observer.disconnect();
   }, []);
+
+  function clearAnimatedPressTimer() {
+    if (!animatedPressTimer.current) return;
+    window.clearTimeout(animatedPressTimer.current);
+    animatedPressTimer.current = 0;
+  }
 
   function updateZoom(clientX: number, clientY: number) {
     const image = imageRef.current;
@@ -117,10 +150,25 @@ export default function ImageViewer({ asset }: Props) {
       onMouseDown={(event) => {
         if (event.button !== 0) return;
         event.preventDefault();
+        if (animated) {
+          clearAnimatedPressTimer();
+          animatedPressActive.current = true;
+          animatedPressTimer.current = window.setTimeout(() => {
+            animatedPressTimer.current = 0;
+            updateZoom(event.clientX, event.clientY);
+            setZoom((current) => ({ ...current, active: true }));
+          }, 160);
+          return;
+        }
         updateZoom(event.clientX, event.clientY);
         setZoom((current) => ({ ...current, active: true }));
       }}
       onMouseMove={(event) => {
+        if (animated && animatedPressActive.current && !zoom.active && event.buttons !== 1) {
+          clearAnimatedPressTimer();
+          animatedPressActive.current = false;
+          return;
+        }
         if (!zoom.active) return;
         if (event.buttons !== 1) {
           setZoom((current) => ({ ...current, active: false }));
@@ -128,22 +176,44 @@ export default function ImageViewer({ asset }: Props) {
         }
         updateZoom(event.clientX, event.clientY);
       }}
-      onMouseUp={() => setZoom((current) => ({ ...current, active: false }))}
+      onMouseUp={() => {
+        if (animated) {
+          const wasWaitingForLongPress = animatedPressTimer.current !== 0;
+          clearAnimatedPressTimer();
+          animatedPressActive.current = false;
+          if (wasWaitingForLongPress) {
+            setAnimatedPlaying((value) => !value);
+          }
+        }
+        setZoom((current) => ({ ...current, active: false }));
+      }}
     >
+      {placeholderSrc && !mainImageReady && (
+        <img
+          className="viewer-image viewer-image-placeholder"
+          src={placeholderSrc}
+          alt=""
+          draggable={false}
+          aria-hidden="true"
+          style={imageStyle}
+          onDragStart={(event) => event.preventDefault()}
+        />
+      )}
       <img
         ref={imageRef}
-        className="viewer-image"
+        className={placeholderSrc && !mainImageReady ? 'viewer-image viewer-image-loading' : 'viewer-image'}
         src={src}
         alt={asset.filename}
         draggable={false}
         style={imageStyle}
+        onLoad={() => setMainImageReady(true)}
         onDragStart={(event) => event.preventDefault()}
       />
       {zoom.active && (
         <div
           className="image-zoom-layer"
           style={{
-            backgroundImage: `url("${src}")`,
+            backgroundImage: `url("${zoomSrc}")`,
             backgroundPosition: `${zoom.backgroundX}px ${zoom.backgroundY}px`,
             backgroundSize: `${zoom.backgroundWidth}px ${zoom.backgroundHeight}px`,
           }}
@@ -151,6 +221,12 @@ export default function ImageViewer({ asset }: Props) {
       )}
     </div>
   );
+}
+
+function isAnimatedImage(asset: Asset) {
+  const mime = asset.mimeType?.toLowerCase() ?? '';
+  const name = asset.filename.toLowerCase();
+  return mime === 'image/gif' || name.endsWith('.gif') || mime === 'image/webp' || name.endsWith('.webp');
 }
 
 function clampNumber(value: number, min: number, max: number) {
