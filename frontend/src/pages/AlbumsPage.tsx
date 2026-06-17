@@ -18,6 +18,7 @@ import type {
   AlbumSource,
   AlbumSourceInput,
   Asset,
+  AssetDeletedEvent,
   LibraryAnchor,
   SortKey,
   SourceFolder,
@@ -146,7 +147,8 @@ export default function AlbumsPage() {
   );
 
   const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
-  const eventsConnected = useAssetReadyEvents(handleAssetReady, [handleAssetReady]);
+  const handleAssetDeleted = useCallback((event: AssetDeletedEvent) => mutateItems((current) => removeAssetById(current, event.id)), [mutateItems]);
+  const eventsConnected = useAssetReadyEvents(handleAssetReady, [handleAssetReady, handleAssetDeleted], handleAssetDeleted);
 
   useEffect(() => {
     if (eventsConnected || !selectedAlbum) return undefined;

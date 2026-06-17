@@ -54,7 +54,7 @@ func main() {
 	videoProcessor := video.Processor{
 		DB: database, Store: store, ProxyEnabled: cfg.VideoProxyEnabled, ProxyMaxHeight: cfg.VideoProxyMaxHeight,
 		ProxyCRF: cfg.VideoProxyCRF, HWAccel: video.ResolveHWAccel(rootCtx, cfg.FFmpegHWAccel, logger), HWDevice: cfg.FFmpegHWDevice,
-		HWFallback: cfg.FFmpegHWFallback, Logger: logger,
+		HWFallback: cfg.FFmpegHWFallback, Events: eventBus, Logger: logger,
 	}
 	queue := jobs.New(logger, thumbProcessor.Handle, videoProcessor.Handle, jobs.ResourcePolicy{
 		MaxActive:          cfg.BackgroundMaxActive,
@@ -70,8 +70,9 @@ func main() {
 
 	scan := &scanner.Scanner{
 		DB: database, Store: store, Extractor: media.NewExtractor(), Jobs: queue,
-		VideoProxyEnabled: cfg.VideoProxyEnabled, ScanWorkers: cfg.ScanWorkers, Logger: logger,
+		Events: eventBus, VideoProxyEnabled: cfg.VideoProxyEnabled, ScanWorkers: cfg.ScanWorkers, Logger: logger,
 	}
+	scan.Start(rootCtx)
 
 	handler := api.NewServer(cfg, database, store, scan, queue, eventBus, logger)
 	if err := api.Start(rootCtx, cfg.HTTPAddr, handler, logger); err != nil {

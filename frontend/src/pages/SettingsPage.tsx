@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, ChevronRight, FolderPlus, Pencil, RotateCw, Square, Trash2, X } from 'lucide-react';
 import Toolbar from '../components/Toolbar';
 import { api } from '../api/client';
 import type { CleanupStatus, ProcessingProgress, ScanLibrary, ScanLibraryProgress, ScanStatus, SourceFolder, WorkStatusCounts } from '../types/api';
+import { useAssetReadyEvents, useScanStatusEvents } from '../hooks/useAssetReadyEvents';
 import { formatBytes } from '../utils/format';
 import { loadGridRowHeightLevel, saveGridRowHeightLevel, type GridRowHeightLevel } from '../utils/gridPrefs';
 import { loadThemeMode, saveThemeMode, type ThemeMode } from '../utils/themePrefs';
@@ -30,6 +31,9 @@ export default function SettingsPage() {
   const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSectionId>('libraries');
   const [stoppingScan, setStoppingScan] = useState(false);
   const [optimisticScanLibraryId, setOptimisticScanLibraryId] = useState<string | null>(null);
+  const progressRefreshTimer = useRef<number | null>(null);
+  const progressRefreshInFlight = useRef(false);
+  const progressRefreshQueued = useRef(false);
 
   const refreshLibraries = useCallback(async () => {
     const librariesResult = await api.scanLibraries();
@@ -54,6 +58,65 @@ export default function SettingsPage() {
     setCleanup(activity.cleanup);
   }, [applyScanStatus]);
 
+  const refreshActivityWithoutScan = useCallback(async () => {
+    const activity = await api.settingsActivity();
+    setProgress(activity.progress);
+    setCleanup(activity.cleanup);
+  }, []);
+
+  const handleLiveScanStatus = useCallback((scan: ScanStatus) => {
+    applyScanStatus(scan);
+    if (!scan.running) {
+      void Promise.all([refreshActivityWithoutScan(), refreshLibraries()]).catch((err) => {
+        setError(err instanceof Error ? err.message : '刷新进度失败');
+      });
+    }
+  }, [applyScanStatus, refreshActivityWithoutScan, refreshLibraries]);
+
+  const runQueuedProgressRefresh = useCallback(() => {
+    if (progressRefreshInFlight.current) {
+      progressRefreshQueued.current = true;
+      return;
+    }
+    progressRefreshInFlight.current = true;
+    void Promise.all([refreshActivityWithoutScan(), refreshLibraries()])
+      .catch((err) => {
+        setError(err instanceof Error ? err.message : '刷新进度失败');
+      })
+      .finally(() => {
+        progressRefreshInFlight.current = false;
+        if (progressRefreshQueued.current && progressRefreshTimer.current === null) {
+          progressRefreshTimer.current = window.setTimeout(() => {
+            progressRefreshTimer.current = null;
+            progressRefreshQueued.current = false;
+            runQueuedProgressRefresh();
+          }, 750);
+        }
+      });
+  }, [refreshActivityWithoutScan, refreshLibraries]);
+
+  const refreshLibraryProgress = useCallback(() => {
+    progressRefreshQueued.current = true;
+    if (progressRefreshTimer.current !== null) {
+      return;
+    }
+    progressRefreshTimer.current = window.setTimeout(() => {
+      progressRefreshTimer.current = null;
+      progressRefreshQueued.current = false;
+      runQueuedProgressRefresh();
+    }, 750);
+  }, [runQueuedProgressRefresh]);
+
+  useEffect(() => () => {
+    if (progressRefreshTimer.current !== null) {
+      window.clearTimeout(progressRefreshTimer.current);
+      progressRefreshTimer.current = null;
+    }
+  }, []);
+
+  const eventsConnected = useScanStatusEvents(handleLiveScanStatus, [handleLiveScanStatus]);
+  useAssetReadyEvents(refreshLibraryProgress, [refreshLibraryProgress], refreshLibraryProgress);
+
   const refreshInitial = useCallback(async () => {
     try {
       await Promise.all([refreshActivity(), refreshLibraries()]);
@@ -69,15 +132,18 @@ export default function SettingsPage() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      void refreshScanStatus().catch((err) => {
-        setError(err instanceof Error ? err.message : '刷新扫描状态失败');
-      });
-      void Promise.all([refreshActivity(), refreshLibraries()]).catch((err) => {
+      if (!eventsConnected) {
+        void refreshScanStatus().catch((err) => {
+          setError(err instanceof Error ? err.message : '刷新扫描状态失败');
+        });
+      }
+      const activityRefresh = eventsConnected ? refreshActivityWithoutScan() : refreshActivity();
+      void Promise.all([activityRefresh, refreshLibraries()]).catch((err) => {
         setError(err instanceof Error ? err.message : '刷新进度失败');
       });
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [refreshActivity, refreshLibraries, refreshScanStatus]);
+  }, [eventsConnected, refreshActivity, refreshActivityWithoutScan, refreshLibraries, refreshScanStatus]);
 
   async function createLibrary(name: string, relPaths: string[]) {
     const tempId = `pending-${Date.now()}`;
@@ -148,10 +214,13 @@ export default function SettingsPage() {
       lastRun: current?.lastRun ?? null,
       progress: {
         reason: `library:${library.name}`,
+        state: 'running',
+        requestedAction: 'start',
         phase: 'queued',
         roots: library.folders.map((folder) => folder.relPath),
         currentRoot: library.folders[0]?.relPath ?? '',
         currentRelPath: '',
+        discoveredFiles: 0,
         totalFiles: library.progress.assetTotal,
         scannedFiles: 0,
         totalSeen: 0,
@@ -163,7 +232,7 @@ export default function SettingsPage() {
     }));
     try {
       const result = await api.scanLibrary(id);
-      if (!result.started) {
+      if (!result.accepted) {
         setError('已有扫描正在运行');
         setOptimisticScanLibraryId(null);
       }
@@ -183,7 +252,7 @@ export default function SettingsPage() {
     setStoppingScan(true);
     setError(null);
     setStatus((current) =>
-      current ? { ...current, progress: { ...current.progress, phase: 'pausing' } } : current,
+      current ? { ...current, progress: { ...current.progress, phase: 'stopping', requestedAction: 'stop' } } : current,
     );
     try {
       await api.pauseScan();
@@ -506,6 +575,11 @@ const rowHeightOptions: Array<{ label: string; value: GridRowHeightLevel }> = [
 ];
 
 function LibraryProgress({ progress }: { progress: ScanLibraryProgress }) {
+  if (!progress.active) {
+    return <div className="library-progress"><div className="muted-line">媒体 {progress.assetTotal}</div></div>;
+  }
+  const discovered = progress.scannedFiles + progress.unscannedFiles;
+  const percent = discovered > 0 ? Math.min(100, Math.round((progress.scannedFiles / discovered) * 100)) : 0;
   return (
     <div className="library-progress">
       <div className="library-stat-strip">
@@ -514,8 +588,8 @@ function LibraryProgress({ progress }: { progress: ScanLibraryProgress }) {
           <strong>{progress.scannedFiles}</strong>
         </span>
         <span>
-          <em>未扫描</em>
-          <strong>{progress.unscannedFiles}</strong>
+          <em>已发现</em>
+          <strong>{discovered}</strong>
         </span>
         <span>
           <em>媒体</em>
@@ -523,30 +597,15 @@ function LibraryProgress({ progress }: { progress: ScanLibraryProgress }) {
         </span>
       </div>
       <div className="library-progress-bars">
-        <ProgressRow label="缩略图" counts={progress.thumb} />
-        <ProgressRow label="转码" counts={progress.transcode} />
-      </div>
-    </div>
-  );
-}
-
-function ProgressRow({ label, counts }: { label: string; counts: WorkStatusCounts | null | undefined }) {
-  const value = counts ?? emptyCounts;
-  const done = value.ready + value.notRequired;
-  const percent = value.total > 0 ? Math.round((done / value.total) * 100) : 0;
-  return (
-    <div className="progress-row">
-      <div className="progress-row-title">
-        <span>{label}</span>
-        <strong>已完成 {done}/{value.total}</strong>
-      </div>
-      <div className="progress-bar" aria-label={`${label} 已完成 ${done}/${value.total}`}>
-        <div className="progress-fill" style={{ width: `${percent}%` }} />
-      </div>
-      <div className="progress-meta">
-        <span>待处理 {value.pending}</span>
-        <span>处理中 {value.processing}</span>
-        <span>错误 {value.error}</span>
+        <div className="progress-row">
+          <div className="progress-row-title">
+            <span>扫描</span>
+            <strong>{progress.scannedFiles}/{discovered}</strong>
+          </div>
+          <div className="progress-bar" aria-label={`扫描 ${progress.scannedFiles}/${discovered}`}>
+            <div className="progress-fill" style={{ width: `${percent}%` }} />
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -555,15 +614,19 @@ function ProgressRow({ label, counts }: { label: string; counts: WorkStatusCount
 function scanPhaseLabel(phase: string | undefined) {
   switch (phase) {
     case 'counting':
+    case 'discovering':
       return '统计中';
     case 'scanning':
       return '扫描中';
+    case 'stopping':
+    case 'pausing':
+      return '暂停中';
     case 'finished':
       return '完成';
     case 'paused':
       return '已暂停';
-    case 'pausing':
-      return '暂停中';
+    case 'idle':
+      return '空闲';
     default:
       return '处理中';
   }

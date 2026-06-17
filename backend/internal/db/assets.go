@@ -252,6 +252,11 @@ func (d *DB) GetAsset(ctx context.Context, id int64) (model.Asset, error) {
 	return scanAsset(row)
 }
 
+func (d *DB) GetAssetByCacheKey(ctx context.Context, cacheKey string) (model.Asset, error) {
+	row := d.conn.QueryRowContext(ctx, assetSelectSQL()+` WHERE cache_key = ? AND deleted_at IS NULL LIMIT 1`, cacheKey)
+	return scanAsset(row)
+}
+
 func (d *DB) GetAssetIncludingDeleted(ctx context.Context, id int64) (model.Asset, error) {
 	row := d.conn.QueryRowContext(ctx, assetSelectSQL()+` WHERE id = ?`, id)
 	return scanAsset(row)
@@ -442,6 +447,27 @@ func (d *DB) listAssets(ctx context.Context, opts AssetListOptions, timeline boo
 
 func (d *DB) ActiveRelPaths(ctx context.Context) (map[string]struct{}, error) {
 	rows, err := d.conn.QueryContext(ctx, `SELECT rel_path FROM assets WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[string]struct{})
+	for rows.Next() {
+		var rel string
+		if err := rows.Scan(&rel); err != nil {
+			return nil, err
+		}
+		result[rel] = struct{}{}
+	}
+	return result, rows.Err()
+}
+
+func (d *DB) ActiveRelPathsForRoots(ctx context.Context, roots []string) (map[string]struct{}, error) {
+	where, args, err := assetRootsWhere(roots)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := d.conn.QueryContext(ctx, `SELECT rel_path FROM assets WHERE `+where, args...)
 	if err != nil {
 		return nil, err
 	}

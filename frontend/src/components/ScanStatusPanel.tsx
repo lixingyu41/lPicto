@@ -26,6 +26,9 @@ export default function ScanStatusPanel() {
   }, []);
 
   const lastRun = status?.lastRun;
+  if (!status?.running) {
+    return null;
+  }
   return (
     <section className="scan-panel">
       <div className="scan-title">

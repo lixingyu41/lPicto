@@ -11,12 +11,17 @@ export function usePagedLoader<T>(
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestId = useRef(0);
+  const loadPageRef = useRef(loadPage);
+
+  useEffect(() => {
+    loadPageRef.current = loadPage;
+  }, [loadPage]);
 
   const load = useCallback(async (pageToLoad: number, replace: boolean, currentRequest: number) => {
     setLoading(true);
     setError(null);
     try {
-      const result = await loadPage(pageToLoad);
+      const result = await loadPageRef.current(pageToLoad);
       if (requestId.current !== currentRequest) return;
       setItems((prev) => (replace ? result.items : [...prev, ...result.items]));
       setHasMore(result.hasMore);
@@ -29,7 +34,7 @@ export function usePagedLoader<T>(
         setLoading(false);
       }
     }
-  }, [loadPage]);
+  }, []);
 
   const loadMore = useCallback(async () => {
     if (loading || !hasMore) return;
@@ -64,8 +69,11 @@ export function usePagedLoader<T>(
     reset();
   }, [reset, ...deps]);
 
-  const mutateItems = useCallback((updater: (items: T[]) => T[]) => {
+  const mutateItems = useCallback((updater: (items: T[]) => T[], nextHasMore?: boolean) => {
     setItems((prev) => updater(prev));
+    if (typeof nextHasMore === 'boolean') {
+      setHasMore(nextHasMore);
+    }
   }, []);
 
   return { items, hasMore, loading, error, loadMore, reset, jumpToPage, mutateItems };

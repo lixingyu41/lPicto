@@ -2,6 +2,7 @@ package video
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/events"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/model"
 	"lpicto/backend/internal/storage"
@@ -52,6 +54,7 @@ type Processor struct {
 	HWFallback     bool
 	CommandTimeout time.Duration
 	ProxyTimeout   time.Duration
+	Events         *events.Bus
 	Logger         *slog.Logger
 }
 
@@ -79,11 +82,15 @@ func (p Processor) proxy(ctx context.Context, assetID int64) error {
 	if fileExists(dest) {
 		return p.DB.SetAssetWorkStatus(ctx, assetID, "video_proxy_status", model.StatusReady, nil)
 	}
-	if err := p.DB.SetAssetWorkStatus(ctx, assetID, "video_proxy_status", model.StatusProcessing, nil); err != nil {
-		return err
-	}
 	source, err := p.Store.PhotoPath(asset.RelPath)
 	if err != nil {
+		return err
+	}
+	deleted, err := p.deleteIfSourceMissing(ctx, asset, "video_proxy_source_missing")
+	if err != nil || deleted {
+		return err
+	}
+	if err := p.DB.SetAssetWorkStatus(ctx, assetID, "video_proxy_status", model.StatusProcessing, nil); err != nil {
 		return err
 	}
 	tmp := dest + ".tmp.mp4"
@@ -93,6 +100,14 @@ func (p Processor) proxy(ctx context.Context, assetID int64) error {
 	if err := p.runFFmpeg(ctx, p.proxyTimeout(), args, func() []string {
 		return p.cpuProxyArgs(source, tmp, filter)
 	}); err != nil {
+		deleted, deleteErr := p.deleteIfSourceMissing(ctx, asset, "video_proxy_source_missing")
+		if deleteErr != nil {
+			return deleteErr
+		}
+		if deleted {
+			_ = os.Remove(tmp)
+			return nil
+		}
 		message := publicError(err)
 		_ = p.DB.SetAssetWorkStatus(ctx, assetID, "video_proxy_status", model.StatusError, &message)
 		_ = os.Remove(tmp)
@@ -145,6 +160,9 @@ func (p Processor) runFFmpeg(ctx context.Context, timeout time.Duration, args []
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
 	if !p.hwAccelEnabled() || !p.HWFallback {
 		return err
 	}
@@ -178,6 +196,64 @@ func (p Processor) proxyTimeout() time.Duration {
 		return p.ProxyTimeout
 	}
 	return 2 * time.Hour
+}
+
+func (p Processor) deleteIfSourceMissing(ctx context.Context, asset model.Asset, reason string) (bool, error) {
+	root, _, err := p.Store.RootForRel(asset.RelPath)
+	if err != nil {
+		return false, err
+	}
+	if !sourceRootAvailable(root.Path) {
+		return false, nil
+	}
+	source, err := p.Store.PhotoPath(asset.RelPath)
+	if err != nil {
+		return false, err
+	}
+	missing, err := sourceFileMissing(source)
+	if err != nil {
+		return false, err
+	}
+	if !missing {
+		return false, nil
+	}
+	deleted, err := p.DB.MarkDeletedWithCache(ctx, asset.RelPath, util.UnixNow())
+	if err != nil {
+		return false, err
+	}
+	if deleted == nil {
+		return true, nil
+	}
+	if deleted.CacheKey != "" {
+		if err := p.Store.RemoveCache(deleted.CacheKey); err != nil && p.Logger != nil {
+			p.Logger.Warn("remove cache after missing source failed", "relPath", asset.RelPath, "reason", reason, "error", err)
+		}
+	}
+	if p.Events != nil {
+		p.Events.Publish(events.Event{Type: "asset_deleted", Payload: asset})
+	}
+	go func() {
+		if err := p.DB.RefreshFolders(context.Background()); err != nil && p.Logger != nil {
+			p.Logger.Warn("refresh folders after missing source failed", "relPath", asset.RelPath, "reason", reason, "error", err)
+		}
+	}()
+	return true, nil
+}
+
+func sourceRootAvailable(path string) bool {
+	info, err := os.Stat(filepath.Clean(path))
+	return err == nil && info.IsDir()
+}
+
+func sourceFileMissing(path string) (bool, error) {
+	info, err := os.Stat(filepath.Clean(path))
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.IsDir(), nil
 }
 
 func fileExists(path string) bool {

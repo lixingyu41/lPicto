@@ -8,7 +8,7 @@ import PressPreviewOverlay from '../components/PressPreviewOverlay';
 import { api } from '../api/client';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
-import type { Asset, Folder, SortKey } from '../types/api';
+import type { Asset, AssetDeletedEvent, Folder, SortKey } from '../types/api';
 import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import {
   decodeReturnState,
@@ -119,7 +119,8 @@ export default function FoldersPage() {
   );
 
   const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
-  const eventsConnected = useAssetReadyEvents(handleAssetReady, [handleAssetReady]);
+  const handleAssetDeleted = useCallback((event: AssetDeletedEvent) => mutateItems((value) => removeAssetById(value, event.id)), [mutateItems]);
+  const eventsConnected = useAssetReadyEvents(handleAssetReady, [handleAssetReady, handleAssetDeleted], handleAssetDeleted);
 
   useEffect(() => {
     if (eventsConnected || !current) return undefined;

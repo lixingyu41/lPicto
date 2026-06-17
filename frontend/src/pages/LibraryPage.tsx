@@ -9,7 +9,7 @@ import PressPreviewOverlay from '../components/PressPreviewOverlay';
 import { api } from '../api/client';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
-import type { Asset, AssetKind, LibraryAnchor, SortKey } from '../types/api';
+import type { Asset, AssetDeletedEvent, AssetKind, LibraryAnchor, SortKey } from '../types/api';
 import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import type { AssetGroupMode } from '../utils/assetGrouping';
 import {
@@ -108,13 +108,14 @@ export default function LibraryPage() {
   );
 
   const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
-  const eventsConnected = useAssetReadyEvents(handleAssetReady, [handleAssetReady]);
+  const handleAssetDeleted = useCallback((event: AssetDeletedEvent) => mutateItems((current) => removeAssetById(current, event.id)), [mutateItems]);
+  const eventsConnected = useAssetReadyEvents(handleAssetReady, [handleAssetReady, handleAssetDeleted], handleAssetDeleted);
 
   useEffect(() => {
     if (eventsConnected) return undefined;
     const timer = window.setInterval(() => {
       void api.libraryAssets(1, pageSize, type, sort, query).then((result) => mergeReadyAssets(result.items)).catch(() => undefined);
-    }, 2000);
+    }, 8000);
     return () => window.clearInterval(timer);
   }, [eventsConnected, mergeReadyAssets, query, sort, type]);
 

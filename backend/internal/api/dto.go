@@ -72,18 +72,21 @@ type ScanStatusDTO struct {
 }
 
 type ScanProgressDTO struct {
-	Reason         string   `json:"reason"`
-	Phase          string   `json:"phase"`
-	Roots          []string `json:"roots"`
-	CurrentRoot    string   `json:"currentRoot"`
-	CurrentRelPath string   `json:"currentRelPath"`
-	TotalFiles     int      `json:"totalFiles"`
-	ScannedFiles   int      `json:"scannedFiles"`
-	TotalSeen      int      `json:"totalSeen"`
-	AssetsAdded    int      `json:"assetsAdded"`
-	AssetsUpdated  int      `json:"assetsUpdated"`
-	AssetsDeleted  int      `json:"assetsDeleted"`
-	Errors         int      `json:"errors"`
+	State           string   `json:"state"`
+	RequestedAction string   `json:"requestedAction"`
+	Reason          string   `json:"reason"`
+	Phase           string   `json:"phase"`
+	Roots           []string `json:"roots"`
+	CurrentRoot     string   `json:"currentRoot"`
+	CurrentRelPath  string   `json:"currentRelPath"`
+	DiscoveredFiles int      `json:"discoveredFiles"`
+	TotalFiles      int      `json:"totalFiles"`
+	ScannedFiles    int      `json:"scannedFiles"`
+	TotalSeen       int      `json:"totalSeen"`
+	AssetsAdded     int      `json:"assetsAdded"`
+	AssetsUpdated   int      `json:"assetsUpdated"`
+	AssetsDeleted   int      `json:"assetsDeleted"`
+	Errors          int      `json:"errors"`
 }
 
 type WorkStatusCountsDTO struct {
@@ -326,18 +329,21 @@ func scanProgressDTO(progress scanner.Progress) ScanProgressDTO {
 		roots = []string{}
 	}
 	return ScanProgressDTO{
-		Reason:         progress.Reason,
-		Phase:          progress.Phase,
-		Roots:          roots,
-		CurrentRoot:    progress.CurrentRoot,
-		CurrentRelPath: progress.CurrentRelPath,
-		TotalFiles:     progress.TotalFiles,
-		ScannedFiles:   progress.ScannedFiles,
-		TotalSeen:      progress.TotalSeen,
-		AssetsAdded:    progress.AssetsAdded,
-		AssetsUpdated:  progress.AssetsUpdated,
-		AssetsDeleted:  progress.AssetsDeleted,
-		Errors:         progress.Errors,
+		State:           progress.State,
+		RequestedAction: progress.RequestedAction,
+		Reason:          progress.Reason,
+		Phase:           progress.Phase,
+		Roots:           roots,
+		CurrentRoot:     progress.CurrentRoot,
+		CurrentRelPath:  progress.CurrentRelPath,
+		DiscoveredFiles: progress.DiscoveredFiles,
+		TotalFiles:      progress.TotalFiles,
+		ScannedFiles:    progress.ScannedFiles,
+		TotalSeen:       progress.TotalSeen,
+		AssetsAdded:     progress.AssetsAdded,
+		AssetsUpdated:   progress.AssetsUpdated,
+		AssetsDeleted:   progress.AssetsDeleted,
+		Errors:          progress.Errors,
 	}
 }
 

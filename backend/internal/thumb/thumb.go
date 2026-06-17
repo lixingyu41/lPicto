@@ -31,6 +31,8 @@ func (p Processor) Handle(ctx context.Context, task jobs.Task) error {
 	switch task.Type {
 	case "thumb":
 		return p.process(ctx, task.AssetID, "thumbs", "thumb_status", p.ThumbLongEdge, 76)
+	case "video_poster":
+		return p.process(ctx, task.AssetID, "thumbs", "thumb_status", p.ThumbLongEdge, 76)
 	case "preview":
 		return p.process(ctx, task.AssetID, "previews", "preview_status", p.PreviewLongEdge, p.PreviewQuality)
 	default:
@@ -51,6 +53,10 @@ func (p Processor) process(ctx context.Context, assetID int64, kind string, stat
 	}
 	source, err := p.Store.PhotoPath(asset.RelPath)
 	if err != nil {
+		return err
+	}
+	deleted, err := p.deleteIfSourceMissing(ctx, asset, "thumb_source_missing")
+	if err != nil || deleted {
 		return err
 	}
 	if statusField == "thumb_status" && asset.MediaType == model.MediaTypeVideo {
@@ -78,6 +84,15 @@ func (p Processor) processVideoThumb(ctx context.Context, asset model.Asset, sou
 	_ = os.Remove(tmpFrame)
 	_ = os.Remove(tmpThumb)
 	if _, err := util.RunLowPriorityCommand(ctx, p.timeout(), "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", "1", "-i", source, "-frames:v", "1", "-q:v", "3", tmpFrame); err != nil {
+		deleted, deleteErr := p.deleteIfSourceMissing(ctx, asset, "video_thumb_source_missing")
+		if deleteErr != nil {
+			return deleteErr
+		}
+		if deleted {
+			_ = os.Remove(tmpFrame)
+			_ = os.Remove(tmpThumb)
+			return nil
+		}
 		message := publicError(err)
 		_ = p.DB.SetAssetWorkStatus(ctx, asset.ID, "thumb_status", model.StatusError, &message)
 		_ = os.Remove(tmpFrame)
@@ -120,6 +135,14 @@ func (p Processor) processAsset(ctx context.Context, asset model.Asset, kind str
 	_ = os.Remove(tmp)
 	args := []string{source, "-s", fmt.Sprintf("%dx%d", longEdge, longEdge), "-o", fmt.Sprintf("%s[Q=%d]", tmp, quality)}
 	if _, err := util.RunLowPriorityCommand(ctx, p.timeout(), "vipsthumbnail", args...); err != nil {
+		deleted, deleteErr := p.deleteIfSourceMissing(ctx, asset, "image_thumb_source_missing")
+		if deleteErr != nil {
+			return deleteErr
+		}
+		if deleted {
+			_ = os.Remove(tmp)
+			return nil
+		}
 		message := publicError(err)
 		_ = p.DB.SetAssetWorkStatus(ctx, asset.ID, statusField, model.StatusError, &message)
 		_ = os.Remove(tmp)
@@ -157,6 +180,64 @@ func (p Processor) timeout() time.Duration {
 		return p.CommandTimeout
 	}
 	return 90 * time.Second
+}
+
+func (p Processor) deleteIfSourceMissing(ctx context.Context, asset model.Asset, reason string) (bool, error) {
+	root, _, err := p.Store.RootForRel(asset.RelPath)
+	if err != nil {
+		return false, err
+	}
+	if !sourceRootAvailable(root.Path) {
+		return false, nil
+	}
+	source, err := p.Store.PhotoPath(asset.RelPath)
+	if err != nil {
+		return false, err
+	}
+	missing, err := sourceFileMissing(source)
+	if err != nil {
+		return false, err
+	}
+	if !missing {
+		return false, nil
+	}
+	deleted, err := p.DB.MarkDeletedWithCache(ctx, asset.RelPath, util.UnixNow())
+	if err != nil {
+		return false, err
+	}
+	if deleted == nil {
+		return true, nil
+	}
+	if deleted.CacheKey != "" {
+		if err := p.Store.RemoveCache(deleted.CacheKey); err != nil && p.Logger != nil {
+			p.Logger.Warn("remove cache after missing source failed", "relPath", asset.RelPath, "reason", reason, "error", err)
+		}
+	}
+	if p.Events != nil {
+		p.Events.Publish(events.Event{Type: "asset_deleted", Payload: asset})
+	}
+	go func() {
+		if err := p.DB.RefreshFolders(context.Background()); err != nil && p.Logger != nil {
+			p.Logger.Warn("refresh folders after missing source failed", "relPath", asset.RelPath, "reason", reason, "error", err)
+		}
+	}()
+	return true, nil
+}
+
+func sourceRootAvailable(path string) bool {
+	info, err := os.Stat(filepath.Clean(path))
+	return err == nil && info.IsDir()
+}
+
+func sourceFileMissing(path string) (bool, error) {
+	info, err := os.Stat(filepath.Clean(path))
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.IsDir(), nil
 }
 
 func fileExists(path string) bool {

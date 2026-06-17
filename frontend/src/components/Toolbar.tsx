@@ -38,7 +38,7 @@ export default function Toolbar({ title, children, onScanStarted, showScanAction
         await api.pauseScan();
       } else {
         const result = await api.triggerScan();
-        if (result.started) onScanStarted?.();
+        if (result.accepted) onScanStarted?.();
       }
       await refreshScanStatus();
     } finally {

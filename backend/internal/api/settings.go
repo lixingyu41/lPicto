@@ -21,6 +21,11 @@ import (
 	"lpicto/backend/internal/util"
 )
 
+type sourceDirCacheEntry struct {
+	exists    bool
+	checkedAt time.Time
+}
+
 type scanFolderRequest struct {
 	RelPath string `json:"relPath"`
 }
@@ -92,7 +97,7 @@ func (s *Server) refreshProcessingProgress() {
 }
 
 func (s *Server) cachedCacheStats() CacheStatsDTO {
-	const ttl = 5 * time.Second
+	const ttl = 60 * time.Second
 	now := time.Now()
 	s.cacheMu.Lock()
 	stats := s.cacheStats
@@ -184,7 +189,7 @@ func (s *Server) addScanLibrary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured": true,
 		"items":      s.scanLibraryDTOs(r.Context(), libraries, scanner.Status{}),
-		"library":    s.scanLibraryDTO(r.Context(), library, scanner.Status{}),
+		"library":    s.scanLibraryDTO(library, s.libraryAssetTotal(r.Context(), library), scanner.Status{}),
 		"started":    false,
 	})
 }
@@ -222,7 +227,7 @@ func (s *Server) updateScanLibrary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured": true,
 		"items":      s.scanLibraryDTOs(r.Context(), libraries, scanner.Status{}),
-		"library":    s.scanLibraryDTO(r.Context(), library, scanner.Status{}),
+		"library":    s.scanLibraryDTO(library, s.libraryAssetTotal(r.Context(), library), scanner.Status{}),
 		"started":    false,
 	})
 }
@@ -311,8 +316,8 @@ func (s *Server) scanLibrary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "scan_library_not_found", "来源不存在")
 		return
 	}
-	started := s.scanner.TriggerRoots("library:"+library.Name, library.Roots)
-	writeJSON(w, http.StatusAccepted, map[string]bool{"started": started})
+	result := s.scanner.RequestScanRoots("library:"+library.Name, library.Roots)
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 }
 
 func (s *Server) scanFolders(w http.ResponseWriter, r *http.Request) {
@@ -482,7 +487,7 @@ func (s *Server) scanFolderDTOs(folders []string) []ScanFolderDTO {
 		parent := parentPtr(rel)
 		items = append(items, ScanFolderDTO{
 			RelPath: rel, Name: storage.FolderName(rel), ParentRelPath: parent,
-			Depth: storage.FolderDepth(rel), Exists: s.sourceDirExists(rel),
+			Depth: storage.FolderDepth(rel), Exists: s.sourceDirExistsCached(rel),
 		})
 	}
 	return items
@@ -490,13 +495,73 @@ func (s *Server) scanFolderDTOs(folders []string) []ScanFolderDTO {
 
 func (s *Server) scanLibraryDTOs(ctx context.Context, libraries []db.ScanLibrary, status scanner.Status) []ScanLibraryDTO {
 	items := make([]ScanLibraryDTO, 0, len(libraries))
+	counts := s.cachedLibraryAssetCounts(ctx, libraries)
 	for _, library := range libraries {
-		items = append(items, s.scanLibraryDTO(ctx, library, status))
+		if ctx.Err() != nil {
+			break
+		}
+		items = append(items, s.scanLibraryDTO(library, counts[library.ID], status))
 	}
 	return items
 }
 
-func (s *Server) scanLibraryDTO(ctx context.Context, library db.ScanLibrary, status scanner.Status) ScanLibraryDTO {
+func (s *Server) cachedLibraryAssetCounts(ctx context.Context, libraries []db.ScanLibrary) map[string]int {
+	const ttl = 5 * time.Second
+	key := scanLibrariesCacheKey(libraries)
+	now := time.Now()
+	s.libraryCountsMu.Lock()
+	cached := copyIntMap(s.libraryCounts)
+	cachedOK := s.libraryCountsKey == key && len(cached) > 0
+	fresh := cachedOK && now.Sub(s.libraryCountsAt) < ttl
+	refreshing := s.libraryCountsRefreshing
+	if fresh {
+		s.libraryCountsMu.Unlock()
+		return cached
+	}
+	if cachedOK && !refreshing {
+		s.libraryCountsRefreshing = true
+		s.libraryCountsMu.Unlock()
+		go s.refreshLibraryAssetCounts(context.Background(), libraries, key)
+		return cached
+	}
+	if cachedOK || refreshing {
+		s.libraryCountsMu.Unlock()
+		return cached
+	}
+	s.libraryCountsRefreshing = true
+	s.libraryCountsMu.Unlock()
+	counts := s.loadLibraryAssetCounts(ctx, libraries)
+	s.libraryCountsMu.Lock()
+	s.libraryCountsKey = key
+	s.libraryCounts = counts
+	s.libraryCountsAt = time.Now()
+	s.libraryCountsRefreshing = false
+	s.libraryCountsMu.Unlock()
+	return counts
+}
+
+func (s *Server) refreshLibraryAssetCounts(ctx context.Context, libraries []db.ScanLibrary, key string) {
+	counts := s.loadLibraryAssetCounts(ctx, libraries)
+	s.libraryCountsMu.Lock()
+	defer s.libraryCountsMu.Unlock()
+	s.libraryCountsKey = key
+	s.libraryCounts = counts
+	s.libraryCountsAt = time.Now()
+	s.libraryCountsRefreshing = false
+}
+
+func (s *Server) loadLibraryAssetCounts(ctx context.Context, libraries []db.ScanLibrary) map[string]int {
+	counts, err := s.db.AssetCountsForLibraries(ctx, libraries)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			s.logger.Warn("load library asset counts failed", "error", err)
+		}
+		return map[string]int{}
+	}
+	return counts
+}
+
+func (s *Server) scanLibraryDTO(library db.ScanLibrary, assetTotal int, status scanner.Status) ScanLibraryDTO {
 	folders := s.scanFolderDTOs(library.Roots)
 	exists := len(folders) > 0
 	for _, folder := range folders {
@@ -505,22 +570,48 @@ func (s *Server) scanLibraryDTO(ctx context.Context, library db.ScanLibrary, sta
 			break
 		}
 	}
-	progress, err := s.db.ProcessingProgressForRoots(ctx, library.Roots)
-	if err != nil {
-		s.logger.Warn("load library progress failed", "libraryID", library.ID, "error", err)
-	}
 	return ScanLibraryDTO{
 		ID:       library.ID,
 		Name:     library.Name,
 		Folders:  folders,
 		Exists:   exists,
-		Progress: scanLibraryProgressDTO(library, progress, status),
+		Progress: scanLibraryProgressDTO(library, assetTotal, status),
 	}
 }
 
-func scanLibraryProgressDTO(library db.ScanLibrary, progress db.ProcessingProgress, status scanner.Status) ScanLibraryProgressDTO {
+func (s *Server) libraryAssetTotal(ctx context.Context, library db.ScanLibrary) int {
+	total, err := s.db.AssetCountForRoots(ctx, library.Roots)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		s.logger.Warn("load library asset count failed", "libraryID", library.ID, "error", err)
+	}
+	return total
+}
+
+func scanLibrariesCacheKey(libraries []db.ScanLibrary) string {
+	var builder strings.Builder
+	for _, library := range libraries {
+		builder.WriteString(library.ID)
+		builder.WriteByte('=')
+		builder.WriteString(strings.Join(library.Roots, ","))
+		builder.WriteByte(';')
+	}
+	return builder.String()
+}
+
+func copyIntMap(source map[string]int) map[string]int {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[string]int, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func scanLibraryProgressDTO(library db.ScanLibrary, assetTotal int, status scanner.Status) ScanLibraryProgressDTO {
 	active := status.Running && scanRootsSame(library.Roots, status.Progress.Roots)
-	scannedFiles := progress.AssetTotal
+	scannedFiles := assetTotal
 	unscannedFiles := 0
 	if active {
 		scannedFiles = status.Progress.ScannedFiles
@@ -530,11 +621,11 @@ func scanLibraryProgressDTO(library db.ScanLibrary, progress db.ProcessingProgre
 		}
 	}
 	return ScanLibraryProgressDTO{
-		AssetTotal:     progress.AssetTotal,
+		AssetTotal:     assetTotal,
 		ScannedFiles:   scannedFiles,
 		UnscannedFiles: unscannedFiles,
-		Thumb:          workStatusCountsDTO(progress.Thumb),
-		Transcode:      workStatusCountsDTO(progress.Transcode),
+		Thumb:          WorkStatusCountsDTO{},
+		Transcode:      WorkStatusCountsDTO{},
 		Active:         active,
 	}
 }
@@ -593,6 +684,43 @@ func (s *Server) sourceDirExists(rel string) bool {
 	}
 	info, err := os.Stat(fullPath)
 	return err == nil && info.IsDir()
+}
+
+func (s *Server) sourceDirExistsCached(rel string) bool {
+	const ttl = 15 * time.Second
+	const timeout = 150 * time.Millisecond
+	if rel == "" && s.store.HasVirtualRoot() {
+		return true
+	}
+	now := time.Now()
+	s.sourceDirMu.Lock()
+	if s.sourceDirCache == nil {
+		s.sourceDirCache = make(map[string]sourceDirCacheEntry)
+	}
+	cached, ok := s.sourceDirCache[rel]
+	if ok && now.Sub(cached.checkedAt) < ttl {
+		s.sourceDirMu.Unlock()
+		return cached.exists
+	}
+	s.sourceDirMu.Unlock()
+
+	result := make(chan bool, 1)
+	go func() {
+		exists := s.sourceDirExists(rel)
+		s.sourceDirMu.Lock()
+		s.sourceDirCache[rel] = sourceDirCacheEntry{exists: exists, checkedAt: time.Now()}
+		s.sourceDirMu.Unlock()
+		result <- exists
+	}()
+	select {
+	case exists := <-result:
+		return exists
+	case <-time.After(timeout):
+		if ok {
+			return cached.exists
+		}
+		return true
+	}
 }
 
 func joinRel(parent string, name string) string {

@@ -37,6 +37,12 @@ export interface Asset {
   rotation: number;
 }
 
+export interface AssetDeletedEvent {
+  id: number;
+  relPath: string;
+  cacheKey: string;
+}
+
 export interface SearchAssetsParams {
   q?: string;
   nfo?: string;
@@ -94,11 +100,14 @@ export interface ScanStatus {
 }
 
 export interface ScanProgress {
+  state: string;
+  requestedAction: string;
   reason: string;
   phase: string;
   roots: string[];
   currentRoot: string;
   currentRelPath: string;
+  discoveredFiles: number;
   totalFiles: number;
   scannedFiles: number;
   totalSeen: number;
@@ -106,6 +115,13 @@ export interface ScanProgress {
   assetsUpdated: number;
   assetsDeleted: number;
   errors: number;
+}
+
+export interface ScanCommandResponse {
+  accepted: boolean;
+  started: boolean;
+  paused: boolean;
+  state: string;
 }
 
 export interface WorkStatusCounts {

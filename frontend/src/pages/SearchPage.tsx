@@ -7,8 +7,9 @@ import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
 import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
+import { useAssetDeletedEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
-import type { Asset, AssetKind, OrientationFilter, SearchAssetsParams, SortKey } from '../types/api';
+import type { Asset, AssetDeletedEvent, AssetKind, OrientationFilter, SearchAssetsParams, SortKey } from '../types/api';
 import {
   decodeReturnState,
   encodeReturnState,
@@ -103,6 +104,8 @@ export default function SearchPage() {
   const searchKey = useMemo(() => JSON.stringify(searchRequest), [searchRequest]);
   const loadAssets = useCallback((page: number) => api.searchAssets(page, pageSize, searchRequest), [searchRequest]);
   const { items, hasMore, loading, error, loadMore, mutateItems } = usePagedLoader<Asset>(loadAssets, [searchKey]);
+  const handleAssetDeleted = useCallback((event: AssetDeletedEvent) => mutateItems((current) => removeAssetById(current, event.id)), [mutateItems]);
+  useAssetDeletedEvents(handleAssetDeleted, [handleAssetDeleted]);
 
   const currentPageState = useCallback(
     (): SearchPageState => ({

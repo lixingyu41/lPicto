@@ -46,6 +46,10 @@ func Open(ctx context.Context, path string, migrationsDir string) (*DB, error) {
 		_ = conn.Close()
 		return nil, err
 	}
+	if err := database.Checkpoint(ctx); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	return database, nil
 }
 
@@ -69,6 +73,11 @@ func (d *DB) Close() error {
 
 func (d *DB) Conn() *sql.DB {
 	return d.conn
+}
+
+func (d *DB) Checkpoint(ctx context.Context) error {
+	_, err := d.conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE);`)
+	return err
 }
 
 func (d *DB) Migrate(ctx context.Context, migrationsDir string) error {

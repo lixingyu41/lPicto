@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -163,6 +164,14 @@ func (s Store) PhotoPath(rel string) (string, error) {
 		return "", errors.New("path escapes photo root")
 	}
 	return full, nil
+}
+
+func (s Store) RootForRel(rel string) (Root, string, error) {
+	normalized, err := NormalizeRelPath(rel)
+	if err != nil {
+		return Root{}, "", err
+	}
+	return s.rootForRel(normalized)
 }
 
 func (s Store) RelPath(absPath string) (string, error) {
@@ -371,5 +380,8 @@ func (s Store) cacheFilePath(kind string, cacheKey string, ext string) string {
 }
 
 func samePath(a, b string) bool {
-	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }

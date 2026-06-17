@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/events"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/media"
 	"lpicto/backend/internal/model"
@@ -24,17 +25,22 @@ type Scanner struct {
 	Store             storage.Store
 	Extractor         media.Extractor
 	Jobs              *jobs.Manager
+	Events            *events.Bus
 	VideoProxyEnabled bool
 	ScanWorkers       int
 	Logger            *slog.Logger
+
+	startOnce sync.Once
+	commands  chan scanCommand
 
 	mu        sync.Mutex
 	running   bool
 	cancel    context.CancelFunc
 	lastStart int64
-	pending   *scanRequest
 	progress  Progress
 }
+
+type Controller = Scanner
 
 type Status struct {
 	Running   bool           `json:"running"`
@@ -44,18 +50,21 @@ type Status struct {
 }
 
 type Progress struct {
-	Reason         string   `json:"reason"`
-	Phase          string   `json:"phase"`
-	Roots          []string `json:"roots"`
-	CurrentRoot    string   `json:"currentRoot"`
-	CurrentRelPath string   `json:"currentRelPath"`
-	TotalFiles     int      `json:"totalFiles"`
-	ScannedFiles   int      `json:"scannedFiles"`
-	TotalSeen      int      `json:"totalSeen"`
-	AssetsAdded    int      `json:"assetsAdded"`
-	AssetsUpdated  int      `json:"assetsUpdated"`
-	AssetsDeleted  int      `json:"assetsDeleted"`
-	Errors         int      `json:"errors"`
+	State           string   `json:"state"`
+	RequestedAction string   `json:"requestedAction"`
+	Reason          string   `json:"reason"`
+	Phase           string   `json:"phase"`
+	Roots           []string `json:"roots"`
+	CurrentRoot     string   `json:"currentRoot"`
+	CurrentRelPath  string   `json:"currentRelPath"`
+	DiscoveredFiles int      `json:"discoveredFiles"`
+	TotalFiles      int      `json:"totalFiles"`
+	ScannedFiles    int      `json:"scannedFiles"`
+	TotalSeen       int      `json:"totalSeen"`
+	AssetsAdded     int      `json:"assetsAdded"`
+	AssetsUpdated   int      `json:"assetsUpdated"`
+	AssetsDeleted   int      `json:"assetsDeleted"`
+	Errors          int      `json:"errors"`
 }
 
 type counters struct {
@@ -72,15 +81,35 @@ type scanFile struct {
 	info    os.FileInfo
 }
 
+type scanWrite struct {
+	kind            string
+	folderRel       string
+	absPath         string
+	rel             string
+	info            os.FileInfo
+	detection       media.Detection
+	meta            media.Metadata
+	mimeType        string
+	browserPlayable bool
+	thumbStatus     string
+	previewStatus   string
+	posterStatus    string
+	proxyStatus     string
+	metadataJSON    *string
+	errorText       *string
+}
+
 type scanState struct {
-	scanner *Scanner
-	ctx     context.Context
-	files   chan scanFile
-	seen    map[string]struct{}
-	counts  *counters
-	rebuild bool
-	mu      sync.Mutex
-	wg      sync.WaitGroup
+	scanner  *Scanner
+	ctx      context.Context
+	files    chan scanFile
+	writes   chan scanWrite
+	seen     map[string]struct{}
+	counts   *counters
+	rebuild  bool
+	mu       sync.Mutex
+	wg       sync.WaitGroup
+	writerWG sync.WaitGroup
 }
 
 type scanRequest struct {
@@ -90,47 +119,169 @@ type scanRequest struct {
 	rebuild     bool
 }
 
+type scanCommandKind string
+
+const (
+	scanCommandStart scanCommandKind = "start"
+	scanCommandStop  scanCommandKind = "stop"
+)
+
+type scanCommand struct {
+	kind  scanCommandKind
+	req   scanRequest
+	reply chan CommandResult
+}
+
+type CommandResult struct {
+	Accepted bool   `json:"accepted"`
+	Started  bool   `json:"started"`
+	Paused   bool   `json:"paused"`
+	State    string `json:"state"`
+}
+
 func (s *Scanner) Trigger(reason string) bool {
-	return s.trigger(reason, nil, false, false)
+	return s.RequestScan(reason).Started
 }
 
 func (s *Scanner) TriggerRoots(reason string, roots []string) bool {
-	return s.trigger(reason, roots, true, false)
+	return s.RequestScanRoots(reason, roots).Started
 }
 
 func (s *Scanner) TriggerRebuild(reason string) bool {
-	return s.trigger(reason, nil, false, true)
+	return s.RequestRebuild(reason).Started
 }
 
-func (s *Scanner) trigger(reason string, roots []string, hasOverride bool, rebuild bool) bool {
-	req := scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: hasOverride, rebuild: rebuild}
-	s.mu.Lock()
-	if s.running {
-		s.pending = &req
-		s.mu.Unlock()
-		return false
+func (s *Scanner) RequestScan(reason string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason})
+}
+
+func (s *Scanner) RequestScanRoots(reason string, roots []string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: true})
+}
+
+func (s *Scanner) RequestRebuild(reason string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, rebuild: true})
+}
+
+func (s *Scanner) requestStart(req scanRequest) CommandResult {
+	if strings.TrimSpace(req.reason) == "" {
+		req.reason = "manual"
 	}
+	return s.submitCommand(scanCommand{kind: scanCommandStart, req: req})
+}
+
+func (s *Scanner) Start(ctx context.Context) {
+	s.startOnce.Do(func() {
+		s.commands = make(chan scanCommand, 128)
+		s.setIdleProgress()
+		go s.commandLoop(ctx)
+	})
+}
+
+func (s *Scanner) ensureStarted() {
+	s.Start(context.Background())
+}
+
+func (s *Scanner) submitCommand(cmd scanCommand) CommandResult {
+	s.ensureStarted()
+	cmd.reply = make(chan CommandResult, 1)
+	select {
+	case s.commands <- cmd:
+	case <-time.After(2 * time.Second):
+		return CommandResult{Accepted: false, State: s.currentState()}
+	}
+	select {
+	case result := <-cmd.reply:
+		return result
+	case <-time.After(2 * time.Second):
+		return CommandResult{Accepted: false, State: s.currentState()}
+	}
+}
+
+func (s *Scanner) commandLoop(ctx context.Context) {
+	var cancel context.CancelFunc
+	var done <-chan struct{}
+	var pendingStart *scanRequest
+	for {
+		select {
+		case <-ctx.Done():
+			if cancel != nil {
+				cancel()
+			}
+			return
+		case cmd := <-s.commands:
+			switch cmd.kind {
+			case scanCommandStart:
+				req := cmd.req
+				if done == nil {
+					cancel, done = s.startRun(ctx, req)
+					cmd.reply <- CommandResult{Accepted: true, Started: true, State: "running"}
+					continue
+				}
+				pendingStart = &req
+				if cancel != nil {
+					cancel()
+				}
+				s.setStopping("start")
+				cmd.reply <- CommandResult{Accepted: true, Started: false, State: "stopping"}
+			case scanCommandStop:
+				pendingStart = nil
+				if done == nil {
+					s.setIdleProgress()
+					cmd.reply <- CommandResult{Accepted: false, Paused: false, State: "idle"}
+					continue
+				}
+				if cancel != nil {
+					cancel()
+				}
+				s.setStopping("stop")
+				cmd.reply <- CommandResult{Accepted: true, Paused: true, State: "stopping"}
+			default:
+				cmd.reply <- CommandResult{Accepted: false, State: s.currentState()}
+			}
+		case <-done:
+			done = nil
+			cancel = nil
+			if pendingStart != nil && ctx.Err() == nil {
+				next := *pendingStart
+				pendingStart = nil
+				cancel, done = s.startRun(ctx, next)
+				continue
+			}
+			s.setIdleAfterRun()
+		}
+	}
+}
+
+func (s *Scanner) startRun(parent context.Context, req scanRequest) (context.CancelFunc, <-chan struct{}) {
+	s.mu.Lock()
 	s.running = true
 	s.lastStart = util.UnixNow()
-	s.progress = Progress{Reason: reason, Phase: "queued", Roots: append([]string(nil), req.roots...)}
-	runCtx, cancel := context.WithCancel(context.Background())
+	s.progress = Progress{
+		State:           "running",
+		RequestedAction: "start",
+		Reason:          req.reason,
+		Phase:           "queued",
+		Roots:           append([]string(nil), req.roots...),
+	}
+	runCtx, cancel := context.WithCancel(parent)
 	s.cancel = cancel
 	s.mu.Unlock()
-	go s.run(runCtx, req)
-	return true
+	s.publishStatus()
+	done := make(chan struct{}, 1)
+	go func() {
+		s.run(runCtx, req)
+		done <- struct{}{}
+	}()
+	return cancel, done
 }
 
 func (s *Scanner) Pause() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.running || s.cancel == nil {
-		s.pending = nil
-		return false
-	}
-	s.pending = nil
-	s.progress.Phase = "pausing"
-	s.cancel()
-	return true
+	return s.RequestStop().Paused
+}
+
+func (s *Scanner) RequestStop() CommandResult {
+	return s.submitCommand(scanCommand{kind: scanCommandStop})
 }
 
 func (s *Scanner) StartPeriodic(ctx context.Context, interval time.Duration) {
@@ -163,39 +314,70 @@ func (s *Scanner) Status(ctx context.Context) (Status, error) {
 	return status, nil
 }
 
+func (s *Scanner) currentState() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.progress.State != "" {
+		return s.progress.State
+	}
+	if s.running {
+		return "running"
+	}
+	return "idle"
+}
+
+func (s *Scanner) setIdleProgress() {
+	s.mu.Lock()
+	s.running = false
+	s.cancel = nil
+	s.progress = Progress{State: "idle", Phase: "idle"}
+	s.mu.Unlock()
+	s.publishStatus()
+}
+
+func (s *Scanner) setIdleAfterRun() {
+	s.mu.Lock()
+	s.running = false
+	s.cancel = nil
+	s.progress.State = "idle"
+	s.progress.RequestedAction = ""
+	s.progress.Phase = "idle"
+	s.mu.Unlock()
+	s.publishStatus()
+}
+
+func (s *Scanner) setStopping(requestedAction string) {
+	s.mu.Lock()
+	if s.running {
+		s.progress.State = "stopping"
+		s.progress.RequestedAction = requestedAction
+		s.progress.Phase = "stopping"
+	}
+	s.mu.Unlock()
+	s.publishStatus()
+}
+
+func (s *Scanner) statusSnapshot() Status {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return Status{Running: s.running, LastStart: s.lastStart, Progress: s.progress}
+}
+
+func (s *Scanner) publishStatus() {
+	if s.Events == nil {
+		return
+	}
+	s.Events.Publish(events.Event{Type: "scan_status", Payload: s.statusSnapshot()})
+}
+
 func (s *Scanner) run(ctx context.Context, req scanRequest) {
-	defer func() {
-		s.mu.Lock()
-		s.cancel = nil
-		next := s.pending
-		if next != nil {
-			s.pending = nil
-			s.lastStart = util.UnixNow()
-			s.progress = Progress{Reason: next.reason, Phase: "queued", Roots: append([]string(nil), next.roots...)}
-			runCtx, cancel := context.WithCancel(context.Background())
-			s.cancel = cancel
-			s.mu.Unlock()
-			go s.run(runCtx, *next)
-			return
-		}
-		s.running = false
-		s.mu.Unlock()
-	}()
 	logger := s.Logger.With("reason", req.reason)
 	runID, err := s.DB.StartScanRun(ctx)
 	if err != nil {
 		logger.Error("start scan run failed", "error", err)
 		return
 	}
-	activeBefore, err := s.DB.ActiveRelPaths(ctx)
-	if err != nil {
-		logger.Error("load active assets failed", "error", err)
-		message := "读取现有资源失败"
-		_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "error", Errors: 1, LastError: &message})
-		return
-	}
 	var scanRoots []string
-	var configuredScanFolders bool
 	if req.hasOverride {
 		scanRoots, err = db.NormalizeScanFolders(req.roots)
 		if err != nil {
@@ -204,9 +386,8 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 			_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "error", Errors: 1, LastError: &message})
 			return
 		}
-		configuredScanFolders = true
 	} else {
-		scanRoots, configuredScanFolders, err = s.DB.GetScanFolders(ctx)
+		scanRoots, _, err = s.DB.GetScanFolders(ctx)
 		if err != nil {
 			logger.Error("load scan folders failed", "error", err)
 			message := "读取扫描文件夹失败"
@@ -215,14 +396,22 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 		}
 	}
 	s.updateProgressRoots(scanRoots)
-	counts := counters{}
-	totalFiles := s.countScanFiles(ctx, scanRoots, logger)
-	if ctx.Err() != nil {
-		s.finishPaused(runID, counts)
+	if len(scanRoots) == 0 {
+		s.updateProgressPhase("finished")
+		if err := s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "finished"}); err != nil {
+			logger.Error("finish empty scan run failed", "error", err)
+		}
 		return
 	}
-	s.updateProgressPhase("scanning")
-	s.updateProgressTotalFiles(totalFiles)
+	activeBefore, err := s.DB.ActiveRelPathsForRoots(ctx, scanRoots)
+	if err != nil {
+		logger.Error("load active assets failed", "error", err)
+		message := "读取现有资源失败"
+		_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "error", Errors: 1, LastError: &message})
+		return
+	}
+	counts := counters{}
+	s.updateProgressPhase("discovering")
 	seen := make(map[string]struct{}, len(activeBefore))
 	state := s.newScanState(ctx, seen, &counts, req.rebuild)
 	state.start(s.scanWorkerCount())
@@ -244,6 +433,7 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 			s.walkManifestTopLevel(ctx, state)
 		}
 	}
+	s.updateProgressPhase("scanning")
 	state.finish()
 	if ctx.Err() != nil {
 		s.finishPaused(runID, counts)
@@ -259,10 +449,10 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 			continue
 		}
 		inScanScope := db.AssetInScanFolders(rel, scanRoots)
-		if !inScanScope && !configuredScanFolders {
+		if !inScanScope {
 			continue
 		}
-		if inScanScope && assetUnderFailedRoot(rel, failedRoots) {
+		if assetUnderFailedRoot(rel, failedRoots) {
 			continue
 		}
 		deleted, err := s.DB.MarkDeletedWithCache(ctx, rel, deletedAt)
@@ -469,9 +659,7 @@ func (s *Scanner) walkRoot(ctx context.Context, rootRel string, state *scanState
 	}
 	s.updateProgressRoot(rootRel)
 	if rootRel == "" && s.Store.HasVirtualRoot() {
-		if err := s.DB.EnsureFolder(ctx, rootRel); err != nil {
-			state.recordError("写入目录失败", err)
-		}
+		state.submitFolder(rootRel)
 		var walkErr error
 		for _, rel := range s.Store.RootRelPaths() {
 			if err := s.walkRoot(ctx, rel, state); err != nil {
@@ -492,9 +680,7 @@ func (s *Scanner) walkRoot(ctx context.Context, rootRel string, state *scanState
 	if !info.IsDir() {
 		return nil
 	}
-	if err := s.DB.EnsureFolder(ctx, rootRel); err != nil {
-		state.recordError("写入目录失败", err)
-	}
+	state.submitFolder(rootRel)
 	return s.walkDir(ctx, rootPath, state)
 }
 
@@ -606,10 +792,7 @@ func (s *Scanner) ensureFolderForPath(ctx context.Context, absPath string, state
 		state.recordError("目录路径不安全", err)
 		return nil
 	}
-	if err := s.DB.EnsureFolder(ctx, rel); err != nil {
-		state.recordError("写入目录失败", err)
-		return nil
-	}
+	state.submitFolder(rel)
 	return nil
 }
 
@@ -618,6 +801,7 @@ func (s *Scanner) newScanState(ctx context.Context, seen map[string]struct{}, co
 		scanner: s,
 		ctx:     ctx,
 		files:   make(chan scanFile, maxInt(64, s.scanWorkerCount()*4)),
+		writes:  make(chan scanWrite, maxInt(64, s.scanWorkerCount()*4)),
 		seen:    seen,
 		counts:  counts,
 		rebuild: rebuild,
@@ -635,6 +819,17 @@ func (st *scanState) start(workers int) {
 	if workers < 1 {
 		workers = 1
 	}
+	st.writerWG.Add(1)
+	go func() {
+		defer st.writerWG.Done()
+		for write := range st.writes {
+			if write.kind == "folder" {
+				st.writeFolder(write.folderRel)
+				continue
+			}
+			st.writeAsset(write)
+		}
+	}()
 	for i := 0; i < workers; i++ {
 		st.wg.Add(1)
 		go func() {
@@ -647,8 +842,16 @@ func (st *scanState) start(workers int) {
 }
 
 func (st *scanState) submit(absPath string, info os.FileInfo) {
+	st.scanner.addDiscoveredFile()
 	select {
 	case st.files <- scanFile{absPath: absPath, info: info}:
+	case <-st.ctx.Done():
+	}
+}
+
+func (st *scanState) submitFolder(rel string) {
+	select {
+	case st.writes <- scanWrite{kind: "folder", folderRel: rel}:
 	case <-st.ctx.Done():
 	}
 }
@@ -656,6 +859,8 @@ func (st *scanState) submit(absPath string, info os.FileInfo) {
 func (st *scanState) finish() {
 	close(st.files)
 	st.wg.Wait()
+	close(st.writes)
+	st.writerWG.Wait()
 }
 
 func (st *scanState) markSeen(rel string) {
@@ -720,12 +925,6 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 		return
 	}
 	info = currentInfo
-	if err := s.DB.EnsureAssetFolders(ctx, rel); err != nil {
-		st.recordError("写入文件夹失败", err)
-		st.updateProgress(rel)
-		s.Logger.Warn("ensure folders failed", "relPath", rel, "error", err)
-		return
-	}
 	importedAt := util.UnixNow()
 	mtime := info.ModTime().Unix()
 	meta := s.Extractor.Extract(ctx, absPath, detection, mtime, importedAt)
@@ -742,7 +941,6 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 	if meta.RawJSON != "" {
 		metadataJSON = &meta.RawJSON
 	}
-	nfoJSON, nfoSearchText, nfoScanned := st.nfoMetadata(absPath, rel)
 	var errorText *string
 	if meta.Err != nil {
 		if ctx.Err() != nil {
@@ -757,33 +955,79 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 		st.updateProgress(rel)
 		s.Logger.Warn("metadata extraction failed", "relPath", rel, "error", meta.Err)
 	}
+	select {
+	case st.writes <- scanWrite{
+		absPath:         absPath,
+		rel:             rel,
+		info:            info,
+		detection:       detection,
+		meta:            meta,
+		mimeType:        mimeType,
+		browserPlayable: browserPlayable,
+		thumbStatus:     thumbStatus,
+		previewStatus:   previewStatus,
+		posterStatus:    posterStatus,
+		proxyStatus:     proxyStatus,
+		metadataJSON:    metadataJSON,
+		errorText:       errorText,
+	}:
+	case <-ctx.Done():
+	}
+}
+
+func (st *scanState) writeFolder(rel string) {
+	if st.ctx.Err() != nil {
+		return
+	}
+	if err := st.scanner.DB.EnsureFolder(st.ctx, rel); err != nil {
+		st.recordError("写入目录失败", err)
+		st.scanner.Logger.Warn("ensure folder failed", "relPath", rel, "error", err)
+	}
+}
+
+func (st *scanState) writeAsset(write scanWrite) {
+	s := st.scanner
+	ctx := st.ctx
+	rel := write.rel
+	if ctx.Err() != nil {
+		return
+	}
+	if err := s.DB.EnsureAssetFolders(ctx, rel); err != nil {
+		st.recordError("写入文件夹失败", err)
+		st.updateProgress(rel)
+		s.Logger.Warn("ensure folders failed", "relPath", rel, "error", err)
+		return
+	}
+	nfoJSON, nfoSearchText, nfoScanned := st.nfoMetadata(write.absPath, rel)
+	importedAt := util.UnixNow()
+	mtime := write.info.ModTime().Unix()
 	st.markSeen(rel)
 	params := db.AssetUpsert{
 		RelPath:           rel,
 		ParentRelPath:     storage.ParentRelPath(rel),
-		Filename:          filepath.Base(absPath),
-		Ext:               detection.Ext,
-		MediaType:         detection.MediaType,
-		MimeType:          &mimeType,
-		Size:              info.Size(),
+		Filename:          filepath.Base(write.absPath),
+		Ext:               write.detection.Ext,
+		MediaType:         write.detection.MediaType,
+		MimeType:          &write.mimeType,
+		Size:              write.info.Size(),
 		Mtime:             mtime,
-		Width:             meta.Width,
-		Height:            meta.Height,
-		Duration:          meta.Duration,
-		TakenAt:           meta.TakenAt,
+		Width:             write.meta.Width,
+		Height:            write.meta.Height,
+		Duration:          write.meta.Duration,
+		TakenAt:           write.meta.TakenAt,
 		ImportedAt:        importedAt,
-		TimelineAt:        media.TimelineAt(meta.TakenAt, meta.VideoCreatedAt, mtime, importedAt),
-		CacheKey:          storage.CacheKey(rel, info.Size(), mtime),
-		BrowserPlayable:   browserPlayable,
-		ThumbStatus:       thumbStatus,
-		PreviewStatus:     previewStatus,
-		VideoPosterStatus: posterStatus,
-		VideoProxyStatus:  proxyStatus,
-		MetadataJSON:      metadataJSON,
+		TimelineAt:        media.TimelineAt(write.meta.TakenAt, write.meta.VideoCreatedAt, mtime, importedAt),
+		CacheKey:          storage.CacheKey(rel, write.info.Size(), mtime),
+		BrowserPlayable:   write.browserPlayable,
+		ThumbStatus:       write.thumbStatus,
+		PreviewStatus:     write.previewStatus,
+		VideoPosterStatus: write.posterStatus,
+		VideoProxyStatus:  write.proxyStatus,
+		MetadataJSON:      write.metadataJSON,
 		NFOJSON:           nfoJSON,
 		NFOSearchText:     nfoSearchText,
 		NFOScanned:        nfoScanned,
-		Error:             errorText,
+		Error:             write.errorText,
 	}
 	result, err := s.DB.UpsertAssetDetailed(ctx, params)
 	if err != nil {
@@ -816,7 +1060,7 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 	}
 	st.updateProgress(rel)
 	if result.Added || result.Updated || st.rebuild {
-		s.enqueueWork(result.ID, detection.MediaType, previewStatus, proxyStatus, st.rebuild)
+		s.enqueueWork(result.ID, write.detection.MediaType, write.previewStatus, write.proxyStatus, st.rebuild)
 		return
 	}
 	if asset, err := s.DB.GetAsset(ctx, result.ID); err == nil {
@@ -867,29 +1111,52 @@ func (s *Scanner) updateProgressRoot(rootRel string) {
 	s.mu.Lock()
 	s.progress.CurrentRoot = rootRel
 	s.mu.Unlock()
+	s.publishStatus()
 }
 
 func (s *Scanner) updateProgressRoots(roots []string) {
 	s.mu.Lock()
 	s.progress.Roots = append([]string(nil), roots...)
 	s.mu.Unlock()
+	s.publishStatus()
 }
 
 func (s *Scanner) updateProgressPhase(phase string) {
 	s.mu.Lock()
 	s.progress.Phase = phase
 	s.mu.Unlock()
+	s.publishStatus()
 }
 
 func (s *Scanner) updateProgressTotalFiles(totalFiles int) {
 	s.mu.Lock()
 	s.progress.TotalFiles = totalFiles
+	if s.progress.DiscoveredFiles < totalFiles {
+		s.progress.DiscoveredFiles = totalFiles
+	}
 	s.mu.Unlock()
+	s.publishStatus()
+}
+
+func (s *Scanner) addDiscoveredFile() {
+	s.mu.Lock()
+	if s.running {
+		s.progress.DiscoveredFiles++
+		s.progress.TotalFiles = s.progress.DiscoveredFiles
+	}
+	s.mu.Unlock()
+	s.publishStatus()
 }
 
 func (s *Scanner) updateProgressCounts(counts counters, currentRelPath string) {
 	s.mu.Lock()
 	s.progress.CurrentRelPath = currentRelPath
+	if counts.totalSeen > s.progress.DiscoveredFiles {
+		s.progress.DiscoveredFiles = counts.totalSeen
+	}
+	if s.progress.DiscoveredFiles > s.progress.TotalFiles {
+		s.progress.TotalFiles = s.progress.DiscoveredFiles
+	}
 	if counts.totalSeen > s.progress.TotalFiles {
 		s.progress.TotalFiles = counts.totalSeen
 	}
@@ -900,6 +1167,7 @@ func (s *Scanner) updateProgressCounts(counts counters, currentRelPath string) {
 	s.progress.AssetsDeleted = counts.assetsDeleted
 	s.progress.Errors = counts.errors
 	s.mu.Unlock()
+	s.publishStatus()
 }
 
 func (s *Scanner) adjustProgressTotal(delta int) {
@@ -915,8 +1183,10 @@ func (s *Scanner) adjustProgressTotal(delta int) {
 		if s.progress.TotalFiles < 0 {
 			s.progress.TotalFiles = 0
 		}
+		s.progress.DiscoveredFiles = s.progress.TotalFiles
 	}
 	s.mu.Unlock()
+	s.publishStatus()
 }
 
 func (s *Scanner) enqueueWork(assetID int64, mediaType string, previewStatus string, proxyStatus string, rebuild bool) {

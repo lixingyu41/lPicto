@@ -13,6 +13,7 @@ import type {
   Page,
   PublicConfig,
   ProcessingProgress,
+  ScanCommandResponse,
   ScanRun,
   SearchAssetsParams,
   ScanFolder,
@@ -31,22 +32,48 @@ interface APIErrorBody {
   };
 }
 
+const requestTimeoutMs = 30_000;
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    headers: { Accept: 'application/json' },
-    ...init,
-  });
-  if (!response.ok) {
-    let message = '请求失败';
-    try {
-      const body = (await response.json()) as APIErrorBody;
-      message = body.error?.message ?? message;
-    } catch {
-      message = response.statusText || message;
-    }
-    throw new Error(message);
+  const controller = new AbortController();
+  const upstreamSignal = init?.signal;
+  let timedOut = false;
+  const timeoutID = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, requestTimeoutMs);
+  const abortFromUpstream = () => controller.abort();
+  if (upstreamSignal?.aborted) {
+    controller.abort();
+  } else {
+    upstreamSignal?.addEventListener('abort', abortFromUpstream, { once: true });
   }
-  return (await response.json()) as T;
+  try {
+    const response = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      ...init,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      let message = '请求失败';
+      try {
+        const body = (await response.json()) as APIErrorBody;
+        message = body.error?.message ?? message;
+      } catch {
+        message = response.statusText || message;
+      }
+      throw new Error(message);
+    }
+    return (await response.json()) as T;
+  } catch (err) {
+    if (timedOut) {
+      throw new Error('请求超时');
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timeoutID);
+    upstreamSignal?.removeEventListener('abort', abortFromUpstream);
+  }
 }
 
 function qs(params: Record<string, string | number | undefined | null>): string {
@@ -63,9 +90,9 @@ function qs(params: Record<string, string | number | undefined | null>): string 
 export const api = {
   health: () => request<{ status: string }>('/api/health'),
   publicConfig: () => request<PublicConfig>('/api/config/public'),
-  triggerScan: () => request<{ started: boolean }>('/api/scan', { method: 'POST' }),
-  pauseScan: () => request<{ paused: boolean }>('/api/scan/pause', { method: 'POST' }),
-  rebuildScan: () => request<{ started: boolean }>('/api/scan/rebuild?force=1', { method: 'POST' }),
+  triggerScan: () => request<ScanCommandResponse>('/api/scan', { method: 'POST' }),
+  pauseScan: () => request<ScanCommandResponse>('/api/scan/pause', { method: 'POST' }),
+  rebuildScan: () => request<ScanCommandResponse>('/api/scan/rebuild?force=1', { method: 'POST' }),
   scanStatus: () => request<ScanStatus>('/api/scan/status'),
   scanRuns: (page = 1, pageSize = 20) => request<Page<ScanRun>>(`/api/scan/runs${qs({ page, pageSize })}`),
   settingsProgress: () => request<ProcessingProgress>('/api/settings/progress'),
@@ -88,7 +115,7 @@ export const api = {
       method: 'DELETE',
     }),
   scanLibrary: (id: string) =>
-    request<{ started: boolean }>(`/api/settings/libraries/${encodeURIComponent(id)}/scan`, { method: 'POST' }),
+    request<ScanCommandResponse>(`/api/settings/libraries/${encodeURIComponent(id)}/scan`, { method: 'POST' }),
   scanFolders: () => request<ScanFoldersResponse>('/api/settings/scan-folders'),
   addScanFolder: (relPath: string) =>
     request<{ items: ScanFolder[] }>('/api/settings/scan-folders', {
@@ -122,7 +149,7 @@ export const api = {
       body: JSON.stringify({ name, groupId, sources }),
     }),
   deleteAlbum: (id: number) => request<{ deleted: boolean }>(`/api/albums/${id}`, { method: 'DELETE' }),
-  refreshAlbum: (id: number) => request<{ started: boolean }>(`/api/albums/${id}/refresh`, { method: 'POST' }),
+  refreshAlbum: (id: number) => request<ScanCommandResponse>(`/api/albums/${id}/refresh`, { method: 'POST' }),
   albumAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string) =>
     request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q })}`),
   albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string) =>

@@ -3,6 +3,7 @@ package storage
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -77,6 +78,18 @@ func TestSymlinkEscapeDetection(t *testing.T) {
 	}
 	if inside {
 		t.Fatal("expected symlink target outside root")
+	}
+}
+
+func TestSamePathCaseSensitivityMatchesOS(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		if !samePath(`C:\Photos\A`, `c:\photos\a`) {
+			t.Fatal("windows paths should compare case-insensitively")
+		}
+		return
+	}
+	if samePath("/photos/A", "/photos/a") {
+		t.Fatal("non-windows paths should compare case-sensitively")
 	}
 }
 

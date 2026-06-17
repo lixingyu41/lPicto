@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 )
@@ -80,6 +81,10 @@ func (m *Manager) Start(ctx context.Context, cfg WorkerConfig) {
 		m.wg.Add(1)
 		go m.worker(ctx, "image", m.imageQueue, m.thumb)
 	}
+	for i := 0; i < cfg.VideoPoster; i++ {
+		m.wg.Add(1)
+		go m.worker(ctx, "video_poster", m.videoPosterQueue, m.thumb)
+	}
 	for i := 0; i < cfg.VideoProxy; i++ {
 		m.wg.Add(1)
 		go m.worker(ctx, "video_proxy", m.videoProxyQueue, m.video)
@@ -107,13 +112,13 @@ func (m *Manager) Stats() QueueStats {
 		ThumbCap:          cap(m.imageQueue),
 		PreviewQueued:     queued["preview"],
 		PreviewCap:        cap(m.imageQueue),
-		VideoPosterQueued: len(m.videoPosterQueue),
+		VideoPosterQueued: queued["video_poster"],
 		VideoPosterCap:    cap(m.videoPosterQueue),
 		VideoProxyQueued:  queued["video_proxy"],
 		VideoProxyCap:     cap(m.videoProxyQueue),
 		VideoQueued:       videoQueued,
 		VideoCap:          videoCap,
-		ActiveThumb:       active["thumb"],
+		ActiveThumb:       active["thumb"] + active["video_poster"],
 		ActiveTranscode:   active["preview"] + active["video_proxy"],
 	}
 }
@@ -123,6 +128,8 @@ func (m *Manager) Enqueue(task Task) {
 	switch task.Type {
 	case "thumb", "preview":
 		queue = m.imageQueue
+	case "video_poster":
+		queue = m.videoPosterQueue
 	case "video_proxy":
 		queue = m.videoProxyQueue
 	default:
@@ -150,7 +157,7 @@ func (m *Manager) worker(ctx context.Context, name string, queue <-chan Task, ha
 				m.markDone(task.Type)
 				return
 			}
-			if err := handler(ctx, task); err != nil {
+			if err := handler(ctx, task); err != nil && !errors.Is(err, context.Canceled) {
 				m.logger.Warn("job failed", "worker", name, "type", task.Type, "assetID", task.AssetID, "error", err)
 			}
 			release()

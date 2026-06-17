@@ -194,8 +194,8 @@ func (s *Server) refreshAlbum(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.db.TouchAlbum(r.Context(), id)
-	started := s.scanner.TriggerRoots("album_refresh", roots)
-	writeJSON(w, http.StatusAccepted, map[string]bool{"started": started})
+	result := s.scanner.RequestScanRoots("album_refresh", roots)
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 }
 
 func (s *Server) albumAssets(w http.ResponseWriter, r *http.Request) {

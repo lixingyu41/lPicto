@@ -40,6 +40,40 @@ func (d *DB) ProcessingProgressForRoots(ctx context.Context, roots []string) (Pr
 	return d.processingProgress(ctx, where, args)
 }
 
+func (d *DB) AssetCountForRoots(ctx context.Context, roots []string) (int, error) {
+	where, args, err := assetRootsWhere(roots)
+	if err != nil {
+		return 0, err
+	}
+	var total int
+	err = d.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM assets WHERE `+where, args...).Scan(&total)
+	return total, err
+}
+
+func (d *DB) AssetCountsForLibraries(ctx context.Context, libraries []ScanLibrary) (map[string]int, error) {
+	counts := make(map[string]int, len(libraries))
+	for _, library := range libraries {
+		counts[library.ID] = 0
+	}
+	rows, err := d.conn.QueryContext(ctx, `SELECT rel_path FROM assets WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rel string
+		if err := rows.Scan(&rel); err != nil {
+			return nil, err
+		}
+		for _, library := range libraries {
+			if AssetInScanFolders(rel, library.Roots) {
+				counts[library.ID]++
+			}
+		}
+	}
+	return counts, rows.Err()
+}
+
 func (d *DB) processingProgress(ctx context.Context, where string, args []any) (ProcessingProgress, error) {
 	var progress ProcessingProgress
 	if err := d.conn.QueryRowContext(ctx, `
@@ -147,8 +181,9 @@ func assetRootsWhere(roots []string) (string, []any, error) {
 	clauses := make([]string, 0, len(normalized))
 	args := make([]any, 0, len(normalized)*2)
 	for _, root := range normalized {
-		clauses = append(clauses, "(rel_path = ? OR rel_path LIKE ? ESCAPE '\\')")
-		args = append(args, root, escapeLike(root)+"/%")
+		lower, upper := descendantPathBounds(root)
+		clauses = append(clauses, "(rel_path = ? OR (rel_path >= ? AND rel_path < ?))")
+		args = append(args, root, lower, upper)
 	}
 	return "deleted_at IS NULL AND (" + strings.Join(clauses, " OR ") + ")", args, nil
 }

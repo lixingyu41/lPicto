@@ -27,6 +27,7 @@ import (
 	"lpicto/backend/internal/model"
 	"lpicto/backend/internal/scanner"
 	"lpicto/backend/internal/storage"
+	"lpicto/backend/internal/util"
 )
 
 type Server struct {
@@ -50,10 +51,21 @@ type Server struct {
 
 	cleanupMu     sync.Mutex
 	cleanupStatus CleanupStatusDTO
+
+	sourceDirMu    sync.Mutex
+	sourceDirCache map[string]sourceDirCacheEntry
+
+	libraryCountsMu         sync.Mutex
+	libraryCountsKey        string
+	libraryCounts           map[string]int
+	libraryCountsAt         time.Time
+	libraryCountsRefreshing bool
+
+	staticDir string
 }
 
 func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan *scanner.Scanner, queue *jobs.Manager, bus *events.Bus, logger *slog.Logger) http.Handler {
-	s := &Server{cfg: cfg, db: database, store: store, scanner: scan, jobs: queue, events: bus, logger: logger}
+	s := &Server{cfg: cfg, db: database, store: store, scanner: scan, jobs: queue, events: bus, logger: logger, staticDir: findStaticDir(cfg.StaticDir)}
 	r := chi.NewRouter()
 	r.Use(foregroundActivity)
 	r.Get("/api/health", s.health)
@@ -135,6 +147,15 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func scanCommandResponse(result scanner.CommandResult) map[string]any {
+	return map[string]any{
+		"accepted": result.Accepted,
+		"started":  result.Started,
+		"paused":   result.Paused,
+		"state":    result.State,
+	}
+}
+
 func (s *Server) publicConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"pageSizeDefault":     s.cfg.PageSizeDefault,
@@ -161,14 +182,41 @@ func (s *Server) eventStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	ch := s.events.Subscribe(r.Context())
 	for event := range ch {
-		if event.Type != "asset_ready" {
+		var data []byte
+		var err error
+		switch event.Type {
+		case "asset_ready":
+			asset, ok := event.Payload.(model.Asset)
+			if !ok {
+				continue
+			}
+			data, err = json.Marshal(assetDTO(asset))
+		case "scan_status":
+			status, ok := event.Payload.(scanner.Status)
+			if !ok {
+				continue
+			}
+			var lastRun *ScanRunDTO
+			if status.LastRun != nil {
+				dto := scanRunDTO(*status.LastRun)
+				lastRun = &dto
+			}
+			data, err = json.Marshal(ScanStatusDTO{
+				Running: status.Running, LastStart: status.LastStart, LastRun: lastRun, Progress: scanProgressDTO(status.Progress),
+			})
+		case "asset_deleted":
+			asset, ok := event.Payload.(model.Asset)
+			if !ok {
+				continue
+			}
+			data, err = json.Marshal(map[string]any{
+				"id":       asset.ID,
+				"relPath":  asset.RelPath,
+				"cacheKey": asset.CacheKey,
+			})
+		default:
 			continue
 		}
-		asset, ok := event.Payload.(model.Asset)
-		if !ok {
-			continue
-		}
-		data, err := json.Marshal(assetDTO(asset))
 		if err != nil {
 			continue
 		}
@@ -179,8 +227,8 @@ func (s *Server) eventStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) triggerScan(w http.ResponseWriter, r *http.Request) {
-	started := s.scanner.Trigger("manual")
-	writeJSON(w, http.StatusAccepted, map[string]bool{"started": started})
+	result := s.scanner.RequestScan("manual")
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 }
 
 func (s *Server) rebuildScan(w http.ResponseWriter, r *http.Request) {
@@ -188,13 +236,13 @@ func (s *Server) rebuildScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "confirm_required", "强制重建需要确认")
 		return
 	}
-	started := s.scanner.TriggerRebuild("rebuild")
-	writeJSON(w, http.StatusAccepted, map[string]bool{"started": started})
+	result := s.scanner.RequestRebuild("rebuild")
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 }
 
 func (s *Server) pauseScan(w http.ResponseWriter, r *http.Request) {
-	paused := s.scanner.Pause()
-	writeJSON(w, http.StatusOK, map[string]bool{"paused": paused})
+	result := s.scanner.RequestStop()
+	writeJSON(w, http.StatusOK, scanCommandResponse(result))
 }
 
 func (s *Server) scanStatus(w http.ResponseWriter, r *http.Request) {
@@ -461,9 +509,9 @@ func (s *Server) cacheThumb(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		http.NotFound(w, r)
+	asset, hasAsset := s.assetByCacheKey(r.Context(), cacheKey)
+	if hasAsset && s.deleteAssetIfSourceMissing(r.Context(), asset, "thumb_source_missing") {
+		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
 		return
 	}
 	file, err := os.Open(path)
@@ -472,6 +520,11 @@ func (s *Server) cacheThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "image/webp")
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("ETag", `"`+cacheKey+`"`)
@@ -524,18 +577,22 @@ func (s *Server) serveCacheAsset(w http.ResponseWriter, r *http.Request, asset m
 		writeError(w, http.StatusInternalServerError, "cache_path_failed", "读取缓存失败")
 		return
 	}
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		_ = taskType
-		writeError(w, http.StatusNotFound, "cache_not_ready", "缓存尚未生成")
+	if s.deleteAssetIfSourceMissing(r.Context(), asset, "cache_source_missing") {
+		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
 		return
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "cache_open_failed", "读取缓存失败")
+		_ = taskType
+		writeError(w, http.StatusNotFound, "cache_not_ready", "缓存尚未生成")
 		return
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		writeError(w, http.StatusNotFound, "cache_not_ready", "缓存尚未生成")
+		return
+	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("ETag", `"`+asset.CacheKey+`"`)
@@ -550,12 +607,19 @@ func (s *Server) serveOriginalAsset(w http.ResponseWriter, r *http.Request, asse
 	}
 	file, err := os.Open(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && s.deleteAssetIfSourceMissing(r.Context(), asset, "original_open_missing") {
+			writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
+			return
+		}
 		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
 		return
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || info.IsDir() {
+		if errors.Is(err, os.ErrNotExist) || info != nil && info.IsDir() {
+			_ = s.deleteAssetIfSourceMissing(r.Context(), asset, "original_stat_missing")
+		}
 		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
 		return
 	}
@@ -575,7 +639,7 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "接口不存在")
 		return
 	}
-	staticDir := findStaticDir(s.cfg.StaticDir)
+	staticDir := s.staticDir
 	cleanPath := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(r.URL.Path, "/")))
 	if cleanPath == "." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == ".." {
 		http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
@@ -692,6 +756,85 @@ func (s *Server) assetByParam(w http.ResponseWriter, r *http.Request) (model.Ass
 	return asset, true
 }
 
+func (s *Server) assetByCacheKey(ctx context.Context, cacheKey string) (model.Asset, bool) {
+	asset, err := s.db.GetAssetByCacheKey(ctx, cacheKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Asset{}, false
+	}
+	if err != nil {
+		s.logger.Warn("read asset by cache key failed", "cacheKey", cacheKey, "error", err)
+		return model.Asset{}, false
+	}
+	return asset, true
+}
+
+func (s *Server) deleteAssetIfSourceMissing(ctx context.Context, asset model.Asset, reason string) bool {
+	missing, err := s.assetSourceMissing(asset)
+	if err != nil {
+		s.logger.Warn("check asset source failed", "assetID", asset.ID, "relPath", asset.RelPath, "reason", reason, "error", err)
+		return false
+	}
+	if !missing {
+		return false
+	}
+	return s.markDeletedAsset(ctx, asset, reason)
+}
+
+func (s *Server) assetSourceMissing(asset model.Asset) (bool, error) {
+	root, _, err := s.store.RootForRel(asset.RelPath)
+	if err != nil {
+		return false, err
+	}
+	if !sourceRootAvailable(root.Path) {
+		return false, nil
+	}
+	path, err := s.store.PhotoPath(asset.RelPath)
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.IsDir(), nil
+}
+
+func sourceRootAvailable(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func (s *Server) markDeletedAsset(ctx context.Context, asset model.Asset, reason string) bool {
+	deleted, err := s.db.MarkDeletedWithCache(ctx, asset.RelPath, util.UnixNow())
+	if err != nil {
+		s.logger.Warn("mark missing source asset deleted failed", "assetID", asset.ID, "relPath", asset.RelPath, "reason", reason, "error", err)
+		return false
+	}
+	if deleted == nil {
+		return true
+	}
+	s.removeDeletedAssetCaches([]db.DeletedAsset{*deleted})
+	s.invalidateProcessingProgress()
+	if s.events != nil {
+		s.events.Publish(events.Event{Type: "asset_deleted", Payload: asset})
+	}
+	go func() {
+		if err := s.db.RefreshFolders(context.Background()); err != nil {
+			s.logger.Warn("refresh folders after asset deletion failed", "assetID", asset.ID, "relPath", asset.RelPath, "reason", reason, "error", err)
+		}
+	}()
+	return true
+}
+
+func (s *Server) invalidateProcessingProgress() {
+	s.progressMu.Lock()
+	s.progressStatsAt = time.Time{}
+	s.progressMu.Unlock()
+}
+
 func contentDisposition(filename string) string {
 	safe := strings.ReplaceAll(filename, `"`, "")
 	if safe == "" {
@@ -706,7 +849,7 @@ func urlPathEscape(value string) string {
 }
 
 func findStaticDir(preferred string) string {
-	candidates := []string{preferred, "frontend/dist", filepath.Join("..", "frontend", "dist"), filepath.Join("LPicto", "frontend", "dist"), "/app/frontend/dist"}
+	candidates := []string{preferred, "frontend/dist", filepath.Join("LPicto", "frontend", "dist"), "/app/frontend/dist"}
 	for _, candidate := range candidates {
 		if info, err := os.Stat(filepath.Join(candidate, "index.html")); err == nil && !info.IsDir() {
 			return candidate
