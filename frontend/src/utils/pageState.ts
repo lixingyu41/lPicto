@@ -1,6 +1,7 @@
 import type { SidebarPanelTarget } from '../components/SidebarContext';
 
 export interface GridReturnState {
+  focusAssetId?: number | null;
   loadedItemCount: number;
   loadedStartIndex: number;
   scrollRatio: number;
@@ -34,6 +35,15 @@ export function savePageState<T extends object>(key: string, value: T) {
   }
 }
 
+export function clearRestoreParamFromLocation() {
+  if (typeof window === 'undefined') return;
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has('restore')) return;
+  url.searchParams.delete('restore');
+  const next = `${url.pathname}${url.search}${url.hash}`;
+  window.history.replaceState(window.history.state, '', next);
+}
+
 export function saveViewerReturnPath(path: string) {
   if (typeof window === 'undefined') return;
   try {
@@ -53,7 +63,15 @@ export function loadViewerReturnPath() {
 }
 
 export function resetGridState(): GridReturnState {
-  return { loadedItemCount: 0, loadedStartIndex: 0, scrollRatio: 0, scrollTop: 0, sidebarCollapsed: false, sidebarExpanded: null };
+  return {
+    focusAssetId: null,
+    loadedItemCount: 0,
+    loadedStartIndex: 0,
+    scrollRatio: 0,
+    scrollTop: 0,
+    sidebarCollapsed: false,
+    sidebarExpanded: null,
+  };
 }
 
 export function encodeReturnState<T extends object>(value: T) {

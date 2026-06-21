@@ -46,6 +46,7 @@
   --index-mark-bg: rgba(0, 0, 0, 0.28);
   --index-year-mark-bg: rgba(0, 0, 0, 0.5);
   --index-bubble-bg: rgba(255, 255, 255, 0.94);
+  --sidebar-switch-radius: 12px;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
 }
 
@@ -136,8 +137,12 @@ a {
   transition: grid-template-columns 180ms ease;
 }
 
-.app-shell.sidebar-panel-open {
+.app-shell.sidebar-panel-open.sidebar-primary-open {
   --sidebar-current-width: calc(var(--sidebar-primary-width) + var(--sidebar-secondary-width));
+}
+
+.app-shell.sidebar-panel-open.sidebar-primary-collapsed {
+  --sidebar-current-width: var(--sidebar-secondary-width);
 }
 
 .app-shell.sidebar-collapsed {
@@ -154,10 +159,19 @@ a {
   background: #171614;
   min-width: 0;
   overflow: visible;
+  transition: grid-template-columns 180ms ease, background-color 180ms ease, border-color 180ms ease;
 }
 
-.app-shell.sidebar-panel-open .sidebar {
+.app-shell.sidebar-panel-open.sidebar-primary-open .sidebar {
   grid-template-columns: var(--sidebar-primary-width) var(--sidebar-secondary-width);
+}
+
+.app-shell.sidebar-panel-open.sidebar-primary-collapsed .sidebar {
+  grid-template-columns: 0 var(--sidebar-secondary-width);
+}
+
+.app-shell.sidebar-panel-open.sidebar-primary-collapsed .sidebar-secondary {
+  grid-column: 2;
 }
 
 .app-shell.sidebar-collapsed .sidebar {
@@ -206,6 +220,10 @@ body.sidebar-resizing .sidebar-resize-handle::after {
   left: calc(var(--sidebar-primary-width) + var(--sidebar-secondary-width) - 5px);
 }
 
+.app-shell.sidebar-panel-open.sidebar-primary-collapsed .sidebar-resize-secondary {
+  left: calc(var(--sidebar-secondary-width) - 5px);
+}
+
 body.sidebar-resizing,
 body.sidebar-resizing * {
   cursor: col-resize !important;
@@ -219,10 +237,14 @@ body.sidebar-resizing .app-shell {
 .brand-row {
   height: 58px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 36px;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
   gap: 4px;
   padding-right: 10px;
+}
+
+.brand-row.has-secondary-toggle {
+  grid-template-columns: minmax(0, 1fr) max-content;
 }
 
 .brand {
@@ -231,6 +253,7 @@ body.sidebar-resizing .app-shell {
   align-items: center;
   width: 100%;
   border: 0;
+  border-radius: var(--sidebar-switch-radius);
   background: transparent;
   color: var(--text);
   cursor: pointer;
@@ -244,37 +267,89 @@ body.sidebar-resizing .app-shell {
   background: var(--hover-bg);
 }
 
-.brand-settings-button {
+.brand-settings-button,
+.brand-secondary-button {
   width: 34px;
   height: 34px;
   display: grid;
   place-items: center;
   border: 1px solid transparent;
-  border-radius: 999px;
+  border-radius: var(--sidebar-switch-radius);
   color: var(--muted);
   text-decoration: none;
 }
 
+.brand-secondary-button {
+  width: auto;
+  min-width: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  cursor: pointer;
+  padding: 0 12px;
+  white-space: nowrap;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
+}
+
 .brand-settings-button:hover,
-.brand-settings-button.active {
+.brand-settings-button.active,
+.brand-secondary-button:hover {
   background: var(--hover-bg);
   color: var(--text);
 }
 
-.sidebar-bubble {
+.brand-row.has-secondary-toggle {
+  gap: 0;
+}
+
+.brand-row.has-secondary-toggle .brand {
+  border-radius: var(--sidebar-switch-radius) 0 0 var(--sidebar-switch-radius);
+}
+
+.brand-row.has-secondary-toggle .brand-secondary-button {
+  margin-left: -1px;
+  border-radius: 0 var(--sidebar-switch-radius) var(--sidebar-switch-radius) 0;
+}
+
+.sidebar-floating-controls {
   position: fixed;
   left: 12px;
   top: 12px;
   z-index: 40;
+  display: inline-flex;
+  align-items: stretch;
+  box-shadow: var(--shadow-soft);
+}
+
+.app-shell.sidebar-primary-collapsed.sidebar-panel-open .sidebar-floating-controls {
+  left: calc(var(--sidebar-secondary-width) + 12px);
+}
+
+.sidebar-floating-button {
   height: 38px;
   border: 1px solid var(--control-border);
-  border-radius: 12px;
+  border-radius: var(--sidebar-switch-radius);
   background: var(--material-solid);
   color: var(--text);
-  box-shadow: var(--shadow-soft);
   padding: 0 14px;
   font-weight: 700;
   cursor: pointer;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
+}
+
+.sidebar-floating-secondary {
+  min-width: 38px;
+  padding: 0 12px;
+}
+
+.sidebar-floating-controls.is-joined .sidebar-floating-primary {
+  border-radius: var(--sidebar-switch-radius) 0 0 var(--sidebar-switch-radius);
+}
+
+.sidebar-floating-controls.is-joined .sidebar-floating-secondary {
+  margin-left: -1px;
+  border-radius: 0 var(--sidebar-switch-radius) var(--sidebar-switch-radius) 0;
 }
 
 .nav {
@@ -409,6 +484,7 @@ body.sidebar-resizing .app-shell {
 .sidebar-secondary {
   display: flex;
   flex-direction: column;
+  gap: 10px;
   height: 100%;
   max-height: 100%;
   min-width: 0;
@@ -416,6 +492,81 @@ body.sidebar-resizing .app-shell {
   overflow: hidden;
   border-left: 1px solid var(--line);
   padding: 12px;
+  animation: sidebar-secondary-enter 180ms ease;
+  transition: background-color 180ms ease, border-color 180ms ease;
+}
+
+.sidebar-secondary-header {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sidebar-secondary-header.has-primary-toggle {
+  grid-template-columns: minmax(0, 1fr) max-content;
+  gap: 0;
+}
+
+.sidebar-secondary-primary-button,
+.sidebar-secondary-title-button {
+  height: 38px;
+  min-width: 38px;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--sidebar-switch-radius);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  padding: 0 14px;
+  font-weight: 700;
+  white-space: nowrap;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
+}
+
+.sidebar-secondary-primary-button {
+  justify-content: flex-start;
+  min-width: 0;
+}
+
+.sidebar-secondary-title-button {
+  justify-self: start;
+  justify-content: center;
+}
+
+.sidebar-secondary-header:not(.has-primary-toggle) .sidebar-secondary-title-button {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.sidebar-secondary-header.has-primary-toggle .sidebar-secondary-title-button {
+  justify-self: end;
+  margin-left: -1px;
+  border-radius: 0 var(--sidebar-switch-radius) var(--sidebar-switch-radius) 0;
+}
+
+.sidebar-secondary-header.has-primary-toggle .sidebar-secondary-primary-button {
+  border-radius: var(--sidebar-switch-radius) 0 0 var(--sidebar-switch-radius);
+}
+
+.sidebar-secondary-primary-button:hover,
+.sidebar-secondary-title-button:hover {
+  background: var(--hover-bg);
+}
+
+@keyframes sidebar-secondary-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 .sidebar-secondary .sidebar-panel {
@@ -448,14 +599,6 @@ body.sidebar-resizing .app-shell {
 .sidebar-search-panel {
   overflow: auto;
   padding-right: 2px;
-}
-
-.sidebar-panel-title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-width: 0;
 }
 
 .sidebar-folder-panel {
@@ -510,6 +653,14 @@ body.sidebar-resizing .app-shell {
 }
 
 .sidebar-folder-search-field {
+  min-width: 0;
+}
+
+.sidebar-mode-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
 }
 
@@ -1839,7 +1990,7 @@ input {
   min-height: 0;
   width: 100%;
   display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 0;
   align-items: stretch;
 }
@@ -2216,6 +2367,20 @@ input {
   justify-content: center;
   gap: 5px;
   padding: 0 10px;
+}
+
+.library-action-group,
+.scan-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.library-action-group button {
+  width: auto;
+  min-width: 58px;
+  padding: 0 8px;
+  white-space: nowrap;
 }
 
 .album-row {
@@ -2721,14 +2886,20 @@ input {
   letter-spacing: 0;
 }
 
-.brand-settings-button {
+.brand-settings-button,
+.brand-secondary-button,
+.sidebar-secondary-primary-button,
+.sidebar-secondary-title-button {
   border-color: var(--control-border);
   background: var(--control-bg);
   box-shadow: var(--control-shadow);
 }
 
 .brand-settings-button:hover,
-.brand-settings-button.active {
+.brand-settings-button.active,
+.brand-secondary-button:hover,
+.sidebar-secondary-primary-button:hover,
+.sidebar-secondary-title-button:hover {
   border-color: var(--button-hover-border);
   background: var(--selection);
   color: var(--accent);
@@ -2864,6 +3035,9 @@ a:focus-visible {
 .sidebar-command,
 .sidebar-square-button,
 .brand-settings-button,
+.brand-secondary-button,
+.sidebar-secondary-primary-button,
+.sidebar-secondary-title-button,
 .sidebar-icon-actions button,
 .folder-setting-row button,
 .library-row button,
@@ -2881,8 +3055,11 @@ a:focus-visible {
   box-shadow: var(--control-shadow);
 }
 
-.brand-settings-button {
-  border-radius: 999px;
+.brand-settings-button,
+.brand-secondary-button,
+.sidebar-secondary-primary-button,
+.sidebar-secondary-title-button {
+  border-radius: var(--sidebar-switch-radius);
 }
 
 button {
@@ -3049,7 +3226,7 @@ button:active,
 }
 
 .settings-layout {
-  grid-template-columns: max-content minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 0;
 }
 
@@ -3259,6 +3436,15 @@ button:active,
     grid-template-columns: minmax(132px, 42vw) minmax(0, 1fr);
   }
 
+  .app-shell.sidebar-primary-collapsed.sidebar-panel-open .sidebar {
+    grid-template-columns: 0 minmax(0, 1fr);
+  }
+
+  .app-shell.sidebar-primary-collapsed.sidebar-panel-open .sidebar-floating-controls {
+    right: 12px;
+    left: auto;
+  }
+
   .sidebar-secondary {
     padding: 10px;
   }
@@ -3357,14 +3543,15 @@ button:active,
   }
 
   .library-row {
-    grid-template-columns: 72px 34px 34px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) 34px 34px;
   }
 
   .library-row .library-info {
     grid-column: 1 / -1;
   }
 
-  .library-row .library-scan-button {
+  .library-row .library-scan-button,
+  .library-row .library-action-group {
     grid-column: 1;
   }
 

@@ -67,11 +67,11 @@ LIMIT ? OFFSET ?`
 func timelineFormat(unit string) (groupExpr string, labelLayout string) {
 	switch unit {
 	case "year":
-		return "strftime('%Y', timeline_at, 'unixepoch')", "2006"
+		return "to_char(to_timestamp(timeline_at), 'YYYY')", "2006"
 	case "day":
-		return "strftime('%Y-%m-%d', timeline_at, 'unixepoch')", "2006-01-02"
+		return "to_char(to_timestamp(timeline_at), 'YYYY-MM-DD')", "2006-01-02"
 	default:
-		return "strftime('%Y-%m', timeline_at, 'unixepoch')", "2006-01"
+		return "to_char(to_timestamp(timeline_at), 'YYYY-MM')", "2006-01"
 	}
 }
 

@@ -24,9 +24,9 @@ import type {
   SourceFolder,
 } from '../types/api';
 import {
+  clearRestoreParamFromLocation,
   decodeReturnState,
   encodeReturnState,
-  loadPageState,
   resetGridState,
   savePageState,
   saveViewerReturnPath,
@@ -61,7 +61,7 @@ export default function AlbumsPage() {
   const location = useLocation();
   const navigate = useNavigate();
   const initialStateRef = useRef(
-    decodeReturnState<AlbumsPageState>(searchParams.get('restore'), loadPageState<AlbumsPageState>(albumsStateKey, defaultAlbumsState)),
+    decodeReturnState<AlbumsPageState>(searchParams.get('restore'), defaultAlbumsState),
   );
   const [albums, setAlbums] = useState<Album[]>([]);
   const [groups, setGroups] = useState<AlbumGroup[]>([]);
@@ -78,7 +78,9 @@ export default function AlbumsPage() {
   );
   const [error, setError] = useState<string | null>(null);
   const [scrollTopTarget, setScrollTopTarget] = useState<{ scrollTop: number; signal: number } | undefined>(() =>
-    initialStateRef.current.scrollTop > 0 ? { scrollTop: initialStateRef.current.scrollTop, signal: 1 } : undefined,
+    initialStateRef.current.scrollTop > 0 && !initialStateRef.current.focusAssetId
+      ? { scrollTop: initialStateRef.current.scrollTop, signal: 1 }
+      : undefined,
   );
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
@@ -92,7 +94,11 @@ export default function AlbumsPage() {
   const restoreSidebarState = useRestoreSidebarState();
   const restoreRef = useRef({
     jumped: false,
-    pending: initialStateRef.current.scrollTop > 0 || initialStateRef.current.loadedItemCount > pageSize || initialStateRef.current.loadedStartIndex > 0,
+    pending:
+      initialStateRef.current.scrollTop > 0 ||
+      initialStateRef.current.loadedItemCount > pageSize ||
+      initialStateRef.current.loadedStartIndex > 0 ||
+      Boolean(initialStateRef.current.focusAssetId),
     signal: 0,
   });
   const indexPageRef = useRef(1);
@@ -189,6 +195,7 @@ export default function AlbumsPage() {
     (): AlbumsPageState => ({
       ...gridStateRef.current,
       collapsedGroupKeys: Array.from(collapsedGroupKeys),
+      focusAssetId: null,
       loadedItemCount: items.length,
       loadedStartIndex,
       query,
@@ -203,6 +210,11 @@ export default function AlbumsPage() {
   const saveCurrentState = useCallback(() => {
     savePageState<AlbumsPageState>(albumsStateKey, currentPageState());
   }, [currentPageState]);
+
+  useEffect(() => {
+    if (!searchParams.has('restore')) return;
+    clearRestoreParamFromLocation();
+  }, [searchParams]);
 
   useEffect(() => {
     indexPageRef.current = 1;
@@ -230,14 +242,17 @@ export default function AlbumsPage() {
       return;
     }
     restoreRef.current.pending = false;
-    restoreRef.current.signal += 1;
-    setScrollTopTarget({ scrollTop: initialStateRef.current.scrollTop, signal: restoreRef.current.signal });
+    if (!initialStateRef.current.focusAssetId) {
+      restoreRef.current.signal += 1;
+      setScrollTopTarget({ scrollTop: initialStateRef.current.scrollTop, signal: restoreRef.current.signal });
+    }
   }, [hasMore, items.length, jumpToPage, loadMore, loading]);
 
   const handleGridScrollState = useCallback(
     (state: { ratio: number; scrollTop: number }) => {
       gridStateRef.current = {
         ...gridStateRef.current,
+        focusAssetId: null,
         loadedItemCount: items.length,
         loadedStartIndex,
         scrollRatio: state.ratio,
@@ -254,8 +269,8 @@ export default function AlbumsPage() {
   }, [saveCurrentState]);
 
   const handleOpenViewer = useCallback(
-    (_asset: Asset, viewerUrl: string) => {
-      navigate(viewerUrl, { state: { backgroundLocation: location } });
+    (asset: Asset, viewerUrl: string) => {
+      navigate(viewerUrl, { state: { backgroundLocation: location, initialAsset: asset } });
     },
     [location, navigate],
   );
@@ -361,7 +376,6 @@ export default function AlbumsPage() {
   useSidebarPanel(
     'albums',
       <div className="sidebar-control-stack">
-        <div className="sidebar-control-title">相册</div>
         <div className="album-toolbar">
           <button className="sidebar-command" type="button" onClick={() => setAddOpen(true)}>
             <Plus size={16} />
@@ -505,6 +519,7 @@ export default function AlbumsPage() {
             onScrollStateChange={handleGridScrollState}
             totalCount={totalCount}
             loadedStartIndex={loadedStartIndex}
+            focusAssetId={initialStateRef.current.focusAssetId}
             scrollSignal={scrollResetSignal}
             scrollTarget={scrollTarget}
             scrollTopTarget={scrollTopTarget}
@@ -710,7 +725,7 @@ function AlbumPickerModal({
           </div>
         )}
         <div className="folder-tree-picker">
-          {rootFolder && (
+          {rootFolder?.included ? (
             <AlbumFolderTreeNode
               childrenMap={children}
               expanded={expanded}
@@ -721,6 +736,19 @@ function AlbumPickerModal({
               onExpand={toggleExpanded}
               onSelect={toggleSelected}
             />
+          ) : (
+            (children[''] ?? []).map((folder) => (
+              <AlbumFolderTreeNode
+                childrenMap={children}
+                expanded={expanded}
+                folder={folder}
+                key={folder.relPath}
+                loading={loading}
+                selected={selected}
+                onExpand={toggleExpanded}
+                onSelect={toggleSelected}
+              />
+            ))
           )}
           {!rootFolder && loading.has('') && <div className="muted-line">读取中</div>}
           {rootFolder && children['']?.length === 0 && !rootFolder.included && (

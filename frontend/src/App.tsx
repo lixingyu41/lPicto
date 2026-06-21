@@ -15,11 +15,12 @@ export default function App() {
   const location = useLocation();
   const state = location.state as ViewerOverlayState | null;
   const backgroundLocation = state?.backgroundLocation;
+  const routeLocation = backgroundLocation ?? location;
   const showingViewerOverlay = Boolean(backgroundLocation && location.pathname.startsWith('/viewer/'));
 
   return (
     <Layout>
-      <Routes location={backgroundLocation ?? location}>
+      <Routes location={routeLocation} key={routeLocation.key}>
         <Route index element={<Navigate to="/library" replace />} />
         <Route path="/timeline" element={<Navigate to="/library" replace />} />
         <Route path="/library" element={<LibraryPage />} />

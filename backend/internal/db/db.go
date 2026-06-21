@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -10,78 +12,110 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type DB struct {
-	conn *sql.DB
+	conn         *sqlConn
+	raw          *sql.DB
+	testAdminURL string
+	testDatabase string
 }
 
-func Open(ctx context.Context, path string, migrationsDir string) (*DB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
+const migrationLockKey int64 = 0x4c506963746f
+
+func Open(ctx context.Context, databaseURL string, migrationsDir string) (*DB, error) {
+	if strings.TrimSpace(databaseURL) == "" {
+		return nil, errors.New("DATABASE_URL is required")
 	}
-	conn, err := sql.Open("sqlite", sqliteDSN(path))
+	testAdminURL := ""
+	testDatabase := ""
+	if !looksLikePostgresURL(databaseURL) {
+		resolved, adminURL, dbName, err := createTestDatabase(ctx, databaseURL)
+		if err != nil {
+			return nil, err
+		}
+		databaseURL = resolved
+		testAdminURL = adminURL
+		testDatabase = dbName
+	}
+	raw, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return nil, err
 	}
-	conn.SetMaxOpenConns(8)
-	conn.SetMaxIdleConns(8)
-	database := &DB{conn: conn}
-	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;`); err != nil {
-		_ = conn.Close()
+	raw.SetMaxOpenConns(32)
+	raw.SetMaxIdleConns(16)
+	if err := raw.PingContext(ctx); err != nil {
+		_ = raw.Close()
 		return nil, err
 	}
+	database := &DB{conn: &sqlConn{db: raw}, raw: raw, testAdminURL: testAdminURL, testDatabase: testDatabase}
 	dir, err := findMigrationsDir(migrationsDir)
 	if err != nil {
-		_ = conn.Close()
+		_ = raw.Close()
 		return nil, err
 	}
 	if err := database.Migrate(ctx, dir); err != nil {
-		_ = conn.Close()
+		_ = raw.Close()
 		return nil, err
 	}
 	if err := database.MarkInterruptedScanRuns(ctx); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	if err := database.Checkpoint(ctx); err != nil {
-		_ = conn.Close()
+		_ = raw.Close()
 		return nil, err
 	}
 	return database, nil
 }
 
-func sqliteDSN(path string) string {
-	if path == ":memory:" || strings.HasPrefix(path, "file:") {
-		return path
-	}
-	q := url.Values{}
-	q.Add("_pragma", "busy_timeout=5000")
-	q.Add("_pragma", "foreign_keys=ON")
-	q.Add("_pragma", "journal_mode(WAL)")
-	return "file:" + filepath.ToSlash(path) + "?" + q.Encode()
-}
-
 func (d *DB) Close() error {
-	if d == nil || d.conn == nil {
+	if d == nil || d.raw == nil {
 		return nil
 	}
-	return d.conn.Close()
-}
-
-func (d *DB) Conn() *sql.DB {
-	return d.conn
-}
-
-func (d *DB) Checkpoint(ctx context.Context) error {
-	_, err := d.conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE);`)
+	err := d.raw.Close()
+	if d.testAdminURL != "" && d.testDatabase != "" {
+		if dropErr := dropTestDatabase(context.Background(), d.testAdminURL, d.testDatabase); err == nil {
+			err = dropErr
+		}
+	}
 	return err
 }
 
-func (d *DB) Migrate(ctx context.Context, migrationsDir string) error {
-	if _, err := d.conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);`); err != nil {
+func (d *DB) Conn() *sql.DB {
+	return d.raw
+}
+
+func (d *DB) Checkpoint(ctx context.Context) error {
+	_ = ctx
+	return nil
+}
+
+func (d *DB) Migrate(ctx context.Context, migrationsDir string) (err error) {
+	conn, err := d.raw.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	locked := false
+	defer func() {
+		if !locked {
+			return
+		}
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, unlockErr := conn.ExecContext(unlockCtx, `SELECT pg_advisory_unlock($1)`, migrationLockKey)
+		if err == nil && unlockErr != nil {
+			err = unlockErr
+		}
+	}()
+
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return err
+	}
+	locked = true
+
+	if _, err := conn.ExecContext(ctx, rebindPostgres(`CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());`)); err != nil {
 		return err
 	}
 	entries, err := os.ReadDir(migrationsDir)
@@ -96,7 +130,7 @@ func (d *DB) Migrate(ctx context.Context, migrationsDir string) error {
 	}
 	sort.Strings(files)
 	for _, name := range files {
-		applied, err := d.migrationApplied(ctx, name)
+		applied, err := migrationAppliedOnConn(ctx, conn, name)
 		if err != nil {
 			return err
 		}
@@ -107,15 +141,15 @@ func (d *DB) Migrate(ctx context.Context, migrationsDir string) error {
 		if err != nil {
 			return err
 		}
-		tx, err := d.conn.BeginTx(ctx, nil)
+		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, string(sqlBytes)); err != nil {
+		if _, err := tx.ExecContext(ctx, rebindPostgres(string(sqlBytes))); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("apply migration %s: %w", name, err)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (?, strftime('%s','now'))`, name); err != nil {
+		if _, err := tx.ExecContext(ctx, rebindPostgres(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, now())`), name); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -127,8 +161,16 @@ func (d *DB) Migrate(ctx context.Context, migrationsDir string) error {
 }
 
 func (d *DB) migrationApplied(ctx context.Context, version string) (bool, error) {
+	return migrationAppliedOnConn(ctx, d.raw, version)
+}
+
+type queryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func migrationAppliedOnConn(ctx context.Context, conn queryRower, version string) (bool, error) {
 	var count int
-	err := d.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, version).Scan(&count)
+	err := conn.QueryRowContext(ctx, rebindPostgres(`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`), version).Scan(&count)
 	return count > 0, err
 }
 
@@ -144,6 +186,134 @@ func findMigrationsDir(preferred string) (string, error) {
 		}
 	}
 	return "", errors.New("migrations directory not found")
+}
+
+func looksLikePostgresURL(value string) bool {
+	value = strings.TrimSpace(strings.ToLower(value))
+	return strings.HasPrefix(value, "postgres://") || strings.HasPrefix(value, "postgresql://")
+}
+
+func createTestDatabase(ctx context.Context, seed string) (string, string, string, error) {
+	base := strings.TrimSpace(os.Getenv("LPIC_TEST_DATABASE_URL"))
+	if base == "" {
+		return "", "", "", fmt.Errorf("cannot parse `%s`: failed to parse as keyword/value (invalid keyword/value)", seed)
+	}
+	adminURL, err := databaseURLWithName(base, "postgres")
+	if err != nil {
+		return "", "", "", err
+	}
+	hash := sha1.Sum([]byte(seed + time.Now().Format(time.RFC3339Nano)))
+	name := "lpicto_test_" + hex.EncodeToString(hash[:])[:20]
+	admin, err := sql.Open("pgx", adminURL)
+	if err != nil {
+		return "", "", "", err
+	}
+	defer admin.Close()
+	if _, err := admin.ExecContext(ctx, `CREATE DATABASE `+name); err != nil {
+		return "", "", "", err
+	}
+	testURL, err := databaseURLWithName(base, name)
+	if err != nil {
+		_ = dropTestDatabase(ctx, adminURL, name)
+		return "", "", "", err
+	}
+	return testURL, adminURL, name, nil
+}
+
+func dropTestDatabase(ctx context.Context, adminURL string, name string) error {
+	admin, err := sql.Open("pgx", adminURL)
+	if err != nil {
+		return err
+	}
+	defer admin.Close()
+	_, _ = admin.ExecContext(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, name)
+	_, err = admin.ExecContext(ctx, `DROP DATABASE IF EXISTS `+name)
+	return err
+}
+
+func databaseURLWithName(rawURL string, name string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	parsed.Path = "/" + name
+	return parsed.String(), nil
+}
+
+type sqlConn struct {
+	db *sql.DB
+}
+
+func (c *sqlConn) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return c.db.ExecContext(ctx, rebindPostgres(query), args...)
+}
+
+func (c *sqlConn) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return c.db.QueryContext(ctx, rebindPostgres(query), args...)
+}
+
+func (c *sqlConn) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return c.db.QueryRowContext(ctx, rebindPostgres(query), args...)
+}
+
+func (c *sqlConn) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sqlTx, error) {
+	tx, err := c.db.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &sqlTx{tx: tx}, nil
+}
+
+type sqlTx struct {
+	tx *sql.Tx
+}
+
+func (t *sqlTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return t.tx.ExecContext(ctx, rebindPostgres(query), args...)
+}
+
+func (t *sqlTx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return t.tx.QueryContext(ctx, rebindPostgres(query), args...)
+}
+
+func (t *sqlTx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return t.tx.QueryRowContext(ctx, rebindPostgres(query), args...)
+}
+
+func (t *sqlTx) Commit() error {
+	return t.tx.Commit()
+}
+
+func (t *sqlTx) Rollback() error {
+	return t.tx.Rollback()
+}
+
+func rebindPostgres(query string) string {
+	var b strings.Builder
+	b.Grow(len(query) + 8)
+	inString := false
+	arg := 1
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if ch == '\'' {
+			b.WriteByte(ch)
+			if inString && i+1 < len(query) && query[i+1] == '\'' {
+				i++
+				b.WriteByte(query[i])
+				continue
+			}
+			inString = !inString
+			continue
+		}
+		if ch == '?' && !inString {
+			b.WriteByte('$')
+			b.WriteString(fmt.Sprint(arg))
+			arg++
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
 }
 
 func nullString(value *string) sql.NullString {

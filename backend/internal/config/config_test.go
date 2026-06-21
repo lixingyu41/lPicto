@@ -3,7 +3,7 @@ package config
 import "testing"
 
 func TestHWAccelEnv(t *testing.T) {
-	t.Setenv("PHOTO_ROOT", t.TempDir())
+	t.Setenv("MEDIA_ROOT", t.TempDir())
 	t.Setenv("DATA_ROOT", t.TempDir())
 	t.Setenv("FFMPEG_HWACCEL", "CUDA")
 	t.Setenv("FFMPEG_HWACCEL_DEVICE", "0")
@@ -20,7 +20,7 @@ func TestHWAccelEnv(t *testing.T) {
 }
 
 func TestHWAccelEnvInvalidFallsBack(t *testing.T) {
-	t.Setenv("PHOTO_ROOT", t.TempDir())
+	t.Setenv("MEDIA_ROOT", t.TempDir())
 	t.Setenv("DATA_ROOT", t.TempDir())
 	t.Setenv("FFMPEG_HWACCEL", "bad")
 	cfg, err := Load()

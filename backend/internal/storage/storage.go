@@ -26,6 +26,7 @@ type Root struct {
 type Store struct {
 	PhotoRoot string
 	DataRoot  string
+	CacheRoot string
 	Roots     []Root
 	rootByID  map[string]Root
 	virtual   bool
@@ -36,6 +37,10 @@ func New(photoRoot, dataRoot string) (Store, error) {
 }
 
 func NewWithRoots(roots []RootConfig, dataRoot string) (Store, error) {
+	return NewWithRootsAndCache(roots, dataRoot, filepath.Join(dataRoot, "cache"))
+}
+
+func NewWithRootsAndCache(roots []RootConfig, dataRoot string, cacheRoot string) (Store, error) {
 	if len(roots) == 0 {
 		return Store{}, errors.New("at least one photo root is required")
 	}
@@ -64,6 +69,10 @@ func NewWithRoots(roots []RootConfig, dataRoot string) (Store, error) {
 	if err != nil {
 		return Store{}, err
 	}
+	cacheAbs, err := filepath.Abs(cacheRoot)
+	if err != nil {
+		return Store{}, err
+	}
 	rootByID := make(map[string]Root, len(normalizedRoots))
 	for _, root := range normalizedRoots {
 		rootByID[root.ID] = root
@@ -71,6 +80,7 @@ func NewWithRoots(roots []RootConfig, dataRoot string) (Store, error) {
 	return Store{
 		PhotoRoot: normalizedRoots[0].Path,
 		DataRoot:  filepath.Clean(dataAbs),
+		CacheRoot: filepath.Clean(cacheAbs),
 		Roots:     normalizedRoots,
 		rootByID:  rootByID,
 		virtual:   hasNamedRoot,
@@ -318,7 +328,7 @@ func (s Store) CacheFilePath(kind, cacheKey, ext string) (string, error) {
 	if len(shard) > 2 {
 		shard = shard[:2]
 	}
-	return filepath.Join(s.DataRoot, "cache", kind, shard, cacheKey+"."+strings.TrimPrefix(ext, ".")), nil
+	return filepath.Join(s.CacheRoot, kind, shard, cacheKey+"."+strings.TrimPrefix(ext, ".")), nil
 }
 
 func (s Store) RemoveCache(cacheKey string) error {
@@ -376,7 +386,7 @@ func (s Store) cacheFilePath(kind string, cacheKey string, ext string) string {
 	if len(shard) > 2 {
 		shard = shard[:2]
 	}
-	return filepath.Join(s.DataRoot, "cache", kind, shard, cacheKey+"."+strings.TrimPrefix(ext, "."))
+	return filepath.Join(s.CacheRoot, kind, shard, cacheKey+"."+strings.TrimPrefix(ext, "."))
 }
 
 func samePath(a, b string) bool {

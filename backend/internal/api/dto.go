@@ -72,21 +72,31 @@ type ScanStatusDTO struct {
 }
 
 type ScanProgressDTO struct {
-	State           string   `json:"state"`
-	RequestedAction string   `json:"requestedAction"`
-	Reason          string   `json:"reason"`
-	Phase           string   `json:"phase"`
-	Roots           []string `json:"roots"`
-	CurrentRoot     string   `json:"currentRoot"`
-	CurrentRelPath  string   `json:"currentRelPath"`
-	DiscoveredFiles int      `json:"discoveredFiles"`
-	TotalFiles      int      `json:"totalFiles"`
-	ScannedFiles    int      `json:"scannedFiles"`
-	TotalSeen       int      `json:"totalSeen"`
-	AssetsAdded     int      `json:"assetsAdded"`
-	AssetsUpdated   int      `json:"assetsUpdated"`
-	AssetsDeleted   int      `json:"assetsDeleted"`
-	Errors          int      `json:"errors"`
+	State           string                         `json:"state"`
+	RequestedAction string                         `json:"requestedAction"`
+	Task            string                         `json:"task"`
+	Reason          string                         `json:"reason"`
+	Phase           string                         `json:"phase"`
+	Roots           []string                       `json:"roots"`
+	CurrentRoot     string                         `json:"currentRoot"`
+	CurrentRelPath  string                         `json:"currentRelPath"`
+	DiscoveredFiles int                            `json:"discoveredFiles"`
+	TotalFiles      int                            `json:"totalFiles"`
+	ScannedFiles    int                            `json:"scannedFiles"`
+	TotalSeen       int                            `json:"totalSeen"`
+	AssetsAdded     int                            `json:"assetsAdded"`
+	AssetsUpdated   int                            `json:"assetsUpdated"`
+	AssetsDeleted   int                            `json:"assetsDeleted"`
+	Errors          int                            `json:"errors"`
+	RootStats       map[string]ScanRootProgressDTO `json:"rootStats,omitempty"`
+}
+
+type ScanRootProgressDTO struct {
+	DiscoveredFiles int  `json:"discoveredFiles"`
+	TotalFiles      int  `json:"totalFiles"`
+	ScannedFiles    int  `json:"scannedFiles"`
+	TotalSeen       int  `json:"totalSeen"`
+	Finished        bool `json:"finished"`
 }
 
 type WorkStatusCountsDTO struct {
@@ -162,12 +172,14 @@ type ScanLibraryDTO struct {
 }
 
 type ScanLibraryProgressDTO struct {
-	AssetTotal     int                 `json:"assetTotal"`
-	ScannedFiles   int                 `json:"scannedFiles"`
-	UnscannedFiles int                 `json:"unscannedFiles"`
-	Thumb          WorkStatusCountsDTO `json:"thumb"`
-	Transcode      WorkStatusCountsDTO `json:"transcode"`
-	Active         bool                `json:"active"`
+	AssetTotal      int                 `json:"assetTotal"`
+	DiscoveredFiles int                 `json:"discoveredFiles"`
+	DiscoveredAt    *int64              `json:"discoveredAt"`
+	ScannedFiles    int                 `json:"scannedFiles"`
+	UnscannedFiles  int                 `json:"unscannedFiles"`
+	Thumb           WorkStatusCountsDTO `json:"thumb"`
+	Transcode       WorkStatusCountsDTO `json:"transcode"`
+	Active          bool                `json:"active"`
 }
 
 type SourceFolderDTO struct {
@@ -328,9 +340,23 @@ func scanProgressDTO(progress scanner.Progress) ScanProgressDTO {
 	if roots == nil {
 		roots = []string{}
 	}
+	var rootStats map[string]ScanRootProgressDTO
+	if len(progress.RootStats) > 0 {
+		rootStats = make(map[string]ScanRootProgressDTO, len(progress.RootStats))
+		for root, stat := range progress.RootStats {
+			rootStats[root] = ScanRootProgressDTO{
+				DiscoveredFiles: stat.DiscoveredFiles,
+				TotalFiles:      stat.TotalFiles,
+				ScannedFiles:    stat.ScannedFiles,
+				TotalSeen:       stat.TotalSeen,
+				Finished:        stat.Finished,
+			}
+		}
+	}
 	return ScanProgressDTO{
 		State:           progress.State,
 		RequestedAction: progress.RequestedAction,
+		Task:            progress.Task,
 		Reason:          progress.Reason,
 		Phase:           progress.Phase,
 		Roots:           roots,
@@ -344,6 +370,7 @@ func scanProgressDTO(progress scanner.Progress) ScanProgressDTO {
 		AssetsUpdated:   progress.AssetsUpdated,
 		AssetsDeleted:   progress.AssetsDeleted,
 		Errors:          progress.Errors,
+		RootStats:       rootStats,
 	}
 }
 

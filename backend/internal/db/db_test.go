@@ -8,25 +8,31 @@ import (
 
 func TestMigrationInitializesDatabase(t *testing.T) {
 	ctx := context.Background()
-	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	database, err := Open(ctx, testDatabaseURL(t, ctx), filepath.Join("..", "..", "migrations"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer database.Close()
 	var count int
-	if err := database.Conn().QueryRowContext(ctx, `SELECT COUNT(*) FROM folders WHERE rel_path = ''`).Scan(&count); err != nil {
+	if err := database.Conn().QueryRowContext(ctx, `SELECT COUNT(*) FROM folder WHERE rel_path = ''`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
 		t.Fatalf("root folder count = %d", count)
 	}
+	if err := database.Conn().QueryRowContext(ctx, `SELECT COUNT(*) FROM scan_library`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("scan library count = %d, want 0", count)
+	}
 }
 
 func TestOpenMarksInterruptedScanRuns(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "lpicto.db")
+	databaseURL := testDatabaseURL(t, ctx)
 	migrationsDir := filepath.Join("..", "..", "migrations")
-	database, err := Open(ctx, dbPath, migrationsDir)
+	database, err := Open(ctx, databaseURL, migrationsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +43,7 @@ func TestOpenMarksInterruptedScanRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	database, err = Open(ctx, dbPath, migrationsDir)
+	database, err = Open(ctx, databaseURL, migrationsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,4 +55,16 @@ func TestOpenMarksInterruptedScanRuns(t *testing.T) {
 	if run == nil || run.Status != "interrupted" || run.FinishedAt == nil {
 		t.Fatalf("last scan run = %#v, want interrupted with finished_at", run)
 	}
+}
+
+func testDatabaseURL(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	databaseURL, adminURL, databaseName, err := createTestDatabase(ctx, t.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = dropTestDatabase(context.Background(), adminURL, databaseName)
+	})
+	return databaseURL
 }

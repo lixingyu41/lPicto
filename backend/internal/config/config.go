@@ -14,83 +14,102 @@ import (
 )
 
 type Config struct {
-	PhotoRoot            string               `json:"photoRoot"`
-	PhotoRoots           []storage.RootConfig `json:"photoRoots"`
-	DataRoot             string               `json:"dataRoot"`
-	HTTPAddr             string               `json:"httpAddr"`
-	ScanInterval         time.Duration        `json:"-"`
-	ScanIntervalMinutes  int                  `json:"scanIntervalMinutes"`
-	ScanWorkers          int                  `json:"scanWorkers"`
-	ThumbWorkers         int                  `json:"thumbWorkers"`
-	VideoWorkers         int                  `json:"videoWorkers"`
-	VideoPosterWorkers   int                  `json:"videoPosterWorkers"`
-	VideoProxyWorkers    int                  `json:"videoProxyWorkers"`
-	BackgroundMaxActive  int                  `json:"backgroundMaxActive"`
-	BackgroundLoadTarget float64              `json:"backgroundLoadTarget"`
-	BackgroundMinFreeMB  int                  `json:"backgroundMinFreeMb"`
-	BackgroundStartGap   time.Duration        `json:"-"`
-	BackgroundStartGapMS int                  `json:"backgroundStartGapMs"`
-	PageSizeDefault      int                  `json:"pageSizeDefault"`
-	PageSizeMax          int                  `json:"pageSizeMax"`
-	EnableFSWatch        bool                 `json:"enableFsWatch"`
-	ThumbLongEdge        int                  `json:"thumbLongEdge"`
-	PreviewLongEdge      int                  `json:"previewLongEdge"`
-	PreviewQuality       int                  `json:"previewQuality"`
-	VideoProxyEnabled    bool                 `json:"videoProxyEnabled"`
-	VideoProxyMaxHeight  int                  `json:"videoProxyMaxHeight"`
-	VideoProxyCRF        int                  `json:"videoProxyCrf"`
-	FFmpegHWAccel        string               `json:"ffmpegHwAccel"`
-	FFmpegHWDevice       string               `json:"ffmpegHwDevice"`
-	FFmpegHWFallback     bool                 `json:"ffmpegHwFallback"`
-	StaticDir            string               `json:"-"`
-	MigrationsDir        string               `json:"-"`
+	PhotoRoot                    string               `json:"photoRoot"`
+	PhotoRoots                   []storage.RootConfig `json:"photoRoots"`
+	DataRoot                     string               `json:"dataRoot"`
+	CacheRoot                    string               `json:"cacheRoot"`
+	DatabaseURL                  string               `json:"-"`
+	RedisURL                     string               `json:"-"`
+	HTTPAddr                     string               `json:"httpAddr"`
+	ScanInterval                 time.Duration        `json:"-"`
+	ScanIntervalMinutes          int                  `json:"scanIntervalMinutes"`
+	FileCountScanInterval        time.Duration        `json:"-"`
+	FileCountScanIntervalMinutes int                  `json:"fileCountScanIntervalMinutes"`
+	ScanWorkers                  int                  `json:"scanWorkers"`
+	ThumbWorkers                 int                  `json:"thumbWorkers"`
+	VideoWorkers                 int                  `json:"videoWorkers"`
+	VideoPosterWorkers           int                  `json:"videoPosterWorkers"`
+	VideoProxyWorkers            int                  `json:"videoProxyWorkers"`
+	BackgroundMaxActive          int                  `json:"backgroundMaxActive"`
+	BackgroundLoadTarget         float64              `json:"backgroundLoadTarget"`
+	BackgroundMinFreeMB          int                  `json:"backgroundMinFreeMb"`
+	BackgroundStartGap           time.Duration        `json:"-"`
+	BackgroundStartGapMS         int                  `json:"backgroundStartGapMs"`
+	PageSizeDefault              int                  `json:"pageSizeDefault"`
+	PageSizeMax                  int                  `json:"pageSizeMax"`
+	EnableFSWatch                bool                 `json:"enableFsWatch"`
+	ThumbLongEdge                int                  `json:"thumbLongEdge"`
+	PreviewLongEdge              int                  `json:"previewLongEdge"`
+	PreviewQuality               int                  `json:"previewQuality"`
+	VideoProxyEnabled            bool                 `json:"videoProxyEnabled"`
+	VideoProxyMaxHeight          int                  `json:"videoProxyMaxHeight"`
+	VideoProxyCRF                int                  `json:"videoProxyCrf"`
+	FFmpegHWAccel                string               `json:"ffmpegHwAccel"`
+	FFmpegHWDevice               string               `json:"ffmpegHwDevice"`
+	FFmpegHWFallback             bool                 `json:"ffmpegHwFallback"`
+	StaticDir                    string               `json:"-"`
+	MigrationsDir                string               `json:"-"`
 }
 
 func Load() (Config, error) {
-	scanMinutes := intEnv("SCAN_INTERVAL_MINUTES", 30)
-	photoRoot := stringEnv("PHOTO_ROOT", "/photos")
+	scanMinutes := intEnv("SCAN_INTERVAL_MINUTES", 0)
+	fileCountScanMinutes := intEnv("FILE_COUNT_SCAN_INTERVAL_MINUTES", 10)
+	photoRoot := stringEnv("MEDIA_ROOT", "/Media")
 	photoRoots, err := photoRootsEnv("PHOTO_ROOTS", photoRoot)
 	if err != nil {
 		return Config{}, err
 	}
-	scanWorkers := intEnv("SCAN_WORKERS", boundedInt(runtime.NumCPU(), 8, 16))
-	thumbWorkers := intEnv("THUMB_WORKERS", boundedInt(runtime.NumCPU(), 8, 24))
-	videoPosterWorkers := intEnv("VIDEO_POSTER_WORKERS", 4)
-	videoProxyWorkers := intEnv("VIDEO_PROXY_WORKERS", 2)
-	videoWorkers := intEnv("VIDEO_WORKERS", videoPosterWorkers+videoProxyWorkers)
-	backgroundMaxActive := intEnv("BACKGROUND_MAX_ACTIVE", boundedInt(runtime.NumCPU()*2, 8, 32))
+	cpus := runtime.NumCPU()
+	scanWorkers := intEnv("SCAN_WORKERS", boundedInt((cpus+1)/2, 1, 8))
+	thumbWorkers := intEnv("THUMB_WORKERS", boundedInt(cpus, 2, 8))
+	videoWorkersOverride := intEnv("VIDEO_WORKERS", 0)
+	videoPosterDefault := boundedInt((cpus+1)/2, 1, 4)
+	videoProxyDefault := 1
+	if videoWorkersOverride > 0 {
+		videoPosterDefault = videoWorkersOverride
+		videoProxyDefault = maxInt(1, videoWorkersOverride/2)
+	}
+	videoPosterWorkers := intEnv("VIDEO_POSTER_WORKERS", videoPosterDefault)
+	videoProxyWorkers := intEnv("VIDEO_PROXY_WORKERS", videoProxyDefault)
+	videoWorkers := videoPosterWorkers + videoProxyWorkers
+	backgroundMaxActive := intEnv("BACKGROUND_MAX_ACTIVE", boundedInt(cpus, 2, 8))
 	backgroundStartGapMS := intEnv("BACKGROUND_START_SPACING_MS", 50)
 	cfg := Config{
-		PhotoRoot:            photoRoot,
-		PhotoRoots:           photoRoots,
-		DataRoot:             stringEnv("DATA_ROOT", "/data"),
-		HTTPAddr:             stringEnv("HTTP_ADDR", ":8080"),
-		ScanIntervalMinutes:  scanMinutes,
-		ScanInterval:         time.Duration(scanMinutes) * time.Minute,
-		ScanWorkers:          scanWorkers,
-		ThumbWorkers:         thumbWorkers,
-		VideoWorkers:         videoWorkers,
-		VideoPosterWorkers:   intEnv("VIDEO_POSTER_WORKERS", videoWorkers),
-		VideoProxyWorkers:    intEnv("VIDEO_PROXY_WORKERS", maxInt(1, videoWorkers/2)),
-		BackgroundMaxActive:  backgroundMaxActive,
-		BackgroundLoadTarget: floatEnv("BACKGROUND_LOAD_TARGET", float64(backgroundMaxActive)),
-		BackgroundMinFreeMB:  intEnv("BACKGROUND_MIN_FREE_MB", 512),
-		BackgroundStartGapMS: backgroundStartGapMS,
-		BackgroundStartGap:   time.Duration(backgroundStartGapMS) * time.Millisecond,
-		PageSizeDefault:      intEnv("PAGE_SIZE_DEFAULT", 100),
-		PageSizeMax:          intEnv("PAGE_SIZE_MAX", 500),
-		EnableFSWatch:        boolEnv("ENABLE_FS_WATCH", true),
-		ThumbLongEdge:        intEnv("THUMB_LONG_EDGE", 320),
-		PreviewLongEdge:      intEnv("PREVIEW_LONG_EDGE", 2560),
-		PreviewQuality:       intEnv("PREVIEW_QUALITY", 82),
-		VideoProxyEnabled:    boolEnv("VIDEO_PROXY_ENABLED", true),
-		VideoProxyMaxHeight:  intEnv("VIDEO_PROXY_MAX_HEIGHT", 1080),
-		VideoProxyCRF:        intEnv("VIDEO_PROXY_CRF", 23),
-		FFmpegHWAccel:        hwAccelEnv("FFMPEG_HWACCEL", "none"),
-		FFmpegHWDevice:       stringEnv("FFMPEG_HWACCEL_DEVICE", ""),
-		FFmpegHWFallback:     boolEnv("FFMPEG_HWACCEL_FALLBACK", true),
-		StaticDir:            stringEnv("STATIC_DIR", "frontend/dist"),
-		MigrationsDir:        stringEnv("MIGRATIONS_DIR", "migrations"),
+		PhotoRoot:                    photoRoot,
+		PhotoRoots:                   photoRoots,
+		DataRoot:                     stringEnv("DATA_ROOT", "/data"),
+		CacheRoot:                    stringEnv("CACHE_ROOT", "/cache"),
+		DatabaseURL:                  stringEnv("DATABASE_URL", "postgres://media:media@postgres:5432/media?sslmode=disable"),
+		RedisURL:                     stringEnv("REDIS_URL", "redis://redis:6379/0"),
+		HTTPAddr:                     stringEnv("HTTP_ADDR", ":8080"),
+		ScanIntervalMinutes:          scanMinutes,
+		ScanInterval:                 time.Duration(scanMinutes) * time.Minute,
+		FileCountScanIntervalMinutes: fileCountScanMinutes,
+		FileCountScanInterval:        time.Duration(fileCountScanMinutes) * time.Minute,
+		ScanWorkers:                  scanWorkers,
+		ThumbWorkers:                 thumbWorkers,
+		VideoWorkers:                 videoWorkers,
+		VideoPosterWorkers:           videoPosterWorkers,
+		VideoProxyWorkers:            videoProxyWorkers,
+		BackgroundMaxActive:          backgroundMaxActive,
+		BackgroundLoadTarget:         floatEnv("BACKGROUND_LOAD_TARGET", float64(maxInt(cpus*2, backgroundMaxActive))),
+		BackgroundMinFreeMB:          intEnv("BACKGROUND_MIN_FREE_MB", 512),
+		BackgroundStartGapMS:         backgroundStartGapMS,
+		BackgroundStartGap:           time.Duration(backgroundStartGapMS) * time.Millisecond,
+		PageSizeDefault:              intEnv("PAGE_SIZE_DEFAULT", 100),
+		PageSizeMax:                  intEnv("PAGE_SIZE_MAX", 500),
+		EnableFSWatch:                boolEnv("ENABLE_FS_WATCH", true),
+		ThumbLongEdge:                intEnv("THUMB_LONG_EDGE", 320),
+		PreviewLongEdge:              intEnv("PREVIEW_LONG_EDGE", 2560),
+		PreviewQuality:               intEnv("PREVIEW_QUALITY", 82),
+		VideoProxyEnabled:            boolEnv("VIDEO_PROXY_ENABLED", true),
+		VideoProxyMaxHeight:          intEnv("VIDEO_PROXY_MAX_HEIGHT", 1080),
+		VideoProxyCRF:                intEnv("VIDEO_PROXY_CRF", 23),
+		FFmpegHWAccel:                hwAccelEnv("FFMPEG_HWACCEL", "none"),
+		FFmpegHWDevice:               stringEnv("FFMPEG_HWACCEL_DEVICE", ""),
+		FFmpegHWFallback:             boolEnv("FFMPEG_HWACCEL_FALLBACK", true),
+		StaticDir:                    stringEnv("STATIC_DIR", "frontend/dist"),
+		MigrationsDir:                stringEnv("MIGRATIONS_DIR", "migrations"),
 	}
 	if cfg.PageSizeDefault < 1 {
 		cfg.PageSizeDefault = 100
@@ -137,8 +156,10 @@ func (c Config) Log(logger *slog.Logger) {
 		"photoRoot", c.PhotoRoot,
 		"photoRoots", c.PhotoRoots,
 		"dataRoot", c.DataRoot,
+		"cacheRoot", c.CacheRoot,
 		"httpAddr", c.HTTPAddr,
 		"scanIntervalMinutes", c.ScanIntervalMinutes,
+		"fileCountScanIntervalMinutes", c.FileCountScanIntervalMinutes,
 		"scanWorkers", c.ScanWorkers,
 		"thumbWorkers", c.ThumbWorkers,
 		"videoWorkers", c.VideoWorkers,
@@ -164,11 +185,11 @@ func (c Config) Log(logger *slog.Logger) {
 }
 
 func (c Config) DBPath() string {
-	return filepath.Join(c.DataRoot, "lpicto.db")
+	return c.DatabaseURL
 }
 
-func (c Config) CacheRoot() string {
-	return filepath.Join(c.DataRoot, "cache")
+func (c Config) CacheDir() string {
+	return c.CacheRoot
 }
 
 func (c Config) preparePaths() error {
@@ -185,11 +206,12 @@ func (c Config) preparePaths() error {
 		return fmt.Errorf("create DATA_ROOT: %w", err)
 	}
 	for _, rel := range []string{
-		filepath.Join("cache", "thumbs"),
-		filepath.Join("cache", "previews"),
-		filepath.Join("cache", "video-proxies"),
+		"thumbs",
+		"previews",
+		"video-posters",
+		"video-proxies",
 	} {
-		if err := os.MkdirAll(filepath.Join(c.DataRoot, rel), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(c.CacheRoot, rel), 0o755); err != nil {
 			return fmt.Errorf("create cache dir %s: %w", rel, err)
 		}
 	}

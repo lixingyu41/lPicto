@@ -47,7 +47,7 @@ func TestLibraryScanDeletesOnlyInsideScope(t *testing.T) {
 	removePath := writeTestFile(t, scan.Store, "Y/remove.jpg")
 	writeTestFile(t, scan.Store, "Z/keep.jpg")
 
-	if result := scan.RequestScan("all"); !result.Accepted {
+	if result := scan.RequestScanRoots("all", []string{""}); !result.Accepted {
 		t.Fatalf("full scan result = %#v", result)
 	}
 	waitScannerIdle(t, ctx, scan)

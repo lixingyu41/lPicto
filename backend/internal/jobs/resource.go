@@ -74,11 +74,6 @@ func (l *ResourceLimiter) Acquire(ctx context.Context) (func(), error) {
 	if l == nil {
 		return func() {}, nil
 	}
-	select {
-	case l.sem <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 	released := false
 	release := func() {
 		l.mu.Lock()
@@ -91,16 +86,40 @@ func (l *ResourceLimiter) Acquire(ctx context.Context) (func(), error) {
 	}
 	for {
 		if err := l.waitForStartSpacing(ctx); err != nil {
-			release()
 			return nil, err
+		}
+		if !l.canStart() {
+			if err := sleepContext(ctx, l.policy.CheckInterval); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		select {
+		case l.sem <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 		if l.canStart() {
 			l.markStarted()
 			return release, nil
 		}
+		release()
 		if err := sleepContext(ctx, l.policy.CheckInterval); err != nil {
-			release()
 			return nil, err
+		}
+	}
+}
+
+func (l *ResourceLimiter) Wait(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	for {
+		if l.canStart() {
+			return nil
+		}
+		if err := sleepContext(ctx, l.policy.CheckInterval); err != nil {
+			return err
 		}
 	}
 }

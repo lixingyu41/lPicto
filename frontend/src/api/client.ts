@@ -5,11 +5,13 @@ import type {
   AlbumsResponse,
   Asset,
   AssetKind,
+  AssetPosition,
   AssetPreference,
   AssetSidecars,
   Folder,
   LibraryAnchorsResponse,
   Neighbors,
+  NFOFilterField,
   Page,
   PublicConfig,
   ProcessingProgress,
@@ -91,8 +93,11 @@ export const api = {
   health: () => request<{ status: string }>('/api/health'),
   publicConfig: () => request<PublicConfig>('/api/config/public'),
   triggerScan: () => request<ScanCommandResponse>('/api/scan', { method: 'POST' }),
+  countScan: () => request<ScanCommandResponse>('/api/scan/count', { method: 'POST' }),
+  metadataScan: () => request<ScanCommandResponse>('/api/scan/metadata', { method: 'POST' }),
   pauseScan: () => request<ScanCommandResponse>('/api/scan/pause', { method: 'POST' }),
   rebuildScan: () => request<ScanCommandResponse>('/api/scan/rebuild?force=1', { method: 'POST' }),
+  rebuildThumbnails: () => request<ScanCommandResponse>('/api/scan/thumbnails/rebuild?force=1', { method: 'POST' }),
   scanStatus: () => request<ScanStatus>('/api/scan/status'),
   scanRuns: (page = 1, pageSize = 20) => request<Page<ScanRun>>(`/api/scan/runs${qs({ page, pageSize })}`),
   settingsProgress: () => request<ProcessingProgress>('/api/settings/progress'),
@@ -116,6 +121,14 @@ export const api = {
     }),
   scanLibrary: (id: string) =>
     request<ScanCommandResponse>(`/api/settings/libraries/${encodeURIComponent(id)}/scan`, { method: 'POST' }),
+  countScanLibrary: (id: string) =>
+    request<ScanCommandResponse>(`/api/settings/libraries/${encodeURIComponent(id)}/scan/count`, { method: 'POST' }),
+  metadataScanLibrary: (id: string) =>
+    request<ScanCommandResponse>(`/api/settings/libraries/${encodeURIComponent(id)}/scan/metadata`, { method: 'POST' }),
+  rebuildLibraryThumbnails: (id: string) =>
+    request<ScanCommandResponse>(`/api/settings/libraries/${encodeURIComponent(id)}/thumbnails/rebuild?force=1`, {
+      method: 'POST',
+    }),
   scanFolders: () => request<ScanFoldersResponse>('/api/settings/scan-folders'),
   addScanFolder: (relPath: string) =>
     request<{ items: ScanFolder[] }>('/api/settings/scan-folders', {
@@ -162,11 +175,17 @@ export const api = {
     request<LibraryAnchorsResponse>(`/api/library/anchors${qs({ pageSize, type, sort, q })}`),
   searchAssets: (page: number, pageSize: number, params: SearchAssetsParams) =>
     request<Page<Asset>>(`/api/search/assets${qs({ page, pageSize, ...params })}`),
+  searchAnchors: (pageSize: number, params: SearchAssetsParams) =>
+    request<LibraryAnchorsResponse>(`/api/search/anchors${qs({ pageSize, ...params })}`),
+  searchNFOOptions: (field: NFOFilterField, q: string, signal?: AbortSignal) =>
+    request<{ items: string[] }>(`/api/search/nfo-options${qs({ field, q, limit: 40 })}`, { signal }),
   folders: (parentId: number) => request<{ items: Folder[] }>(`/api/folders${qs({ parentId })}`),
   folderTree: () => request<{ items: Folder[] }>('/api/folders/tree'),
   folder: (id: number) => request<Folder>(`/api/folders/${id}`),
   folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, recursive: boolean) =>
     request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0 })}`),
+  folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean) =>
+    request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0 })}`),
   asset: (id: number) => request<Asset>(`/api/assets/${id}`),
   assetPreferences: (id: number) => request<AssetPreference>(`/api/assets/${id}/preferences`),
   assetSidecars: (id: number) => request<AssetSidecars>(`/api/assets/${id}/sidecars`),
@@ -178,6 +197,8 @@ export const api = {
     }),
   neighbors: (id: number, params: Record<string, string | number | undefined | null>, signal?: AbortSignal) =>
     request<Neighbors>(`/api/assets/${id}/neighbors${qs(params)}`, { signal }),
+  assetPosition: (id: number, params: Record<string, string | number | undefined | null>) =>
+    request<AssetPosition>(`/api/assets/${id}/position${qs(params)}`),
 };
 
 export function assetThumbUrl(asset: Asset): string {

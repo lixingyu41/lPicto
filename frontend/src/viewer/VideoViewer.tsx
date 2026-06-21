@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Pause, Play, Volume2, VolumeX } from 'lucide-react';
 import type { Asset } from '../types/api';
-import { assetPreviewUrl, assetSubtitleUrl, assetVideoProxyUrl, assetVideoUrl } from '../api/client';
+import { api, assetPreviewUrl, assetSubtitleUrl, assetVideoProxyUrl, assetVideoUrl } from '../api/client';
 import { formatDuration } from '../utils/format';
 import { normalizeRotation, rotatedContainStyle } from '../utils/rotation';
 import { loadViewerPrefs, viewerPrefsChanged, type ViewerPrefs } from '../utils/viewerPrefs';
@@ -14,6 +14,7 @@ interface Props {
 }
 
 const autoplayDelayMs = 800;
+const proxyPollMs = 3000;
 const videoAudioStorageKey = 'lpicto-video-audio';
 
 interface VideoAudioPreference {
@@ -29,29 +30,35 @@ export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, s
   const frameRef = useRef<HTMLDivElement | null>(null);
   const autoplayTimer = useRef<number | null>(null);
   const resumeTimer = useRef<number | null>(null);
+  const proxyPollTimer = useRef<number | null>(null);
   const wantsPlaying = useRef(false);
   const resumeAttempts = useRef(0);
+  const [liveAsset, setLiveAsset] = useState(asset);
   const [audio, setAudio] = useState<VideoAudioPreference>(() => loadVideoAudioPreference());
   const [prefs, setPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
-  const [forceProxy, setForceProxy] = useState(false);
+  const [proxyFailed, setProxyFailed] = useState(false);
   const [sourceFailed, setSourceFailed] = useState(false);
   const [hasPlaybackStarted, setHasPlaybackStarted] = useState(false);
   const [playError, setPlayError] = useState('');
   const [paused, setPaused] = useState(true);
   const [duration, setDuration] = useState(asset.duration ?? 0);
   const [currentTime, setCurrentTime] = useState(0);
+  const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [frameSize, setFrameSize] = useState({ width: 0, height: 0 });
+  const playbackAsset = liveAsset.id === asset.id && liveAsset.cacheKey === asset.cacheKey ? liveAsset : asset;
   const source = useMemo(() => {
-    if (forceProxy && asset.videoProxyStatus === 'ready') return assetVideoProxyUrl(asset);
-    if (!asset.browserPlayable && asset.videoProxyStatus === 'ready') return assetVideoProxyUrl(asset);
+    if (playbackAsset.videoProxyStatus === 'ready' && !proxyFailed) {
+      return assetVideoProxyUrl(playbackAsset);
+    }
     return assetVideoUrl(asset);
-  }, [asset, forceProxy]);
+  }, [asset, playbackAsset, proxyFailed]);
 
   const subtitleSource = subtitlesEnabled && selectedSubtitleId ? assetSubtitleUrl(asset, selectedSubtitleId) : '';
   const canPlay = Boolean(source) && !sourceFailed;
   const posterSource = asset.thumbStatus === 'ready' ? assetPreviewUrl(asset) : '';
   const showPosterLayer = Boolean(posterSource) && (!canPlay || (!hasPlaybackStarted && paused && currentTime <= 0.01));
-  const statusLabel = videoStatusLabel(asset, sourceFailed);
+  const statusLabel = videoStatusLabel(playbackAsset, sourceFailed);
+  const displayedTime = scrubTime ?? currentTime;
 
   const mediaStyle = useMemo(() => {
     const rotation = normalizeRotation(asset.rotation);
@@ -172,14 +179,52 @@ export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, s
     setPlayError('');
     setPaused(true);
     setCurrentTime(0);
+    setScrubTime(null);
     setDuration(asset.duration ?? 0);
-    setForceProxy(false);
+    setLiveAsset(asset);
+    setProxyFailed(false);
     wantsPlaying.current = false;
     resumeAttempts.current = 0;
     clearResumeTimer();
   }, [asset.id]);
 
-  useEffect(() => () => clearResumeTimer(), []);
+  useEffect(() => {
+    setSourceFailed(false);
+    setPlayError('');
+  }, [source]);
+
+  useEffect(() => {
+    if (playbackAsset.videoProxyStatus === 'ready' || playbackAsset.videoProxyStatus === 'error') {
+      clearProxyPollTimer();
+      return clearProxyPollTimer;
+    }
+    clearProxyPollTimer();
+    const poll = async () => {
+      let nextStatus = playbackAsset.videoProxyStatus;
+      try {
+        const next = await api.asset(asset.id);
+        nextStatus = next.videoProxyStatus;
+        if (next.cacheKey === asset.cacheKey) {
+          if (!(next.videoProxyStatus === 'ready' && hasPlaybackStarted)) {
+            setLiveAsset(next);
+          }
+        }
+      } catch {
+        // Keep the current source usable if the lightweight status poll fails.
+      } finally {
+        if (nextStatus !== 'ready' && nextStatus !== 'error') {
+          proxyPollTimer.current = window.setTimeout(poll, proxyPollMs);
+        }
+      }
+    };
+    proxyPollTimer.current = window.setTimeout(poll, proxyPollMs);
+    return clearProxyPollTimer;
+  }, [asset.id, asset.cacheKey, hasPlaybackStarted, playbackAsset.videoProxyStatus]);
+
+  useEffect(() => () => {
+    clearResumeTimer();
+    clearProxyPollTimer();
+  }, []);
 
   function clearAutoplayTimer() {
     if (autoplayTimer.current === null) return;
@@ -191,6 +236,20 @@ export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, s
     if (resumeTimer.current === null) return;
     window.clearTimeout(resumeTimer.current);
     resumeTimer.current = null;
+  }
+
+  function clearProxyPollTimer() {
+    if (proxyPollTimer.current === null) return;
+    window.clearTimeout(proxyPollTimer.current);
+    proxyPollTimer.current = null;
+  }
+
+  function commitSeek(value = scrubTime) {
+    if (value === null || !ref.current) return;
+    const next = clampTime(value, duration || ref.current.duration || value);
+    ref.current.currentTime = next;
+    setCurrentTime(next);
+    setScrubTime(null);
   }
 
   function scheduleResumeAfterUnexpectedPause(video: HTMLVideoElement) {
@@ -214,13 +273,14 @@ export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, s
             className="viewer-video"
             src={source}
             poster={posterSource || undefined}
+            preload="auto"
             playsInline
             style={mediaStyle}
             onClick={togglePlay}
             onDurationChange={(event) => setDuration(event.currentTarget.duration || asset.duration || 0)}
             onError={() => {
-              if (!forceProxy && asset.videoProxyStatus === 'ready') {
-                setForceProxy(true);
+              if (!proxyFailed && playbackAsset.videoProxyStatus === 'ready' && asset.browserPlayable) {
+                setProxyFailed(true);
                 return;
               }
               setSourceFailed(true);
@@ -246,7 +306,9 @@ export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, s
             }}
             onTimeUpdate={(event) => {
               const next = event.currentTarget.currentTime;
-              setCurrentTime(next);
+              if (scrubTime === null) {
+                setCurrentTime(next);
+              }
               if (next > 0.01) setHasPlaybackStarted(true);
             }}
             onVolumeChange={(event) => {
@@ -284,7 +346,7 @@ export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, s
           <button type="button" disabled={!canPlay} onClick={togglePlay} title={paused ? '播放' : '暂停'}>
             {paused ? <Play size={18} /> : <Pause size={18} />}
           </button>
-          <span>{formatDuration(currentTime)}</span>
+          <span>{formatDuration(displayedTime)}</span>
           <input
             aria-label="播放进度"
             max={duration || 0}
@@ -292,12 +354,16 @@ export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, s
             step={0.01}
             disabled={!canPlay}
             type="range"
-            value={Math.min(currentTime, duration || currentTime)}
+            value={Math.min(displayedTime, duration || displayedTime)}
+            onBlur={(event) => commitSeek(Number(event.currentTarget.value))}
             onChange={(event) => {
               const next = Number(event.target.value);
-              setCurrentTime(next);
-              if (ref.current) ref.current.currentTime = next;
+              setScrubTime(next);
             }}
+            onKeyUp={(event) => commitSeek(Number(event.currentTarget.value))}
+            onPointerCancel={(event) => commitSeek(Number(event.currentTarget.value))}
+            onPointerDown={(event) => setScrubTime(Number(event.currentTarget.value))}
+            onPointerUp={(event) => commitSeek(Number(event.currentTarget.value))}
           />
           <span>{formatDuration(duration)}</span>
           <button
@@ -390,4 +456,10 @@ function saveVideoAudioPreference(volumeValue: number, muted: boolean): VideoAud
 function clampVolume(value: number) {
   if (!Number.isFinite(value)) return 1;
   return Math.min(1, Math.max(0, value));
+}
+
+function clampTime(value: number, max: number) {
+  if (!Number.isFinite(value)) return 0;
+  if (!Number.isFinite(max) || max <= 0) return Math.max(0, value);
+  return Math.min(max, Math.max(0, value));
 }

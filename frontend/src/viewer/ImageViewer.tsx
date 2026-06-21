@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Asset } from '../types/api';
-import { assetOriginalUrl, assetPreviewUrl, assetThumbUrl } from '../api/client';
+import { assetOriginalUrl, assetThumbUrl } from '../api/client';
 import { loadViewerPrefs, viewerPrefsChanged, type ViewerPrefs } from '../utils/viewerPrefs';
 import { rotatedContainStyle } from '../utils/rotation';
+import { viewerImageUrl } from '../utils/imagePreload';
 
 interface Props {
   asset: Asset;
@@ -33,7 +34,7 @@ export default function ImageViewer({ asset }: Props) {
   });
   const [stageSize, setStageSize] = useState({ height: 0, width: 0 });
   const [mainImageReady, setMainImageReady] = useState(false);
-  const originalSrc = asset.browserPlayable ? assetOriginalUrl(asset) : assetPreviewUrl(asset);
+  const originalSrc = viewerImageUrl(asset);
   const thumbSrc = asset.thumbStatus === 'ready' ? assetThumbUrl(asset) : '';
   const pausedSrc = thumbSrc || originalSrc;
   const src = animated && !animatedPlaying ? pausedSrc : originalSrc;
@@ -193,6 +194,7 @@ export default function ImageViewer({ asset }: Props) {
           className="viewer-image viewer-image-placeholder"
           src={placeholderSrc}
           alt=""
+          decoding="async"
           draggable={false}
           aria-hidden="true"
           style={imageStyle}
@@ -204,6 +206,9 @@ export default function ImageViewer({ asset }: Props) {
         className={placeholderSrc && !mainImageReady ? 'viewer-image viewer-image-loading' : 'viewer-image'}
         src={src}
         alt={asset.filename}
+        decoding="async"
+        fetchPriority="high"
+        loading="eager"
         draggable={false}
         style={imageStyle}
         onLoad={() => setMainImageReady(true)}

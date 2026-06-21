@@ -34,7 +34,7 @@ type Server struct {
 	cfg     config.Config
 	db      *db.DB
 	store   storage.Store
-	scanner *scanner.Scanner
+	scanner ScanController
 	jobs    *jobs.Manager
 	events  *events.Bus
 	logger  *slog.Logger
@@ -57,14 +57,28 @@ type Server struct {
 
 	libraryCountsMu         sync.Mutex
 	libraryCountsKey        string
-	libraryCounts           map[string]int
+	libraryCounts           map[string]scanLibraryProgressStats
 	libraryCountsAt         time.Time
 	libraryCountsRefreshing bool
 
 	staticDir string
 }
 
-func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan *scanner.Scanner, queue *jobs.Manager, bus *events.Bus, logger *slog.Logger) http.Handler {
+type ScanController interface {
+	RequestScan(reason string) scanner.CommandResult
+	RequestScanRoots(reason string, roots []string) scanner.CommandResult
+	RequestRebuild(reason string) scanner.CommandResult
+	RequestCountScan(reason string) scanner.CommandResult
+	RequestCountScanRoots(reason string, roots []string) scanner.CommandResult
+	RequestMetadataScan(reason string) scanner.CommandResult
+	RequestMetadataScanRoots(reason string, roots []string) scanner.CommandResult
+	RequestThumbnailRebuild(reason string) scanner.CommandResult
+	RequestThumbnailRebuildRoots(reason string, roots []string) scanner.CommandResult
+	RequestStop() scanner.CommandResult
+	Status(context.Context) (scanner.Status, error)
+}
+
+func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan ScanController, queue *jobs.Manager, bus *events.Bus, logger *slog.Logger) http.Handler {
 	s := &Server{cfg: cfg, db: database, store: store, scanner: scan, jobs: queue, events: bus, logger: logger, staticDir: findStaticDir(cfg.StaticDir)}
 	r := chi.NewRouter()
 	r.Use(foregroundActivity)
@@ -72,8 +86,11 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan *sc
 	r.Get("/api/config/public", s.publicConfig)
 	r.Get("/api/events", s.eventStream)
 	r.Post("/api/scan", s.triggerScan)
+	r.Post("/api/scan/count", s.countScan)
+	r.Post("/api/scan/metadata", s.metadataScan)
 	r.Post("/api/scan/pause", s.pauseScan)
 	r.Post("/api/scan/rebuild", s.rebuildScan)
+	r.Post("/api/scan/thumbnails/rebuild", s.thumbnailRebuildScan)
 	r.Get("/api/scan/status", s.scanStatus)
 	r.Get("/api/scan/runs", s.scanRuns)
 	r.Get("/api/settings/progress", s.settingsProgress)
@@ -83,6 +100,9 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan *sc
 	r.Put("/api/settings/libraries/{id}", s.updateScanLibrary)
 	r.Delete("/api/settings/libraries/{id}", s.removeScanLibrary)
 	r.Post("/api/settings/libraries/{id}/scan", s.scanLibrary)
+	r.Post("/api/settings/libraries/{id}/scan/count", s.countScanLibrary)
+	r.Post("/api/settings/libraries/{id}/scan/metadata", s.metadataScanLibrary)
+	r.Post("/api/settings/libraries/{id}/thumbnails/rebuild", s.thumbnailRebuildLibrary)
 	r.Get("/api/settings/scan-folders", s.scanFolders)
 	r.Post("/api/settings/scan-folders", s.addScanFolder)
 	r.Delete("/api/settings/scan-folders", s.removeScanFolder)
@@ -101,16 +121,20 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan *sc
 	r.Get("/api/library/assets", s.libraryAssets)
 	r.Get("/api/library/anchors", s.libraryAnchors)
 	r.Get("/api/search/assets", s.searchAssets)
+	r.Get("/api/search/anchors", s.searchAnchors)
+	r.Get("/api/search/nfo-options", s.searchNFOOptions)
 	r.Get("/api/folders", s.folders)
 	r.Get("/api/folders/tree", s.folderTree)
 	r.Get("/api/folders/{id}", s.folder)
 	r.Get("/api/folders/{id}/assets", s.folderAssets)
+	r.Get("/api/folders/{id}/anchors", s.folderAnchors)
 	r.Get("/api/assets/{id}", s.asset)
 	r.Get("/api/assets/{id}/preferences", s.assetPreferences)
 	r.Put("/api/assets/{id}/preferences", s.updateAssetPreferences)
 	r.Get("/api/assets/{id}/sidecars", s.assetSidecars)
 	r.Get("/api/assets/{id}/subtitles/{subtitleID}", s.assetSubtitle)
 	r.Get("/api/assets/{id}/neighbors", s.neighbors)
+	r.Get("/api/assets/{id}/position", s.assetPosition)
 	r.Get("/api/assets/{id}/thumb", s.thumb)
 	r.Get("/api/assets/{id}/preview", s.preview)
 	r.Get("/api/assets/{id}/original", s.original)
@@ -227,16 +251,30 @@ func (s *Server) eventStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) triggerScan(w http.ResponseWriter, r *http.Request) {
-	result := s.scanner.RequestScan("manual")
+	result := s.scanner.RequestMetadataScan("manual")
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
+}
+
+func (s *Server) countScan(w http.ResponseWriter, r *http.Request) {
+	result := s.scanner.RequestCountScan("count")
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
+}
+
+func (s *Server) metadataScan(w http.ResponseWriter, r *http.Request) {
+	result := s.scanner.RequestMetadataScan("metadata")
 	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 }
 
 func (s *Server) rebuildScan(w http.ResponseWriter, r *http.Request) {
+	s.thumbnailRebuildScan(w, r)
+}
+
+func (s *Server) thumbnailRebuildScan(w http.ResponseWriter, r *http.Request) {
 	if !boolQuery(r, "force", false) {
 		writeError(w, http.StatusBadRequest, "confirm_required", "强制重建需要确认")
 		return
 	}
-	result := s.scanner.RequestRebuild("rebuild")
+	result := s.scanner.RequestThumbnailRebuild("thumb_rebuild")
 	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 }
 
@@ -355,6 +393,46 @@ func (s *Server) searchAssets(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) searchAnchors(w http.ResponseWriter, r *http.Request) {
+	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
+	opts := s.searchAssetOptions(r, 1, pageSize)
+	anchorResult, err := s.db.SearchAnchors(r.Context(), opts)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "search_anchors_failed", "读取搜索索引失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": libraryAnchorDTOs(anchorResult.Items), "total": anchorResult.Total})
+}
+
+func (s *Server) searchNFOOptions(w http.ResponseWriter, r *http.Request) {
+	field := safeNFOOptionField(r.URL.Query().Get("field"))
+	if field == "" {
+		writeError(w, http.StatusBadRequest, "nfo_field_invalid", "NFO 字段不支持")
+		return
+	}
+	limit := intQuery(r, "limit", 40)
+	if limit < 1 {
+		limit = 40
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	items, err := s.db.NFOOptions(r.Context(), db.NFOOptionOptions{
+		Field:       field,
+		Query:       strings.TrimSpace(r.URL.Query().Get("q")),
+		Limit:       limit,
+		VisibleOnly: visibleOnly(r),
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "nfo_options_failed", "读取 NFO 选项失败")
+		return
+	}
+	if items == nil {
+		items = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
 func (s *Server) folders(w http.ResponseWriter, r *http.Request) {
 	parentID := int64(intQuery(r, "parentId", 0))
 	folders, err := s.db.ListFolders(r.Context(), parentID)
@@ -424,6 +502,28 @@ func (s *Server) folderAssets(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) folderAnchors(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idParam(w, r)
+	if !ok {
+		return
+	}
+	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
+	opts := db.AssetListOptions{
+		PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")),
+		Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r),
+	}
+	anchorResult, err := s.db.FolderAnchors(r.Context(), id, opts)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "folder_not_found", "文件夹不存在")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "folder_anchors_failed", "读取文件夹索引失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": libraryAnchorDTOs(anchorResult.Items), "total": anchorResult.Total})
+}
+
 func (s *Server) asset(w http.ResponseWriter, r *http.Request) {
 	asset, ok := s.assetByParam(w, r)
 	if !ok {
@@ -454,9 +554,15 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), FolderID: folderID,
 		From: int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: 5, Recursive: boolQuery(r, "recursive", false),
 		NFOQuery: strings.TrimSpace(r.URL.Query().Get("nfo")),
+		NFOActor: strings.TrimSpace(r.URL.Query().Get("nfoActor")),
+		NFOID:    strings.TrimSpace(r.URL.Query().Get("nfoId")),
+		NFOTag:   strings.TrimSpace(r.URL.Query().Get("nfoTag")),
+		NFOTitle: strings.TrimSpace(r.URL.Query().Get("nfoTitle")),
+		NFOYear:  strings.TrimSpace(r.URL.Query().Get("nfoYear")),
 		MinWidth: intQueryPtr(r, "widthMin"), MaxWidth: intQueryPtr(r, "widthMax"),
 		MinHeight: intQueryPtr(r, "heightMin"), MaxHeight: intQueryPtr(r, "heightMax"),
-		MinDuration: float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
+		MatchAnyAxis: dimensionMode(r) == "both",
+		MinDuration:  float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
 		MinSize: int64QueryPtr(r, "sizeMin"), MaxSize: int64QueryPtr(r, "sizeMax"),
 		Orientation: searchOrientation(r),
 	}
@@ -482,6 +588,65 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, NeighborsDTO{
 		Current: assetDTO(result.Current), Previous: assetDTOs(result.Previous), Next: assetDTOs(result.Next),
+	})
+}
+
+func (s *Server) assetPosition(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.idParam(w, r)
+	if !ok {
+		return
+	}
+	contextName := r.URL.Query().Get("context")
+	if contextName != "folder" && contextName != "album" && contextName != "search" {
+		contextName = "library"
+	}
+	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
+	typeFilter := safeType(r.URL.Query().Get("type"))
+	if typeFilter == "all" {
+		typeFilter = ""
+	}
+	var result db.AssetPosition
+	var err error
+	switch contextName {
+	case "folder":
+		folderID := int64QueryPtr(r, "folderId")
+		if folderID == nil {
+			writeError(w, http.StatusBadRequest, "folder_required", "文件夹 ID 缺失")
+			return
+		}
+		result, err = s.db.FolderAssetPosition(r.Context(), *folderID, id, db.AssetListOptions{
+			PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")),
+			Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r),
+		})
+	case "album":
+		albumID := int64QueryPtr(r, "albumId")
+		if albumID == nil {
+			writeError(w, http.StatusBadRequest, "album_required", "相册 ID 缺失")
+			return
+		}
+		result, err = s.db.AlbumAssetPosition(r.Context(), *albumID, id, db.AssetListOptions{
+			PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")),
+			Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r),
+		})
+	case "search":
+		opts := s.searchAssetOptions(r, 1, pageSize)
+		result, err = s.db.AssetPosition(r.Context(), id, opts, true)
+	default:
+		result, err = s.db.AssetPosition(r.Context(), id, db.AssetListOptions{
+			PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")),
+			Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r),
+		}, false)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "asset_position_not_found", "资源不在当前列表")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "asset_position_failed", "读取资源位置失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"index": result.Index, "page": result.Page, "position": result.Position, "total": result.Total,
 	})
 }
 
@@ -596,6 +761,10 @@ func (s *Server) serveCacheAsset(w http.ResponseWriter, r *http.Request, asset m
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("ETag", `"`+asset.CacheKey+`"`)
+	if kind == "video-proxies" {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("X-Accel-Buffering", "no")
+	}
 	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
 }
 
@@ -631,6 +800,10 @@ func (s *Server) serveOriginalAsset(w http.ResponseWriter, r *http.Request, asse
 	w.Header().Set("ETag", fmt.Sprintf(`W/"asset-%d-%s"`, asset.ID, asset.CacheKey))
 	w.Header().Set("Content-Disposition", contentDisposition(asset.Filename))
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	if asset.MediaType == model.MediaTypeVideo {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("X-Accel-Buffering", "no")
+	}
 	http.ServeContent(w, r, asset.Filename, info.ModTime(), file)
 }
 
@@ -642,15 +815,24 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	staticDir := s.staticDir
 	cleanPath := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(r.URL.Path, "/")))
 	if cleanPath == "." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == ".." {
-		http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
+		serveStaticFile(w, r, filepath.Join(staticDir, "index.html"), false)
 		return
 	}
 	target := filepath.Join(staticDir, cleanPath)
 	if info, err := os.Stat(target); err == nil && !info.IsDir() {
-		http.ServeFile(w, r, target)
+		serveStaticFile(w, r, target, strings.HasPrefix(filepath.ToSlash(cleanPath), "assets/"))
 		return
 	}
-	http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
+	serveStaticFile(w, r, filepath.Join(staticDir, "index.html"), false)
+}
+
+func serveStaticFile(w http.ResponseWriter, r *http.Request, path string, immutable bool) {
+	if immutable {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	http.ServeFile(w, r, path)
 }
 
 func (s *Server) page(r *http.Request, fallback int) (int, int) {
@@ -681,10 +863,16 @@ func (s *Server) searchAssetOptions(r *http.Request, page int, pageSize int) db.
 	return db.AssetListOptions{
 		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), NFOQuery: strings.TrimSpace(r.URL.Query().Get("nfo")),
-		From: int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), VisibleOnly: visibleOnly(r),
+		NFOActor: strings.TrimSpace(r.URL.Query().Get("nfoActor")),
+		NFOID:    strings.TrimSpace(r.URL.Query().Get("nfoId")),
+		NFOTag:   strings.TrimSpace(r.URL.Query().Get("nfoTag")),
+		NFOTitle: strings.TrimSpace(r.URL.Query().Get("nfoTitle")),
+		NFOYear:  strings.TrimSpace(r.URL.Query().Get("nfoYear")),
+		From:     int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), VisibleOnly: visibleOnly(r),
 		MinWidth: intQueryPtr(r, "widthMin"), MaxWidth: intQueryPtr(r, "widthMax"),
 		MinHeight: intQueryPtr(r, "heightMin"), MaxHeight: intQueryPtr(r, "heightMax"),
-		MinDuration: float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
+		MatchAnyAxis: dimensionMode(r) == "both",
+		MinDuration:  float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
 		MinSize: int64QueryPtr(r, "sizeMin"), MaxSize: int64QueryPtr(r, "sizeMax"),
 		Orientation: searchOrientation(r),
 	}
@@ -696,6 +884,33 @@ func searchOrientation(r *http.Request) string {
 		return ""
 	}
 	return orientation
+}
+
+func dimensionMode(r *http.Request) string {
+	if searchOrientation(r) != "" {
+		return "axis"
+	}
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("dimensionMode")), "both") {
+		return "both"
+	}
+	return "axis"
+}
+
+func safeNFOOptionField(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "actor":
+		return "actor"
+	case "id":
+		return "id"
+	case "tag":
+		return "tag"
+	case "title":
+		return "title"
+	case "year":
+		return "year"
+	default:
+		return ""
+	}
 }
 
 func validCacheKey(value string) bool {

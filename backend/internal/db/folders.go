@@ -23,14 +23,14 @@ func (d *DB) EnsureFolder(ctx context.Context, rel string) error {
 		parentValue = parent
 	}
 	_, err := d.conn.ExecContext(ctx, `
-INSERT INTO folders (rel_path, name, parent_rel_path, depth, updated_at)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(rel_path) DO UPDATE SET
+INSERT INTO folder (library_id, rel_path, name, parent_id, depth, updated_at)
+VALUES (1, ?, ?, (SELECT id FROM folder WHERE library_id = 1 AND rel_path = ?), ?, ?)
+ON CONFLICT(library_id, rel_path) DO UPDATE SET
   name = excluded.name,
-  parent_rel_path = excluded.parent_rel_path,
+  parent_id = excluded.parent_id,
   depth = excluded.depth,
   updated_at = excluded.updated_at`,
-		rel, storage.FolderName(rel), parentValue, storage.FolderDepth(rel), now)
+		rel, storage.FolderName(rel), parentValue, storage.FolderDepth(rel), unixTime(now))
 	return err
 }
 
@@ -44,55 +44,83 @@ func (d *DB) EnsureAssetFolders(ctx context.Context, assetRel string) error {
 }
 
 func (d *DB) RefreshFolders(ctx context.Context) error {
-	if err := d.rebuildFoldersFromAssets(ctx); err != nil {
-		return err
-	}
-	now := util.UnixNow()
-	_, err := d.conn.ExecContext(ctx, `
-UPDATE folders
-SET
-  asset_count = (
-    SELECT COUNT(*) FROM assets
-    WHERE assets.deleted_at IS NULL AND assets.thumb_status = 'ready' AND assets.parent_rel_path = folders.rel_path
-  ),
-  recursive_asset_count = (
-    SELECT COUNT(*) FROM assets
-    WHERE assets.deleted_at IS NULL AND assets.thumb_status = 'ready' AND (
-      folders.rel_path = '' OR
-      assets.parent_rel_path = folders.rel_path OR
-      assets.parent_rel_path LIKE folders.rel_path || '/%'
-    )
-  ),
-  cover_asset_id = (
-    SELECT id FROM assets
-    WHERE assets.deleted_at IS NULL AND assets.thumb_status = 'ready' AND (
-      folders.rel_path = '' OR
-      assets.parent_rel_path = folders.rel_path OR
-      assets.parent_rel_path LIKE folders.rel_path || '/%'
-    )
-    ORDER BY timeline_at DESC, id DESC
-    LIMIT 1
-  ),
-  updated_at = ?`, now)
+	activeFolders, err := d.rebuildFoldersFromAssets(ctx)
 	if err != nil {
 		return err
 	}
-	_, err = d.conn.ExecContext(ctx, `DELETE FROM folders WHERE rel_path <> '' AND recursive_asset_count = 0`)
-	return err
+	if err := d.relinkAssetFolders(ctx); err != nil {
+		return err
+	}
+	folders, err := d.folderStatsSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	folders, err = d.populateFolderStats(ctx, folders)
+	if err != nil {
+		return err
+	}
+	return d.writeFolderStats(ctx, folders, activeFolders)
 }
 
-func (d *DB) rebuildFoldersFromAssets(ctx context.Context) error {
-	rows, err := d.conn.QueryContext(ctx, `SELECT DISTINCT parent_rel_path FROM assets WHERE deleted_at IS NULL`)
+func (d *DB) folderStatsSnapshot(ctx context.Context) ([]model.Folder, error) {
+	rows, err := d.conn.QueryContext(ctx, folderSelectSQL()+` ORDER BY f.depth ASC, lower(f.rel_path) ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFolderRows(rows)
+}
+
+func (d *DB) writeFolderStats(ctx context.Context, folders []model.Folder, activeFolders map[string]struct{}) error {
+	now := util.UnixNow()
+	tx, err := d.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
+	}
+	defer tx.Rollback()
+	for _, folder := range folders {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE folder
+SET asset_count = ?,
+    recursive_asset_count = ?,
+    cover_asset_id = ?,
+    updated_at = ?
+WHERE id = ?`,
+			folder.AssetCount, folder.RecursiveAssetCount, nullInt64(folder.CoverAssetID), unixTime(now), folder.ID); err != nil {
+			return err
+		}
+	}
+	for _, folder := range folders {
+		if folder.RelPath == "" {
+			continue
+		}
+		if _, ok := activeFolders[folder.RelPath]; ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM folder WHERE id = ?`, folder.ID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (d *DB) rebuildFoldersFromAssets(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := d.conn.QueryContext(ctx, `
+SELECT DISTINCT fi.rel_path
+FROM file_instance fi
+JOIN media_asset ma ON ma.id = fi.asset_id
+WHERE fi.missing = false AND ma.deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 	needed := map[string]struct{}{"": {}}
 	for rows.Next() {
-		var parent string
-		if err := rows.Scan(&parent); err != nil {
-			return err
+		var rel string
+		if err := rows.Scan(&rel); err != nil {
+			return nil, err
 		}
+		parent := storage.ParentRelPath(rel)
 		if parent == "" {
 			continue
 		}
@@ -107,7 +135,7 @@ func (d *DB) rebuildFoldersFromAssets(ctx context.Context) error {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	var rels []string
 	for rel := range needed {
@@ -121,10 +149,34 @@ func (d *DB) rebuildFoldersFromAssets(ctx context.Context) error {
 	})
 	for _, rel := range rels {
 		if err := d.EnsureFolder(ctx, rel); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return needed, nil
+}
+
+func (d *DB) relinkAssetFolders(ctx context.Context) error {
+	_, err := d.conn.ExecContext(ctx, `
+WITH asset_folders AS (
+  SELECT DISTINCT ON (fi.asset_id)
+    fi.asset_id,
+    f.id AS folder_id
+  FROM file_instance fi
+  JOIN media_asset ma ON ma.id = fi.asset_id
+  JOIN folder f ON f.library_id = fi.library_id AND f.rel_path = CASE
+    WHEN POSITION('/' IN REVERSE(fi.rel_path)) = 0 THEN ''
+    ELSE LEFT(fi.rel_path, LENGTH(fi.rel_path) - POSITION('/' IN REVERSE(fi.rel_path)))
+  END
+  WHERE fi.missing = false AND ma.deleted_at IS NULL
+  ORDER BY fi.asset_id, fi.library_id, fi.id
+)
+UPDATE media_asset ma
+SET folder_id = asset_folders.folder_id,
+    updated_at = now()
+FROM asset_folders
+WHERE ma.id = asset_folders.asset_id
+  AND ma.folder_id IS DISTINCT FROM asset_folders.folder_id`)
+	return err
 }
 
 func (d *DB) GetFolder(ctx context.Context, id int64) (model.Folder, error) {
@@ -139,7 +191,7 @@ func (d *DB) getFolderRaw(ctx context.Context, id int64) (model.Folder, error) {
 	if id == 0 {
 		return d.getFolderByRelRaw(ctx, "")
 	}
-	row := d.conn.QueryRowContext(ctx, folderSelectSQL()+` WHERE id = ?`, id)
+	row := d.conn.QueryRowContext(ctx, folderSelectSQL()+` WHERE f.id = ?`, id)
 	return scanFolder(row)
 }
 
@@ -152,7 +204,7 @@ func (d *DB) GetFolderByRel(ctx context.Context, rel string) (model.Folder, erro
 }
 
 func (d *DB) getFolderByRelRaw(ctx context.Context, rel string) (model.Folder, error) {
-	row := d.conn.QueryRowContext(ctx, folderSelectSQL()+` WHERE rel_path = ?`, rel)
+	row := d.conn.QueryRowContext(ctx, folderSelectSQL()+` WHERE f.rel_path = ?`, rel)
 	return scanFolder(row)
 }
 
@@ -161,7 +213,7 @@ func (d *DB) ListFolders(ctx context.Context, parentID int64) ([]model.Folder, e
 	if err != nil {
 		return nil, err
 	}
-	rows, err := d.conn.QueryContext(ctx, folderSelectSQL()+` WHERE parent_rel_path = ? ORDER BY name COLLATE NOCASE ASC`, parent.RelPath)
+	rows, err := d.conn.QueryContext(ctx, folderSelectSQL()+` WHERE f.parent_id = ? ORDER BY lower(f.name) ASC`, parent.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +236,7 @@ func (d *DB) FolderTree(ctx context.Context) ([]model.Folder, error) {
 }
 
 func (d *DB) FolderTreeWithRoots(ctx context.Context, includedRoots []string) ([]model.Folder, error) {
-	rows, err := d.conn.QueryContext(ctx, folderSelectSQL()+` ORDER BY depth ASC, rel_path COLLATE NOCASE ASC`)
+	rows, err := d.conn.QueryContext(ctx, folderSelectSQL()+` ORDER BY f.depth ASC, lower(f.rel_path) ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -193,11 +245,15 @@ func (d *DB) FolderTreeWithRoots(ctx context.Context, includedRoots []string) ([
 	if err != nil {
 		return nil, err
 	}
+	folders, err = d.populateFolderStats(ctx, folders)
+	if err != nil {
+		return nil, err
+	}
 	return filterFoldersWithAssets(folders, includedRoots), nil
 }
 
 func folderSelectSQL() string {
-	return `SELECT id, rel_path, name, parent_rel_path, depth, asset_count, recursive_asset_count, cover_asset_id, updated_at FROM folders`
+	return `SELECT f.id, f.rel_path, f.name, p.rel_path AS parent_rel_path, f.depth, f.asset_count, f.recursive_asset_count, f.cover_asset_id, EXTRACT(EPOCH FROM f.updated_at)::BIGINT AS updated_at FROM folder f LEFT JOIN folder p ON p.id = f.parent_id`
 }
 
 func (d *DB) populateFolderStat(ctx context.Context, folder model.Folder) (model.Folder, error) {
@@ -237,8 +293,11 @@ func folderAssetScopeSQL(rel string) (string, []any) {
 	if rel == "" {
 		return "", nil
 	}
-	lower, upper := descendantPathBounds(rel)
-	return `(parent_rel_path = ? OR (parent_rel_path >= ? AND parent_rel_path < ?))`, []any{rel, lower, upper}
+	return `(parent_rel_path = ? OR parent_rel_path LIKE ? ESCAPE '\')`, []any{rel, descendantPathLike(rel)}
+}
+
+func folderPathLikeSQL(expr string) string {
+	return `replace(replace(replace(` + expr + `, '\', '\\'), '%', '\%'), '_', '\_') || '/%'`
 }
 
 func (d *DB) populateFolderStats(ctx context.Context, folders []model.Folder) ([]model.Folder, error) {
@@ -252,7 +311,7 @@ func (d *DB) populateFolderStats(ctx context.Context, folders []model.Folder) ([
 		folders[index].CoverAssetID = nil
 		relIndex[folders[index].RelPath] = index
 	}
-	rows, err := d.conn.QueryContext(ctx, `SELECT id, parent_rel_path, timeline_at FROM assets WHERE deleted_at IS NULL AND thumb_status = 'ready'`)
+	rows, err := d.conn.QueryContext(ctx, `SELECT id, parent_rel_path, timeline_at, thumb_status FROM assets WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -263,8 +322,12 @@ func (d *DB) populateFolderStats(ctx context.Context, folders []model.Folder) ([
 		var id int64
 		var parent string
 		var timelineAt int64
-		if err := rows.Scan(&id, &parent, &timelineAt); err != nil {
+		var thumbStatus string
+		if err := rows.Scan(&id, &parent, &timelineAt, &thumbStatus); err != nil {
 			return nil, err
+		}
+		if thumbStatus != model.StatusReady {
+			continue
 		}
 		if index, ok := relIndex[parent]; ok {
 			folders[index].AssetCount++
@@ -317,6 +380,9 @@ func folderAncestorRels(rel string) []string {
 }
 
 func filterFoldersWithAssets(folders []model.Folder, includedRoots ...[]string) []model.Folder {
+	if len(includedRoots) > 0 && includedRoots[0] != nil && len(includedRoots[0]) == 0 {
+		return []model.Folder{}
+	}
 	included := map[string]struct{}{}
 	if len(includedRoots) > 0 {
 		for _, root := range includedRoots[0] {

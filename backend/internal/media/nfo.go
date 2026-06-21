@@ -36,6 +36,31 @@ type NFOField struct {
 	Copyable bool   `json:"copyable"`
 }
 
+type NFOFileSignature struct {
+	Size  int64
+	Mtime int64
+}
+
+func NFOFileSignatureForAsset(assetPath string, rootPath string) (*NFOFileSignature, error) {
+	dir := filepath.Dir(assetPath)
+	base := strings.TrimSuffix(filepath.Base(assetPath), filepath.Ext(assetPath))
+	path, ok := FindSidecarPath(rootPath, dir, base, []string{".nfo"})
+	if !ok {
+		return nil, nil
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil
+	}
+	return &NFOFileSignature{Size: info.Size(), Mtime: info.ModTime().Unix()}, nil
+}
+
 func ReadNFOForAsset(assetPath string, rootPath string, limit int64) (*NFOInfo, error) {
 	dir := filepath.Dir(assetPath)
 	base := strings.TrimSuffix(filepath.Base(assetPath), filepath.Ext(assetPath))
@@ -99,6 +124,51 @@ func NFOSearchText(info NFOInfo) string {
 		}
 	}
 	return strings.ToLower(strings.Join(parts, " "))
+}
+
+func NFOTimelineAt(info NFOInfo) *int64 {
+	for _, key := range []string{"premiered", "releasedate", "released", "aired", "date", "year", "dateadded"} {
+		for _, value := range nfoValuesForKey(info, key) {
+			if parsed := unixTime(value); parsed != nil {
+				return parsed
+			}
+		}
+	}
+	for _, label := range []string{"首映时间", "发布日期", "播出时间", "日期", "年份", "添加时间"} {
+		if parsed := unixTime(info.Fields[label]); parsed != nil {
+			return parsed
+		}
+	}
+	return nil
+}
+
+func NFOTimelineAtJSON(value string) *int64 {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	var info NFOInfo
+	if err := json.Unmarshal([]byte(value), &info); err != nil {
+		return nil
+	}
+	return NFOTimelineAt(info)
+}
+
+func nfoValuesForKey(info NFOInfo, key string) []string {
+	key = strings.ToLower(strings.TrimSpace(key))
+	var values []string
+	for _, group := range info.Groups {
+		for _, item := range group.Items {
+			if strings.ToLower(strings.TrimSpace(item.Key)) == key {
+				values = append(values, item.Value)
+			}
+		}
+	}
+	for fieldKey, value := range info.Fields {
+		if strings.ToLower(strings.TrimSpace(fieldKey)) == key {
+			values = append(values, value)
+		}
+	}
+	return values
 }
 
 func FindSidecarPath(root string, dir string, base string, extensions []string) (string, bool) {
@@ -177,8 +247,12 @@ func parseNFOFields(text string) (map[string]string, []NFOGroup) {
 		"originaltitle": {label: "原名", group: "基本"},
 		"outline":       {label: "概述", group: "简介"},
 		"plot":          {label: "简介", group: "简介"},
+		"aired":         {label: "播出时间", group: "基本"},
+		"date":          {label: "日期", group: "基本"},
+		"dateadded":     {label: "添加时间", group: "基本"},
 		"premiered":     {label: "首映时间", group: "基本"},
 		"rating":        {label: "评分", group: "基本"},
+		"released":      {label: "发布日期", group: "基本"},
 		"releasedate":   {label: "发布日期", group: "基本"},
 		"runtime":       {label: "片长", group: "基本"},
 		"sorttitle":     {label: "排序", group: "基本"},

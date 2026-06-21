@@ -26,6 +26,7 @@ type Scanner struct {
 	Extractor         media.Extractor
 	Jobs              *jobs.Manager
 	Events            *events.Bus
+	StatusReporter    StatusReporter
 	VideoProxyEnabled bool
 	ScanWorkers       int
 	Logger            *slog.Logger
@@ -40,6 +41,10 @@ type Scanner struct {
 	progress  Progress
 }
 
+type StatusReporter interface {
+	SetScanStatus(context.Context, Status) error
+}
+
 type Controller = Scanner
 
 type Status struct {
@@ -47,24 +52,35 @@ type Status struct {
 	LastStart int64          `json:"lastStart"`
 	LastRun   *model.ScanRun `json:"lastRun"`
 	Progress  Progress       `json:"progress"`
+	Revision  int64          `json:"revision,omitempty"`
 }
 
 type Progress struct {
-	State           string   `json:"state"`
-	RequestedAction string   `json:"requestedAction"`
-	Reason          string   `json:"reason"`
-	Phase           string   `json:"phase"`
-	Roots           []string `json:"roots"`
-	CurrentRoot     string   `json:"currentRoot"`
-	CurrentRelPath  string   `json:"currentRelPath"`
-	DiscoveredFiles int      `json:"discoveredFiles"`
-	TotalFiles      int      `json:"totalFiles"`
-	ScannedFiles    int      `json:"scannedFiles"`
-	TotalSeen       int      `json:"totalSeen"`
-	AssetsAdded     int      `json:"assetsAdded"`
-	AssetsUpdated   int      `json:"assetsUpdated"`
-	AssetsDeleted   int      `json:"assetsDeleted"`
-	Errors          int      `json:"errors"`
+	State           string                  `json:"state"`
+	RequestedAction string                  `json:"requestedAction"`
+	Task            string                  `json:"task"`
+	Reason          string                  `json:"reason"`
+	Phase           string                  `json:"phase"`
+	Roots           []string                `json:"roots"`
+	CurrentRoot     string                  `json:"currentRoot"`
+	CurrentRelPath  string                  `json:"currentRelPath"`
+	DiscoveredFiles int                     `json:"discoveredFiles"`
+	TotalFiles      int                     `json:"totalFiles"`
+	ScannedFiles    int                     `json:"scannedFiles"`
+	TotalSeen       int                     `json:"totalSeen"`
+	AssetsAdded     int                     `json:"assetsAdded"`
+	AssetsUpdated   int                     `json:"assetsUpdated"`
+	AssetsDeleted   int                     `json:"assetsDeleted"`
+	Errors          int                     `json:"errors"`
+	RootStats       map[string]RootProgress `json:"rootStats,omitempty"`
+}
+
+type RootProgress struct {
+	DiscoveredFiles int  `json:"discoveredFiles"`
+	TotalFiles      int  `json:"totalFiles"`
+	ScannedFiles    int  `json:"scannedFiles"`
+	TotalSeen       int  `json:"totalSeen"`
+	Finished        bool `json:"finished"`
 }
 
 type counters struct {
@@ -74,6 +90,7 @@ type counters struct {
 	assetsDeleted int
 	errors        int
 	lastError     *string
+	rootSeen      map[string]int
 }
 
 type scanFile struct {
@@ -96,6 +113,9 @@ type scanWrite struct {
 	posterStatus    string
 	proxyStatus     string
 	metadataJSON    *string
+	nfoChanged      bool
+	nfoSize         *int64
+	nfoMtime        *int64
 	errorText       *string
 }
 
@@ -106,7 +126,8 @@ type scanState struct {
 	writes   chan scanWrite
 	seen     map[string]struct{}
 	counts   *counters
-	rebuild  bool
+	roots    []string
+	task     scanTask
 	mu       sync.Mutex
 	wg       sync.WaitGroup
 	writerWG sync.WaitGroup
@@ -115,9 +136,18 @@ type scanState struct {
 type scanRequest struct {
 	reason      string
 	roots       []string
+	paths       []string
 	hasOverride bool
-	rebuild     bool
+	task        scanTask
 }
+
+type scanTask string
+
+const (
+	scanTaskMetadata     scanTask = "metadata"
+	scanTaskCount        scanTask = "count"
+	scanTaskThumbRebuild scanTask = "thumb_rebuild"
+)
 
 type scanCommandKind string
 
@@ -140,32 +170,63 @@ type CommandResult struct {
 }
 
 func (s *Scanner) Trigger(reason string) bool {
-	return s.RequestScan(reason).Started
+	return s.RequestMetadataScan(reason).Started
 }
 
 func (s *Scanner) TriggerRoots(reason string, roots []string) bool {
-	return s.RequestScanRoots(reason, roots).Started
+	return s.RequestMetadataScanRoots(reason, roots).Started
 }
 
 func (s *Scanner) TriggerRebuild(reason string) bool {
-	return s.RequestRebuild(reason).Started
+	return s.RequestThumbnailRebuild(reason).Started
 }
 
 func (s *Scanner) RequestScan(reason string) CommandResult {
-	return s.requestStart(scanRequest{reason: reason})
+	return s.RequestMetadataScan(reason)
 }
 
 func (s *Scanner) RequestScanRoots(reason string, roots []string) CommandResult {
-	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: true})
+	return s.RequestMetadataScanRoots(reason, roots)
 }
 
 func (s *Scanner) RequestRebuild(reason string) CommandResult {
-	return s.requestStart(scanRequest{reason: reason, rebuild: true})
+	return s.RequestThumbnailRebuild(reason)
+}
+
+func (s *Scanner) RequestCountScan(reason string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, task: scanTaskCount})
+}
+
+func (s *Scanner) RequestCountScanRoots(reason string, roots []string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: true, task: scanTaskCount})
+}
+
+func (s *Scanner) RequestMetadataScan(reason string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, task: scanTaskMetadata})
+}
+
+func (s *Scanner) RequestMetadataScanRoots(reason string, roots []string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: true, task: scanTaskMetadata})
+}
+
+func (s *Scanner) RequestMetadataScanPaths(reason string, roots []string, paths []string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), paths: append([]string(nil), paths...), hasOverride: true, task: scanTaskMetadata})
+}
+
+func (s *Scanner) RequestThumbnailRebuild(reason string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, task: scanTaskThumbRebuild})
+}
+
+func (s *Scanner) RequestThumbnailRebuildRoots(reason string, roots []string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: true, task: scanTaskThumbRebuild})
 }
 
 func (s *Scanner) requestStart(req scanRequest) CommandResult {
 	if strings.TrimSpace(req.reason) == "" {
 		req.reason = "manual"
+	}
+	if req.task == "" {
+		req.task = scanTaskMetadata
 	}
 	return s.submitCommand(scanCommand{kind: scanCommandStart, req: req})
 }
@@ -201,6 +262,7 @@ func (s *Scanner) submitCommand(cmd scanCommand) CommandResult {
 func (s *Scanner) commandLoop(ctx context.Context) {
 	var cancel context.CancelFunc
 	var done <-chan struct{}
+	var activeStart *scanRequest
 	var pendingStart *scanRequest
 	for {
 		select {
@@ -215,7 +277,21 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 				req := cmd.req
 				if done == nil {
 					cancel, done = s.startRun(ctx, req)
+					activeStart = &req
 					cmd.reply <- CommandResult{Accepted: true, Started: true, State: "running"}
+					continue
+				}
+				if activeStart != nil && sameScanRequest(*activeStart, req) {
+					cmd.reply <- CommandResult{Accepted: true, Started: false, State: s.currentState()}
+					continue
+				}
+				if pendingStart != nil && sameScanRequest(*pendingStart, req) {
+					cmd.reply <- CommandResult{Accepted: true, Started: false, State: s.currentState()}
+					continue
+				}
+				if isAutomaticScanRequest(req) {
+					pendingStart = &req
+					cmd.reply <- CommandResult{Accepted: true, Started: false, State: s.currentState()}
 					continue
 				}
 				pendingStart = &req
@@ -242,15 +318,43 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 		case <-done:
 			done = nil
 			cancel = nil
+			activeStart = nil
 			if pendingStart != nil && ctx.Err() == nil {
 				next := *pendingStart
 				pendingStart = nil
 				cancel, done = s.startRun(ctx, next)
+				activeStart = &next
 				continue
 			}
 			s.setIdleAfterRun()
 		}
 	}
+}
+
+func sameScanRequest(a scanRequest, b scanRequest) bool {
+	return a.task == b.task && equalStringSet(a.roots, b.roots) && equalStringSet(a.paths, b.paths)
+}
+
+func isAutomaticScanRequest(req scanRequest) bool {
+	reason := strings.TrimSpace(req.reason)
+	return strings.HasPrefix(reason, "auto_") || strings.HasPrefix(reason, "fsnotify") || strings.HasPrefix(reason, "count_changed:")
+}
+
+func equalStringSet(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, value := range a {
+		counts[value]++
+	}
+	for _, value := range b {
+		if counts[value] == 0 {
+			return false
+		}
+		counts[value]--
+	}
+	return true
 }
 
 func (s *Scanner) startRun(parent context.Context, req scanRequest) (context.CancelFunc, <-chan struct{}) {
@@ -260,6 +364,7 @@ func (s *Scanner) startRun(parent context.Context, req scanRequest) (context.Can
 	s.progress = Progress{
 		State:           "running",
 		RequestedAction: "start",
+		Task:            string(req.task),
 		Reason:          req.reason,
 		Phase:           "queued",
 		Roots:           append([]string(nil), req.roots...),
@@ -297,6 +402,26 @@ func (s *Scanner) StartPeriodic(ctx context.Context, interval time.Duration) {
 				return
 			case <-ticker.C:
 				s.Trigger("periodic")
+			}
+		}
+	}()
+}
+
+func (s *Scanner) StartPeriodicCount(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if s.Jobs != nil {
+					s.Jobs.Enqueue(jobs.Task{Type: "scan_count", Reason: "auto_count"})
+				}
 			}
 		}
 	}()
@@ -360,14 +485,37 @@ func (s *Scanner) setStopping(requestedAction string) {
 func (s *Scanner) statusSnapshot() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Status{Running: s.running, LastStart: s.lastStart, Progress: s.progress}
+	return Status{Running: s.running, LastStart: s.lastStart, Progress: cloneProgress(s.progress)}
+}
+
+func cloneProgress(progress Progress) Progress {
+	progress.Roots = append([]string(nil), progress.Roots...)
+	if len(progress.RootStats) > 0 {
+		rootStats := make(map[string]RootProgress, len(progress.RootStats))
+		for root, stat := range progress.RootStats {
+			rootStats[root] = stat
+		}
+		progress.RootStats = rootStats
+	}
+	return progress
 }
 
 func (s *Scanner) publishStatus() {
+	status := s.statusSnapshot()
+	status.Revision = nextStatusRevision()
+	if s.StatusReporter != nil {
+		go func() {
+			_ = s.StatusReporter.SetScanStatus(context.Background(), status)
+		}()
+	}
 	if s.Events == nil {
 		return
 	}
-	s.Events.Publish(events.Event{Type: "scan_status", Payload: s.statusSnapshot()})
+	s.Events.Publish(events.Event{Type: "scan_status", Payload: status})
+}
+
+func nextStatusRevision() int64 {
+	return time.Now().UnixNano()
 }
 
 func (s *Scanner) run(ctx context.Context, req scanRequest) {
@@ -403,6 +551,14 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 		}
 		return
 	}
+	switch req.task {
+	case scanTaskCount:
+		s.runCount(ctx, runID, scanRoots, req.reason, logger)
+		return
+	case scanTaskThumbRebuild:
+		s.runThumbnailRebuild(ctx, runID, scanRoots, logger)
+		return
+	}
 	activeBefore, err := s.DB.ActiveRelPathsForRoots(ctx, scanRoots)
 	if err != nil {
 		logger.Error("load active assets failed", "error", err)
@@ -410,27 +566,39 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 		_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "error", Errors: 1, LastError: &message})
 		return
 	}
-	counts := counters{}
+	counts := counters{rootSeen: make(map[string]int, len(scanRoots))}
 	s.updateProgressPhase("discovering")
 	seen := make(map[string]struct{}, len(activeBefore))
-	state := s.newScanState(ctx, seen, &counts, req.rebuild)
+	state := s.newScanState(ctx, seen, &counts, scanRoots, req.task)
 	state.start(s.scanWorkerCount())
 	failedRoots := map[string]struct{}{}
-	for _, root := range scanRoots {
-		if ctx.Err() != nil {
-			break
+	if len(req.paths) > 0 {
+		for _, rel := range req.paths {
+			if ctx.Err() != nil {
+				break
+			}
+			if err := s.submitRelPath(ctx, rel, state); err != nil {
+				state.recordError("扫描文件失败", err)
+				logger.Warn("path scan failed", "relPath", rel, "error", err)
+			}
 		}
-		walkErr := s.walkRoot(ctx, root, state)
-		if ctx.Err() != nil {
-			break
-		}
-		if walkErr != nil {
-			failedRoots[root] = struct{}{}
-			state.recordError("扫描目录失败", walkErr)
-			logger.Warn("walk failed", "root", root, "error", walkErr)
-		}
-		if root == "" && walkErr != nil {
-			s.walkManifestTopLevel(ctx, state)
+	} else {
+		for _, root := range scanRoots {
+			if ctx.Err() != nil {
+				break
+			}
+			walkErr := s.walkRoot(ctx, root, state)
+			if ctx.Err() != nil {
+				break
+			}
+			if walkErr != nil {
+				failedRoots[root] = struct{}{}
+				state.recordError("扫描目录失败", walkErr)
+				logger.Warn("walk failed", "root", root, "error", walkErr)
+			}
+			if root == "" && walkErr != nil {
+				s.walkManifestTopLevel(ctx, state)
+			}
 		}
 	}
 	s.updateProgressPhase("scanning")
@@ -439,37 +607,39 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 		s.finishPaused(runID, counts)
 		return
 	}
-	deletedAt := util.UnixNow()
-	for rel := range activeBefore {
-		if ctx.Err() != nil {
-			s.finishPaused(runID, counts)
-			return
+	if len(req.paths) == 0 {
+		deletedAt := util.UnixNow()
+		for rel := range activeBefore {
+			if ctx.Err() != nil {
+				s.finishPaused(runID, counts)
+				return
+			}
+			if _, ok := seen[rel]; ok {
+				continue
+			}
+			inScanScope := db.AssetInScanFolders(rel, scanRoots)
+			if !inScanScope {
+				continue
+			}
+			if assetUnderFailedRoot(rel, failedRoots) {
+				continue
+			}
+			deleted, err := s.DB.MarkDeletedWithCache(ctx, rel, deletedAt)
+			if err != nil {
+				counts.recordError("标记删除失败", err)
+				logger.Warn("mark deleted failed", "relPath", rel, "error", err)
+				continue
+			}
+			if deleted == nil {
+				continue
+			}
+			if err := s.removeCacheKey(deleted.CacheKey); err != nil {
+				counts.recordError("删除缓存失败", err)
+				logger.Warn("remove cache failed", "relPath", rel, "cacheKey", deleted.CacheKey, "error", err)
+			}
+			counts.assetsDeleted++
+			s.updateProgressCounts(counts, rel)
 		}
-		if _, ok := seen[rel]; ok {
-			continue
-		}
-		inScanScope := db.AssetInScanFolders(rel, scanRoots)
-		if !inScanScope {
-			continue
-		}
-		if assetUnderFailedRoot(rel, failedRoots) {
-			continue
-		}
-		deleted, err := s.DB.MarkDeletedWithCache(ctx, rel, deletedAt)
-		if err != nil {
-			counts.recordError("标记删除失败", err)
-			logger.Warn("mark deleted failed", "relPath", rel, "error", err)
-			continue
-		}
-		if deleted == nil {
-			continue
-		}
-		if err := s.removeCacheKey(deleted.CacheKey); err != nil {
-			counts.recordError("删除缓存失败", err)
-			logger.Warn("remove cache failed", "relPath", rel, "cacheKey", deleted.CacheKey, "error", err)
-		}
-		counts.assetsDeleted++
-		s.updateProgressCounts(counts, rel)
 	}
 	if err := s.DB.RefreshFolders(ctx); err != nil {
 		counts.recordError("更新文件夹统计失败", err)
@@ -492,6 +662,92 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 		logger.Error("finish scan run failed", "error", err)
 	}
 	logger.Info("scan finished", "seen", counts.totalSeen, "added", counts.assetsAdded, "updated", counts.assetsUpdated, "deleted", counts.assetsDeleted, "errors", counts.errors)
+}
+
+func (s *Scanner) runCount(ctx context.Context, runID int64, scanRoots []string, reason string, logger *slog.Logger) {
+	s.updateProgressPhase("counting")
+	libraries, _, err := s.DB.GetScanLibraries(ctx)
+	if err != nil {
+		message := "读取图库失败"
+		_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "error", Errors: 1, LastError: &message})
+		logger.Error("load scan libraries for count failed", "error", err)
+		return
+	}
+	total := 0
+	errors := 0
+	var lastError *string
+	countedAnyLibrary := false
+	for _, library := range libraries {
+		if !scanRootsOverlap(library.Roots, scanRoots) {
+			continue
+		}
+		count, err := CountMediaFilesForRoots(ctx, s.Store, library.Roots)
+		if err != nil {
+			errors++
+			message := "文件数量扫描失败"
+			lastError = &message
+			logger.Warn("count library media files failed", "library", library.Name, "roots", library.Roots, "error", err)
+		}
+		now := util.UnixNow()
+		if err := s.DB.UpdateScanLibraryDiscovered(ctx, library.ID, count, now); err != nil {
+			errors++
+			message := "保存文件数量失败"
+			lastError = &message
+			logger.Warn("save discovered count failed", "library", library.Name, "error", err)
+		}
+		total += count
+		countedAnyLibrary = true
+		s.updateProgressTotalFiles(total)
+		if strings.HasPrefix(reason, "auto_count") && library.DiscoveredAt != nil && library.DiscoveredFiles != count && s.Jobs != nil {
+			s.Jobs.Enqueue(jobs.Task{Type: "scan_metadata", Reason: "count_changed:" + library.Name, Roots: append([]string(nil), library.Roots...)})
+		}
+	}
+	if !countedAnyLibrary {
+		count, err := CountMediaFilesForRoots(ctx, s.Store, scanRoots)
+		if err != nil {
+			errors++
+			message := "文件数量扫描失败"
+			lastError = &message
+			logger.Warn("count media files failed", "roots", scanRoots, "error", err)
+		}
+		total = count
+		s.updateProgressTotalFiles(total)
+	}
+	s.updateProgressPhase("finished")
+	status := "finished"
+	if errors > 0 {
+		status = "finished_with_errors"
+	}
+	_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: status, TotalSeen: total, Errors: errors, LastError: lastError})
+	logger.Info("file count scan finished", "total", total, "errors", errors)
+}
+
+func (s *Scanner) runThumbnailRebuild(ctx context.Context, runID int64, scanRoots []string, logger *slog.Logger) {
+	s.updateProgressPhase("thumb_rebuild")
+	reset, err := s.DB.ResetAssetThumbnailsForRoots(ctx, scanRoots)
+	if err != nil {
+		message := "重置缩略图状态失败"
+		_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "error", Errors: 1, LastError: &message})
+		logger.Error("reset thumbnails for rebuild failed", "error", err)
+		return
+	}
+	items, err := s.DB.ThumbnailWorkForRoots(ctx, scanRoots)
+	if err != nil {
+		message := "读取缩略图任务失败"
+		_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "error", Errors: 1, LastError: &message})
+		logger.Error("load thumbnail rebuild work failed", "error", err)
+		return
+	}
+	if s.Jobs != nil {
+		for _, item := range items {
+			s.Jobs.Enqueue(jobs.Task{Type: item.Type, AssetID: item.AssetID})
+		}
+	}
+	s.updateProgressTotalFiles(reset)
+	s.updateProgressCounts(counters{totalSeen: reset}, "")
+	s.updateProgressPhase("finished")
+	_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "finished", TotalSeen: reset})
+	logger.Info("thumbnail rebuild queued", "reset", reset, "queued", len(items))
 }
 
 func (s *Scanner) finishPaused(runID int64, counts counters) {
@@ -742,6 +998,43 @@ func (s *Scanner) walkManifestTopLevel(ctx context.Context, state *scanState) {
 	}
 }
 
+func (s *Scanner) submitRelPath(ctx context.Context, rel string, state *scanState) error {
+	normalized, err := storage.NormalizeRelPath(rel)
+	if err != nil {
+		return err
+	}
+	if _, ok := scanRootForRel(normalized, state.roots); !ok {
+		return nil
+	}
+	absPath, err := s.Store.PhotoPath(normalized)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			deletedAt := util.UnixNow()
+			deleted, markErr := s.DB.MarkDeletedWithCache(ctx, normalized, deletedAt)
+			if markErr != nil {
+				return markErr
+			}
+			if deleted != nil {
+				s.removeDeletedCaches([]db.DeletedAsset{*deleted}, s.Logger)
+			}
+			return nil
+		}
+		return err
+	}
+	if info.IsDir() {
+		return s.walkDir(ctx, absPath, state)
+	}
+	if !info.Mode().IsRegular() || !media.DetectByPath(info.Name()).OK {
+		return nil
+	}
+	state.submit(absPath, info)
+	return nil
+}
+
 func (s *Scanner) handleSymlink(ctx context.Context, absPath string, entry fs.DirEntry, state *scanState) error {
 	inside, target, err := s.Store.SymlinkTargetWithinRoot(absPath)
 	if err != nil {
@@ -779,6 +1072,34 @@ func assetUnderFailedRoot(rel string, failedRoots map[string]struct{}) bool {
 	return false
 }
 
+func scanRootForRel(rel string, roots []string) (string, bool) {
+	for _, root := range roots {
+		if root == "" || rel == root || strings.HasPrefix(rel, root+"/") {
+			return root, true
+		}
+	}
+	return "", false
+}
+
+func scanRootsOverlap(a []string, b []string) bool {
+	left, err := db.NormalizeScanFolders(a)
+	if err != nil {
+		return false
+	}
+	right, err := db.NormalizeScanFolders(b)
+	if err != nil {
+		return false
+	}
+	for _, l := range left {
+		for _, r := range right {
+			if l == "" || r == "" || l == r || strings.HasPrefix(l, r+"/") || strings.HasPrefix(r, l+"/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func maxInt(a, b int) int {
 	if a > b {
 		return a
@@ -796,7 +1117,7 @@ func (s *Scanner) ensureFolderForPath(ctx context.Context, absPath string, state
 	return nil
 }
 
-func (s *Scanner) newScanState(ctx context.Context, seen map[string]struct{}, counts *counters, rebuild bool) *scanState {
+func (s *Scanner) newScanState(ctx context.Context, seen map[string]struct{}, counts *counters, roots []string, task scanTask) *scanState {
 	return &scanState{
 		scanner: s,
 		ctx:     ctx,
@@ -804,7 +1125,8 @@ func (s *Scanner) newScanState(ctx context.Context, seen map[string]struct{}, co
 		writes:  make(chan scanWrite, maxInt(64, s.scanWorkerCount()*4)),
 		seen:    seen,
 		counts:  counts,
-		rebuild: rebuild,
+		roots:   append([]string(nil), roots...),
+		task:    task,
 	}
 }
 
@@ -842,7 +1164,8 @@ func (st *scanState) start(workers int) {
 }
 
 func (st *scanState) submit(absPath string, info os.FileInfo) {
-	st.scanner.addDiscoveredFile()
+	root, ok := st.rootForAbsPath(absPath)
+	st.scanner.addDiscoveredFile(root, ok)
 	select {
 	case st.files <- scanFile{absPath: absPath, info: info}:
 	case <-st.ctx.Done():
@@ -864,10 +1187,17 @@ func (st *scanState) finish() {
 }
 
 func (st *scanState) markSeen(rel string) {
+	root, hasRoot := scanRootForRel(rel, st.roots)
 	st.mu.Lock()
 	st.seen[rel] = struct{}{}
 	st.counts.totalSeen++
-	counts := *st.counts
+	if hasRoot {
+		if st.counts.rootSeen == nil {
+			st.counts.rootSeen = map[string]int{}
+		}
+		st.counts.rootSeen[root]++
+	}
+	counts := st.counts.clone()
 	st.mu.Unlock()
 	st.scanner.updateProgressCounts(counts, rel)
 }
@@ -887,16 +1217,35 @@ func (st *scanState) addUpdated() {
 func (st *scanState) recordError(publicMessage string, err error) {
 	st.mu.Lock()
 	st.counts.recordError(publicMessage, err)
-	counts := *st.counts
+	counts := st.counts.clone()
 	st.mu.Unlock()
 	st.scanner.updateProgressCounts(counts, "")
 }
 
 func (st *scanState) updateProgress(currentRelPath string) {
 	st.mu.Lock()
-	counts := *st.counts
+	counts := st.counts.clone()
 	st.mu.Unlock()
 	st.scanner.updateProgressCounts(counts, currentRelPath)
+}
+
+func (st *scanState) rootForAbsPath(absPath string) (string, bool) {
+	rel, err := st.scanner.Store.RelPath(absPath)
+	if err != nil {
+		return "", false
+	}
+	return scanRootForRel(rel, st.roots)
+}
+
+func (c counters) clone() counters {
+	result := c
+	if len(c.rootSeen) > 0 {
+		result.rootSeen = make(map[string]int, len(c.rootSeen))
+		for root, count := range c.rootSeen {
+			result.rootSeen[root] = count
+		}
+	}
+	return result
 }
 
 func (st *scanState) processFile(absPath string, info os.FileInfo) {
@@ -925,6 +1274,31 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 		return
 	}
 	info = currentInfo
+	nfoSignature, nfoErr := s.nfoFileSignature(absPath)
+	if nfoErr != nil {
+		st.recordError("读取NFO状态失败", nfoErr)
+		s.Logger.Warn("nfo signature failed", "relPath", rel, "error", nfoErr)
+	}
+	nfoChanged := nfoErr == nil
+	signature, err := s.DB.AssetSignature(ctx, rel)
+	if err != nil {
+		st.recordError("读取资源签名失败", err)
+		s.Logger.Warn("asset signature failed", "relPath", rel, "error", err)
+	}
+	if signature != nil {
+		nfoChanged = !sameNFOSignature(signature, nfoSignature)
+		if signature.Size == info.Size() && signature.Mtime == info.ModTime().Unix() && !nfoChanged {
+			st.markSeen(rel)
+			if asset, err := s.DB.GetAsset(ctx, signature.ID); err == nil {
+				s.enqueuePendingWork(asset)
+			}
+			st.updateProgress(rel)
+			return
+		}
+	}
+	if signature == nil {
+		nfoChanged = nfoSignature != nil
+	}
 	importedAt := util.UnixNow()
 	mtime := info.ModTime().Unix()
 	meta := s.Extractor.Extract(ctx, absPath, detection, mtime, importedAt)
@@ -969,6 +1343,7 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 		posterStatus:    posterStatus,
 		proxyStatus:     proxyStatus,
 		metadataJSON:    metadataJSON,
+		nfoChanged:      nfoChanged,
 		errorText:       errorText,
 	}:
 	case <-ctx.Done():
@@ -998,9 +1373,13 @@ func (st *scanState) writeAsset(write scanWrite) {
 		s.Logger.Warn("ensure folders failed", "relPath", rel, "error", err)
 		return
 	}
-	nfoJSON, nfoSearchText, nfoScanned := st.nfoMetadata(write.absPath, rel)
+	nfoJSON, nfoSearchText, nfoTimelineAt, nfoSize, nfoMtime, nfoScanned := st.nfoMetadata(write.absPath, rel, write.nfoChanged)
 	importedAt := util.UnixNow()
 	mtime := write.info.ModTime().Unix()
+	timelineAt := media.TimelineAt(write.meta.TakenAt, write.meta.VideoCreatedAt, mtime, importedAt)
+	if nfoTimelineAt != nil && *nfoTimelineAt > 0 {
+		timelineAt = *nfoTimelineAt
+	}
 	st.markSeen(rel)
 	params := db.AssetUpsert{
 		RelPath:           rel,
@@ -1016,7 +1395,7 @@ func (st *scanState) writeAsset(write scanWrite) {
 		Duration:          write.meta.Duration,
 		TakenAt:           write.meta.TakenAt,
 		ImportedAt:        importedAt,
-		TimelineAt:        media.TimelineAt(write.meta.TakenAt, write.meta.VideoCreatedAt, mtime, importedAt),
+		TimelineAt:        timelineAt,
 		CacheKey:          storage.CacheKey(rel, write.info.Size(), mtime),
 		BrowserPlayable:   write.browserPlayable,
 		ThumbStatus:       write.thumbStatus,
@@ -1026,6 +1405,8 @@ func (st *scanState) writeAsset(write scanWrite) {
 		MetadataJSON:      write.metadataJSON,
 		NFOJSON:           nfoJSON,
 		NFOSearchText:     nfoSearchText,
+		NFOSize:           nfoSize,
+		NFOMtime:          nfoMtime,
 		NFOScanned:        nfoScanned,
 		Error:             write.errorText,
 	}
@@ -1048,19 +1429,9 @@ func (st *scanState) writeAsset(write scanWrite) {
 	if result.Updated {
 		st.addUpdated()
 	}
-	if st.rebuild {
-		if err := s.DB.ResetAssetThumbnail(ctx, result.ID); err != nil {
-			st.recordError("重建缩略图失败", err)
-			s.Logger.Warn("reset thumbnail failed", "relPath", rel, "assetID", result.ID, "error", err)
-		}
-		if err := s.Store.RemoveCacheVariant(params.CacheKey, "thumbs", "webp"); err != nil {
-			st.recordError("删除缩略图缓存失败", err)
-			s.Logger.Warn("remove thumbnail cache failed", "relPath", rel, "cacheKey", params.CacheKey, "error", err)
-		}
-	}
 	st.updateProgress(rel)
-	if result.Added || result.Updated || st.rebuild {
-		s.enqueueWork(result.ID, write.detection.MediaType, write.previewStatus, write.proxyStatus, st.rebuild)
+	if result.Added || result.Updated {
+		s.enqueueWork(result.ID, write.detection.MediaType, write.previewStatus, write.proxyStatus, false)
 		return
 	}
 	if asset, err := s.DB.GetAsset(ctx, result.ID); err == nil {
@@ -1068,43 +1439,78 @@ func (st *scanState) writeAsset(write scanWrite) {
 	}
 }
 
-func (st *scanState) nfoMetadata(absPath string, rel string) (*string, *string, bool) {
-	scanNFO := st.rebuild
+func (st *scanState) nfoMetadata(absPath string, rel string, nfoChanged bool) (*string, *string, *int64, *int64, *int64, bool) {
+	scanNFO := nfoChanged
 	if !scanNFO {
-		hasNFO, err := st.scanner.DB.AssetHasNFO(st.ctx, rel)
+		nfoJSON, err := st.scanner.DB.AssetNFOJSON(st.ctx, rel)
 		if err != nil {
 			st.recordError("读取NFO状态失败", err)
 			st.scanner.Logger.Warn("read nfo state failed", "relPath", rel, "error", err)
-			return nil, nil, false
+			return nil, nil, nil, nil, nil, false
 		}
-		scanNFO = !hasNFO
+		if nfoJSON != nil {
+			return nil, nil, media.NFOTimelineAtJSON(*nfoJSON), nil, nil, false
+		}
 	}
 	if !scanNFO {
-		return nil, nil, false
+		return nil, nil, nil, nil, nil, false
 	}
 	root, err := st.scanner.Store.RootForPath(absPath)
 	if err != nil {
 		st.recordError("NFO路径不安全", err)
 		st.scanner.Logger.Warn("nfo root lookup failed", "relPath", rel, "error", err)
-		return nil, nil, false
+		return nil, nil, nil, nil, nil, false
+	}
+	signature, err := media.NFOFileSignatureForAsset(absPath, root.Path)
+	if err != nil {
+		st.recordError("读取NFO状态失败", err)
+		st.scanner.Logger.Warn("nfo signature failed", "relPath", rel, "error", err)
+		return nil, nil, nil, nil, nil, false
 	}
 	info, err := media.ReadNFOForAsset(absPath, root.Path, media.MaxNFOBytes)
 	if err != nil {
 		st.recordError("读取NFO失败", err)
 		st.scanner.Logger.Warn("read nfo failed", "relPath", rel, "error", err)
-		return nil, nil, false
+		return nil, nil, nil, nil, nil, false
 	}
 	if info == nil {
-		return nil, nil, st.rebuild
+		return nil, nil, nil, nil, nil, true
 	}
 	nfoJSON, err := media.NFOJSON(*info)
 	if err != nil {
 		st.recordError("解析NFO失败", err)
 		st.scanner.Logger.Warn("marshal nfo failed", "relPath", rel, "error", err)
-		return nil, nil, false
+		return nil, nil, nil, nil, nil, false
 	}
 	nfoSearchText := media.NFOSearchText(*info)
-	return &nfoJSON, &nfoSearchText, true
+	var nfoSize *int64
+	var nfoMtime *int64
+	if signature != nil {
+		nfoSize = &signature.Size
+		nfoMtime = &signature.Mtime
+	}
+	return &nfoJSON, &nfoSearchText, media.NFOTimelineAt(*info), nfoSize, nfoMtime, true
+}
+
+func (s *Scanner) nfoFileSignature(absPath string) (*media.NFOFileSignature, error) {
+	root, err := s.Store.RootForPath(absPath)
+	if err != nil {
+		return nil, err
+	}
+	return media.NFOFileSignatureForAsset(absPath, root.Path)
+}
+
+func sameNFOSignature(signature *db.AssetSignature, current *media.NFOFileSignature) bool {
+	if signature == nil {
+		return current == nil
+	}
+	if current == nil {
+		return !signature.HasNFO && signature.NFOSize == nil && signature.NFOMtime == nil
+	}
+	if signature.NFOSize == nil || signature.NFOMtime == nil {
+		return false
+	}
+	return *signature.NFOSize == current.Size && *signature.NFOMtime == current.Mtime
 }
 
 func (s *Scanner) updateProgressRoot(rootRel string) {
@@ -1117,6 +1523,11 @@ func (s *Scanner) updateProgressRoot(rootRel string) {
 func (s *Scanner) updateProgressRoots(roots []string) {
 	s.mu.Lock()
 	s.progress.Roots = append([]string(nil), roots...)
+	rootStats := make(map[string]RootProgress, len(roots))
+	for _, root := range roots {
+		rootStats[root] = RootProgress{}
+	}
+	s.progress.RootStats = rootStats
 	s.mu.Unlock()
 	s.publishStatus()
 }
@@ -1138,11 +1549,20 @@ func (s *Scanner) updateProgressTotalFiles(totalFiles int) {
 	s.publishStatus()
 }
 
-func (s *Scanner) addDiscoveredFile() {
+func (s *Scanner) addDiscoveredFile(root string, hasRoot bool) {
 	s.mu.Lock()
 	if s.running {
 		s.progress.DiscoveredFiles++
 		s.progress.TotalFiles = s.progress.DiscoveredFiles
+		if hasRoot {
+			if s.progress.RootStats == nil {
+				s.progress.RootStats = map[string]RootProgress{}
+			}
+			stat := s.progress.RootStats[root]
+			stat.DiscoveredFiles++
+			stat.TotalFiles = stat.DiscoveredFiles
+			s.progress.RootStats[root] = stat
+		}
 	}
 	s.mu.Unlock()
 	s.publishStatus()
@@ -1166,6 +1586,26 @@ func (s *Scanner) updateProgressCounts(counts counters, currentRelPath string) {
 	s.progress.AssetsUpdated = counts.assetsUpdated
 	s.progress.AssetsDeleted = counts.assetsDeleted
 	s.progress.Errors = counts.errors
+	if len(counts.rootSeen) > 0 {
+		if s.progress.RootStats == nil {
+			s.progress.RootStats = map[string]RootProgress{}
+		}
+		for root, totalSeen := range counts.rootSeen {
+			stat := s.progress.RootStats[root]
+			if totalSeen > stat.DiscoveredFiles {
+				stat.DiscoveredFiles = totalSeen
+			}
+			if stat.DiscoveredFiles > stat.TotalFiles {
+				stat.TotalFiles = stat.DiscoveredFiles
+			}
+			if totalSeen > stat.TotalFiles {
+				stat.TotalFiles = totalSeen
+			}
+			stat.ScannedFiles = totalSeen
+			stat.TotalSeen = totalSeen
+			s.progress.RootStats[root] = stat
+		}
+	}
 	s.mu.Unlock()
 	s.publishStatus()
 }

@@ -40,55 +40,85 @@ type AssetUpsert struct {
 	MetadataJSON      *string
 	NFOJSON           *string
 	NFOSearchText     *string
+	NFOSize           *int64
+	NFOMtime          *int64
 	NFOScanned        bool
 	Error             *string
 }
 
+type AssetSignature struct {
+	ID       int64
+	Size     int64
+	Mtime    int64
+	NFOSize  *int64
+	NFOMtime *int64
+	HasNFO   bool
+}
+
 type AssetListOptions struct {
-	Page        int
-	PageSize    int
-	Type        string
-	Sort        string
-	Query       string
-	FolderID    *int64
-	From        *int64
-	To          *int64
-	FolderRel   *string
-	Recursive   bool
-	VisibleOnly bool
-	NFOQuery    string
-	MinWidth    *int
-	MaxWidth    *int
-	MinHeight   *int
-	MaxHeight   *int
-	MinDuration *float64
-	MaxDuration *float64
-	MinSize     *int64
-	MaxSize     *int64
-	Orientation string
+	Page         int
+	PageSize     int
+	Type         string
+	Sort         string
+	Query        string
+	FolderID     *int64
+	From         *int64
+	To           *int64
+	FolderRel    *string
+	Recursive    bool
+	VisibleOnly  bool
+	NFOQuery     string
+	NFOActor     string
+	NFOID        string
+	NFOTag       string
+	NFOTitle     string
+	NFOYear      string
+	MinWidth     *int
+	MaxWidth     *int
+	MinHeight    *int
+	MaxHeight    *int
+	MatchAnyAxis bool
+	MinDuration  *float64
+	MaxDuration  *float64
+	MinSize      *int64
+	MaxSize      *int64
+	Orientation  string
 }
 
 type NeighborOptions struct {
-	Context     string
-	AssetID     int64
-	Type        string
-	Sort        string
+	Context      string
+	AssetID      int64
+	Type         string
+	Sort         string
+	Query        string
+	FolderID     *int64
+	From         *int64
+	To           *int64
+	Limit        int
+	Recursive    bool
+	NFOQuery     string
+	NFOActor     string
+	NFOID        string
+	NFOTag       string
+	NFOTitle     string
+	NFOYear      string
+	MinWidth     *int
+	MaxWidth     *int
+	MinHeight    *int
+	MaxHeight    *int
+	MatchAnyAxis bool
+	MinDuration  *float64
+	MaxDuration  *float64
+	MinSize      *int64
+	MaxSize      *int64
+	Orientation  string
+}
+
+type NFOOptionOptions struct {
+	Field       string
 	Query       string
-	FolderID    *int64
-	From        *int64
-	To          *int64
 	Limit       int
-	Recursive   bool
-	NFOQuery    string
-	MinWidth    *int
-	MaxWidth    *int
-	MinHeight   *int
-	MaxHeight   *int
-	MinDuration *float64
-	MaxDuration *float64
-	MinSize     *int64
-	MaxSize     *int64
-	Orientation string
+	VisibleOnly bool
 }
 
 type Neighbors struct {
@@ -130,6 +160,13 @@ type LibraryAnchorResult struct {
 	Total int
 }
 
+type AssetPosition struct {
+	Index    int
+	Page     int
+	Position float64
+	Total    int
+}
+
 type libraryAnchorRow struct {
 	Filename   string
 	ImportedAt int64
@@ -150,31 +187,57 @@ func (d *DB) UpsertAssetDetailed(ctx context.Context, p AssetUpsert) (AssetUpser
 	if p.ImportedAt == 0 {
 		p.ImportedAt = now
 	}
+	if err := d.EnsureAssetFolders(ctx, p.RelPath); err != nil {
+		return AssetUpsertResult{}, err
+	}
 	var existingID int64
 	var existingSize int64
 	var existingMtime int64
 	var existingCacheKey string
+	var existingTimelineAt int64
 	var deletedAt sql.NullInt64
 	var existingNFOJSON sql.NullString
 	var existingNFOSearchText sql.NullString
-	err := d.conn.QueryRowContext(ctx, `SELECT id, size, mtime, cache_key, deleted_at, nfo_json, nfo_search_text FROM assets WHERE rel_path = ?`, p.RelPath).Scan(&existingID, &existingSize, &existingMtime, &existingCacheKey, &deletedAt, &existingNFOJSON, &existingNFOSearchText)
+	var existingNFOSize sql.NullInt64
+	var existingNFOMtime sql.NullInt64
+	err := d.conn.QueryRowContext(ctx, `SELECT id, size, mtime, cache_key, timeline_at, deleted_at, nfo_json, nfo_search_text, nfo_size, nfo_mtime FROM assets WHERE rel_path = ?`, p.RelPath).Scan(&existingID, &existingSize, &existingMtime, &existingCacheKey, &existingTimelineAt, &deletedAt, &existingNFOJSON, &existingNFOSearchText, &existingNFOSize, &existingNFOMtime)
 	if errors.Is(err, sql.ErrNoRows) {
-		result, err := d.conn.ExecContext(ctx, `
-INSERT INTO assets (
-  rel_path, parent_rel_path, filename, ext, media_type, mime_type, size, mtime,
-  width, height, duration, taken_at, imported_at, timeline_at, cache_key,
-  browser_playable, scan_status, thumb_status, preview_status, video_poster_status,
-  video_proxy_status, metadata_json, nfo_json, nfo_search_text, error, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			p.RelPath, p.ParentRelPath, p.Filename, p.Ext, p.MediaType, nullString(p.MimeType), p.Size, p.Mtime,
-			nullInt(p.Width), nullInt(p.Height), nullFloat(p.Duration), nullInt64(p.TakenAt), p.ImportedAt, p.TimelineAt, p.CacheKey,
-			boolInt(p.BrowserPlayable), model.StatusOK, p.ThumbStatus, p.PreviewStatus, p.VideoPosterStatus,
-			p.VideoProxyStatus, nullString(p.MetadataJSON), nullString(p.NFOJSON), nullString(p.NFOSearchText), nullString(p.Error), now, now)
+		tx, err := d.conn.BeginTx(ctx, nil)
 		if err != nil {
 			return AssetUpsertResult{}, err
 		}
-		id, err := result.LastInsertId()
+		folderID, err := folderIDForRel(ctx, tx, p.ParentRelPath)
 		if err != nil {
+			_ = tx.Rollback()
+			return AssetUpsertResult{}, err
+		}
+		var id int64
+		err = tx.QueryRowContext(ctx, `
+INSERT INTO media_asset (
+  media_type, status, basename, ext, mime_type, width, height, aspect_ratio,
+  duration_ms, size_bytes, file_mtime, captured_at, imported_at, sort_time,
+  folder_id, metadata_json, nfo_json, nfo_search_text, cache_key, browser_playable,
+  thumb_ready, preview_ready, proxy_ready, thumb_status, preview_status,
+  video_poster_status, video_proxy_status, nfo_size, nfo_mtime, error_text, created_at, updated_at
+) VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id`,
+			mediaTypeCode(p.MediaType), p.Filename, p.Ext, nullString(p.MimeType), nullInt(p.Width), nullInt(p.Height), aspectRatio(p.Width, p.Height),
+			durationMillis(p.Duration), p.Size, unixTime(p.Mtime), unixTimePtr(p.TakenAt), unixTime(p.ImportedAt), unixTime(p.TimelineAt),
+			folderID, nullString(p.MetadataJSON), nullString(p.NFOJSON), nullString(p.NFOSearchText), p.CacheKey, p.BrowserPlayable,
+			p.ThumbStatus == model.StatusReady, p.PreviewStatus == model.StatusReady, p.VideoProxyStatus == model.StatusReady,
+			p.ThumbStatus, p.PreviewStatus, p.VideoPosterStatus, p.VideoProxyStatus, nullInt64(p.NFOSize), unixTimePtr(p.NFOMtime), nullString(p.Error), unixTime(now), unixTime(now)).Scan(&id)
+		if err != nil {
+			_ = tx.Rollback()
+			return AssetUpsertResult{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO file_instance (asset_id, library_id, rel_path, size_bytes, file_mtime, last_seen_at, missing)
+VALUES (?, 1, ?, ?, ?, ?, false)`,
+			id, p.RelPath, p.Size, unixTime(p.Mtime), unixTime(now)); err != nil {
+			_ = tx.Rollback()
+			return AssetUpsertResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
 			return AssetUpsertResult{}, err
 		}
 		return AssetUpsertResult{ID: id, Added: true}, nil
@@ -183,12 +246,21 @@ INSERT INTO assets (
 		return AssetUpsertResult{}, err
 	}
 	if existingSize == p.Size && existingMtime == p.Mtime && !deletedAt.Valid {
+		timelineChanged := p.TimelineAt > 0 && p.TimelineAt != existingTimelineAt
 		if p.NFOScanned {
-			if nfoColumnsEqual(existingNFOJSON, p.NFOJSON) && nfoColumnsEqual(existingNFOSearchText, p.NFOSearchText) {
+			nfoSignatureChanged := !nullInt64Equal(existingNFOSize, p.NFOSize) || !nullInt64Equal(existingNFOMtime, p.NFOMtime)
+			if nfoColumnsEqual(existingNFOJSON, p.NFOJSON) && nfoColumnsEqual(existingNFOSearchText, p.NFOSearchText) && !nfoSignatureChanged && !timelineChanged {
 				return AssetUpsertResult{ID: existingID}, nil
 			}
-			_, err = d.conn.ExecContext(ctx, `UPDATE assets SET nfo_json = ?, nfo_search_text = ?, updated_at = ? WHERE id = ?`,
-				nullString(p.NFOJSON), nullString(p.NFOSearchText), now, existingID)
+			_, err = d.conn.ExecContext(ctx, `UPDATE media_asset SET nfo_json = ?::jsonb, nfo_search_text = ?, nfo_size = ?, nfo_mtime = ?, sort_time = ?, updated_at = ? WHERE id = ?`,
+				nullString(p.NFOJSON), nullString(p.NFOSearchText), nullInt64(p.NFOSize), unixTimePtr(p.NFOMtime), unixTime(p.TimelineAt), unixTime(now), existingID)
+			if err != nil {
+				return AssetUpsertResult{}, err
+			}
+			return AssetUpsertResult{ID: existingID, Updated: true}, nil
+		}
+		if timelineChanged {
+			_, err = d.conn.ExecContext(ctx, `UPDATE media_asset SET sort_time = ?, updated_at = ? WHERE id = ?`, unixTime(p.TimelineAt), unixTime(now), existingID)
 			if err != nil {
 				return AssetUpsertResult{}, err
 			}
@@ -197,33 +269,9 @@ INSERT INTO assets (
 		return AssetUpsertResult{ID: existingID}, nil
 	}
 	if p.NFOScanned {
-		_, err = d.conn.ExecContext(ctx, `
-UPDATE assets SET
-  parent_rel_path = ?, filename = ?, ext = ?, media_type = ?, mime_type = ?,
-  size = ?, mtime = ?, width = ?, height = ?, duration = ?, taken_at = ?,
-  timeline_at = ?, cache_key = ?, browser_playable = ?, scan_status = ?,
-  thumb_status = ?, preview_status = ?, video_poster_status = ?, video_proxy_status = ?,
-  metadata_json = ?, nfo_json = ?, nfo_search_text = ?, error = ?, deleted_at = NULL, updated_at = ?
-WHERE id = ?`,
-			p.ParentRelPath, p.Filename, p.Ext, p.MediaType, nullString(p.MimeType),
-			p.Size, p.Mtime, nullInt(p.Width), nullInt(p.Height), nullFloat(p.Duration), nullInt64(p.TakenAt),
-			p.TimelineAt, p.CacheKey, boolInt(p.BrowserPlayable), model.StatusOK,
-			p.ThumbStatus, p.PreviewStatus, p.VideoPosterStatus, p.VideoProxyStatus,
-			nullString(p.MetadataJSON), nullString(p.NFOJSON), nullString(p.NFOSearchText), nullString(p.Error), now, existingID)
+		err = d.updateAssetRecord(ctx, existingID, p, now, true)
 	} else {
-		_, err = d.conn.ExecContext(ctx, `
-UPDATE assets SET
-  parent_rel_path = ?, filename = ?, ext = ?, media_type = ?, mime_type = ?,
-  size = ?, mtime = ?, width = ?, height = ?, duration = ?, taken_at = ?,
-  timeline_at = ?, cache_key = ?, browser_playable = ?, scan_status = ?,
-  thumb_status = ?, preview_status = ?, video_poster_status = ?, video_proxy_status = ?,
-  metadata_json = ?, error = ?, deleted_at = NULL, updated_at = ?
-WHERE id = ?`,
-			p.ParentRelPath, p.Filename, p.Ext, p.MediaType, nullString(p.MimeType),
-			p.Size, p.Mtime, nullInt(p.Width), nullInt(p.Height), nullFloat(p.Duration), nullInt64(p.TakenAt),
-			p.TimelineAt, p.CacheKey, boolInt(p.BrowserPlayable), model.StatusOK,
-			p.ThumbStatus, p.PreviewStatus, p.VideoPosterStatus, p.VideoProxyStatus,
-			nullString(p.MetadataJSON), nullString(p.Error), now, existingID)
+		err = d.updateAssetRecord(ctx, existingID, p, now, false)
 	}
 	if err != nil {
 		return AssetUpsertResult{}, err
@@ -235,16 +283,114 @@ WHERE id = ?`,
 	return result, nil
 }
 
-func (d *DB) AssetHasNFO(ctx context.Context, relPath string) (bool, error) {
-	var value sql.NullString
-	err := d.conn.QueryRowContext(ctx, `SELECT nfo_json FROM assets WHERE rel_path = ?`, relPath).Scan(&value)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+func (d *DB) updateAssetRecord(ctx context.Context, id int64, p AssetUpsert, now int64, updateNFO bool) error {
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
 	}
+	folderID, err := folderIDForRel(ctx, tx, p.ParentRelPath)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if updateNFO {
+		_, err = tx.ExecContext(ctx, `
+UPDATE media_asset SET
+  media_type = ?, basename = ?, ext = ?, mime_type = ?, size_bytes = ?, file_mtime = ?,
+  width = ?, height = ?, aspect_ratio = ?, duration_ms = ?, captured_at = ?, sort_time = ?,
+  cache_key = ?, browser_playable = ?, status = 0, thumb_status = ?, preview_status = ?,
+  video_poster_status = ?, video_proxy_status = ?, thumb_ready = ?, preview_ready = ?, proxy_ready = ?,
+  metadata_json = ?::jsonb, nfo_json = ?::jsonb, nfo_search_text = ?, nfo_size = ?, nfo_mtime = ?, error_text = ?, deleted = false,
+  deleted_at = NULL, folder_id = ?, updated_at = ?
+WHERE id = ?`,
+			mediaTypeCode(p.MediaType), p.Filename, p.Ext, nullString(p.MimeType), p.Size, unixTime(p.Mtime),
+			nullInt(p.Width), nullInt(p.Height), aspectRatio(p.Width, p.Height), durationMillis(p.Duration), unixTimePtr(p.TakenAt), unixTime(p.TimelineAt),
+			p.CacheKey, p.BrowserPlayable, p.ThumbStatus, p.PreviewStatus,
+			p.VideoPosterStatus, p.VideoProxyStatus, p.ThumbStatus == model.StatusReady, p.PreviewStatus == model.StatusReady, p.VideoProxyStatus == model.StatusReady,
+			nullString(p.MetadataJSON), nullString(p.NFOJSON), nullString(p.NFOSearchText), nullInt64(p.NFOSize), unixTimePtr(p.NFOMtime), nullString(p.Error), folderID, unixTime(now), id)
+	} else {
+		_, err = tx.ExecContext(ctx, `
+UPDATE media_asset SET
+  media_type = ?, basename = ?, ext = ?, mime_type = ?, size_bytes = ?, file_mtime = ?,
+  width = ?, height = ?, aspect_ratio = ?, duration_ms = ?, captured_at = ?, sort_time = ?,
+  cache_key = ?, browser_playable = ?, status = 0, thumb_status = ?, preview_status = ?,
+  video_poster_status = ?, video_proxy_status = ?, thumb_ready = ?, preview_ready = ?, proxy_ready = ?,
+  metadata_json = ?::jsonb, error_text = ?, deleted = false, deleted_at = NULL, folder_id = ?, updated_at = ?
+WHERE id = ?`,
+			mediaTypeCode(p.MediaType), p.Filename, p.Ext, nullString(p.MimeType), p.Size, unixTime(p.Mtime),
+			nullInt(p.Width), nullInt(p.Height), aspectRatio(p.Width, p.Height), durationMillis(p.Duration), unixTimePtr(p.TakenAt), unixTime(p.TimelineAt),
+			p.CacheKey, p.BrowserPlayable, p.ThumbStatus, p.PreviewStatus,
+			p.VideoPosterStatus, p.VideoProxyStatus, p.ThumbStatus == model.StatusReady, p.PreviewStatus == model.StatusReady, p.VideoProxyStatus == model.StatusReady,
+			nullString(p.MetadataJSON), nullString(p.Error), folderID, unixTime(now), id)
+	}
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE file_instance
+SET rel_path = ?, size_bytes = ?, file_mtime = ?, last_seen_at = ?, missing = false
+WHERE asset_id = ? AND library_id = 1`,
+		p.RelPath, p.Size, unixTime(p.Mtime), unixTime(now), id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *DB) AssetHasNFO(ctx context.Context, relPath string) (bool, error) {
+	value, err := d.AssetNFOJSON(ctx, relPath)
 	if err != nil {
 		return false, err
 	}
-	return value.Valid && strings.TrimSpace(value.String) != "", nil
+	return value != nil && strings.TrimSpace(*value) != "", nil
+}
+
+func (d *DB) AssetNFOJSON(ctx context.Context, relPath string) (*string, error) {
+	var value sql.NullString
+	err := d.conn.QueryRowContext(ctx, `SELECT nfo_json FROM assets WHERE rel_path = ?`, relPath).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !value.Valid || strings.TrimSpace(value.String) == "" {
+		return nil, nil
+	}
+	return &value.String, nil
+}
+
+func (d *DB) AssetSignature(ctx context.Context, relPath string) (*AssetSignature, error) {
+	var signature AssetSignature
+	var nfoSize sql.NullInt64
+	var nfoMtime sql.NullInt64
+	err := d.conn.QueryRowContext(ctx, `
+SELECT
+  ma.id,
+  ma.size_bytes,
+  EXTRACT(EPOCH FROM ma.file_mtime)::BIGINT,
+  ma.nfo_size,
+  EXTRACT(EPOCH FROM ma.nfo_mtime)::BIGINT,
+  ma.nfo_json IS NOT NULL
+FROM media_asset ma
+JOIN file_instance fi ON fi.asset_id = ma.id AND fi.missing = false
+WHERE fi.rel_path = ?
+  AND ma.deleted = false
+  AND ma.deleted_at IS NULL`, relPath).Scan(&signature.ID, &signature.Size, &signature.Mtime, &nfoSize, &nfoMtime, &signature.HasNFO)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if nfoSize.Valid {
+		signature.NFOSize = &nfoSize.Int64
+	}
+	if nfoMtime.Valid {
+		signature.NFOMtime = &nfoMtime.Int64
+	}
+	return &signature, nil
 }
 
 func (d *DB) GetAsset(ctx context.Context, id int64) (model.Asset, error) {
@@ -270,12 +416,78 @@ func (d *DB) SearchAssets(ctx context.Context, opts AssetListOptions) (model.Pag
 	return d.listAssets(ctx, opts, true)
 }
 
+func (d *DB) NFOOptions(ctx context.Context, opts NFOOptionOptions) ([]string, error) {
+	filter, ok := nfoFieldFilterSQL(opts.Field)
+	if !ok {
+		return nil, nil
+	}
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 40
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	where := []string{"deleted_at IS NULL", "nfo_json IS NOT NULL", "(" + filter + ")"}
+	var args []any
+	if opts.VisibleOnly {
+		where = append(where, "thumb_status = 'ready'")
+	}
+	if query := strings.TrimSpace(opts.Query); query != "" {
+		where = append(where, "lower(trim(COALESCE(nfo_item.item_value->>'value', ''))) LIKE ? ESCAPE '\\'")
+		args = append(args, "%"+escapeLike(strings.ToLower(query))+"%")
+	}
+	args = append(args, limit)
+	query := `
+SELECT value
+FROM (
+  SELECT DISTINCT trim(COALESCE(nfo_item.item_value->>'value', '')) AS value
+  FROM assets
+  CROSS JOIN LATERAL jsonb_array_elements(COALESCE(nfo_json::jsonb->'groups', '[]'::jsonb)) AS nfo_group(group_value)
+  CROSS JOIN LATERAL jsonb_array_elements(COALESCE(nfo_group.group_value->'items', '[]'::jsonb)) AS nfo_item(item_value)
+  WHERE ` + strings.Join(where, " AND ") + `
+) options
+WHERE value <> ''
+ORDER BY lower(value), value
+LIMIT ?`
+	rows, err := d.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	values := make([]string, 0)
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
+}
+
 func (d *DB) LibraryAnchors(ctx context.Context, opts AssetListOptions) (LibraryAnchorResult, error) {
 	if opts.PageSize <= 0 {
 		opts.PageSize = 100
 	}
 	where, args := assetFilterSQL(opts, false)
 	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.PageSize)
+}
+
+func (d *DB) SearchAnchors(ctx context.Context, opts AssetListOptions) (LibraryAnchorResult, error) {
+	if opts.PageSize <= 0 {
+		opts.PageSize = 100
+	}
+	where, args := assetFilterSQL(opts, true)
+	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.PageSize)
+}
+
+func (d *DB) AssetPosition(ctx context.Context, assetID int64, opts AssetListOptions, timeline bool) (AssetPosition, error) {
+	if opts.PageSize <= 0 {
+		opts.PageSize = 100
+	}
+	where, args := assetFilterSQL(opts, timeline)
+	return d.assetPositionForFilter(ctx, assetID, where, args, opts.Sort, opts.PageSize)
 }
 
 func (d *DB) anchorsForFilter(ctx context.Context, where string, args []any, sort string, pageSize int) (LibraryAnchorResult, error) {
@@ -340,6 +552,29 @@ func (d *DB) anchorsForFilter(ctx context.Context, where string, args []any, sor
 		})
 	}
 	return LibraryAnchorResult{Items: anchors, Total: len(items)}, nil
+}
+
+func (d *DB) assetPositionForFilter(ctx context.Context, assetID int64, where string, args []any, sort string, pageSize int) (AssetPosition, error) {
+	query := `
+SELECT item_index, total_count
+FROM (
+  SELECT id, ROW_NUMBER() OVER (ORDER BY ` + sortSQL(sort) + `) - 1 AS item_index, COUNT(*) OVER () AS total_count
+  FROM assets
+  WHERE ` + where + `
+) ranked
+WHERE id = ?`
+	queryArgs := append([]any{}, args...)
+	queryArgs = append(queryArgs, assetID)
+	var index int
+	var total int
+	if err := d.conn.QueryRowContext(ctx, query, queryArgs...).Scan(&index, &total); err != nil {
+		return AssetPosition{}, err
+	}
+	position := 0.0
+	if total > 1 {
+		position = float64(index) / float64(total-1)
+	}
+	return AssetPosition{Index: index, Page: index/pageSize + 1, Position: position, Total: total}, nil
 }
 
 func usesUniformAnchors(sort string) bool {
@@ -422,6 +657,32 @@ func (d *DB) ListFolderAssets(ctx context.Context, folderID int64, opts AssetLis
 	return d.listAssets(ctx, opts, false)
 }
 
+func (d *DB) FolderAnchors(ctx context.Context, folderID int64, opts AssetListOptions) (LibraryAnchorResult, error) {
+	if opts.PageSize <= 0 {
+		opts.PageSize = 100
+	}
+	folder, err := d.getFolderRaw(ctx, folderID)
+	if err != nil {
+		return LibraryAnchorResult{}, err
+	}
+	opts.FolderRel = &folder.RelPath
+	where, args := assetFilterSQL(opts, false)
+	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.PageSize)
+}
+
+func (d *DB) FolderAssetPosition(ctx context.Context, folderID int64, assetID int64, opts AssetListOptions) (AssetPosition, error) {
+	if opts.PageSize <= 0 {
+		opts.PageSize = 100
+	}
+	folder, err := d.getFolderRaw(ctx, folderID)
+	if err != nil {
+		return AssetPosition{}, err
+	}
+	opts.FolderRel = &folder.RelPath
+	where, args := assetFilterSQL(opts, false)
+	return d.assetPositionForFilter(ctx, assetID, where, args, opts.Sort, opts.PageSize)
+}
+
 func (d *DB) listAssets(ctx context.Context, opts AssetListOptions, timeline bool) (model.Page[model.Asset], error) {
 	where, args := assetFilterSQL(opts, timeline)
 	order := sortSQL(opts.Sort)
@@ -500,10 +761,15 @@ WHERE rel_path = ? AND deleted_at IS NULL`, relPath).Scan(&asset.ID, &asset.RelP
 	if err != nil {
 		return nil, err
 	}
-	_, err = d.conn.ExecContext(ctx, `UPDATE assets SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, deletedAt, deletedAt, asset.ID)
+	_, err = d.conn.ExecContext(ctx, `
+UPDATE media_asset
+SET deleted = true, deleted_at = ?, updated_at = ?
+WHERE id = ? AND deleted = false`,
+		unixTime(deletedAt), unixTime(deletedAt), asset.ID)
 	if err != nil {
 		return nil, err
 	}
+	_, _ = d.conn.ExecContext(ctx, `UPDATE file_instance SET missing = true WHERE asset_id = ?`, asset.ID)
 	return &asset, nil
 }
 
@@ -556,15 +822,16 @@ WHERE `+where, args...)
 	}
 	placeholders := make([]string, len(ids))
 	updateArgs := make([]any, 0, len(ids)+2)
-	updateArgs = append(updateArgs, deletedAt, deletedAt)
+	updateArgs = append(updateArgs, unixTime(deletedAt), unixTime(deletedAt))
 	for i, id := range ids {
 		placeholders[i] = "?"
 		updateArgs = append(updateArgs, id)
 	}
-	_, err = d.conn.ExecContext(ctx, `UPDATE assets SET deleted_at = ?, updated_at = ? WHERE deleted_at IS NULL AND id IN (`+strings.Join(placeholders, ",")+`)`, updateArgs...)
+	_, err = d.conn.ExecContext(ctx, `UPDATE media_asset SET deleted = true, deleted_at = ?, updated_at = ? WHERE deleted = false AND id IN (`+strings.Join(placeholders, ",")+`)`, updateArgs...)
 	if err != nil {
 		return nil, err
 	}
+	_, _ = d.conn.ExecContext(ctx, `UPDATE file_instance SET missing = true WHERE asset_id IN (`+strings.Join(placeholders, ",")+`)`, ids...)
 	return items, nil
 }
 
@@ -573,22 +840,118 @@ func (d *DB) SetAssetWorkStatus(ctx context.Context, assetID int64, field string
 		return fmt.Errorf("invalid status field %s", field)
 	}
 	now := util.UnixNow()
-	if message == nil {
-		_, err := d.conn.ExecContext(ctx, fmt.Sprintf(`UPDATE assets SET %s = ?, error = NULL, updated_at = ? WHERE id = ?`, field), status, now, assetID)
+	readyField := readyColumnForStatus(field)
+	if readyField != "" {
+		_, err := d.conn.ExecContext(ctx, fmt.Sprintf(`UPDATE media_asset SET %s = ?, %s = ?, error_text = ?, updated_at = ? WHERE id = ?`, field, readyField),
+			status, status == model.StatusReady, nullString(message), unixTime(now), assetID)
+		if err != nil {
+			return err
+		}
+	} else {
+		_, err := d.conn.ExecContext(ctx, fmt.Sprintf(`UPDATE media_asset SET %s = ?, error_text = ?, updated_at = ? WHERE id = ?`, field),
+			status, nullString(message), unixTime(now), assetID)
+		if err != nil {
+			return err
+		}
+	}
+	if err := d.upsertMediaJob(ctx, assetID, field, status, message, now); err != nil {
 		return err
 	}
-	_, err := d.conn.ExecContext(ctx, fmt.Sprintf(`UPDATE assets SET %s = ?, error = ?, updated_at = ? WHERE id = ?`, field), status, *message, now, assetID)
-	return err
+	if status == model.StatusReady {
+		return d.upsertMediaVariant(ctx, assetID, field)
+	}
+	return nil
 }
 
 func (d *DB) ResetAssetThumbnail(ctx context.Context, assetID int64) error {
 	now := util.UnixNow()
 	_, err := d.conn.ExecContext(ctx, `
-UPDATE assets
-SET thumb_status = ?, video_poster_status = ?, error = NULL, updated_at = ?
-WHERE id = ? AND deleted_at IS NULL`,
-		model.StatusPending, model.StatusNotRequired, now, assetID)
+UPDATE media_asset
+SET thumb_status = ?, video_poster_status = ?, thumb_ready = false, error_text = NULL, updated_at = ?
+WHERE id = ? AND deleted = false`,
+		model.StatusPending, model.StatusNotRequired, unixTime(now), assetID)
 	return err
+}
+
+func (d *DB) ResetAssetThumbnailsForRoots(ctx context.Context, roots []string) (int, error) {
+	where, args, err := assetRootsWhere(roots)
+	if err != nil {
+		return 0, err
+	}
+	now := util.UnixNow()
+	queryArgs := []any{model.StatusPending, model.StatusNotRequired, unixTime(now)}
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, model.StatusPending)
+	var count int
+	err = d.conn.QueryRowContext(ctx, `
+WITH reset AS (
+  UPDATE media_asset
+  SET thumb_status = ?, video_poster_status = ?, thumb_ready = false, error_text = NULL, updated_at = ?
+  WHERE deleted = false
+    AND deleted_at IS NULL
+    AND id IN (SELECT id FROM assets WHERE `+where+`)
+  RETURNING id
+), jobs AS (
+  INSERT INTO media_job (asset_id, job_type, status, error_text, started_at, finished_at)
+  SELECT id, 'thumb', ?, NULL, NULL, NULL FROM reset
+  ON CONFLICT(asset_id, job_type) DO UPDATE SET
+    status = excluded.status,
+    error_text = excluded.error_text,
+    started_at = NULL,
+    finished_at = NULL
+  RETURNING 1
+)
+SELECT COUNT(*) FROM reset`, queryArgs...).Scan(&count)
+	return count, err
+}
+
+func (d *DB) ThumbnailWorkForRoots(ctx context.Context, roots []string) ([]WorkItem, error) {
+	where, args, err := assetRootsWhere(roots)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := d.conn.QueryContext(ctx, `SELECT id FROM assets WHERE `+where+` AND media_type IN (?, ?)`, append(args, model.MediaTypeImage, model.MediaTypeVideo)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []WorkItem
+	for rows.Next() {
+		var item WorkItem
+		item.Type = "thumb"
+		if err := rows.Scan(&item.AssetID); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (d *DB) EnableVideoProxies(ctx context.Context) error {
+	now := util.UnixNow()
+	rows, err := d.conn.QueryContext(ctx, `
+UPDATE media_asset
+SET video_proxy_status = ?, proxy_ready = false, error_text = NULL, updated_at = ?
+WHERE deleted = false
+  AND deleted_at IS NULL
+  AND media_type = ?
+  AND video_proxy_status = ?
+RETURNING id`,
+		model.StatusPending, unixTime(now), mediaTypeCode(model.MediaTypeVideo), model.StatusNotRequired)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var assetID int64
+		if err := rows.Scan(&assetID); err != nil {
+			return err
+		}
+		if err := d.upsertMediaJob(ctx, assetID, "video_proxy_status", model.StatusPending, nil, now); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 func (d *DB) PendingWork(ctx context.Context, videoProxyEnabled bool) ([]WorkItem, error) {
@@ -641,7 +1004,8 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 	}
 	filterOpts := AssetListOptions{
 		Type: opts.Type, Sort: opts.Sort, Query: opts.Query, From: opts.From, To: opts.To, VisibleOnly: true,
-		NFOQuery: opts.NFOQuery, MinWidth: opts.MinWidth, MaxWidth: opts.MaxWidth, MinHeight: opts.MinHeight, MaxHeight: opts.MaxHeight,
+		NFOQuery: opts.NFOQuery, NFOActor: opts.NFOActor, NFOID: opts.NFOID, NFOTag: opts.NFOTag, NFOTitle: opts.NFOTitle, NFOYear: opts.NFOYear,
+		MinWidth: opts.MinWidth, MaxWidth: opts.MaxWidth, MinHeight: opts.MinHeight, MaxHeight: opts.MaxHeight, MatchAnyAxis: opts.MatchAnyAxis,
 		MinDuration: opts.MinDuration, MaxDuration: opts.MaxDuration, MinSize: opts.MinSize, MaxSize: opts.MaxSize, Orientation: opts.Orientation,
 	}
 	if opts.Context == "folder" {
@@ -704,21 +1068,29 @@ func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 		where = append(where, "nfo_search_text IS NOT NULL AND lower(nfo_search_text) LIKE ? ESCAPE '\\'")
 		args = append(args, "%"+escapeLike(strings.ToLower(opts.NFOQuery))+"%")
 	}
-	if opts.MinWidth != nil {
-		where = append(where, "width IS NOT NULL AND width >= ?")
-		args = append(args, *opts.MinWidth)
+	if condition, conditionArgs := nfoValueSearchCondition("actor", opts.NFOActor); condition != "" {
+		where = append(where, condition)
+		args = append(args, conditionArgs...)
 	}
-	if opts.MaxWidth != nil {
-		where = append(where, "width IS NOT NULL AND width <= ?")
-		args = append(args, *opts.MaxWidth)
+	if condition, conditionArgs := nfoValueSearchCondition("id", opts.NFOID); condition != "" {
+		where = append(where, condition)
+		args = append(args, conditionArgs...)
 	}
-	if opts.MinHeight != nil {
-		where = append(where, "height IS NOT NULL AND height >= ?")
-		args = append(args, *opts.MinHeight)
+	if condition, conditionArgs := nfoValueSearchCondition("tag", opts.NFOTag); condition != "" {
+		where = append(where, condition)
+		args = append(args, conditionArgs...)
 	}
-	if opts.MaxHeight != nil {
-		where = append(where, "height IS NOT NULL AND height <= ?")
-		args = append(args, *opts.MaxHeight)
+	if condition, conditionArgs := nfoValueSearchCondition("title", opts.NFOTitle); condition != "" {
+		where = append(where, condition)
+		args = append(args, conditionArgs...)
+	}
+	if condition, conditionArgs := nfoValueSearchCondition("year", opts.NFOYear); condition != "" {
+		where = append(where, condition)
+		args = append(args, conditionArgs...)
+	}
+	if condition, conditionArgs := dimensionFilterSQL(opts); condition != "" {
+		where = append(where, condition)
+		args = append(args, conditionArgs...)
 	}
 	if opts.MinDuration != nil {
 		where = append(where, "duration IS NOT NULL AND duration >= ?")
@@ -745,9 +1117,8 @@ func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 	if opts.FolderRel != nil {
 		if opts.Recursive {
 			if *opts.FolderRel != "" {
-				lower, upper := descendantPathBounds(*opts.FolderRel)
-				where = append(where, "(parent_rel_path = ? OR (parent_rel_path >= ? AND parent_rel_path < ?))")
-				args = append(args, *opts.FolderRel, lower, upper)
+				where = append(where, "(parent_rel_path = ? OR parent_rel_path LIKE ? ESCAPE '\\')")
+				args = append(args, *opts.FolderRel, descendantPathLike(*opts.FolderRel))
 			}
 		} else {
 			where = append(where, "parent_rel_path = ?")
@@ -765,6 +1136,83 @@ func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 		}
 	}
 	return strings.Join(where, " AND "), args
+}
+
+func dimensionFilterSQL(opts AssetListOptions) (string, []any) {
+	if opts.MinWidth == nil && opts.MaxWidth == nil && opts.MinHeight == nil && opts.MaxHeight == nil {
+		return "", nil
+	}
+	primary, primaryArgs := axisDimensionFilterSQL("width", "height", opts)
+	if !opts.MatchAnyAxis {
+		return primary, primaryArgs
+	}
+	swapped, swappedArgs := axisDimensionFilterSQL("height", "width", opts)
+	if primary == "" {
+		return swapped, swappedArgs
+	}
+	if swapped == "" {
+		return primary, primaryArgs
+	}
+	args := append([]any{}, primaryArgs...)
+	args = append(args, swappedArgs...)
+	return "((" + primary + ") OR (" + swapped + "))", args
+}
+
+func axisDimensionFilterSQL(widthColumn string, heightColumn string, opts AssetListOptions) (string, []any) {
+	var parts []string
+	var args []any
+	if opts.MinWidth != nil {
+		parts = append(parts, widthColumn+" IS NOT NULL AND "+widthColumn+" >= ?")
+		args = append(args, *opts.MinWidth)
+	}
+	if opts.MaxWidth != nil {
+		parts = append(parts, widthColumn+" IS NOT NULL AND "+widthColumn+" <= ?")
+		args = append(args, *opts.MaxWidth)
+	}
+	if opts.MinHeight != nil {
+		parts = append(parts, heightColumn+" IS NOT NULL AND "+heightColumn+" >= ?")
+		args = append(args, *opts.MinHeight)
+	}
+	if opts.MaxHeight != nil {
+		parts = append(parts, heightColumn+" IS NOT NULL AND "+heightColumn+" <= ?")
+		args = append(args, *opts.MaxHeight)
+	}
+	return strings.Join(parts, " AND "), args
+}
+
+func nfoValueSearchCondition(field string, query string) (string, []any) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return "", nil
+	}
+	filter, ok := nfoFieldFilterSQL(field)
+	if !ok {
+		return "", nil
+	}
+	return `nfo_json IS NOT NULL AND EXISTS (
+  SELECT 1
+  FROM jsonb_array_elements(COALESCE(nfo_json::jsonb->'groups', '[]'::jsonb)) AS nfo_group(group_value)
+  CROSS JOIN LATERAL jsonb_array_elements(COALESCE(nfo_group.group_value->'items', '[]'::jsonb)) AS nfo_item(item_value)
+  WHERE (` + filter + `)
+    AND lower(COALESCE(nfo_item.item_value->>'value', '')) LIKE ? ESCAPE '\'
+)`, []any{"%" + escapeLike(strings.ToLower(query)) + "%"}
+}
+
+func nfoFieldFilterSQL(field string) (string, bool) {
+	switch field {
+	case "actor":
+		return "lower(COALESCE(nfo_group.group_value->>'title', '')) = '演员' OR lower(COALESCE(nfo_item.item_value->>'key', '')) = 'actor'", true
+	case "id":
+		return "lower(COALESCE(nfo_group.group_value->>'title', '')) = 'id' OR lower(COALESCE(nfo_item.item_value->>'key', '')) = 'uniqueid' OR lower(COALESCE(nfo_item.item_value->>'key', '')) LIKE 'uniqueid:%'", true
+	case "tag":
+		return "lower(COALESCE(nfo_group.group_value->>'title', '')) = '标记' OR lower(COALESCE(nfo_item.item_value->>'key', '')) IN ('tag', 'genre')", true
+	case "title":
+		return "lower(COALESCE(nfo_item.item_value->>'key', '')) IN ('title', 'originaltitle', 'sorttitle')", true
+	case "year":
+		return "lower(COALESCE(nfo_item.item_value->>'key', '')) = 'year'", true
+	default:
+		return "", false
+	}
 }
 
 func sortSQL(sort string) string {
@@ -989,6 +1437,13 @@ func nfoColumnsEqual(existing sql.NullString, next *string) bool {
 	return existing.Valid && existing.String == *next
 }
 
+func nullInt64Equal(existing sql.NullInt64, next *int64) bool {
+	if next == nil {
+		return !existing.Valid
+	}
+	return existing.Valid && existing.Int64 == *next
+}
+
 func escapeLike(value string) string {
 	value = strings.ReplaceAll(value, `\`, `\\`)
 	value = strings.ReplaceAll(value, `%`, `\%`)
@@ -1009,6 +1464,10 @@ func descendantPathBounds(rel string) (string, string) {
 	return lower, lower + "\x00"
 }
 
+func descendantPathLike(rel string) string {
+	return escapeLike(rel) + "/%"
+}
+
 func validStatusField(field string) bool {
 	switch field {
 	case "thumb_status", "preview_status", "video_poster_status", "video_proxy_status":
@@ -1016,6 +1475,126 @@ func validStatusField(field string) bool {
 	default:
 		return false
 	}
+}
+
+func mediaTypeCode(value string) int {
+	switch value {
+	case model.MediaTypeVideo:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func unixTime(value int64) time.Time {
+	return time.Unix(value, 0).UTC()
+}
+
+func unixTimePtr(value *int64) any {
+	if value == nil || *value == 0 {
+		return nil
+	}
+	return unixTime(*value)
+}
+
+func durationMillis(value *float64) any {
+	if value == nil {
+		return nil
+	}
+	return int64(*value * 1000)
+}
+
+func aspectRatio(width *int, height *int) any {
+	if width == nil || height == nil || *height == 0 {
+		return nil
+	}
+	return float64(*width) / float64(*height)
+}
+
+func folderIDForRel(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, rel string) (int64, error) {
+	var id int64
+	err := q.QueryRowContext(ctx, `SELECT id FROM folder WHERE library_id = 1 AND rel_path = ?`, rel).Scan(&id)
+	return id, err
+}
+
+func readyColumnForStatus(field string) string {
+	switch field {
+	case "thumb_status", "video_poster_status":
+		return "thumb_ready"
+	case "preview_status":
+		return "preview_ready"
+	case "video_proxy_status":
+		return "proxy_ready"
+	default:
+		return ""
+	}
+}
+
+func variantTypeForStatus(field string) (int, string, bool) {
+	switch field {
+	case "thumb_status":
+		return 1, "thumbs", true
+	case "video_poster_status":
+		return 4, "thumbs", true
+	case "preview_status":
+		return 3, "previews", true
+	case "video_proxy_status":
+		return 6, "video-proxies", true
+	default:
+		return 0, "", false
+	}
+}
+
+func variantExt(field string) string {
+	if field == "video_proxy_status" {
+		return "mp4"
+	}
+	return "webp"
+}
+
+func (d *DB) upsertMediaVariant(ctx context.Context, assetID int64, field string) error {
+	variantType, dir, ok := variantTypeForStatus(field)
+	if !ok {
+		return nil
+	}
+	var cacheKey string
+	if err := d.conn.QueryRowContext(ctx, `SELECT cache_key FROM media_asset WHERE id = ?`, assetID).Scan(&cacheKey); err != nil {
+		return err
+	}
+	path := fmt.Sprintf("%s/%s.%s", dir, cacheKey, variantExt(field))
+	_, err := d.conn.ExecContext(ctx, `
+INSERT INTO media_variant (asset_id, variant_type, path, ready, generated_at)
+VALUES (?, ?, ?, true, now())
+ON CONFLICT(asset_id, variant_type) DO UPDATE SET
+  path = excluded.path,
+  ready = true,
+  generated_at = excluded.generated_at`,
+		assetID, variantType, path)
+	return err
+}
+
+func (d *DB) upsertMediaJob(ctx context.Context, assetID int64, field string, status string, message *string, now int64) error {
+	jobType := strings.TrimSuffix(field, "_status")
+	startedAt := any(nil)
+	finishedAt := any(nil)
+	if status == model.StatusProcessing {
+		startedAt = unixTime(now)
+	}
+	if status == model.StatusReady || status == model.StatusError || status == model.StatusNotRequired {
+		finishedAt = unixTime(now)
+	}
+	_, err := d.conn.ExecContext(ctx, `
+INSERT INTO media_job (asset_id, job_type, status, error_text, started_at, finished_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(asset_id, job_type) DO UPDATE SET
+  status = excluded.status,
+  error_text = excluded.error_text,
+  started_at = COALESCE(excluded.started_at, media_job.started_at),
+  finished_at = excluded.finished_at`,
+		assetID, jobType, status, nullString(message), startedAt, finishedAt)
+	return err
 }
 
 func ParentFolderRel(rel string) string {
@@ -1036,7 +1615,7 @@ func AssetStatuses(mediaType string, browserPlayable bool, proxyEnabled bool) (t
 	}
 	if mediaType == model.MediaTypeVideo {
 		proxyStatus := model.StatusNotRequired
-		if proxyEnabled && !browserPlayable {
+		if proxyEnabled {
 			proxyStatus = model.StatusPending
 		}
 		return model.StatusPending, model.StatusNotRequired, model.StatusNotRequired, proxyStatus

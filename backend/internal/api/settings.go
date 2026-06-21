@@ -26,6 +26,12 @@ type sourceDirCacheEntry struct {
 	checkedAt time.Time
 }
 
+type scanLibraryProgressStats struct {
+	DiscoveredFiles int
+	DiscoveredAt    *int64
+	Progress        db.ProcessingProgress
+}
+
 type scanFolderRequest struct {
 	RelPath string `json:"relPath"`
 }
@@ -186,11 +192,12 @@ func (s *Server) addScanLibrary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "scan_library_add_failed", "添加来源失败")
 		return
 	}
+	result := s.scanner.RequestCountScanRoots("auto_count:"+library.Name, library.Roots)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured": true,
 		"items":      s.scanLibraryDTOs(r.Context(), libraries, scanner.Status{}),
-		"library":    s.scanLibraryDTO(library, s.libraryAssetTotal(r.Context(), library), scanner.Status{}),
-		"started":    false,
+		"library":    s.scanLibraryDTO(library, s.libraryProgressStats(r.Context(), library), scanner.Status{}),
+		"started":    result.Accepted,
 	})
 }
 
@@ -224,11 +231,12 @@ func (s *Server) updateScanLibrary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "scan_library_update_failed", "更新来源失败")
 		return
 	}
+	result := s.scanner.RequestCountScanRoots("auto_count:"+library.Name, library.Roots)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured": true,
 		"items":      s.scanLibraryDTOs(r.Context(), libraries, scanner.Status{}),
-		"library":    s.scanLibraryDTO(library, s.libraryAssetTotal(r.Context(), library), scanner.Status{}),
-		"started":    false,
+		"library":    s.scanLibraryDTO(library, s.libraryProgressStats(r.Context(), library), scanner.Status{}),
+		"started":    result.Accepted,
 	})
 }
 
@@ -306,18 +314,52 @@ func (s *Server) removeDeletedAssetCaches(items []db.DeletedAsset) {
 }
 
 func (s *Server) scanLibrary(w http.ResponseWriter, r *http.Request) {
+	s.metadataScanLibrary(w, r)
+}
+
+func (s *Server) countScanLibrary(w http.ResponseWriter, r *http.Request) {
+	library, ok := s.scanLibraryForAction(w, r)
+	if !ok {
+		return
+	}
+	result := s.scanner.RequestCountScanRoots("count:"+library.Name, library.Roots)
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
+}
+
+func (s *Server) metadataScanLibrary(w http.ResponseWriter, r *http.Request) {
+	library, ok := s.scanLibraryForAction(w, r)
+	if !ok {
+		return
+	}
+	result := s.scanner.RequestMetadataScanRoots("library:"+library.Name, library.Roots)
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
+}
+
+func (s *Server) thumbnailRebuildLibrary(w http.ResponseWriter, r *http.Request) {
+	if !boolQuery(r, "force", false) {
+		writeError(w, http.StatusBadRequest, "confirm_required", "强制重建需要确认")
+		return
+	}
+	library, ok := s.scanLibraryForAction(w, r)
+	if !ok {
+		return
+	}
+	result := s.scanner.RequestThumbnailRebuildRoots("thumb_rebuild:"+library.Name, library.Roots)
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
+}
+
+func (s *Server) scanLibraryForAction(w http.ResponseWriter, r *http.Request) (db.ScanLibrary, bool) {
 	id := strings.TrimSpace(chi.URLParam(r, "id"))
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "invalid_id", "来源 ID 无效")
-		return
+		return db.ScanLibrary{}, false
 	}
 	library, err := s.db.FindScanLibrary(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "scan_library_not_found", "来源不存在")
-		return
+		return db.ScanLibrary{}, false
 	}
-	result := s.scanner.RequestScanRoots("library:"+library.Name, library.Roots)
-	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
+	return library, true
 }
 
 func (s *Server) scanFolders(w http.ResponseWriter, r *http.Request) {
@@ -495,7 +537,7 @@ func (s *Server) scanFolderDTOs(folders []string) []ScanFolderDTO {
 
 func (s *Server) scanLibraryDTOs(ctx context.Context, libraries []db.ScanLibrary, status scanner.Status) []ScanLibraryDTO {
 	items := make([]ScanLibraryDTO, 0, len(libraries))
-	counts := s.cachedLibraryAssetCounts(ctx, libraries)
+	counts := s.cachedLibraryProgressStats(ctx, libraries)
 	for _, library := range libraries {
 		if ctx.Err() != nil {
 			break
@@ -505,12 +547,12 @@ func (s *Server) scanLibraryDTOs(ctx context.Context, libraries []db.ScanLibrary
 	return items
 }
 
-func (s *Server) cachedLibraryAssetCounts(ctx context.Context, libraries []db.ScanLibrary) map[string]int {
-	const ttl = 5 * time.Second
+func (s *Server) cachedLibraryProgressStats(ctx context.Context, libraries []db.ScanLibrary) map[string]scanLibraryProgressStats {
+	const ttl = 2 * time.Second
 	key := scanLibrariesCacheKey(libraries)
 	now := time.Now()
 	s.libraryCountsMu.Lock()
-	cached := copyIntMap(s.libraryCounts)
+	cached := copyLibraryProgressStatsMap(s.libraryCounts)
 	cachedOK := s.libraryCountsKey == key && len(cached) > 0
 	fresh := cachedOK && now.Sub(s.libraryCountsAt) < ttl
 	refreshing := s.libraryCountsRefreshing
@@ -521,7 +563,7 @@ func (s *Server) cachedLibraryAssetCounts(ctx context.Context, libraries []db.Sc
 	if cachedOK && !refreshing {
 		s.libraryCountsRefreshing = true
 		s.libraryCountsMu.Unlock()
-		go s.refreshLibraryAssetCounts(context.Background(), libraries, key)
+		go s.refreshLibraryAssetCounts(context.Background(), libraries, key, cached)
 		return cached
 	}
 	if cachedOK || refreshing {
@@ -530,7 +572,7 @@ func (s *Server) cachedLibraryAssetCounts(ctx context.Context, libraries []db.Sc
 	}
 	s.libraryCountsRefreshing = true
 	s.libraryCountsMu.Unlock()
-	counts := s.loadLibraryAssetCounts(ctx, libraries)
+	counts := s.loadLibraryProgressStats(ctx, libraries, cached)
 	s.libraryCountsMu.Lock()
 	s.libraryCountsKey = key
 	s.libraryCounts = counts
@@ -540,8 +582,8 @@ func (s *Server) cachedLibraryAssetCounts(ctx context.Context, libraries []db.Sc
 	return counts
 }
 
-func (s *Server) refreshLibraryAssetCounts(ctx context.Context, libraries []db.ScanLibrary, key string) {
-	counts := s.loadLibraryAssetCounts(ctx, libraries)
+func (s *Server) refreshLibraryAssetCounts(ctx context.Context, libraries []db.ScanLibrary, key string, previous map[string]scanLibraryProgressStats) {
+	counts := s.loadLibraryProgressStats(ctx, libraries, previous)
 	s.libraryCountsMu.Lock()
 	defer s.libraryCountsMu.Unlock()
 	s.libraryCountsKey = key
@@ -550,18 +592,28 @@ func (s *Server) refreshLibraryAssetCounts(ctx context.Context, libraries []db.S
 	s.libraryCountsRefreshing = false
 }
 
-func (s *Server) loadLibraryAssetCounts(ctx context.Context, libraries []db.ScanLibrary) map[string]int {
-	counts, err := s.db.AssetCountsForLibraries(ctx, libraries)
-	if err != nil {
-		if !errors.Is(err, context.Canceled) {
-			s.logger.Warn("load library asset counts failed", "error", err)
+func (s *Server) loadLibraryProgressStats(ctx context.Context, libraries []db.ScanLibrary, previous map[string]scanLibraryProgressStats) map[string]scanLibraryProgressStats {
+	_ = previous
+	stats := make(map[string]scanLibraryProgressStats, len(libraries))
+	for _, library := range libraries {
+		progress, err := s.db.ProcessingProgressForRoots(ctx, library.Roots)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				s.logger.Warn("load library processing progress failed", "libraryID", library.ID, "error", err)
+			}
+			progress = db.ProcessingProgress{}
 		}
-		return map[string]int{}
+		discoveredFiles := library.DiscoveredFiles
+		discoveredAt := library.DiscoveredAt
+		if discoveredFiles < progress.AssetTotal {
+			discoveredFiles = progress.AssetTotal
+		}
+		stats[library.ID] = scanLibraryProgressStats{DiscoveredFiles: discoveredFiles, DiscoveredAt: discoveredAt, Progress: progress}
 	}
-	return counts
+	return stats
 }
 
-func (s *Server) scanLibraryDTO(library db.ScanLibrary, assetTotal int, status scanner.Status) ScanLibraryDTO {
+func (s *Server) scanLibraryDTO(library db.ScanLibrary, stats scanLibraryProgressStats, status scanner.Status) ScanLibraryDTO {
 	folders := s.scanFolderDTOs(library.Roots)
 	exists := len(folders) > 0
 	for _, folder := range folders {
@@ -575,16 +627,13 @@ func (s *Server) scanLibraryDTO(library db.ScanLibrary, assetTotal int, status s
 		Name:     library.Name,
 		Folders:  folders,
 		Exists:   exists,
-		Progress: scanLibraryProgressDTO(library, assetTotal, status),
+		Progress: scanLibraryProgressDTO(library, stats, status),
 	}
 }
 
-func (s *Server) libraryAssetTotal(ctx context.Context, library db.ScanLibrary) int {
-	total, err := s.db.AssetCountForRoots(ctx, library.Roots)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		s.logger.Warn("load library asset count failed", "libraryID", library.ID, "error", err)
-	}
-	return total
+func (s *Server) libraryProgressStats(ctx context.Context, library db.ScanLibrary) scanLibraryProgressStats {
+	stats := s.loadLibraryProgressStats(ctx, []db.ScanLibrary{library}, nil)
+	return stats[library.ID]
 }
 
 func scanLibrariesCacheKey(libraries []db.ScanLibrary) string {
@@ -598,36 +647,84 @@ func scanLibrariesCacheKey(libraries []db.ScanLibrary) string {
 	return builder.String()
 }
 
-func copyIntMap(source map[string]int) map[string]int {
+func copyLibraryProgressStatsMap(source map[string]scanLibraryProgressStats) map[string]scanLibraryProgressStats {
 	if len(source) == 0 {
 		return nil
 	}
-	result := make(map[string]int, len(source))
+	result := make(map[string]scanLibraryProgressStats, len(source))
 	for key, value := range source {
 		result[key] = value
 	}
 	return result
 }
 
-func scanLibraryProgressDTO(library db.ScanLibrary, assetTotal int, status scanner.Status) ScanLibraryProgressDTO {
-	active := status.Running && scanRootsSame(library.Roots, status.Progress.Roots)
-	scannedFiles := assetTotal
-	unscannedFiles := 0
+func scanLibraryProgressDTO(library db.ScanLibrary, stats scanLibraryProgressStats, status scanner.Status) ScanLibraryProgressDTO {
+	liveDiscovered, liveScanned, hasRootStats := scanLibraryLiveProgress(library.Roots, status.Progress)
+	sameRoots := scanRootsSame(library.Roots, status.Progress.Roots)
+	active := status.Running && scanRootsCovered(library.Roots, status.Progress.Roots) && (hasRootStats || sameRoots)
+	discoveredFiles := stats.DiscoveredFiles
+	scannedFiles := stats.Progress.AssetTotal
 	if active {
-		scannedFiles = status.Progress.ScannedFiles
-		unscannedFiles = status.Progress.TotalFiles - status.Progress.ScannedFiles
-		if unscannedFiles < 0 {
-			unscannedFiles = 0
+		if !hasRootStats && sameRoots {
+			liveDiscovered = status.Progress.DiscoveredFiles
+			if status.Progress.TotalFiles > liveDiscovered {
+				liveDiscovered = status.Progress.TotalFiles
+			}
+			liveScanned = status.Progress.ScannedFiles
+			if status.Progress.TotalSeen > liveScanned {
+				liveScanned = status.Progress.TotalSeen
+			}
+			hasRootStats = true
+		}
+		if hasRootStats {
+			if liveDiscovered > discoveredFiles {
+				discoveredFiles = liveDiscovered
+			}
+			if liveScanned > scannedFiles {
+				scannedFiles = liveScanned
+			}
 		}
 	}
-	return ScanLibraryProgressDTO{
-		AssetTotal:     assetTotal,
-		ScannedFiles:   scannedFiles,
-		UnscannedFiles: unscannedFiles,
-		Thumb:          WorkStatusCountsDTO{},
-		Transcode:      WorkStatusCountsDTO{},
-		Active:         active,
+	if discoveredFiles < scannedFiles {
+		discoveredFiles = scannedFiles
 	}
+	unscannedFiles := discoveredFiles - scannedFiles
+	return ScanLibraryProgressDTO{
+		AssetTotal:      stats.Progress.AssetTotal,
+		DiscoveredFiles: discoveredFiles,
+		DiscoveredAt:    stats.DiscoveredAt,
+		ScannedFiles:    scannedFiles,
+		UnscannedFiles:  unscannedFiles,
+		Thumb:           workStatusCountsDTO(stats.Progress.Thumb),
+		Transcode:       workStatusCountsDTO(stats.Progress.Transcode),
+		Active:          active,
+	}
+}
+
+func scanLibraryLiveProgress(roots []string, progress scanner.Progress) (int, int, bool) {
+	normalized, err := db.NormalizeScanFolders(roots)
+	if err != nil || len(normalized) == 0 || len(progress.RootStats) == 0 {
+		return 0, 0, false
+	}
+	discoveredFiles := 0
+	scannedFiles := 0
+	for _, root := range normalized {
+		stat, ok := progress.RootStats[root]
+		if !ok {
+			return 0, 0, false
+		}
+		liveDiscovered := stat.DiscoveredFiles
+		if stat.TotalFiles > liveDiscovered {
+			liveDiscovered = stat.TotalFiles
+		}
+		liveScanned := stat.ScannedFiles
+		if stat.TotalSeen > liveScanned {
+			liveScanned = stat.TotalSeen
+		}
+		discoveredFiles += liveDiscovered
+		scannedFiles += liveScanned
+	}
+	return discoveredFiles, scannedFiles, true
 }
 
 func scanRootsSame(a []string, b []string) bool {
@@ -644,6 +741,26 @@ func scanRootsSame(a []string, b []string) bool {
 	}
 	for index := range left {
 		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func scanRootsCovered(libraryRoots []string, scanRoots []string) bool {
+	left, err := db.NormalizeScanFolders(libraryRoots)
+	if err != nil {
+		return false
+	}
+	right, err := db.NormalizeScanFolders(scanRoots)
+	if err != nil {
+		return false
+	}
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	for _, root := range left {
+		if !db.AssetInScanFolders(root, right) {
 			return false
 		}
 	}

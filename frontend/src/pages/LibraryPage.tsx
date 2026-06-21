@@ -13,9 +13,9 @@ import type { Asset, AssetDeletedEvent, AssetKind, LibraryAnchor, SortKey } from
 import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import type { AssetGroupMode } from '../utils/assetGrouping';
 import {
+  clearRestoreParamFromLocation,
   decodeReturnState,
   encodeReturnState,
-  loadPageState,
   resetGridState,
   savePageState,
   saveViewerReturnPath,
@@ -62,10 +62,10 @@ export default function LibraryPage() {
   const navigate = useNavigate();
   const decodedInitialState = decodeReturnState<LibraryPageState>(
     searchParams.get('restore'),
-    loadPageState<LibraryPageState>(libraryStateKey, defaultLibraryState),
+    defaultLibraryState,
   );
   const initialStateRef = useRef(
-    searchParams.has('restore') ? decodedInitialState : libraryStateFromSearchParams(searchParams, decodedInitialState),
+    searchParams.has('restore') ? decodedInitialState : libraryStateFromSearchParams(searchParams, defaultLibraryState),
   );
   const [type, setType] = useState<AssetKind>(initialStateRef.current.type);
   const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
@@ -74,7 +74,9 @@ export default function LibraryPage() {
   const [totalCount, setTotalCount] = useState(0);
   const [scrollTarget, setScrollTarget] = useState<{ ratio: number; signal: number } | undefined>();
   const [scrollTopTarget, setScrollTopTarget] = useState<{ scrollTop: number; signal: number } | undefined>(() =>
-    initialStateRef.current.scrollTop > 0 ? { scrollTop: initialStateRef.current.scrollTop, signal: 1 } : undefined,
+    initialStateRef.current.scrollTop > 0 && !initialStateRef.current.focusAssetId
+      ? { scrollTop: initialStateRef.current.scrollTop, signal: 1 }
+      : undefined,
   );
   const [scrollResetSignal, setScrollResetSignal] = useState(0);
   const [scrollRatio, setScrollRatio] = useState(0);
@@ -87,7 +89,11 @@ export default function LibraryPage() {
   const restoreSidebarState = useRestoreSidebarState();
   const restoreRef = useRef({
     jumped: false,
-    pending: initialStateRef.current.scrollTop > 0 || initialStateRef.current.loadedItemCount > pageSize || initialStateRef.current.loadedStartIndex > 0,
+    pending:
+      initialStateRef.current.scrollTop > 0 ||
+      initialStateRef.current.loadedItemCount > pageSize ||
+      initialStateRef.current.loadedStartIndex > 0 ||
+      Boolean(initialStateRef.current.focusAssetId),
     signal: 0,
   });
   const indexPageRef = useRef(1);
@@ -122,6 +128,7 @@ export default function LibraryPage() {
   const currentPageState = useCallback(
     (): LibraryPageState => ({
       ...gridStateRef.current,
+      focusAssetId: null,
       groupMode,
       loadedItemCount: items.length,
       loadedStartIndex,
@@ -137,6 +144,11 @@ export default function LibraryPage() {
   const saveCurrentState = useCallback(() => {
     savePageState<LibraryPageState>(libraryStateKey, currentPageState());
   }, [currentPageState]);
+
+  useEffect(() => {
+    if (!searchParams.has('restore')) return;
+    clearRestoreParamFromLocation();
+  }, [searchParams]);
 
   useEffect(() => {
     indexPageRef.current = 1;
@@ -195,14 +207,17 @@ export default function LibraryPage() {
       return;
     }
     restore.pending = false;
-    restore.signal += 1;
-    setScrollTopTarget({ scrollTop: saved.scrollTop, signal: restore.signal });
+    if (!saved.focusAssetId) {
+      restore.signal += 1;
+      setScrollTopTarget({ scrollTop: saved.scrollTop, signal: restore.signal });
+    }
   }, [hasMore, items.length, jumpToPage, loadMore, loading]);
 
   const handleGridScrollState = useCallback(
     (state: { ratio: number; scrollTop: number }) => {
       gridStateRef.current = {
         ...gridStateRef.current,
+        focusAssetId: null,
         loadedItemCount: items.length,
         loadedStartIndex,
         scrollRatio: state.ratio,
@@ -219,8 +234,8 @@ export default function LibraryPage() {
   }, [saveCurrentState]);
 
   const handleOpenViewer = useCallback(
-    (_asset: Asset, viewerUrl: string) => {
-      navigate(viewerUrl, { state: { backgroundLocation: location } });
+    (asset: Asset, viewerUrl: string) => {
+      navigate(viewerUrl, { state: { backgroundLocation: location, initialAsset: asset } });
     },
     [location, navigate],
   );
@@ -246,7 +261,6 @@ export default function LibraryPage() {
   useSidebarPanel(
     'library',
     <div className="sidebar-control-stack">
-      <div className="sidebar-control-title">图库</div>
       <div className="sidebar-list">
         {(['all', 'image', 'video'] as AssetKind[]).map((value) => (
           <button className={type === value ? 'sidebar-list-row active' : 'sidebar-list-row'} key={value} type="button" onClick={() => setType(value)}>
@@ -316,6 +330,7 @@ export default function LibraryPage() {
             onScrollStateChange={handleGridScrollState}
             totalCount={totalCount}
             loadedStartIndex={loadedStartIndex}
+            focusAssetId={initialStateRef.current.focusAssetId}
             groupMode={groupMode}
             sort={sort}
             scrollSignal={scrollResetSignal}

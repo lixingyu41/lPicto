@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams, useSearchParams, type Location } from 'react-router-dom';
 import { Captions, CaptionsOff, Gauge, LogOut, Maximize2, Minimize2, RotateCw } from 'lucide-react';
-import { api, assetOriginalUrl, assetPreviewUrl } from '../api/client';
+import { api } from '../api/client';
 import type { Asset, AssetSidecars, Neighbors, NFOField } from '../types/api';
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format';
 import ImageViewer from '../viewer/ImageViewer';
@@ -9,8 +9,9 @@ import VideoViewer from '../viewer/VideoViewer';
 import { useKeyboard } from '../hooks/useKeyboard';
 import { useRestoreSidebarState, useSidebarPanel, type SidebarReturnState } from '../components/SidebarContext';
 import { nextRotation } from '../utils/rotation';
-import { decodeReturnState, loadViewerReturnPath } from '../utils/pageState';
+import { decodeReturnState, encodeReturnState, loadViewerReturnPath, type GridReturnState } from '../utils/pageState';
 import { loadViewerPrefs, nextPlaybackRate, saveViewerPrefs, viewerPrefsChanged } from '../utils/viewerPrefs';
+import { preloadViewerAsset, preloadViewerAssets } from '../utils/imagePreload';
 
 interface WheelBase {
   next: Asset[];
@@ -24,10 +25,12 @@ interface ViewerPageProps {
 
 interface ViewerLocationState {
   backgroundLocation?: Location;
+  initialAsset?: Asset;
 }
 
 const wheelStepCooldownMs = 220;
 const wheelStepThreshold = 60;
+const viewerReturnPageSize = 100;
 
 export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const params = useParams();
@@ -42,7 +45,6 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const [selectedSubtitleId, setSelectedSubtitleId] = useState('');
   const [playbackRate, setPlaybackRate] = useState(() => loadViewerPrefs().playbackRate);
   const [fullscreen, setFullscreen] = useState(false);
-  const preloadImages = useRef<HTMLImageElement[]>([]);
   const wheelBase = useRef<WheelBase | null>(null);
   const wheelDelta = useRef(0);
   const wheelLastStepAt = useRef(0);
@@ -53,6 +55,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const viewerLocationState = location.state as ViewerLocationState | null;
   const backgroundLocation = viewerLocationState?.backgroundLocation;
   const assetId = Number(params.assetId || assetIdFromPath(location.pathname) || 0);
+  const initialAsset = viewerLocationState?.initialAsset?.id === assetId ? viewerLocationState.initialAsset : undefined;
 
   const query = useMemo(() => {
     const result: Record<string, string> = {};
@@ -85,18 +88,16 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   }, [assetId, query]);
 
   const activeNeighbors = neighbors?.current.id === assetId ? neighbors : null;
+  const current = activeNeighbors?.current ?? initialAsset;
 
   useEffect(() => {
-    if (!activeNeighbors) return;
-    preloadImages.current = preloadOrder(activeNeighbors).map((asset) => {
-      const image = new Image();
-      image.decoding = 'async';
-      image.src = preloadUrl(asset);
-      return image;
-    });
-  }, [activeNeighbors]);
-
-  const current = activeNeighbors?.current;
+    if (current?.mediaType === 'image') {
+      preloadViewerAsset(current, 'high');
+    }
+    if (activeNeighbors) {
+      preloadViewerAssets(preloadOrder(activeNeighbors).slice(1));
+    }
+  }, [activeNeighbors, current]);
 
   useEffect(() => {
     let live = true;
@@ -176,9 +177,12 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const goAsset = useCallback(
     (asset: Asset | undefined) => {
       if (!asset) return;
+      preloadViewerAsset(asset, 'high');
       navigate(
         { pathname: `/viewer/${asset.id}`, search: searchParams.toString() },
-        overlay && backgroundLocation ? { replace: true, state: { backgroundLocation } } : undefined,
+        overlay && backgroundLocation
+          ? { replace: true, state: { backgroundLocation, initialAsset: asset } }
+          : { state: { initialAsset: asset } },
       );
     },
     [backgroundLocation, navigate, overlay, searchParams],
@@ -231,21 +235,24 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   }, [goWheelStep]);
 
   const leave = useCallback(() => {
-    if (overlay) {
-      navigate(-1);
-      return;
-    }
-    const context = searchParams.get('context');
-    const fallback = context === 'folder' ? '/folders' : context === 'album' ? '/albums' : context === 'search' ? '/search' : '/library';
-    const returnPath = searchParams.get('returnPath');
-    const returnState = searchParams.get('returnState');
-    if (returnPath === fallback && returnState) {
-      navigate(`${fallback}?restore=${encodeURIComponent(returnState)}`);
-      return;
-    }
-    const storageReturnPath = loadViewerReturnPath();
-    navigate(storageReturnPath === fallback ? storageReturnPath : fallback);
-  }, [navigate, overlay, searchParams]);
+    void (async () => {
+      const context = searchParams.get('context');
+      const fallback = context === 'folder' ? '/folders' : context === 'album' ? '/albums' : context === 'search' ? '/search' : '/library';
+      const returnPath = searchParams.get('returnPath');
+      const targetPath = returnPath === fallback ? returnPath : fallback;
+      const restoreState = await returnStateForCurrentAsset(searchParams, current?.id);
+      if (restoreState) {
+        navigate(`${targetPath}?restore=${encodeReturnState(restoreState)}`, overlay ? { replace: true } : undefined);
+        return;
+      }
+      if (overlay) {
+        navigate(-1);
+        return;
+      }
+      const storageReturnPath = loadViewerReturnPath();
+      navigate(storageReturnPath === fallback ? storageReturnPath : fallback);
+    })();
+  }, [current?.id, navigate, overlay, searchParams]);
 
   const rotateCurrentAsset = useCallback(async () => {
     if (!current) return;
@@ -354,6 +361,36 @@ function isAbortError(err: unknown) {
 function assetIdFromPath(pathname: string) {
   const match = pathname.match(/^\/viewer\/(\d+)/);
   return match?.[1] ?? '';
+}
+
+async function returnStateForCurrentAsset(searchParams: URLSearchParams, assetId: number | undefined) {
+  const rawReturnState = searchParams.get('returnState');
+  const baseState = decodeReturnState<Record<string, unknown> & Partial<GridReturnState>>(rawReturnState, {});
+  if (!assetId) {
+    return rawReturnState ? baseState : null;
+  }
+  try {
+    const position = await api.assetPosition(assetId, assetPositionParams(searchParams));
+    return {
+      ...baseState,
+      focusAssetId: assetId,
+      loadedItemCount: viewerReturnPageSize,
+      loadedStartIndex: Math.max(0, (position.page - 1) * viewerReturnPageSize),
+      scrollRatio: position.position,
+      scrollTop: 0,
+    };
+  } catch {
+    return rawReturnState ? baseState : null;
+  }
+}
+
+function assetPositionParams(searchParams: URLSearchParams) {
+  const params: Record<string, string | number> = { pageSize: viewerReturnPageSize };
+  searchParams.forEach((value, key) => {
+    if (key === 'returnPath' || key === 'returnState') return;
+    params[key] = value;
+  });
+  return params;
 }
 
 function ViewerSidebarPanel({
@@ -542,14 +579,6 @@ function updateNeighborRotation(neighbors: Neighbors, assetId: number, rotation:
     previous: neighbors.previous.map(update),
     next: neighbors.next.map(update),
   };
-}
-
-function viewerImageUrl(asset: Asset) {
-  return asset.browserPlayable ? assetOriginalUrl(asset) : assetPreviewUrl(asset);
-}
-
-function preloadUrl(asset: Asset) {
-  return asset.mediaType === 'image' ? viewerImageUrl(asset) : assetPreviewUrl(asset);
 }
 
 function preloadOrder(neighbors: Neighbors) {

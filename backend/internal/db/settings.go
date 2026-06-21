@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,46 +11,60 @@ import (
 	"lpicto/backend/internal/util"
 )
 
-const (
-	scanFoldersKey   = "scan_folders"
-	scanLibrariesKey = "scan_libraries"
-)
-
 type ScanLibrary struct {
-	ID    string   `json:"id"`
-	Name  string   `json:"name"`
-	Roots []string `json:"roots"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Roots           []string `json:"roots"`
+	DiscoveredFiles int      `json:"discoveredFiles"`
+	DiscoveredAt    *int64   `json:"discoveredAt"`
 }
 
 func (d *DB) GetScanLibraries(ctx context.Context) ([]ScanLibrary, bool, error) {
-	var value string
-	err := d.conn.QueryRowContext(ctx, `SELECT value FROM app_state WHERE key = ?`, scanLibrariesKey).Scan(&value)
-	if err == nil {
-		var libraries []ScanLibrary
-		if err := json.Unmarshal([]byte(value), &libraries); err != nil {
-			return nil, true, err
-		}
-		normalized, err := NormalizeScanLibraries(libraries)
-		if err != nil {
-			return nil, true, err
-		}
-		return normalized, true, nil
-	}
-	if err != sql.ErrNoRows {
+	rows, err := d.conn.QueryContext(ctx, `
+SELECT l.public_id, l.name, COALESCE(l.discovered_files, 0), l.discovered_at, r.rel_path
+FROM scan_library l
+LEFT JOIN scan_library_root r ON r.scan_library_id = l.id
+ORDER BY l.id ASC, r.position ASC, r.rel_path ASC`)
+	if err != nil {
 		return nil, false, err
 	}
-
-	folders, configured, err := d.getLegacyScanFolders(ctx)
+	defer rows.Close()
+	index := map[string]int{}
+	var libraries []ScanLibrary
+	for rows.Next() {
+		var id string
+		var name string
+		var discoveredFiles int
+		var discoveredAt sql.NullInt64
+		var root sql.NullString
+		if err := rows.Scan(&id, &name, &discoveredFiles, &discoveredAt, &root); err != nil {
+			return nil, false, err
+		}
+		pos, ok := index[id]
+		if !ok {
+			pos = len(libraries)
+			index[id] = pos
+			library := ScanLibrary{ID: id, Name: name, DiscoveredFiles: discoveredFiles}
+			if discoveredAt.Valid {
+				library.DiscoveredAt = &discoveredAt.Int64
+			}
+			libraries = append(libraries, library)
+		}
+		if root.Valid {
+			libraries[pos].Roots = append(libraries[pos].Roots, root.String)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(libraries) == 0 {
+		return []ScanLibrary{}, false, nil
+	}
+	normalized, err := NormalizeScanLibraries(libraries)
 	if err != nil {
-		return nil, configured, err
+		return nil, true, err
 	}
-	if !configured {
-		return []ScanLibrary{{ID: "default", Name: "默认来源", Roots: []string{""}}}, false, nil
-	}
-	if len(folders) == 0 {
-		return []ScanLibrary{}, true, nil
-	}
-	return []ScanLibrary{{ID: "legacy", Name: "默认来源", Roots: folders}}, true, nil
+	return normalized, true, nil
 }
 
 func (d *DB) SetScanLibraries(ctx context.Context, libraries []ScanLibrary) error {
@@ -59,16 +72,33 @@ func (d *DB) SetScanLibraries(ctx context.Context, libraries []ScanLibrary) erro
 	if err != nil {
 		return err
 	}
-	data, err := json.Marshal(normalized)
+	tx, err := d.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	now := util.UnixNow()
-	_, err = d.conn.ExecContext(ctx, `
-INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-		scanLibrariesKey, string(data), now)
-	return err
+	if _, err := tx.ExecContext(ctx, `DELETE FROM scan_library`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, library := range normalized {
+		var libraryID int64
+		if err := tx.QueryRowContext(ctx, `
+INSERT INTO scan_library (public_id, name, discovered_files, discovered_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, now(), now())
+RETURNING id`, library.ID, library.Name, library.DiscoveredFiles, nullInt64(library.DiscoveredAt)).Scan(&libraryID); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		for index, root := range library.Roots {
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO scan_library_root (scan_library_id, rel_path, position)
+VALUES (?, ?, ?)`, libraryID, root, index); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func (d *DB) AddScanLibrary(ctx context.Context, name string, roots []string) ([]ScanLibrary, ScanLibrary, error) {
@@ -117,6 +147,10 @@ func (d *DB) UpdateScanLibrary(ctx context.Context, id string, name string, root
 	for index := range libraries {
 		if libraries[index].ID != id {
 			continue
+		}
+		if !sameStringSet(libraries[index].Roots, roots) {
+			libraries[index].DiscoveredFiles = 0
+			libraries[index].DiscoveredAt = nil
 		}
 		libraries[index].Name = strings.TrimSpace(name)
 		libraries[index].Roots = roots
@@ -167,6 +201,14 @@ func (d *DB) FindScanLibrary(ctx context.Context, id string) (ScanLibrary, error
 	return ScanLibrary{}, sql.ErrNoRows
 }
 
+func (d *DB) UpdateScanLibraryDiscovered(ctx context.Context, id string, discoveredFiles int, discoveredAt int64) error {
+	_, err := d.conn.ExecContext(ctx, `
+UPDATE scan_library
+SET discovered_files = ?, discovered_at = ?, updated_at = now()
+WHERE public_id = ?`, discoveredFiles, discoveredAt, strings.TrimSpace(id))
+	return err
+}
+
 func (d *DB) GetScanFolders(ctx context.Context) ([]string, bool, error) {
 	libraries, configured, err := d.GetScanLibraries(ctx)
 	if err != nil {
@@ -176,23 +218,7 @@ func (d *DB) GetScanFolders(ctx context.Context) ([]string, bool, error) {
 }
 
 func (d *DB) getLegacyScanFolders(ctx context.Context) ([]string, bool, error) {
-	var value string
-	err := d.conn.QueryRowContext(ctx, `SELECT value FROM app_state WHERE key = ?`, scanFoldersKey).Scan(&value)
-	if err == sql.ErrNoRows {
-		return []string{""}, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	var folders []string
-	if err := json.Unmarshal([]byte(value), &folders); err != nil {
-		return nil, true, err
-	}
-	normalized, err := NormalizeScanFolders(folders)
-	if err != nil {
-		return nil, true, err
-	}
-	return normalized, true, nil
+	return []string{""}, false, nil
 }
 
 func (d *DB) SetScanFolders(ctx context.Context, folders []string) error {
@@ -207,20 +233,7 @@ func (d *DB) SetScanFolders(ctx context.Context, folders []string) error {
 }
 
 func (d *DB) setLegacyScanFolders(ctx context.Context, folders []string) error {
-	normalized, err := NormalizeScanFolders(folders)
-	if err != nil {
-		return err
-	}
-	data, err := json.Marshal(normalized)
-	if err != nil {
-		return err
-	}
-	now := util.UnixNow()
-	_, err = d.conn.ExecContext(ctx, `
-INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-		scanFoldersKey, string(data), now)
-	return err
+	return d.SetScanFolders(ctx, folders)
 }
 
 func (d *DB) AddScanFolder(ctx context.Context, rel string) ([]string, error) {
@@ -321,7 +334,13 @@ func NormalizeScanLibraries(libraries []ScanLibrary) ([]ScanLibrary, error) {
 			id = fmt.Sprintf("%s-%d", id, index+1)
 		}
 		ids[id] = struct{}{}
-		result = append(result, ScanLibrary{ID: id, Name: name, Roots: roots})
+		result = append(result, ScanLibrary{
+			ID:              id,
+			Name:            name,
+			Roots:           roots,
+			DiscoveredFiles: library.DiscoveredFiles,
+			DiscoveredAt:    library.DiscoveredAt,
+		})
 	}
 	return result, nil
 }
@@ -354,4 +373,24 @@ func hasAncestor(rel string, roots []string) bool {
 		}
 	}
 	return false
+}
+
+func sameStringSet(a []string, b []string) bool {
+	left, err := NormalizeScanFolders(a)
+	if err != nil {
+		return false
+	}
+	right, err := NormalizeScanFolders(b)
+	if err != nil {
+		return false
+	}
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }

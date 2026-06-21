@@ -25,6 +25,7 @@ const navItems: Array<{
   { Icon: Search, label: '搜索', target: 'search', to: '/search' },
   { Icon: Images, label: '相册', target: 'albums', to: '/albums' },
   { Icon: FolderTree, label: '文件夹', target: 'folders', to: '/folders' },
+  { Icon: Settings, label: '设置', target: 'settings', to: '/settings' },
 ];
 
 export default function Sidebar({
@@ -51,6 +52,16 @@ export default function Sidebar({
     panels[target] ? <div className={`sidebar-panel sidebar-panel-${target}`}>{panels[target]}</div> : null;
   const activeSecondaryTarget = routeTarget && expanded === routeTarget ? routeTarget : null;
   const secondaryPanel = activeSecondaryTarget ? panels[activeSecondaryTarget] : null;
+  const routeSecondaryLabel = routeTarget ? sidebarLabel(routeTarget) : '';
+  const canToggleRouteSecondary = routeTarget !== null && Boolean(panels[routeTarget]);
+  const routeSecondaryOpen = activeSecondaryTarget !== null;
+  const routeSecondaryToggleLabel = `${routeSecondaryOpen ? '折叠' : '展开'}${routeSecondaryLabel}`;
+  const showPrimarySecondaryButton = !collapsed && canToggleRouteSecondary && !routeSecondaryOpen;
+  const showFloatingSecondaryButton = collapsed && canToggleRouteSecondary && !routeSecondaryOpen;
+  const toggleRouteSecondary = () => {
+    if (!routeTarget) return;
+    onToggleExpanded(routeSecondaryOpen ? null : routeTarget);
+  };
   const startResize = useCallback(
     (kind: 'primary' | 'secondary', event: PointerEvent<HTMLButtonElement>) => {
       if (event.button !== 0) return;
@@ -75,60 +86,84 @@ export default function Sidebar({
     [onPrimaryWidthChange, onSecondaryWidthChange, primaryWidth, secondaryWidth],
   );
 
-  if (collapsed) {
-    return (
-      <button className="sidebar-bubble" type="button" onClick={onToggleCollapsed} aria-label="展开侧栏">
-        LPicto
-      </button>
-    );
-  }
-
   return (
     <>
-      <nav className="nav">
-        <div className="brand-row">
-          <button className="brand" type="button" onClick={onToggleCollapsed} aria-label="折叠侧栏">
+      {collapsed && !routeSecondaryOpen && (
+        <div className={showFloatingSecondaryButton ? 'sidebar-floating-controls is-joined' : 'sidebar-floating-controls'}>
+          <button className="sidebar-floating-button sidebar-floating-primary" type="button" onClick={onToggleCollapsed} aria-label="展开一级侧栏">
             LPicto
           </button>
-          <NavLink
-            className={({ isActive }) => (isActive ? 'brand-settings-button active' : 'brand-settings-button')}
-            to="/settings"
-            title="设置"
-            aria-label="设置"
-          >
-            <Settings size={18} />
-          </NavLink>
+          {showFloatingSecondaryButton && routeTarget && (
+            <button
+              className="sidebar-floating-button sidebar-floating-secondary"
+              type="button"
+              title={routeSecondaryToggleLabel}
+              aria-label={routeSecondaryToggleLabel}
+              onClick={toggleRouteSecondary}
+            >
+              {routeSecondaryLabel}
+            </button>
+          )}
         </div>
-        <div className="nav-main">
-          {navItems.map(({ Icon, label, target, to }) => (
-            <SidebarItem
-              expanded={expanded === target}
-              icon={<Icon size={18} />}
-              key={target}
-              label={label}
-              target={target}
-              to={to}
-              onToggle={onToggleExpanded}
-              routeTarget={routeTarget}
-            />
-          ))}
-        </div>
-        <div className="nav-bottom">
-          <div className="nav-bottom-panels">{renderBottomPanel('viewer')}</div>
-        </div>
-      </nav>
+      )}
+      {!collapsed && (
+        <nav className="nav">
+          <div className={showPrimarySecondaryButton ? 'brand-row has-secondary-toggle' : 'brand-row'}>
+            <button className="brand" type="button" onClick={onToggleCollapsed} aria-label="折叠一级侧栏">
+              LPicto
+            </button>
+            {showPrimarySecondaryButton && routeTarget && (
+              <button
+                className="brand-secondary-button"
+                type="button"
+                title={routeSecondaryToggleLabel}
+                aria-label={routeSecondaryToggleLabel}
+                onClick={toggleRouteSecondary}
+              >
+                {routeSecondaryLabel}
+              </button>
+            )}
+          </div>
+          <div className="nav-main">
+            {navItems.map(({ Icon, label, target, to }) => (
+              <SidebarItem icon={<Icon size={18} />} key={target} label={label} to={to} />
+            ))}
+          </div>
+          <div className="nav-bottom">
+            <div className="nav-bottom-panels">{renderBottomPanel('viewer')}</div>
+          </div>
+        </nav>
+      )}
       {activeSecondaryTarget && (
         <aside className={`sidebar-secondary sidebar-secondary-${activeSecondaryTarget}`}>
+          <div className={collapsed ? 'sidebar-secondary-header has-primary-toggle' : 'sidebar-secondary-header'}>
+            {collapsed && (
+              <button className="sidebar-secondary-primary-button" type="button" onClick={onToggleCollapsed} aria-label="展开一级侧栏">
+                LPicto
+              </button>
+            )}
+            <button
+              className="sidebar-secondary-title-button"
+              type="button"
+              title={routeSecondaryToggleLabel}
+              aria-label={routeSecondaryToggleLabel}
+              onClick={toggleRouteSecondary}
+            >
+              {routeSecondaryLabel}
+            </button>
+          </div>
           {secondaryPanel && <div className={`sidebar-panel sidebar-panel-${activeSecondaryTarget}`}>{secondaryPanel}</div>}
         </aside>
       )}
-      <button
-        aria-label="调整一级栏宽度"
-        className="sidebar-resize-handle sidebar-resize-primary"
-        title="调整一级栏宽度"
-        type="button"
-        onPointerDown={(event) => startResize('primary', event)}
-      />
+      {!collapsed && (
+        <button
+          aria-label="调整一级栏宽度"
+          className="sidebar-resize-handle sidebar-resize-primary"
+          title="调整一级栏宽度"
+          type="button"
+          onPointerDown={(event) => startResize('primary', event)}
+        />
+      )}
       {activeSecondaryTarget && (
         <button
           aria-label="调整二级栏宽度"
@@ -143,42 +178,24 @@ export default function Sidebar({
 }
 
 function SidebarItem({
-  expanded,
   icon,
   label,
-  target,
   to,
-  onToggle,
-  routeTarget,
 }: {
-  expanded: boolean;
   icon: ReactNode;
   label: string;
-  target: SidebarPanelTarget;
   to: string;
-  onToggle: (target: SidebarPanelTarget | null) => void;
-  routeTarget: SidebarPanelTarget | null;
 }) {
-  const isCurrentRoute = routeTarget === target;
   return (
     <div className="nav-item">
-      <NavLink
-        to={to}
-        className="nav-link"
-        aria-expanded={expanded}
-        onClick={(event) => {
-          if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-          if (isCurrentRoute) {
-            event.preventDefault();
-            onToggle(expanded ? null : target);
-          } else if (expanded) {
-            onToggle(null);
-          }
-        }}
-      >
+      <NavLink to={to} className="nav-link">
         {icon}
         <span>{label}</span>
       </NavLink>
     </div>
   );
+}
+
+function sidebarLabel(target: PrimarySidebarPanelTarget) {
+  return navItems.find((item) => item.target === target)?.label ?? '';
 }

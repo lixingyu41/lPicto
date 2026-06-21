@@ -26,7 +26,14 @@ export default function Layout({ children }: Props) {
     routeTarget && loadSidebarSecondaryExpanded(routeTarget) ? routeTarget : null,
   );
   const sidebarPanelOpen = sidebarExpanded !== null && sidebarExpanded === routeTarget;
-  const shellClass = sidebarCollapsed ? 'app-shell sidebar-collapsed' : sidebarPanelOpen ? 'app-shell sidebar-panel-open' : 'app-shell';
+  const shellClass = [
+    'app-shell',
+    sidebarCollapsed ? 'sidebar-primary-collapsed' : 'sidebar-primary-open',
+    sidebarPanelOpen ? 'sidebar-panel-open' : 'sidebar-panel-closed',
+    sidebarCollapsed && !sidebarPanelOpen ? 'sidebar-collapsed' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
   const setSidebarExpanded = useCallback(
     (target: SidebarPanelTarget | null) => {
       if (target === null) {
@@ -69,7 +76,7 @@ export default function Layout({ children }: Props) {
       setSidebarExpanded={setSidebarExpanded}
     >
       <div className={shellClass} style={shellStyle}>
-        <aside className={sidebarCollapsed ? 'sidebar is-collapsed' : 'sidebar'}>
+        <aside className={sidebarCollapsed ? 'sidebar is-primary-collapsed' : 'sidebar'}>
           <Sidebar
             collapsed={sidebarCollapsed}
             expanded={sidebarExpanded}

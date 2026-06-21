@@ -1,6 +1,10 @@
 package db
 
-import "testing"
+import (
+	"context"
+	"path/filepath"
+	"testing"
+)
 
 func TestNormalizeScanFolders(t *testing.T) {
 	got, err := NormalizeScanFolders([]string{"2024/01", "2024", "2024/01", "2025"})
@@ -68,5 +72,25 @@ func TestScanRootsFromLibraries(t *testing.T) {
 		if roots[i] != want[i] {
 			t.Fatalf("roots = %#v, want %#v", roots, want)
 		}
+	}
+}
+
+func TestGetScanLibrariesEmptyByDefault(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	libraries, configured, err := database.GetScanLibraries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured {
+		t.Fatal("configured = true, want false")
+	}
+	if len(libraries) != 0 {
+		t.Fatalf("libraries = %#v, want empty", libraries)
 	}
 }

@@ -72,7 +72,7 @@ func (p Processor) proxy(ctx context.Context, assetID int64) error {
 	if err != nil {
 		return err
 	}
-	if asset.MediaType != model.MediaTypeVideo || !p.ProxyEnabled || asset.BrowserPlayable {
+	if asset.MediaType != model.MediaTypeVideo || !p.ProxyEnabled {
 		return p.DB.SetAssetWorkStatus(ctx, assetID, "video_proxy_status", model.StatusNotRequired, nil)
 	}
 	dest, err := p.Store.CachePath("video-proxies", asset.CacheKey, "mp4")
@@ -132,6 +132,7 @@ func (p Processor) proxyArgs(source string, tmp string, filter string) []string 
 			"-i", source,
 			"-map", "0:v:0", "-map", "0:a?",
 			"-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", strconv.Itoa(p.ProxyCRF), "-b:v", "0",
+			"-g", "48", "-force_key_frames", "expr:gte(t,n_forced*2)",
 			"-vf", filter, "-pix_fmt", "yuv420p",
 			"-c:a", "aac", "-movflags", "+faststart", "-max_muxing_queue_size", "1024", tmp,
 		}
@@ -150,6 +151,7 @@ func (p Processor) cpuProxyTail(source string, tmp string, filter string) []stri
 		"-i", source,
 		"-map", "0:v:0", "-map", "0:a?",
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", strconv.Itoa(p.ProxyCRF),
+		"-g", "48", "-keyint_min", "24", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)",
 		"-vf", filter, "-pix_fmt", "yuv420p",
 		"-c:a", "aac", "-movflags", "+faststart", "-max_muxing_queue_size", "1024", tmp,
 	}

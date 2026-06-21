@@ -6,6 +6,7 @@ import { assetThumbUrl } from '../api/client';
 import { effectiveAspect, rotatedCoverStyle } from '../utils/rotation';
 import { assetGroupLabel, type AssetGroupMode } from '../utils/assetGrouping';
 import { gridRowHeightChanged, gridRowHeightForLevel, loadGridRowHeightLevel } from '../utils/gridPrefs';
+import { preloadViewerAsset } from '../utils/imagePreload';
 
 interface Props {
   assets: Asset[];
@@ -21,6 +22,7 @@ interface Props {
   onScrollStateChange?: (state: { ratio: number; scrollTop: number }) => void;
   totalCount?: number;
   loadedStartIndex?: number;
+  focusAssetId?: number | null;
   groupMode?: AssetGroupMode;
   sort?: SortKey;
   scrollSignal?: number;
@@ -76,6 +78,7 @@ export default function AssetGrid({
   onScrollStateChange,
   totalCount = assets.length,
   loadedStartIndex = 0,
+  focusAssetId = null,
   groupMode = 'none',
   sort = 'timeline_desc',
   scrollSignal = 0,
@@ -96,9 +99,12 @@ export default function AssetGrid({
     timer: 0,
   });
   const previewFrame = useRef(0);
+  const hoverPreloadTimer = useRef(0);
   const lastPreviewID = useRef<number | null>(null);
   const gridRowsRef = useRef<GridRow[]>([]);
   const scrollMetaRef = useRef({ loadedStartIndex: 0, totalCount: assets.length });
+  const appliedFocusAssetId = useRef<number | null>(null);
+  const appliedScrollTopTargetSignal = useRef<number | null>(null);
   const onPressPreviewChangeRef = useRef(onPressPreviewChange);
   const onOpenAssetRef = useRef(onOpenAsset);
   const onOpenViewerRef = useRef(onOpenViewer);
@@ -109,7 +115,6 @@ export default function AssetGrid({
   const [width, setWidth] = useState(0);
   const [rowHeight, setRowHeight] = useState(() => gridRowHeightForLevel(loadGridRowHeightLevel()));
   const visibleAssets = useMemo(() => assets.filter(assetReadyForThumb), [assets]);
-
   useEffect(() => {
     assetsByID.current = new Map(visibleAssets.map((asset) => [asset.id, asset]));
   }, [visibleAssets]);
@@ -199,6 +204,7 @@ export default function AssetGrid({
       if (previewFrame.current) {
         window.cancelAnimationFrame(previewFrame.current);
       }
+      clearHoverPreloadTimer();
     };
   }, []);
 
@@ -242,13 +248,30 @@ export default function AssetGrid({
   const totalHeight = virtualizer.getTotalSize();
 
   useEffect(() => {
-    if (!parentRef.current || !scrollTopTarget) return;
+    if (!parentRef.current || !focusAssetId || appliedFocusAssetId.current === focusAssetId) return;
     const element = parentRef.current;
-    window.requestAnimationFrame(() => {
-      const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
-      element.scrollTop = Math.min(maxScroll, Math.max(0, scrollTopTarget.scrollTop));
+    const targetTop = scrollTopForAsset(element, gridRowsRef.current, focusAssetId);
+    if (targetTop === null) return;
+    const frame = window.requestAnimationFrame(() => {
+      element.scrollTop = targetTop;
+      appliedFocusAssetId.current = focusAssetId;
       emitScrollState();
     });
+    return () => window.cancelAnimationFrame(frame);
+  }, [focusAssetId, gridRows, totalHeight]);
+
+  useEffect(() => {
+    if (!parentRef.current || !scrollTopTarget) return;
+    if (appliedScrollTopTargetSignal.current === scrollTopTarget.signal) return;
+    if (scrollTopTarget.scrollTop > 0 && gridRowsRef.current.length === 0) return;
+    const element = parentRef.current;
+    const frame = window.requestAnimationFrame(() => {
+      const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
+      element.scrollTop = Math.min(maxScroll, Math.max(0, scrollTopTarget.scrollTop));
+      appliedScrollTopTargetSignal.current = scrollTopTarget.signal;
+      emitScrollState();
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [scrollTopTarget?.scrollTop, scrollTopTarget?.signal, totalHeight]);
 
   return (
@@ -284,6 +307,9 @@ export default function AssetGrid({
                     draggable={false}
                     style={{ width: tileWidth, height: rowHeight }}
                     title={asset.relPath}
+                    onFocus={() => preloadViewerAsset(asset)}
+                    onMouseEnter={() => scheduleHoverPreload(asset)}
+                    onMouseLeave={clearHoverPreloadTimer}
                     onMouseDown={(event) => startPressPreview(event, asset)}
                     onDragStart={(event) => event.preventDefault()}
                     onClick={(event) => {
@@ -295,6 +321,7 @@ export default function AssetGrid({
                       }
                       const viewerUrl = buildViewerUrl(asset);
                       event.currentTarget.href = viewerUrl;
+                      preloadViewerAsset(asset, 'high');
                       onOpenAssetRef.current?.(asset);
                       if (onOpenViewerRef.current && !usesNativeNavigation(event)) {
                         event.preventDefault();
@@ -325,6 +352,8 @@ export default function AssetGrid({
   );
 
   function startPressPreview(event: ReactMouseEvent<HTMLAnchorElement>, asset: Asset) {
+    clearHoverPreloadTimer();
+    preloadViewerAsset(asset, 'high');
     if (!onPressPreviewChangeRef.current || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey) {
       return;
     }
@@ -352,6 +381,17 @@ export default function AssetGrid({
     if (!pressState.current.timer) return;
     window.clearTimeout(pressState.current.timer);
     pressState.current.timer = 0;
+  }
+
+  function scheduleHoverPreload(asset: Asset) {
+    clearHoverPreloadTimer();
+    hoverPreloadTimer.current = window.setTimeout(() => preloadViewerAsset(asset), 90);
+  }
+
+  function clearHoverPreloadTimer() {
+    if (!hoverPreloadTimer.current) return;
+    window.clearTimeout(hoverPreloadTimer.current);
+    hoverPreloadTimer.current = 0;
   }
 
   function endPressPreview() {
@@ -518,6 +558,19 @@ function scrollTopForGlobalRatio(
     offset += row.height + gap;
   }
   return Math.max(0, element.scrollHeight - element.clientHeight);
+}
+
+function scrollTopForAsset(element: HTMLDivElement, rows: GridRow[], assetId: number) {
+  let offset = 0;
+  for (const row of rows) {
+    if (row.type === 'assets' && row.items.some((item) => item.asset.id === assetId)) {
+      const centered = offset - Math.max(0, (element.clientHeight - row.height) / 2);
+      const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
+      return Math.min(maxScroll, Math.max(0, centered));
+    }
+    offset += row.height + gap;
+  }
+  return null;
 }
 
 function buildRows(

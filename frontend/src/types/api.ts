@@ -1,6 +1,7 @@
 export type MediaType = 'image' | 'video';
 export type AssetKind = 'all' | MediaType;
 export type OrientationFilter = 'all' | 'landscape' | 'portrait';
+export type NFOFilterField = 'actor' | 'id' | 'tag' | 'title' | 'year';
 export type SortKey =
   | 'timeline_desc'
   | 'timeline_asc'
@@ -46,6 +47,11 @@ export interface AssetDeletedEvent {
 export interface SearchAssetsParams {
   q?: string;
   nfo?: string;
+  nfoActor?: string;
+  nfoId?: string;
+  nfoTag?: string;
+  nfoTitle?: string;
+  nfoYear?: string;
   type?: AssetKind;
   sort?: SortKey;
   from?: number;
@@ -59,6 +65,7 @@ export interface SearchAssetsParams {
   sizeMin?: number;
   sizeMax?: number;
   orientation?: OrientationFilter;
+  dimensionMode?: 'both';
 }
 
 export interface Folder {
@@ -102,6 +109,7 @@ export interface ScanStatus {
 export interface ScanProgress {
   state: string;
   requestedAction: string;
+  task: string;
   reason: string;
   phase: string;
   roots: string[];
@@ -204,6 +212,8 @@ export interface ScanLibrary {
 
 export interface ScanLibraryProgress {
   assetTotal: number;
+  discoveredFiles: number;
+  discoveredAt: number | null;
   scannedFiles: number;
   unscannedFiles: number;
   thumb: WorkStatusCounts;
@@ -252,6 +262,13 @@ export interface LibraryAnchor {
 
 export interface LibraryAnchorsResponse {
   items: LibraryAnchor[];
+  total: number;
+}
+
+export interface AssetPosition {
+  index: number;
+  page: number;
+  position: number;
   total: number;
 }
 

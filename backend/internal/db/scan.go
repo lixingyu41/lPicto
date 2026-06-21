@@ -20,11 +20,9 @@ type ScanFinish struct {
 
 func (d *DB) StartScanRun(ctx context.Context) (int64, error) {
 	now := util.UnixNow()
-	result, err := d.conn.ExecContext(ctx, `INSERT INTO scan_runs (status, started_at) VALUES ('running', ?)`, now)
-	if err != nil {
-		return 0, err
-	}
-	return result.LastInsertId()
+	var id int64
+	err := d.conn.QueryRowContext(ctx, `INSERT INTO scan_runs (status, started_at) VALUES ('running', ?) RETURNING id`, now).Scan(&id)
+	return id, err
 }
 
 func (d *DB) FinishScanRun(ctx context.Context, id int64, result ScanFinish) error {

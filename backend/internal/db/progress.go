@@ -175,15 +175,17 @@ func assetRootsWhere(roots []string) (string, []any, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	if len(normalized) == 0 || (len(normalized) == 1 && normalized[0] == "") {
+	if len(normalized) == 0 {
+		return "0 = 1", nil, nil
+	}
+	if len(normalized) == 1 && normalized[0] == "" {
 		return "deleted_at IS NULL", nil, nil
 	}
 	clauses := make([]string, 0, len(normalized))
 	args := make([]any, 0, len(normalized)*2)
 	for _, root := range normalized {
-		lower, upper := descendantPathBounds(root)
-		clauses = append(clauses, "(rel_path = ? OR (rel_path >= ? AND rel_path < ?))")
-		args = append(args, root, lower, upper)
+		clauses = append(clauses, "(rel_path = ? OR rel_path LIKE ? ESCAPE '\\')")
+		args = append(args, root, descendantPathLike(root))
 	}
 	return "deleted_at IS NULL AND (" + strings.Join(clauses, " OR ") + ")", args, nil
 }

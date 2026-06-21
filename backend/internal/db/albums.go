@@ -26,7 +26,7 @@ WHERE album_sources.album_id = ?
   AND album_sources.source_type = 'folder'
   AND (
     (
-      album_sources.recursive = 1
+      album_sources.recursive = true
       AND (
         album_sources.rel_path = ''
         OR assets.parent_rel_path = album_sources.rel_path
@@ -34,7 +34,7 @@ WHERE album_sources.album_id = ?
       )
     )
     OR (
-      album_sources.recursive = 0
+      album_sources.recursive = false
       AND assets.parent_rel_path = album_sources.rel_path
     )
   )
@@ -112,13 +112,11 @@ func (d *DB) CreateAlbumGroup(ctx context.Context, p AlbumGroupCreate) (model.Al
 		return model.AlbumGroup{}, errors.New("album group name is required")
 	}
 	now := util.UnixNow()
-	result, err := d.conn.ExecContext(ctx, `
+	var id int64
+	err := d.conn.QueryRowContext(ctx, `
 INSERT INTO album_groups (name, created_at, updated_at)
-VALUES (?, ?, ?)`, name, now, now)
-	if err != nil {
-		return model.AlbumGroup{}, err
-	}
-	id, err := result.LastInsertId()
+VALUES (?, ?, ?)
+RETURNING id`, name, now, now).Scan(&id)
 	if err != nil {
 		return model.AlbumGroup{}, err
 	}
@@ -183,14 +181,11 @@ func (d *DB) CreateAlbum(ctx context.Context, p AlbumCreate) (model.Album, error
 	if err != nil {
 		return model.Album{}, err
 	}
-	result, err := tx.ExecContext(ctx, `
+	var albumID int64
+	err = tx.QueryRowContext(ctx, `
 INSERT INTO albums (name, group_id, media_type_filter, orientation_filter, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?)`, name, nullableInt64(p.GroupID), mediaFilter, orientationFilter, now, now)
-	if err != nil {
-		_ = tx.Rollback()
-		return model.Album{}, err
-	}
-	albumID, err := result.LastInsertId()
+VALUES (?, ?, ?, ?, ?, ?)
+RETURNING id`, name, nullableInt64(p.GroupID), mediaFilter, orientationFilter, now, now).Scan(&albumID)
 	if err != nil {
 		_ = tx.Rollback()
 		return model.Album{}, err
@@ -199,7 +194,7 @@ VALUES (?, ?, ?, ?, ?, ?)`, name, nullableInt64(p.GroupID), mediaFilter, orienta
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO album_sources (album_id, source_type, rel_path, recursive, media_type_filter, orientation_filter, created_at)
 VALUES (?, 'folder', ?, ?, ?, ?, ?)`,
-			albumID, source.RelPath, boolInt(source.Recursive), source.MediaTypeFilter, source.OrientationFilter, now); err != nil {
+			albumID, source.RelPath, source.Recursive, source.MediaTypeFilter, source.OrientationFilter, now); err != nil {
 			_ = tx.Rollback()
 			return model.Album{}, err
 		}
@@ -261,7 +256,7 @@ WHERE id = ?`, name, nullableInt64(p.GroupID), mediaFilter, orientationFilter, n
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO album_sources (album_id, source_type, rel_path, recursive, media_type_filter, orientation_filter, created_at)
 VALUES (?, 'folder', ?, ?, ?, ?, ?)`,
-			id, source.RelPath, boolInt(source.Recursive), source.MediaTypeFilter, source.OrientationFilter, now); err != nil {
+			id, source.RelPath, source.Recursive, source.MediaTypeFilter, source.OrientationFilter, now); err != nil {
 			_ = tx.Rollback()
 			return model.Album{}, err
 		}
@@ -315,6 +310,18 @@ func (d *DB) AlbumAnchors(ctx context.Context, albumID int64, opts AssetListOpti
 	}
 	where, args := albumAssetFilterSQL(album, opts)
 	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.PageSize)
+}
+
+func (d *DB) AlbumAssetPosition(ctx context.Context, albumID int64, assetID int64, opts AssetListOptions) (AssetPosition, error) {
+	if opts.PageSize <= 0 {
+		opts.PageSize = 100
+	}
+	album, err := d.getAlbumWithSources(ctx, albumID)
+	if err != nil {
+		return AssetPosition{}, err
+	}
+	where, args := albumAssetFilterSQL(album, opts)
+	return d.assetPositionForFilter(ctx, assetID, where, args, opts.Sort, opts.PageSize)
 }
 
 func (d *DB) AlbumNeighbors(ctx context.Context, albumID int64, opts NeighborOptions) (Neighbors, error) {
@@ -390,7 +397,7 @@ ORDER BY id ASC`, albumID)
 	var sources []model.AlbumSource
 	for rows.Next() {
 		var source model.AlbumSource
-		var recursive int
+		var recursive bool
 		if err := rows.Scan(
 			&source.ID,
 			&source.AlbumID,
@@ -403,7 +410,7 @@ ORDER BY id ASC`, albumID)
 		); err != nil {
 			return nil, err
 		}
-		source.Recursive = recursive == 1
+		source.Recursive = recursive
 		sources = append(sources, source)
 	}
 	return sources, rows.Err()
@@ -468,9 +475,8 @@ func albumSourceFilterSQL(sources []model.AlbumSource) (string, []any) {
 		var parts []string
 		if source.Recursive {
 			if source.RelPath != "" {
-				lower, upper := descendantPathBounds(source.RelPath)
-				parts = append(parts, `(assets.parent_rel_path = ? OR (assets.parent_rel_path >= ? AND assets.parent_rel_path < ?))`)
-				args = append(args, source.RelPath, lower, upper)
+				parts = append(parts, `(assets.parent_rel_path = ? OR assets.parent_rel_path LIKE ? ESCAPE '\')`)
+				args = append(args, source.RelPath, descendantPathLike(source.RelPath))
 			}
 		} else {
 			parts = append(parts, `assets.parent_rel_path = ?`)

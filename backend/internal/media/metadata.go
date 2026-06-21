@@ -248,6 +248,13 @@ func unixTime(value any) *int64 {
 		"2006-01-02 15:04:05",
 		"2006-01-02T15:04:05",
 		"2006-01-02T15:04:05Z0700",
+		"2006-01-02",
+		"2006/01/02",
+		"2006.01.02",
+		"2006-01",
+		"2006/01",
+		"2006.01",
+		"2006",
 	}
 	for _, layout := range layouts {
 		if parsed, err := time.Parse(layout, text); err == nil {

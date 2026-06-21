@@ -256,10 +256,33 @@ func (s *Server) albumSourceFolders(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "scan_folders_failed", "读取来源失败")
 		return
 	}
+	if parentRel == "" && !db.AssetInScanFolders(parentRel, scanRoots) {
+		items := make([]SourceFolderDTO, 0, len(scanRoots))
+		for _, rel := range scanRoots {
+			if rel == "" || !s.sourceDirExists(rel) {
+				continue
+			}
+			items = append(items, s.sourceFolderDTO(rel, scanRoots))
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].RelPath < items[j].RelPath })
+		writeJSON(w, http.StatusOK, map[string]any{"current": s.sourceFolderDTO(parentRel, scanRoots), "items": items, "warning": ""})
+		return
+	}
+	if parentRel != "" && !db.AssetInScanFolders(parentRel, scanRoots) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"current": s.sourceFolderDTO(parentRel, scanRoots),
+			"items":   []SourceFolderDTO{},
+			"warning": "",
+		})
+		return
+	}
 
 	if parentRel == "" && s.store.HasVirtualRoot() {
 		items := make([]SourceFolderDTO, 0, len(s.store.Roots))
 		for _, rel := range s.store.RootRelPaths() {
+			if !db.AssetInScanFolders(rel, scanRoots) {
+				continue
+			}
 			items = append(items, s.sourceFolderDTO(rel, scanRoots))
 		}
 		sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
@@ -288,6 +311,9 @@ func (s *Server) albumSourceFolders(w http.ResponseWriter, r *http.Request) {
 	items := make([]SourceFolderDTO, 0, len(entries))
 	for _, entry := range entries {
 		childRel := joinRel(parentRel, entry.Name())
+		if !db.AssetInScanFolders(childRel, scanRoots) {
+			continue
+		}
 		childPath, err := s.store.PhotoPath(childRel)
 		if err != nil {
 			continue
@@ -370,18 +396,6 @@ func albumSourceFolderDTO(rel string, scanRoots []string) SourceFolderDTO {
 		RelPath: rel, Name: storage.FolderName(rel), ParentRelPath: parentPtr(rel),
 		Depth: storage.FolderDepth(rel), Selected: scanRootExact(rel, scanRoots), Included: db.AssetInScanFolders(rel, scanRoots),
 	}
-}
-
-func folderVisibleForAlbum(rel string, scanRoots []string) bool {
-	if db.AssetInScanFolders(rel, scanRoots) {
-		return true
-	}
-	for _, root := range scanRoots {
-		if root != "" && (rel == storage.ParentRelPath(root) || strings.HasPrefix(root, rel+"/")) {
-			return true
-		}
-	}
-	return false
 }
 
 func scanRootExact(rel string, scanRoots []string) bool {

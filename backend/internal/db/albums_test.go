@@ -94,7 +94,7 @@ func TestAlbumSourceRecursiveFlag(t *testing.T) {
 	if _, _, _, err := database.UpsertAsset(ctx, testAlbumAsset("root.jpg", "", model.MediaTypeImage, 100, 100)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := database.UpsertAsset(ctx, testAlbumAsset("child.jpg", "dir", model.MediaTypeImage, 100, 100)); err != nil {
+	if _, _, _, err := database.UpsertAsset(ctx, testAlbumAsset("dir/child.jpg", "dir", model.MediaTypeImage, 100, 100)); err != nil {
 		t.Fatal(err)
 	}
 	album, err := database.CreateAlbum(ctx, AlbumCreate{
@@ -149,7 +149,7 @@ func TestAlbumRepeatableSourceFilters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := relPaths(page.Items); len(got) != 2 || got[0] != "media/a.jpg" || got[1] != "media/b.mp4" {
+	if got := albumRelPaths(page.Items); len(got) != 2 || got[0] != "media/a.jpg" || got[1] != "media/b.mp4" {
 		t.Fatalf("repeatable album filters = %#v, want media/a.jpg and media/b.mp4", got)
 	}
 }
@@ -208,7 +208,7 @@ func TestUpdateAlbumAndGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := relPaths(page.Items); len(got) != 1 || got[0] != "b/two.jpg" {
+	if got := albumRelPaths(page.Items); len(got) != 1 || got[0] != "b/two.jpg" {
 		t.Fatalf("updated album assets = %#v, want b/two.jpg", got)
 	}
 }
@@ -264,7 +264,7 @@ func testAlbumAsset(relPath string, parent string, mediaType string, width int, 
 	}
 }
 
-func relPaths(assets []model.Asset) []string {
+func albumRelPaths(assets []model.Asset) []string {
 	result := make([]string, 0, len(assets))
 	for _, asset := range assets {
 		result = append(result, asset.RelPath)

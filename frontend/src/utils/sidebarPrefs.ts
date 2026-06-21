@@ -1,6 +1,6 @@
 import type { SidebarPanelTarget } from '../components/SidebarContext';
 
-export type PrimarySidebarPanelTarget = 'library' | 'search' | 'albums' | 'folders';
+export type PrimarySidebarPanelTarget = 'library' | 'search' | 'albums' | 'folders' | 'settings';
 
 const sidebarSecondaryKey = 'lpicto.sidebarSecondaryExpanded';
 const sidebarWidthsKey = 'lpicto.sidebarWidths';
@@ -16,7 +16,7 @@ export interface SidebarWidths {
 }
 
 export function isPrimarySidebarPanelTarget(target: SidebarPanelTarget | null | undefined): target is PrimarySidebarPanelTarget {
-  return target === 'library' || target === 'search' || target === 'albums' || target === 'folders';
+  return target === 'library' || target === 'search' || target === 'albums' || target === 'folders' || target === 'settings';
 }
 
 export function primaryTargetForPath(pathname: string): PrimarySidebarPanelTarget | null {
@@ -24,6 +24,7 @@ export function primaryTargetForPath(pathname: string): PrimarySidebarPanelTarge
   if (pathname === '/search' || pathname.startsWith('/search/')) return 'search';
   if (pathname === '/albums' || pathname.startsWith('/albums/')) return 'albums';
   if (pathname === '/folders' || pathname.startsWith('/folders/')) return 'folders';
+  if (pathname === '/settings' || pathname.startsWith('/settings/')) return 'settings';
   return null;
 }
 
@@ -91,6 +92,7 @@ function loadSidebarSecondaryState(): Partial<Record<PrimarySidebarPanelTarget, 
       search: parsed.search === true,
       albums: parsed.albums === true,
       folders: parsed.folders === true,
+      settings: parsed.settings === true,
     };
   } catch {
     return {};

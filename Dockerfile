@@ -38,20 +38,14 @@ RUN set -eux; \
   && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --system --uid 10001 --create-home --home-dir /nonexistent --shell /usr/sbin/nologin lpicto \
-  && mkdir -p /app/frontend/dist /app/migrations /photos /storage /data/cache/thumbs /data/cache/previews /data/cache/video-posters /data/cache/video-proxies \
-  && chown -R lpicto:lpicto /app /data
+  && mkdir -p /app/frontend/dist /app/migrations /Media /storage /data /cache/thumbs /cache/previews /cache/video-posters /cache/video-proxies \
+  && chown -R lpicto:lpicto /app /data /cache
 
 WORKDIR /app
 COPY --from=backend --chown=lpicto:lpicto /out/lpicto /app/lpicto
 COPY --from=frontend --chown=lpicto:lpicto /src/frontend/dist /app/frontend/dist
 COPY --chown=lpicto:lpicto backend/migrations /app/migrations
 RUN chmod -R a+rX /app
-
-ENV PHOTO_ROOT=/photos \
-    DATA_ROOT=/data \
-    HTTP_ADDR=:8080 \
-    STATIC_DIR=/app/frontend/dist \
-    MIGRATIONS_DIR=/app/migrations
 
 USER lpicto
 EXPOSE 8080
