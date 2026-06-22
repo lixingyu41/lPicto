@@ -1,6 +1,6 @@
 import type { SidebarPanelTarget } from '../components/SidebarContext';
 
-export type PrimarySidebarPanelTarget = 'library' | 'search' | 'albums' | 'folders' | 'settings';
+export type PrimarySidebarPanelTarget = 'library' | 'ratings' | 'search' | 'albums' | 'folders' | 'settings';
 
 const sidebarSecondaryKey = 'lpicto.sidebarSecondaryExpanded';
 const sidebarWidthsKey = 'lpicto.sidebarWidths';
@@ -16,11 +16,12 @@ export interface SidebarWidths {
 }
 
 export function isPrimarySidebarPanelTarget(target: SidebarPanelTarget | null | undefined): target is PrimarySidebarPanelTarget {
-  return target === 'library' || target === 'search' || target === 'albums' || target === 'folders' || target === 'settings';
+  return target === 'library' || target === 'ratings' || target === 'search' || target === 'albums' || target === 'folders' || target === 'settings';
 }
 
 export function primaryTargetForPath(pathname: string): PrimarySidebarPanelTarget | null {
   if (pathname === '/library' || pathname.startsWith('/library/')) return 'library';
+  if (pathname === '/ratings' || pathname.startsWith('/ratings/')) return 'ratings';
   if (pathname === '/search' || pathname.startsWith('/search/')) return 'search';
   if (pathname === '/albums' || pathname.startsWith('/albums/')) return 'albums';
   if (pathname === '/folders' || pathname.startsWith('/folders/')) return 'folders';
@@ -89,6 +90,7 @@ function loadSidebarSecondaryState(): Partial<Record<PrimarySidebarPanelTarget, 
     if (!parsed || typeof parsed !== 'object') return {};
     return {
       library: parsed.library === true,
+      ratings: parsed.ratings === true,
       search: parsed.search === true,
       albums: parsed.albums === true,
       folders: parsed.folders === true,

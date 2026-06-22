@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
-import { useLocation } from 'react-router-dom';
+import { useLocation, type Location } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import { SidebarPanelProvider, type SidebarPanelTarget } from './SidebarContext';
 import {
@@ -15,13 +15,16 @@ import {
 
 interface Props {
   children: ReactNode;
+  overlay?: ReactNode;
+  routeLocation?: Location;
 }
 
-export default function Layout({ children }: Props) {
+export default function Layout({ children, overlay = null, routeLocation }: Props) {
   const location = useLocation();
+  const effectivePathname = routeLocation?.pathname ?? location.pathname;
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sidebarWidths, setSidebarWidths] = useState<SidebarWidths>(() => loadSidebarWidths());
-  const routeTarget = primaryTargetForPath(location.pathname);
+  const routeTarget = primaryTargetForPath(effectivePathname);
   const [sidebarExpanded, setSidebarExpandedState] = useState<SidebarPanelTarget | null>(() =>
     routeTarget && loadSidebarSecondaryExpanded(routeTarget) ? routeTarget : null,
   );
@@ -81,6 +84,7 @@ export default function Layout({ children }: Props) {
             collapsed={sidebarCollapsed}
             expanded={sidebarExpanded}
             primaryWidth={sidebarWidths.primary}
+            routePathname={effectivePathname}
             secondaryWidth={sidebarWidths.secondary}
             onToggleCollapsed={() => setSidebarCollapsed((value) => !value)}
             onToggleExpanded={setSidebarExpanded}
@@ -89,6 +93,7 @@ export default function Layout({ children }: Props) {
           />
         </aside>
         <main className="main-panel">{children}</main>
+        {overlay && <div className="viewer-shell-overlay">{overlay}</div>}
       </div>
     </SidebarPanelProvider>
   );

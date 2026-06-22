@@ -49,6 +49,47 @@ WHERE album_sources.album_id = ?
   )
 )`
 
+func albumMembershipExistsSQL() string {
+	return `EXISTS (
+SELECT 1
+FROM albums album_filter
+JOIN album_sources album_source_filter ON album_source_filter.album_id = album_filter.id
+WHERE album_source_filter.source_type = 'folder'
+  AND (
+    (
+      album_source_filter.recursive = true
+      AND (
+        album_source_filter.rel_path = ''
+        OR assets.parent_rel_path = album_source_filter.rel_path
+        OR assets.parent_rel_path LIKE replace(replace(replace(album_source_filter.rel_path, '\', '\\'), '%', '\%'), '_', '\_') || '/%' ESCAPE '\'
+      )
+    )
+    OR (
+      album_source_filter.recursive = false
+      AND assets.parent_rel_path = album_source_filter.rel_path
+    )
+  )
+  AND (
+    album_source_filter.media_type_filter = 'all'
+    OR assets.media_type = album_source_filter.media_type_filter
+  )
+  AND (
+    album_filter.media_type_filter = 'all'
+    OR assets.media_type = album_filter.media_type_filter
+  )
+  AND (
+    album_source_filter.orientation_filter = 'all'
+    OR (album_source_filter.orientation_filter = 'landscape' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveWidthSQL() + ` >= ` + effectiveHeightSQL() + `)
+    OR (album_source_filter.orientation_filter = 'portrait' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveHeightSQL() + ` > ` + effectiveWidthSQL() + `)
+  )
+  AND (
+    album_filter.orientation_filter = 'all'
+    OR (album_filter.orientation_filter = 'landscape' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveWidthSQL() + ` >= ` + effectiveHeightSQL() + `)
+    OR (album_filter.orientation_filter = 'portrait' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveHeightSQL() + ` > ` + effectiveWidthSQL() + `)
+  )
+)`
+}
+
 type AlbumSourceCreate struct {
 	RelPath           string
 	Recursive         bool
@@ -286,6 +327,9 @@ func (d *DB) ListAlbumAssets(ctx context.Context, albumID int64, opts AssetListO
 	limit := opts.PageSize + 1
 	offset := (opts.Page - 1) * opts.PageSize
 	query := assetSelectSQL() + " WHERE " + where + " ORDER BY " + sortSQL(opts.Sort) + " LIMIT ? OFFSET ?"
+	if opts.Group == assetGroupFolder {
+		query = folderGroupedRankedSQL(where, opts.Sort) + assetSelectSQLFrom("ranked") + " ORDER BY " + folderGroupSortSQL(opts.Sort) + " LIMIT ? OFFSET ?"
+	}
 	args = append(args, limit, offset)
 	rows, err := d.conn.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -309,7 +353,7 @@ func (d *DB) AlbumAnchors(ctx context.Context, albumID int64, opts AssetListOpti
 		return LibraryAnchorResult{}, err
 	}
 	where, args := albumAssetFilterSQL(album, opts)
-	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.PageSize)
+	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.Group, opts.PageSize)
 }
 
 func (d *DB) AlbumAssetPosition(ctx context.Context, albumID int64, assetID int64, opts AssetListOptions) (AssetPosition, error) {
@@ -321,7 +365,7 @@ func (d *DB) AlbumAssetPosition(ctx context.Context, albumID int64, assetID int6
 		return AssetPosition{}, err
 	}
 	where, args := albumAssetFilterSQL(album, opts)
-	return d.assetPositionForFilter(ctx, assetID, where, args, opts.Sort, opts.PageSize)
+	return d.assetPositionForFilter(ctx, assetID, where, args, opts.Sort, opts.Group, opts.PageSize)
 }
 
 func (d *DB) AlbumNeighbors(ctx context.Context, albumID int64, opts NeighborOptions) (Neighbors, error) {
@@ -336,8 +380,19 @@ func (d *DB) AlbumNeighbors(ctx context.Context, albumID int64, opts NeighborOpt
 	if err != nil {
 		return Neighbors{}, err
 	}
-	filterOpts := AssetListOptions{Sort: opts.Sort, Query: opts.Query, VisibleOnly: true}
+	filterOpts := AssetListOptions{Type: opts.Type, Sort: opts.Sort, Group: opts.Group, Query: opts.Query, VisibleOnly: true, Rating: opts.Rating}
 	where, args := albumAssetFilterSQL(album, filterOpts)
+	if filterOpts.Group == assetGroupFolder {
+		previous, err := d.groupedNeighborSide(ctx, where, args, filterOpts.Sort, opts.AssetID, true, opts.Limit)
+		if err != nil {
+			return Neighbors{}, err
+		}
+		next, err := d.groupedNeighborSide(ctx, where, args, filterOpts.Sort, opts.AssetID, false, opts.Limit)
+		if err != nil {
+			return Neighbors{}, err
+		}
+		return Neighbors{Current: current, Previous: previous, Next: next}, nil
+	}
 	prevCond, prevArgs, prevOrder := neighborCondition(current, filterOpts.Sort, true)
 	nextCond, nextArgs, nextOrder := neighborCondition(current, filterOpts.Sort, false)
 	previous, err := d.neighborSide(ctx, where, args, prevCond, prevArgs, prevOrder, opts.Limit)
@@ -455,6 +510,10 @@ func albumAssetFilterSQL(album model.Album, opts AssetListOptions) (string, []an
 	if opts.Query != "" {
 		where = append(where, "lower(filename) LIKE ? ESCAPE '\\'")
 		args = append(args, "%"+escapeLike(strings.ToLower(opts.Query))+"%")
+	}
+	if opts.Rating != nil {
+		where = append(where, assetRatingSQL("assets")+" = ?")
+		args = append(args, NormalizeRating(*opts.Rating))
 	}
 	switch normalizeAlbumOrientationFilter(album.OrientationFilter) {
 	case AlbumOrientationWide:

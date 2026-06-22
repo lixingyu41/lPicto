@@ -1,8 +1,10 @@
 import type { Asset, SortKey } from '../types/api';
+import type { AssetGroupMode } from './assetGrouping';
 
 interface MergeWindowOptions {
   hasMore: boolean;
   loadedStartIndex?: number;
+  groupMode?: AssetGroupMode;
 }
 
 export function mergeSortedAssets(current: Asset[], incoming: Asset[], sort: SortKey, options?: MergeWindowOptions) {
@@ -17,11 +19,11 @@ export function mergeSortedAssets(current: Asset[], incoming: Asset[], sort: Sor
     const existingIndex = next.findIndex((item) => item.id === asset.id);
     if (existingIndex >= 0) {
       if (sameAsset(next[existingIndex], asset)) return;
-      next = next.map((item, index) => (index === existingIndex ? asset : item)).sort((a, b) => compareAssets(a, b, sort));
+      next = sortAssets(next.map((item, index) => (index === existingIndex ? asset : item)), sort, options?.groupMode);
       return;
     }
     if (!shouldInsertIntoWindow(next, asset, sort, options)) return;
-    next = [...next, asset].sort((a, b) => compareAssets(a, b, sort));
+    next = sortAssets([...next, asset], sort, options?.groupMode);
     if (options?.hasMore && windowSize > 0 && next.length > windowSize) {
       next = next.slice(0, windowSize);
     }
@@ -56,6 +58,34 @@ export function compareAssets(a: Asset, b: Asset, sort: SortKey) {
   }
 }
 
+function sortAssets(assets: Asset[], sort: SortKey, groupMode: AssetGroupMode = 'none') {
+  if (groupMode !== 'folder') {
+    return [...assets].sort((a, b) => compareAssets(a, b, sort));
+  }
+  const leaders = folderLeaders(assets, sort);
+  return [...assets].sort((a, b) => compareFolderGroupedAssets(a, b, sort, leaders));
+}
+
+function compareFolderGroupedAssets(a: Asset, b: Asset, sort: SortKey, leaders: Map<string, Asset>) {
+  if (a.parentRelPath === b.parentRelPath) {
+    return compareAssets(a, b, sort);
+  }
+  const aLeader = leaders.get(a.parentRelPath) ?? a;
+  const bLeader = leaders.get(b.parentRelPath) ?? b;
+  return compareAssets(aLeader, bLeader, sort) || textAsc(a.parentRelPath, b.parentRelPath);
+}
+
+function folderLeaders(assets: Asset[], sort: SortKey) {
+  const leaders = new Map<string, Asset>();
+  assets.forEach((asset) => {
+    const current = leaders.get(asset.parentRelPath);
+    if (!current || compareAssets(asset, current, sort) < 0) {
+      leaders.set(asset.parentRelPath, asset);
+    }
+  });
+  return leaders;
+}
+
 function asc(a: number, b: number) {
   return a === b ? 0 : a < b ? -1 : 1;
 }
@@ -75,10 +105,14 @@ function textDesc(a: string, b: string) {
 function shouldInsertIntoWindow(current: Asset[], asset: Asset, sort: SortKey, options?: MergeWindowOptions) {
   if (!options) return true;
   if (current.length === 0) return (options.loadedStartIndex ?? 0) === 0;
-  if (compareAssets(asset, current[0], sort) < 0) {
+  const scope = [...current, asset];
+  const leaders = options.groupMode === 'folder' ? folderLeaders(scope, sort) : undefined;
+  const compare = (a: Asset, b: Asset) =>
+    leaders ? compareFolderGroupedAssets(a, b, sort, leaders) : compareAssets(a, b, sort);
+  if (compare(asset, current[0]) < 0) {
     return (options.loadedStartIndex ?? 0) === 0;
   }
-  if (compareAssets(asset, current[current.length - 1], sort) > 0) {
+  if (compare(asset, current[current.length - 1]) > 0) {
     return !options.hasMore;
   }
   return true;
@@ -106,6 +140,7 @@ function sameAsset(a: Asset, b: Asset) {
     a.previewStatus === b.previewStatus &&
     a.videoPosterStatus === b.videoPosterStatus &&
     a.videoProxyStatus === b.videoProxyStatus &&
-    a.rotation === b.rotation
+    a.rotation === b.rotation &&
+    a.rating === b.rating
   );
 }

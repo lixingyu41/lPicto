@@ -26,6 +26,8 @@ services:
         NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org/}
         APT_MIRROR: ${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian}
         APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian-security}
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
     group_add:
       - "${LPICTO_MEDIA_GID:-950}"
     volumes:
@@ -56,6 +58,8 @@ services:
         NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org/}
         APT_MIRROR: ${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian}
         APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian-security}
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
     command: ["worker"]
     group_add:
       - "${LPICTO_MEDIA_GID:-950}"
@@ -82,6 +86,7 @@ services:
   postgres:
     image: postgres:17
     environment:
+      - TZ=${TZ:-Asia/Shanghai}
       - POSTGRES_DB=media
       - POSTGRES_USER=media
       - POSTGRES_PASSWORD=media

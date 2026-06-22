@@ -238,12 +238,13 @@ export default function AssetGrid({
 
   const rows = virtualizer.getVirtualItems();
   const lastRow = rows[rows.length - 1];
+  const lastRowIndex = lastRow?.index ?? -1;
   useEffect(() => {
-    if (!lastRow) return;
-    if (hasMore && !loading && lastRow.index >= gridRows.length - 3) {
+    if (lastRowIndex < 0) return;
+    if (hasMore && !loading && lastRowIndex >= gridRows.length - 3) {
       onLoadMore();
     }
-  }, [gridRows.length, hasMore, lastRow, loading, onLoadMore]);
+  }, [gridRows.length, hasMore, lastRowIndex, loading, onLoadMore]);
 
   const totalHeight = virtualizer.getTotalSize();
 
@@ -545,11 +546,14 @@ function scrollTopForGlobalRatio(
   ratio: number,
   meta: { loadedStartIndex: number; totalCount: number },
 ) {
+  const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
+  const clampedRatio = clampRatio(ratio);
+  if (clampedRatio <= 0) return 0;
+  if (clampedRatio >= 1) return maxScroll;
   if (meta.totalCount <= 1 || rows.length === 0) {
-    const maxScroll = element.scrollHeight - element.clientHeight;
-    return maxScroll > 0 ? maxScroll * clampRatio(ratio) : 0;
+    return maxScroll > 0 ? maxScroll * clampedRatio : 0;
   }
-  const targetLocalIndex = clampRatio(ratio) * (meta.totalCount - 1) - meta.loadedStartIndex;
+  const targetLocalIndex = clampedRatio * (meta.totalCount - 1) - meta.loadedStartIndex;
   let offset = 0;
   for (const row of rows) {
     if (row.type === 'assets' && targetLocalIndex <= row.endAssetIndex) {

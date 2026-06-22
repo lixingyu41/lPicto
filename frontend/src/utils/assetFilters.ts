@@ -1,7 +1,11 @@
-import type { Album, AlbumSource, Asset, AssetKind } from '../types/api';
+import type { Album, AlbumSource, Asset, AssetKind, AssetRating } from '../types/api';
 
-export function assetMatchesLibrary(asset: Asset, type: AssetKind, query: string) {
-  return asset.thumbStatus === 'ready' && matchesType(asset, type) && matchesQuery(asset, query);
+export function assetMatchesLibrary(asset: Asset, type: AssetKind, query: string, rating?: AssetRating) {
+  return asset.thumbStatus === 'ready' && matchesType(asset, type) && matchesQuery(asset, query) && matchesRating(asset, rating);
+}
+
+export function assetMatchesRating(asset: Asset, rating: AssetRating, type: AssetKind, query: string) {
+  return assetMatchesLibrary(asset, type, query, rating);
 }
 
 export function assetMatchesFolder(asset: Asset, folderRelPath: string, recursive: boolean, query: string) {
@@ -15,6 +19,10 @@ export function assetMatchesFolder(asset: Asset, folderRelPath: string, recursiv
 export function assetMatchesAlbum(asset: Asset, album: Album | null, query: string) {
   if (!album || asset.thumbStatus !== 'ready' || !matchesQuery(asset, query)) return false;
   return album.sources.some((source) => assetMatchesAlbumSource(asset, source));
+}
+
+export function assetMatchesAnyAlbum(asset: Asset, albums: Album[]) {
+  return albums.some((album) => assetMatchesAlbum(asset, album, ''));
 }
 
 function assetMatchesAlbumSource(asset: Asset, source: AlbumSource) {
@@ -37,6 +45,10 @@ function matchesType(asset: Asset, type: AssetKind) {
 function matchesQuery(asset: Asset, query: string) {
   const normalized = query.trim().toLowerCase();
   return normalized === '' || asset.filename.toLowerCase().includes(normalized);
+}
+
+function matchesRating(asset: Asset, rating: AssetRating | undefined) {
+  return rating === undefined || asset.rating === rating;
 }
 
 function effectiveWidth(asset: Asset) {

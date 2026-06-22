@@ -205,8 +205,8 @@ func (s *Server) albumAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	page, pageSize := s.page(r, s.cfg.PageSizeDefault)
 	opts := db.AssetListOptions{
-		Page: page, PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")),
-		Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r),
+		Page: page, PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
+		Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
 	}
 	assets, err := s.db.ListAlbumAssets(r.Context(), id, opts)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -231,8 +231,10 @@ func (s *Server) albumAnchors(w http.ResponseWriter, r *http.Request) {
 	anchorResult, err := s.db.AlbumAnchors(r.Context(), id, db.AssetListOptions{
 		PageSize:    pageSize,
 		Sort:        safeSort(r.URL.Query().Get("sort")),
+		Group:       safeGroup(r.URL.Query().Get("group")),
 		Query:       strings.TrimSpace(r.URL.Query().Get("q")),
 		VisibleOnly: visibleOnly(r),
+		Rating:      ratingQueryPtr(r, "rating"),
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "album_not_found", "相册不存在")

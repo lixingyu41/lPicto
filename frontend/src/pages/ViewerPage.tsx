@@ -1,16 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams, useSearchParams, type Location } from 'react-router-dom';
-import { Captions, CaptionsOff, Gauge, LogOut, Maximize2, Minimize2, RotateCw } from 'lucide-react';
+import { LogOut } from 'lucide-react';
 import { api } from '../api/client';
-import type { Asset, AssetSidecars, Neighbors, NFOField } from '../types/api';
+import type { Asset, AssetRating, AssetSidecars, Neighbors, NFOField } from '../types/api';
+import RatingStars, { normalizeAssetRating } from '../components/RatingStars';
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format';
 import ImageViewer from '../viewer/ImageViewer';
 import VideoViewer from '../viewer/VideoViewer';
 import { useKeyboard } from '../hooks/useKeyboard';
 import { useRestoreSidebarState, useSidebarPanel, type SidebarReturnState } from '../components/SidebarContext';
 import { nextRotation } from '../utils/rotation';
-import { decodeReturnState, encodeReturnState, loadViewerReturnPath, type GridReturnState } from '../utils/pageState';
-import { loadViewerPrefs, nextPlaybackRate, saveViewerPrefs, viewerPrefsChanged } from '../utils/viewerPrefs';
+import {
+  decodeReturnState,
+  emitAssetRatingChanged,
+  emitViewerOverlayAssetFocus,
+  encodeReturnState,
+  loadViewerReturnPath,
+  type GridReturnState,
+} from '../utils/pageState';
+import { loadViewerPrefs, saveViewerPrefs, viewerPrefsChanged } from '../utils/viewerPrefs';
 import { preloadViewerAsset, preloadViewerAssets } from '../utils/imagePreload';
 
 interface WheelBase {
@@ -89,6 +97,11 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
 
   const activeNeighbors = neighbors?.current.id === assetId ? neighbors : null;
   const current = activeNeighbors?.current ?? initialAsset;
+
+  useEffect(() => {
+    if (!overlay || !current) return;
+    emitViewerOverlayAssetFocus(current.id);
+  }, [current?.id, overlay]);
 
   useEffect(() => {
     if (current?.mediaType === 'image') {
@@ -235,18 +248,19 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   }, [goWheelStep]);
 
   const leave = useCallback(() => {
+    if (overlay) {
+      navigate(-1);
+      return;
+    }
     void (async () => {
       const context = searchParams.get('context');
-      const fallback = context === 'folder' ? '/folders' : context === 'album' ? '/albums' : context === 'search' ? '/search' : '/library';
+      const fallback =
+        context === 'folder' ? '/folders' : context === 'album' ? '/albums' : context === 'search' ? '/search' : context === 'rating' ? '/ratings' : '/library';
       const returnPath = searchParams.get('returnPath');
       const targetPath = returnPath === fallback ? returnPath : fallback;
       const restoreState = await returnStateForCurrentAsset(searchParams, current?.id);
       if (restoreState) {
         navigate(`${targetPath}?restore=${encodeReturnState(restoreState)}`, overlay ? { replace: true } : undefined);
-        return;
-      }
-      if (overlay) {
-        navigate(-1);
         return;
       }
       const storageReturnPath = loadViewerReturnPath();
@@ -258,6 +272,20 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     if (!current) return;
     const pref = await api.updateAssetPreferences(current.id, nextRotation(current.rotation));
     setNeighbors((value) => (value ? updateNeighborRotation(value, pref.assetId, pref.rotation) : value));
+  }, [current]);
+
+  const rateCurrentAsset = useCallback(async (rating: AssetRating) => {
+    if (!current) return;
+    const pref = await api.updateAssetRating(current.id, rating);
+    const nextRating = normalizeAssetRating(pref.rating);
+    emitAssetRatingChanged(pref.assetId, nextRating);
+    setNeighbors((value) => {
+      if (value) return updateNeighborRating(value, pref.assetId, nextRating);
+      if (current.id === pref.assetId) {
+        return { current: { ...current, rating: nextRating }, previous: [], next: [] };
+      }
+      return value;
+    });
   }, [current]);
 
   const toggleFullscreen = useCallback(() => {
@@ -295,35 +323,20 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     <ViewerSidebarPanel
       asset={current}
       error={error}
-      fullscreen={fullscreen}
-      playbackRate={playbackRate}
-      selectedSubtitleId={selectedSubtitleId}
       sidecarError={sidecarError}
       sidecars={sidecars}
-      subtitlesEnabled={subtitlesEnabled}
       onLeave={leave}
-      onPlaybackRateChange={updatePlaybackRate}
-      onRotate={() => void rotateCurrentAsset()}
-      onSelectedSubtitleChange={updateSelectedSubtitle}
-      onSubtitlesEnabledChange={updateSubtitlesEnabled}
-      onToggleFullscreen={toggleFullscreen}
+      onRatingChange={(rating) => void rateCurrentAsset(rating)}
     />,
     [
       current?.id,
+      current?.rating,
       current?.rotation,
       error,
-      playbackRate,
-      selectedSubtitleId,
       sidecarError,
       sidecars,
-      subtitlesEnabled,
-      fullscreen,
       leave,
-      updatePlaybackRate,
-      rotateCurrentAsset,
-      updateSelectedSubtitle,
-      updateSubtitlesEnabled,
-      toggleFullscreen,
+      rateCurrentAsset,
     ],
   );
 
@@ -340,13 +353,25 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       <div className="viewer-body">
         {current &&
           (current.mediaType === 'image' ? (
-            <ImageViewer asset={current} />
+            <ImageViewer
+              asset={current}
+              fullscreen={fullscreen}
+              onRotate={() => void rotateCurrentAsset()}
+              onToggleFullscreen={toggleFullscreen}
+            />
           ) : (
             <VideoViewer
               asset={current}
+              fullscreen={fullscreen}
               playbackRate={playbackRate}
               selectedSubtitleId={selectedSubtitleId}
+              subtitles={sidecars?.subtitles ?? []}
               subtitlesEnabled={subtitlesEnabled}
+              onPlaybackRateChange={updatePlaybackRate}
+              onRotate={() => void rotateCurrentAsset()}
+              onSelectedSubtitleChange={updateSelectedSubtitle}
+              onSubtitlesEnabledChange={updateSubtitlesEnabled}
+              onToggleFullscreen={toggleFullscreen}
             />
           ))}
       </div>
@@ -396,38 +421,21 @@ function assetPositionParams(searchParams: URLSearchParams) {
 function ViewerSidebarPanel({
   asset,
   error,
-  fullscreen,
-  playbackRate,
-  selectedSubtitleId,
   sidecarError,
   sidecars,
-  subtitlesEnabled,
   onLeave,
-  onPlaybackRateChange,
-  onRotate,
-  onSelectedSubtitleChange,
-  onSubtitlesEnabledChange,
-  onToggleFullscreen,
+  onRatingChange,
 }: {
   asset: Asset | undefined;
   error: string | null;
-  fullscreen: boolean;
-  playbackRate: number;
-  selectedSubtitleId: string;
   sidecarError: string | null;
   sidecars: AssetSidecars | null;
-  subtitlesEnabled: boolean;
   onLeave: () => void;
-  onPlaybackRateChange: (value: number) => void;
-  onRotate: () => void;
-  onSelectedSubtitleChange: (value: string) => void;
-  onSubtitlesEnabledChange: (value: boolean) => void;
-  onToggleFullscreen: () => void;
+  onRatingChange: (rating: AssetRating) => void;
 }) {
   const nfoFields = sidecars?.nfo?.fields ?? {};
   const nfoGroups = sidecars?.nfo?.groups?.filter((group) => group.items.length > 0) ?? [];
   const nfoFieldEntries = Object.entries(nfoFields).filter(([, value]) => value.trim() !== '');
-  const hasSubtitles = Boolean(sidecars?.subtitles.length);
   return (
     <div className="sidebar-control-stack">
       <div className="sidebar-control-title">查看器</div>
@@ -435,71 +443,25 @@ function ViewerSidebarPanel({
         <button className="sidebar-square-button" type="button" title="退出查看" onClick={onLeave}>
           <LogOut size={16} />
         </button>
-        <button className="sidebar-square-button" type="button" title={fullscreen ? '退出全屏' : '全屏'} onClick={onToggleFullscreen}>
-          {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
-        </button>
-        {asset && (
-          <button className="sidebar-square-button" type="button" title={`旋转 ${asset.rotation || 0}°`} onClick={onRotate}>
-            <RotateCw size={16} />
-          </button>
-        )}
-        {asset?.mediaType === 'video' && (
-          <>
-            <button
-              className="sidebar-square-button sidebar-rate-button"
-              type="button"
-              title={`倍速 ${playbackRate}x`}
-              onClick={() => onPlaybackRateChange(nextPlaybackRate(playbackRate))}
-            >
-              <Gauge size={15} />
-              <span>{playbackRate}x</span>
-            </button>
-            <button
-              className={subtitlesEnabled && hasSubtitles ? 'sidebar-square-button active' : 'sidebar-square-button'}
-              type="button"
-              title={hasSubtitles ? (subtitlesEnabled ? '关闭弹幕' : '开启弹幕') : '无弹幕'}
-              disabled={!hasSubtitles}
-              onClick={() => onSubtitlesEnabledChange(!subtitlesEnabled)}
-            >
-              {subtitlesEnabled && hasSubtitles ? <Captions size={16} /> : <CaptionsOff size={16} />}
-            </button>
-          </>
-        )}
       </div>
-      {asset?.mediaType === 'video' && (
-        <>
-          {hasSubtitles && (
-            <select
-              className="sidebar-subtitle-select"
-              value={selectedSubtitleId}
-              onChange={(event) => {
-                onSelectedSubtitleChange(event.target.value);
-                onSubtitlesEnabledChange(Boolean(event.target.value));
-              }}
-            >
-              {sidecars?.subtitles.map((subtitle) => (
-                <option key={subtitle.id} value={subtitle.id}>
-                  {subtitle.filename}
-                </option>
-              ))}
-            </select>
-          )}
-        </>
-      )}
       {error && <div className="sidebar-error">{error}</div>}
       {sidecarError && <div className="sidebar-error">{sidecarError}</div>}
       {asset && (
-        <div className="sidebar-asset-info">
-          <strong>{asset.filename}</strong>
-          <span>{asset.relPath}</span>
-          <div className="sidebar-info-chips">
-            {assetInfoChips(asset).map((value) => (
-              <span className="sidebar-info-chip" key={value}>
-                {value}
-              </span>
-            ))}
+        <>
+          <div className="sidebar-asset-info">
+            <strong>{asset.filename}</strong>
+            <span>{asset.relPath}</span>
+            <div className="sidebar-info-chips">
+              {assetInfoChips(asset).map((value) => (
+                <span className="sidebar-info-chip" key={value}>
+                  {value}
+                </span>
+              ))}
+            </div>
           </div>
-        </div>
+          <div className="sidebar-control-title">星级</div>
+          <RatingStars value={normalizeAssetRating(asset.rating)} onChange={onRatingChange} />
+        </>
       )}
       {sidecars?.nfo && (
         <div className="sidebar-nfo">
@@ -574,6 +536,15 @@ async function copyText(value: string) {
 
 function updateNeighborRotation(neighbors: Neighbors, assetId: number, rotation: number): Neighbors {
   const update = (asset: Asset) => (asset.id === assetId ? { ...asset, rotation } : asset);
+  return {
+    current: update(neighbors.current),
+    previous: neighbors.previous.map(update),
+    next: neighbors.next.map(update),
+  };
+}
+
+function updateNeighborRating(neighbors: Neighbors, assetId: number, rating: AssetRating): Neighbors {
+  const update = (asset: Asset) => (asset.id === assetId ? { ...asset, rating } : asset);
   return {
     current: update(neighbors.current),
     previous: neighbors.previous.map(update),

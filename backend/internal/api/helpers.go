@@ -53,6 +53,22 @@ func intQueryPtr(r *http.Request, key string) *int {
 	return &parsed
 }
 
+func ratingQueryPtr(r *http.Request, key string) *int {
+	value := intQueryPtr(r, key)
+	if value == nil || *value < 0 || *value > 5 {
+		return nil
+	}
+	return value
+}
+
+func albumUnassignedQuery(r *http.Request) bool {
+	value := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("albumFilter")))
+	if value == "" {
+		value = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("album")))
+	}
+	return value == "none" || value == "unassigned"
+}
+
 func float64QueryPtr(r *http.Request, key string) *float64 {
 	value := strings.TrimSpace(r.URL.Query().Get(key))
 	if value == "" {
@@ -84,6 +100,15 @@ func safeSort(value string) string {
 		return value
 	default:
 		return "timeline_desc"
+	}
+}
+
+func safeGroup(value string) string {
+	switch value {
+	case "folder":
+		return "folder"
+	default:
+		return ""
 	}
 }
 

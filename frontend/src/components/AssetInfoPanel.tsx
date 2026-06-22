@@ -26,6 +26,10 @@ export default function AssetInfoPanel({ asset, title }: Props) {
             <dt>时间</dt>
             <dd>{formatDateTime(asset.timelineAt)}</dd>
           </div>
+          <div>
+            <dt>星级</dt>
+            <dd>{asset.rating === 0 ? '未评级' : `${asset.rating} 星`}</dd>
+          </div>
           {asset.width && asset.height && (
             <div>
               <dt>尺寸</dt>

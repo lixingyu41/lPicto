@@ -33,7 +33,7 @@ func TestNFOTimelineAtUsesPremieredBeforeYear(t *testing.T) {
   <premiered>2024-05-01</premiered>
 </movie>`)
 	got := NFOTimelineAt(info)
-	want := time.Date(2024, 5, 1, 0, 0, 0, 0, time.UTC).Unix()
+	want := time.Date(2024, 5, 1, 0, 0, 0, 0, time.Local).Unix()
 	if got == nil || *got != want {
 		t.Fatalf("nfo timeline = %v, want %d", got, want)
 	}
@@ -41,7 +41,7 @@ func TestNFOTimelineAtUsesPremieredBeforeYear(t *testing.T) {
 
 func TestNFOTimelineAtJSONUsesStoredNFO(t *testing.T) {
 	got := NFOTimelineAtJSON(`{"groups":[{"title":"基本","items":[{"key":"releasedate","label":"发布日期","value":"2023-02-03","copyable":false}]}]}`)
-	want := time.Date(2023, 2, 3, 0, 0, 0, 0, time.UTC).Unix()
+	want := time.Date(2023, 2, 3, 0, 0, 0, 0, time.Local).Unix()
 	if got == nil || *got != want {
 		t.Fatalf("stored nfo timeline = %v, want %d", got, want)
 	}

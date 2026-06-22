@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Maximize2, Minimize2, RotateCw } from 'lucide-react';
 import type { Asset } from '../types/api';
 import { assetOriginalUrl, assetThumbUrl } from '../api/client';
 import { loadViewerPrefs, viewerPrefsChanged, type ViewerPrefs } from '../utils/viewerPrefs';
@@ -7,6 +8,9 @@ import { viewerImageUrl } from '../utils/imagePreload';
 
 interface Props {
   asset: Asset;
+  fullscreen: boolean;
+  onRotate: () => void;
+  onToggleFullscreen: () => void;
 }
 
 interface ZoomState {
@@ -17,7 +21,7 @@ interface ZoomState {
   backgroundY: number;
 }
 
-export default function ImageViewer({ asset }: Props) {
+export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFullscreen }: Props) {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const animatedPressTimer = useRef(0);
@@ -224,6 +228,16 @@ export default function ImageViewer({ asset }: Props) {
           }}
         />
       )}
+      <div className="image-control-zone" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="image-controls">
+          <button type="button" title={`旋转 ${asset.rotation || 0}°`} onClick={onRotate}>
+            <RotateCw size={18} />
+          </button>
+          <button type="button" title={fullscreen ? '退出全屏' : '全屏'} onClick={onToggleFullscreen}>
+            {fullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

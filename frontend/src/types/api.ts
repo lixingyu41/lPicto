@@ -2,6 +2,9 @@ export type MediaType = 'image' | 'video';
 export type AssetKind = 'all' | MediaType;
 export type OrientationFilter = 'all' | 'landscape' | 'portrait';
 export type NFOFilterField = 'actor' | 'id' | 'tag' | 'title' | 'year';
+export type AssetServerGroup = 'folder';
+export type AssetRating = 0 | 1 | 2 | 3 | 4 | 5;
+export type AlbumAssetFilter = 'none';
 export type SortKey =
   | 'timeline_desc'
   | 'timeline_asc'
@@ -36,6 +39,7 @@ export interface Asset {
   videoPosterStatus: string;
   videoProxyStatus: string;
   rotation: number;
+  rating: AssetRating;
 }
 
 export interface AssetDeletedEvent {
@@ -66,6 +70,8 @@ export interface SearchAssetsParams {
   sizeMax?: number;
   orientation?: OrientationFilter;
   dimensionMode?: 'both';
+  group?: AssetServerGroup;
+  rating?: AssetRating;
 }
 
 export interface Folder {
@@ -254,7 +260,7 @@ export interface Neighbors {
 export interface LibraryAnchor {
   key: string;
   label: string;
-  kind: 'year' | 'month' | 'day' | 'letter' | 'size';
+  kind: 'year' | 'month' | 'day' | 'letter' | 'size' | 'folder';
   page: number;
   position: number;
   value: number;
@@ -278,6 +284,7 @@ export type AlbumOrientationFilter = 'all' | 'landscape' | 'portrait';
 export interface AssetPreference {
   assetId: number;
   rotation: number;
+  rating: AssetRating;
   updatedAt: number;
 }
 

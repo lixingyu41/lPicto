@@ -12,6 +12,8 @@ export interface GridReturnState {
 
 const pageStatePrefix = 'lpicto:page-state:';
 const viewerReturnKey = 'lpicto:viewer-return-path';
+export const viewerOverlayAssetFocusChanged = 'lpicto:viewer-overlay-asset-focus';
+export const assetRatingChanged = 'lpicto:asset-rating-changed';
 
 export function loadPageState<T extends object>(key: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
@@ -76,6 +78,36 @@ export function resetGridState(): GridReturnState {
 
 export function encodeReturnState<T extends object>(value: T) {
   return encodeURIComponent(JSON.stringify(value));
+}
+
+export function appendViewerReturnParams(url: string, returnPath: string, state: object) {
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}returnPath=${encodeURIComponent(returnPath)}&returnState=${encodeReturnState(state)}`;
+}
+
+export function emitViewerOverlayAssetFocus(assetId: number) {
+  if (typeof window === 'undefined' || !Number.isFinite(assetId) || assetId <= 0) return;
+  window.dispatchEvent(new CustomEvent(viewerOverlayAssetFocusChanged, { detail: { assetId } }));
+}
+
+export function emitAssetRatingChanged(assetId: number, rating: number) {
+  if (typeof window === 'undefined' || !Number.isFinite(assetId) || assetId <= 0) return;
+  if (!Number.isFinite(rating) || rating < 0 || rating > 5) return;
+  window.dispatchEvent(new CustomEvent(assetRatingChanged, { detail: { assetId, rating } }));
+}
+
+export function viewerOverlayAssetFocusId(event: Event) {
+  if (!(event instanceof CustomEvent)) return null;
+  const assetId = Number((event.detail as { assetId?: unknown } | null)?.assetId);
+  return Number.isFinite(assetId) && assetId > 0 ? assetId : null;
+}
+
+export function assetRatingChangeDetail(event: Event) {
+  if (!(event instanceof CustomEvent)) return null;
+  const assetId = Number((event.detail as { assetId?: unknown; rating?: unknown } | null)?.assetId);
+  const rating = Number((event.detail as { assetId?: unknown; rating?: unknown } | null)?.rating);
+  if (!Number.isFinite(assetId) || assetId <= 0 || !Number.isFinite(rating) || rating < 0 || rating > 5) return null;
+  return { assetId, rating };
 }
 
 export function decodeReturnState<T extends object>(value: string | null, fallback: T): T {

@@ -1,16 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Pause, Play, Volume2, VolumeX } from 'lucide-react';
-import type { Asset } from '../types/api';
+import { Captions, CaptionsOff, Gauge, Maximize2, Minimize2, Pause, Play, RotateCw, Volume2, VolumeX } from 'lucide-react';
+import type { Asset, SubtitleInfo } from '../types/api';
 import { api, assetPreviewUrl, assetSubtitleUrl, assetVideoProxyUrl, assetVideoUrl } from '../api/client';
 import { formatDuration } from '../utils/format';
 import { normalizeRotation, rotatedContainStyle } from '../utils/rotation';
-import { loadViewerPrefs, viewerPrefsChanged, type ViewerPrefs } from '../utils/viewerPrefs';
+import { loadViewerPrefs, nextPlaybackRate, viewerPrefsChanged, type ViewerPrefs } from '../utils/viewerPrefs';
 
 interface Props {
   asset: Asset;
+  fullscreen: boolean;
   playbackRate: number;
   selectedSubtitleId: string;
+  subtitles: SubtitleInfo[];
   subtitlesEnabled: boolean;
+  onPlaybackRateChange: (value: number) => void;
+  onRotate: () => void;
+  onSelectedSubtitleChange: (value: string) => void;
+  onSubtitlesEnabledChange: (value: boolean) => void;
+  onToggleFullscreen: () => void;
 }
 
 const autoplayDelayMs = 800;
@@ -25,7 +32,19 @@ interface VideoAudioPreference {
 
 let sharedVideoAudio: VideoAudioPreference | null = null;
 
-export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, subtitlesEnabled }: Props) {
+export default function VideoViewer({
+  asset,
+  fullscreen,
+  playbackRate,
+  selectedSubtitleId,
+  subtitles,
+  subtitlesEnabled,
+  onPlaybackRateChange,
+  onRotate,
+  onSelectedSubtitleChange,
+  onSubtitlesEnabledChange,
+  onToggleFullscreen,
+}: Props) {
   const ref = useRef<HTMLVideoElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
   const autoplayTimer = useRef<number | null>(null);
@@ -59,6 +78,7 @@ export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, s
   const showPosterLayer = Boolean(posterSource) && (!canPlay || (!hasPlaybackStarted && paused && currentTime <= 0.01));
   const statusLabel = videoStatusLabel(playbackAsset, sourceFailed);
   const displayedTime = scrubTime ?? currentTime;
+  const hasSubtitles = subtitles.length > 0;
 
   const mediaStyle = useMemo(() => {
     const rotation = normalizeRotation(asset.rotation);
@@ -346,8 +366,9 @@ export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, s
           <button type="button" disabled={!canPlay} onClick={togglePlay} title={paused ? '播放' : '暂停'}>
             {paused ? <Play size={18} /> : <Pause size={18} />}
           </button>
-          <span>{formatDuration(displayedTime)}</span>
+          <span className="video-time">{formatDuration(displayedTime)}</span>
           <input
+            className="video-progress-slider"
             aria-label="播放进度"
             max={duration || 0}
             min={0}
@@ -365,38 +386,81 @@ export default function VideoViewer({ asset, playbackRate, selectedSubtitleId, s
             onPointerDown={(event) => setScrubTime(Number(event.currentTarget.value))}
             onPointerUp={(event) => commitSeek(Number(event.currentTarget.value))}
           />
-          <span>{formatDuration(duration)}</span>
-          <button
-            type="button"
-            disabled={!canPlay}
-            onClick={() => {
-              if (!ref.current) return;
-              if (audio.muted || ref.current.volume === 0) {
-                ref.current.volume = audio.lastVolume || 1;
-                ref.current.muted = false;
-              } else {
-                ref.current.muted = true;
-              }
-            }}
-            title={audio.muted ? '取消静音' : '静音'}
-          >
-            {audio.muted ? <VolumeX size={18} /> : <Volume2 size={18} />}
-          </button>
-          <input
-            aria-label="音量"
-            max={1}
-            min={0}
-            step={0.01}
-            disabled={!canPlay}
-            type="range"
-            value={audio.muted ? 0 : audio.volume}
-            onChange={(event) => {
-              const next = clampVolume(Number(event.target.value));
-              if (!ref.current) return;
-              ref.current.volume = next;
-              ref.current.muted = next === 0;
-            }}
-          />
+          <span className="video-time">{formatDuration(duration)}</span>
+          <div className="video-control-group video-audio-controls">
+            <button
+              type="button"
+              disabled={!canPlay}
+              onClick={() => {
+                if (!ref.current) return;
+                if (audio.muted || ref.current.volume === 0) {
+                  ref.current.volume = audio.lastVolume || 1;
+                  ref.current.muted = false;
+                } else {
+                  ref.current.muted = true;
+                }
+              }}
+              title={audio.muted ? '取消静音' : '静音'}
+            >
+              {audio.muted ? <VolumeX size={18} /> : <Volume2 size={18} />}
+            </button>
+            <input
+              className="video-volume-slider"
+              aria-label="音量"
+              max={1}
+              min={0}
+              step={0.01}
+              disabled={!canPlay}
+              type="range"
+              value={audio.muted ? 0 : audio.volume}
+              onChange={(event) => {
+                const next = clampVolume(Number(event.target.value));
+                if (!ref.current) return;
+                ref.current.volume = next;
+                ref.current.muted = next === 0;
+              }}
+            />
+          </div>
+          <div className="video-control-group video-option-controls">
+            <button
+              className="video-rate-button"
+              type="button"
+              title={`倍速 ${playbackRate}x`}
+              onClick={() => onPlaybackRateChange(nextPlaybackRate(playbackRate))}
+            >
+              <Gauge size={16} />
+              <span className="video-rate-label">{playbackRate}x</span>
+            </button>
+            <button
+              className={subtitlesEnabled && hasSubtitles ? 'active' : ''}
+              type="button"
+              title={hasSubtitles ? (subtitlesEnabled ? '关闭字幕' : '开启字幕') : '无字幕'}
+              disabled={!hasSubtitles}
+              onClick={() => onSubtitlesEnabledChange(!subtitlesEnabled)}
+            >
+              {subtitlesEnabled && hasSubtitles ? <Captions size={18} /> : <CaptionsOff size={18} />}
+            </button>
+            {hasSubtitles && (
+              <select
+                className="video-subtitle-select"
+                aria-label="字幕选择"
+                value={selectedSubtitleId}
+                onChange={(event) => onSelectedSubtitleChange(event.target.value)}
+              >
+                {subtitles.map((subtitle) => (
+                  <option key={subtitle.id} value={subtitle.id}>
+                    {subtitle.filename}
+                  </option>
+                ))}
+              </select>
+            )}
+            <button type="button" title={`旋转 ${asset.rotation || 0}°`} onClick={onRotate}>
+              <RotateCw size={18} />
+            </button>
+            <button type="button" title={fullscreen ? '退出全屏' : '全屏'} onClick={onToggleFullscreen}>
+              {fullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+            </button>
+          </div>
         </div>
       </div>
     </div>

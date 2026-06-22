@@ -347,8 +347,24 @@ func (s *Server) libraryAssets(w http.ResponseWriter, r *http.Request) {
 		typeFilter = ""
 	}
 	opts := db.AssetListOptions{
-		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")),
-		Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r),
+		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
+		Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
+		AlbumUnassigned: albumUnassignedQuery(r),
+	}
+	if albumID := int64QueryPtr(r, "albumId"); albumID != nil {
+		assets, err := s.db.ListAlbumAssets(r.Context(), *albumID, opts)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "album_not_found", "相册不存在")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "library_assets_failed", "读取图库失败")
+			return
+		}
+		writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{
+			Items: assetDTOs(assets.Items), Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore,
+		})
+		return
 	}
 	assets, err := s.db.ListLibraryAssets(r.Context(), opts)
 	if err != nil {
@@ -366,13 +382,27 @@ func (s *Server) libraryAnchors(w http.ResponseWriter, r *http.Request) {
 	if typeFilter == "all" {
 		typeFilter = ""
 	}
-	anchorResult, err := s.db.LibraryAnchors(r.Context(), db.AssetListOptions{
+	opts := db.AssetListOptions{
 		PageSize:    pageSize,
 		Type:        typeFilter,
 		Sort:        safeSort(r.URL.Query().Get("sort")),
+		Group:       safeGroup(r.URL.Query().Get("group")),
 		Query:       strings.TrimSpace(r.URL.Query().Get("q")),
 		VisibleOnly: visibleOnly(r),
-	})
+		Rating:      ratingQueryPtr(r, "rating"),
+		AlbumUnassigned: albumUnassignedQuery(r),
+	}
+	var anchorResult db.LibraryAnchorResult
+	var err error
+	if albumID := int64QueryPtr(r, "albumId"); albumID != nil {
+		anchorResult, err = s.db.AlbumAnchors(r.Context(), *albumID, opts)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "album_not_found", "相册不存在")
+			return
+		}
+	} else {
+		anchorResult, err = s.db.LibraryAnchors(r.Context(), opts)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "library_anchors_failed", "读取图库索引失败")
 		return
@@ -485,8 +515,8 @@ func (s *Server) folderAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	page, pageSize := s.page(r, s.cfg.PageSizeDefault)
 	opts := db.AssetListOptions{
-		Page: page, PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")),
-		Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r),
+		Page: page, PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
+		Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
 	}
 	assets, err := s.db.ListFolderAssets(r.Context(), id, opts)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -509,8 +539,8 @@ func (s *Server) folderAnchors(w http.ResponseWriter, r *http.Request) {
 	}
 	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
 	opts := db.AssetListOptions{
-		PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")),
-		Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r),
+		PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
+		Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
 	}
 	anchorResult, err := s.db.FolderAnchors(r.Context(), id, opts)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -538,7 +568,7 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contextName := r.URL.Query().Get("context")
-	if contextName != "folder" && contextName != "album" && contextName != "search" {
+	if contextName != "folder" && contextName != "album" && contextName != "search" && contextName != "rating" {
 		contextName = "library"
 	}
 	typeFilter := safeType(r.URL.Query().Get("type"))
@@ -549,8 +579,9 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 	if v := int64QueryPtr(r, "folderId"); v != nil {
 		folderID = v
 	}
+	albumID := int64QueryPtr(r, "albumId")
 	opts := db.NeighborOptions{
-		Context: contextName, AssetID: id, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")),
+		Context: contextName, AssetID: id, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), FolderID: folderID,
 		From: int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: 5, Recursive: boolQuery(r, "recursive", false),
 		NFOQuery: strings.TrimSpace(r.URL.Query().Get("nfo")),
@@ -565,11 +596,12 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		MinDuration:  float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
 		MinSize: int64QueryPtr(r, "sizeMin"), MaxSize: int64QueryPtr(r, "sizeMax"),
 		Orientation: searchOrientation(r),
+		Rating:      ratingQueryPtr(r, "rating"),
+		AlbumUnassigned: albumUnassignedQuery(r),
 	}
 	var result db.Neighbors
 	var err error
-	if contextName == "album" {
-		albumID := int64QueryPtr(r, "albumId")
+	if contextName == "album" || albumID != nil {
 		if albumID == nil {
 			writeError(w, http.StatusBadRequest, "album_required", "相册 ID 缺失")
 			return
@@ -597,7 +629,7 @@ func (s *Server) assetPosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contextName := r.URL.Query().Get("context")
-	if contextName != "folder" && contextName != "album" && contextName != "search" {
+	if contextName != "folder" && contextName != "album" && contextName != "search" && contextName != "rating" {
 		contextName = "library"
 	}
 	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
@@ -605,6 +637,7 @@ func (s *Server) assetPosition(w http.ResponseWriter, r *http.Request) {
 	if typeFilter == "all" {
 		typeFilter = ""
 	}
+	albumID := int64QueryPtr(r, "albumId")
 	var result db.AssetPosition
 	var err error
 	switch contextName {
@@ -615,27 +648,32 @@ func (s *Server) assetPosition(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		result, err = s.db.FolderAssetPosition(r.Context(), *folderID, id, db.AssetListOptions{
-			PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")),
-			Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r),
+			PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
+			Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
 		})
 	case "album":
-		albumID := int64QueryPtr(r, "albumId")
 		if albumID == nil {
 			writeError(w, http.StatusBadRequest, "album_required", "相册 ID 缺失")
 			return
 		}
 		result, err = s.db.AlbumAssetPosition(r.Context(), *albumID, id, db.AssetListOptions{
-			PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")),
-			Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r),
+			PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
+			Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
 		})
 	case "search":
 		opts := s.searchAssetOptions(r, 1, pageSize)
 		result, err = s.db.AssetPosition(r.Context(), id, opts, true)
 	default:
-		result, err = s.db.AssetPosition(r.Context(), id, db.AssetListOptions{
-			PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")),
-			Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r),
-		}, false)
+		opts := db.AssetListOptions{
+			PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
+			Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
+			AlbumUnassigned: albumUnassignedQuery(r),
+		}
+		if albumID != nil {
+			result, err = s.db.AlbumAssetPosition(r.Context(), *albumID, id, opts)
+		} else {
+			result, err = s.db.AssetPosition(r.Context(), id, opts, false)
+		}
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "asset_position_not_found", "资源不在当前列表")
@@ -861,7 +899,7 @@ func (s *Server) searchAssetOptions(r *http.Request, page int, pageSize int) db.
 		typeFilter = ""
 	}
 	return db.AssetListOptions{
-		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")),
+		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), NFOQuery: strings.TrimSpace(r.URL.Query().Get("nfo")),
 		NFOActor: strings.TrimSpace(r.URL.Query().Get("nfoActor")),
 		NFOID:    strings.TrimSpace(r.URL.Query().Get("nfoId")),
@@ -875,6 +913,8 @@ func (s *Server) searchAssetOptions(r *http.Request, page int, pageSize int) db.
 		MinDuration:  float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
 		MinSize: int64QueryPtr(r, "sizeMin"), MaxSize: int64QueryPtr(r, "sizeMax"),
 		Orientation: searchOrientation(r),
+		Rating:      ratingQueryPtr(r, "rating"),
+		AlbumUnassigned: albumUnassignedQuery(r),
 	}
 }
 

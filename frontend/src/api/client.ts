@@ -4,6 +4,9 @@ import type {
   AlbumSourceInput,
   AlbumsResponse,
   Asset,
+  AlbumAssetFilter,
+  AssetRating,
+  AssetServerGroup,
   AssetKind,
   AssetPosition,
   AssetPreference,
@@ -163,16 +166,33 @@ export const api = {
     }),
   deleteAlbum: (id: number) => request<{ deleted: boolean }>(`/api/albums/${id}`, { method: 'DELETE' }),
   refreshAlbum: (id: number) => request<ScanCommandResponse>(`/api/albums/${id}/refresh`, { method: 'POST' }),
-  albumAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string) =>
-    request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q })}`),
-  albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string) =>
-    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, sort, q })}`),
+  albumAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating) =>
+    request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q, group, rating })}`),
+  albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating) =>
+    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, sort, q, group, rating })}`),
   albumSourceFolders: (parentRelPath: string) =>
     request<SourceFoldersResponse>(`/api/albums/source-folders${qs({ parentRelPath })}`),
-  libraryAssets: (page: number, pageSize: number, type: AssetKind, sort: SortKey, q: string) =>
-    request<Page<Asset>>(`/api/library/assets${qs({ page, pageSize, type, sort, q })}`),
-  libraryAnchors: (pageSize: number, type: AssetKind, sort: SortKey, q: string) =>
-    request<LibraryAnchorsResponse>(`/api/library/anchors${qs({ pageSize, type, sort, q })}`),
+  libraryAssets: (
+    page: number,
+    pageSize: number,
+    type: AssetKind,
+    sort: SortKey,
+    q: string,
+    group?: AssetServerGroup,
+    rating?: AssetRating,
+    albumId?: number,
+    albumFilter?: AlbumAssetFilter,
+  ) => request<Page<Asset>>(`/api/library/assets${qs({ page, pageSize, type, sort, q, group, rating, albumId, albumFilter })}`),
+  libraryAnchors: (
+    pageSize: number,
+    type: AssetKind,
+    sort: SortKey,
+    q: string,
+    group?: AssetServerGroup,
+    rating?: AssetRating,
+    albumId?: number,
+    albumFilter?: AlbumAssetFilter,
+  ) => request<LibraryAnchorsResponse>(`/api/library/anchors${qs({ pageSize, type, sort, q, group, rating, albumId, albumFilter })}`),
   searchAssets: (page: number, pageSize: number, params: SearchAssetsParams) =>
     request<Page<Asset>>(`/api/search/assets${qs({ page, pageSize, ...params })}`),
   searchAnchors: (pageSize: number, params: SearchAssetsParams) =>
@@ -182,10 +202,10 @@ export const api = {
   folders: (parentId: number) => request<{ items: Folder[] }>(`/api/folders${qs({ parentId })}`),
   folderTree: () => request<{ items: Folder[] }>('/api/folders/tree'),
   folder: (id: number) => request<Folder>(`/api/folders/${id}`),
-  folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, recursive: boolean) =>
-    request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0 })}`),
-  folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean) =>
-    request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0 })}`),
+  folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating) =>
+    request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating })}`),
+  folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating) =>
+    request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating })}`),
   asset: (id: number) => request<Asset>(`/api/assets/${id}`),
   assetPreferences: (id: number) => request<AssetPreference>(`/api/assets/${id}/preferences`),
   assetSidecars: (id: number) => request<AssetSidecars>(`/api/assets/${id}/sidecars`),
@@ -194,6 +214,12 @@ export const api = {
       method: 'PUT',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ rotation }),
+    }),
+  updateAssetRating: (id: number, rating: AssetRating) =>
+    request<AssetPreference>(`/api/assets/${id}/preferences`, {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rating }),
     }),
   neighbors: (id: number, params: Record<string, string | number | undefined | null>, signal?: AbortSignal) =>
     request<Neighbors>(`/api/assets/${id}/neighbors${qs(params)}`, { signal }),

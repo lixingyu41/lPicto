@@ -6,29 +6,36 @@ import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
+import SortControls from '../components/SortControls';
 import { api } from '../api/client';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
+import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
 import type { Asset, AssetDeletedEvent, Folder, LibraryAnchor, SortKey } from '../types/api';
 import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import {
-  clearRestoreParamFromLocation,
+  appendViewerReturnParams,
   decodeReturnState,
-  encodeReturnState,
   resetGridState,
   savePageState,
   saveViewerReturnPath,
   type GridReturnState,
 } from '../utils/pageState';
+import { serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import { assetMatchesFolder } from '../utils/assetFilters';
 import { mergeSortedAssets, removeAssetById } from '../utils/assetSort';
 
 const pageSize = 100;
 const foldersStateKey = 'folders';
+const mediaGroupOptions: Array<{ value: AssetGroupMode; label: string }> = [
+  { value: 'none', label: '不分' },
+  { value: 'folder', label: '文件夹' },
+];
 
 interface FoldersPageState extends GridReturnState {
   currentId: number;
   expandedRelPaths: string[];
+  groupMode: AssetGroupMode;
   includeSubfolders: boolean;
   query: string;
   sort: SortKey;
@@ -38,9 +45,10 @@ const defaultFoldersState: FoldersPageState = {
   ...resetGridState(),
   currentId: 0,
   expandedRelPaths: [''],
+  groupMode: 'none',
   includeSubfolders: true,
   query: '',
-  sort: 'filename',
+  sort: 'timeline_desc',
 };
 
 export default function FoldersPage() {
@@ -55,36 +63,16 @@ export default function FoldersPage() {
   const [current, setCurrent] = useState<Folder | null>(null);
   const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
   const [query, setQuery] = useState(initialStateRef.current.query);
+  const [groupMode, setGroupMode] = useState<AssetGroupMode>(initialStateRef.current.groupMode);
   const [folderSearchFocused, setFolderSearchFocused] = useState(false);
   const [includeSubfolders, setIncludeSubfolders] = useState(initialStateRef.current.includeSubfolders);
   const [expandedRelPaths, setExpandedRelPaths] = useState<Set<string>>(() => new Set(initialStateRef.current.expandedRelPaths));
-  const [scrollTopTarget, setScrollTopTarget] = useState<{ scrollTop: number; signal: number } | undefined>(() =>
-    initialStateRef.current.scrollTop > 0 && !initialStateRef.current.focusAssetId
-      ? { scrollTop: initialStateRef.current.scrollTop, signal: 1 }
-      : undefined,
-  );
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
-  const [scrollTarget, setScrollTarget] = useState<{ ratio: number; signal: number } | undefined>();
-  const [scrollResetSignal, setScrollResetSignal] = useState(0);
-  const [scrollRatio, setScrollRatio] = useState(0);
-  const [loadedStartIndex, setLoadedStartIndex] = useState(0);
-  const [, setGridUrlSignal] = useState(0);
-  const gridStateRef = useRef<GridReturnState>(initialStateRef.current);
   const sidebarState = useSidebarReturnState();
   const restoreSidebarState = useRestoreSidebarState();
-  const restoreRef = useRef({
-    jumped: false,
-    pending:
-      initialStateRef.current.scrollTop > 0 ||
-      initialStateRef.current.loadedItemCount > pageSize ||
-      initialStateRef.current.loadedStartIndex > 0 ||
-      Boolean(initialStateRef.current.focusAssetId),
-    signal: 0,
-  });
-  const indexPageRef = useRef(1);
-  const seekSignalRef = useRef(0);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
+  const serverGroup = serverGroupForMode(groupMode);
 
   useEffect(() => {
     let live = true;
@@ -113,24 +101,47 @@ export default function FoldersPage() {
   );
 
   const loadAssets = useCallback(
-    (page: number) => api.folderAssets(currentId, page, pageSize, sort, query, includeSubfolders),
-    [currentId, includeSubfolders, query, sort],
+    (page: number) => api.folderAssets(currentId, page, pageSize, sort, query, includeSubfolders, serverGroup),
+    [currentId, includeSubfolders, query, serverGroup, sort],
   );
   const { items, hasMore, loading, error, loadMore, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     currentId,
+    groupMode,
     includeSubfolders,
     sort,
     query,
   ]);
+  const {
+    focusAssetId,
+    getGridState,
+    handleGridScrollState,
+    loadedStartIndex,
+    scrollRatio,
+    scrollResetSignal,
+    scrollTarget,
+    scrollTopTarget,
+    seekIndex,
+    setScrollRatio,
+  } = useWaterfallGridState({
+    hasMore,
+    initialState: initialStateRef.current,
+    itemsLength: items.length,
+    jumpToPage,
+    loading,
+    loadMore,
+    pageSize,
+    resetKey: JSON.stringify([currentId, includeSubfolders, sort, query, groupMode]),
+    searchParams,
+  });
 
   const mergeReadyAssets = useCallback(
     (incoming: Asset[]) => {
       const folderRelPath = current?.relPath ?? '';
       const filtered = incoming.filter((asset) => assetMatchesFolder(asset, folderRelPath, includeSubfolders, query));
       if (filtered.length === 0) return;
-      mutateItems((value) => mergeSortedAssets(value, filtered, sort, { hasMore, loadedStartIndex }));
+      mutateItems((value) => mergeSortedAssets(value, filtered, sort, { hasMore, loadedStartIndex, groupMode }));
     },
-    [current?.relPath, hasMore, includeSubfolders, loadedStartIndex, mutateItems, query, sort],
+    [current?.relPath, groupMode, hasMore, includeSubfolders, loadedStartIndex, mutateItems, query, sort],
   );
 
   const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
@@ -140,68 +151,29 @@ export default function FoldersPage() {
   useEffect(() => {
     if (eventsConnected || !current) return undefined;
     const timer = window.setInterval(() => {
-      void api.folderAssets(currentId, 1, pageSize, sort, query, includeSubfolders).then((result) => mergeReadyAssets(result.items)).catch(() => undefined);
+      void api.folderAssets(currentId, 1, pageSize, sort, query, includeSubfolders, serverGroup).then((result) => mergeReadyAssets(result.items)).catch(() => undefined);
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [current, currentId, eventsConnected, includeSubfolders, mergeReadyAssets, query, sort]);
+  }, [current, currentId, eventsConnected, includeSubfolders, mergeReadyAssets, query, serverGroup, sort]);
 
   const currentPageState = useCallback(
     (): FoldersPageState => ({
-      ...gridStateRef.current,
+      ...getGridState(),
       currentId,
       expandedRelPaths: Array.from(expandedRelPaths),
-      focusAssetId: null,
+      groupMode,
       includeSubfolders,
-      loadedItemCount: items.length,
-      loadedStartIndex,
       query,
       sidebarCollapsed: sidebarState.sidebarCollapsed,
       sidebarExpanded: sidebarState.sidebarExpanded,
       sort,
     }),
-    [currentId, expandedRelPaths, includeSubfolders, items.length, loadedStartIndex, query, sidebarState.sidebarCollapsed, sidebarState.sidebarExpanded, sort],
+    [currentId, expandedRelPaths, getGridState, groupMode, includeSubfolders, query, sidebarState.sidebarCollapsed, sidebarState.sidebarExpanded, sort],
   );
 
   const saveCurrentState = useCallback(() => {
     savePageState<FoldersPageState>(foldersStateKey, currentPageState());
   }, [currentPageState]);
-
-  useEffect(() => {
-    if (!searchParams.has('restore')) return;
-    clearRestoreParamFromLocation();
-  }, [searchParams]);
-
-  useEffect(() => {
-    indexPageRef.current = 1;
-    setLoadedStartIndex(0);
-    setScrollTarget(undefined);
-    if (restoreRef.current.pending) return;
-    gridStateRef.current = resetGridState();
-    setScrollResetSignal((value) => value + 1);
-  }, [currentId, includeSubfolders, query, sort]);
-
-  useEffect(() => {
-    if (!restoreRef.current.pending || loading) return;
-    const startIndex = Math.max(0, initialStateRef.current.loadedStartIndex);
-    if (startIndex > 0 && !restoreRef.current.jumped) {
-      restoreRef.current.jumped = true;
-      const page = Math.floor(startIndex / pageSize) + 1;
-      indexPageRef.current = page;
-      setLoadedStartIndex(startIndex);
-      void jumpToPage(page);
-      return;
-    }
-    const targetCount = Math.max(pageSize, initialStateRef.current.loadedItemCount);
-    if (items.length < targetCount && hasMore) {
-      void loadMore();
-      return;
-    }
-    restoreRef.current.pending = false;
-    if (!initialStateRef.current.focusAssetId) {
-      restoreRef.current.signal += 1;
-      setScrollTopTarget({ scrollTop: initialStateRef.current.scrollTop, signal: restoreRef.current.signal });
-    }
-  }, [hasMore, items.length, jumpToPage, loadMore, loading]);
 
   useEffect(() => {
     let live = true;
@@ -225,21 +197,6 @@ export default function FoldersPage() {
     };
   }, [currentId, includeSubfolders, query, sort]);
 
-  const handleGridScrollState = useCallback(
-    (state: { ratio: number; scrollTop: number }) => {
-      gridStateRef.current = {
-        ...gridStateRef.current,
-        focusAssetId: null,
-        loadedItemCount: items.length,
-        loadedStartIndex,
-        scrollRatio: state.ratio,
-        scrollTop: state.scrollTop,
-      };
-      setGridUrlSignal((value) => value + 1);
-    },
-    [items.length, loadedStartIndex],
-  );
-
   const handleOpenAsset = useCallback(() => {
     saveCurrentState();
     saveViewerReturnPath('/folders');
@@ -250,24 +207,6 @@ export default function FoldersPage() {
       navigate(viewerUrl, { state: { backgroundLocation: location, initialAsset: asset } });
     },
     [location, navigate],
-  );
-
-  const seekIndex = useCallback(
-    (_anchor: LibraryAnchor, page: number, ratio: number) => {
-      const signal = seekSignalRef.current + 1;
-      seekSignalRef.current = signal;
-      setScrollTarget({ ratio, signal });
-      if (page === indexPageRef.current) return;
-      indexPageRef.current = page;
-      setLoadedStartIndex((Math.max(1, page) - 1) * pageSize);
-      void jumpToPage(page).then(() => {
-        if (seekSignalRef.current !== signal) return;
-        const nextSignal = seekSignalRef.current + 1;
-        seekSignalRef.current = nextSignal;
-        setScrollTarget({ ratio, signal: nextSignal });
-      });
-    },
-    [jumpToPage],
   );
 
   const hasCurrentChildren = current ? (childrenByParent.get(current.relPath)?.length ?? 0) > 0 : false;
@@ -288,15 +227,21 @@ export default function FoldersPage() {
   useSidebarPanel(
     'folders',
     <div className="sidebar-control-stack sidebar-folder-panel">
-      <label className="sidebar-field">
-        <span>排序</span>
-        <select value={sort} onChange={(event) => setSort(event.target.value as SortKey)}>
-          <option value="filename">文件名</option>
-          <option value="timeline_desc">时间新到旧</option>
-          <option value="timeline_asc">时间旧到新</option>
-          <option value="size">大小</option>
-        </select>
-      </label>
+      <SortControls sort={sort} onChange={setSort} />
+      <div className="sidebar-control-title">分组</div>
+      <div className="sidebar-list">
+        {mediaGroupOptions.map((option) => (
+          <button
+            className={groupMode === option.value ? 'sidebar-list-row active' : 'sidebar-list-row'}
+            key={option.value}
+            type="button"
+            onClick={() => setGroupMode(option.value)}
+          >
+            <span className="sidebar-list-marker" aria-hidden="true" />
+            <span>{option.label}</span>
+          </button>
+        ))}
+      </div>
       <div className={folderSearchFocused ? 'sidebar-folder-search-row search-focused' : 'sidebar-folder-search-row'}>
         <label className="sidebar-field sidebar-folder-search-field">
           <span>搜索</span>
@@ -358,6 +303,7 @@ export default function FoldersPage() {
       currentId,
       expandedRelPaths,
       folderSearchFocused,
+      groupMode,
       includeSubfolders,
       query,
       selectFolder,
@@ -398,14 +344,20 @@ export default function FoldersPage() {
               onScrollStateChange={handleGridScrollState}
               totalCount={totalCount}
               loadedStartIndex={loadedStartIndex}
-              focusAssetId={initialStateRef.current.focusAssetId}
+              focusAssetId={focusAssetId}
+              groupMode={groupMode}
+              sort={sort}
               scrollSignal={scrollResetSignal}
               scrollTarget={scrollTarget}
               scrollTopTarget={scrollTopTarget}
               buildViewerUrl={(asset) =>
-                `/viewer/${asset.id}?context=folder&folderId=${currentId}&sort=${sort}&q=${encodeURIComponent(query)}&recursive=${
-                  includeSubfolders ? 1 : 0
-                }&returnPath=%2Ffolders&returnState=${encodeReturnState(currentPageState())}`
+                appendViewerReturnParams(
+                  `/viewer/${asset.id}?context=folder&folderId=${currentId}&sort=${sort}&q=${encodeURIComponent(query)}&recursive=${
+                    includeSubfolders ? 1 : 0
+                  }${serverGroup ? `&group=${serverGroup}` : ''}`,
+                  '/folders',
+                  currentPageState(),
+                )
               }
             />
             <LibraryIndexRail

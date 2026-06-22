@@ -1,6 +1,6 @@
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 
-export type SidebarPanelTarget = 'library' | 'search' | 'albums' | 'folders' | 'viewer' | 'settings';
+export type SidebarPanelTarget = 'library' | 'ratings' | 'search' | 'albums' | 'folders' | 'viewer' | 'settings';
 
 type SidebarPanels = Partial<Record<SidebarPanelTarget, ReactNode>>;
 
@@ -105,5 +105,13 @@ export function useSidebarPanel(target: SidebarPanelTarget, content: ReactNode, 
 }
 
 function isSidebarPanelTarget(value: unknown): value is SidebarPanelTarget {
-  return value === 'library' || value === 'search' || value === 'albums' || value === 'folders' || value === 'viewer' || value === 'settings';
+  return (
+    value === 'library' ||
+    value === 'ratings' ||
+    value === 'search' ||
+    value === 'albums' ||
+    value === 'folders' ||
+    value === 'viewer' ||
+    value === 'settings'
+  );
 }

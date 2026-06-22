@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"path"
 	"strings"
 	"time"
@@ -60,6 +61,7 @@ type AssetListOptions struct {
 	PageSize     int
 	Type         string
 	Sort         string
+	Group        string
 	Query        string
 	FolderID     *int64
 	From         *int64
@@ -83,6 +85,8 @@ type AssetListOptions struct {
 	MinSize      *int64
 	MaxSize      *int64
 	Orientation  string
+	Rating       *int
+	AlbumUnassigned bool
 }
 
 type NeighborOptions struct {
@@ -90,6 +94,7 @@ type NeighborOptions struct {
 	AssetID      int64
 	Type         string
 	Sort         string
+	Group        string
 	Query        string
 	FolderID     *int64
 	From         *int64
@@ -112,6 +117,8 @@ type NeighborOptions struct {
 	MinSize      *int64
 	MaxSize      *int64
 	Orientation  string
+	Rating       *int
+	AlbumUnassigned bool
 }
 
 type NFOOptionOptions struct {
@@ -168,11 +175,14 @@ type AssetPosition struct {
 }
 
 type libraryAnchorRow struct {
-	Filename   string
-	ImportedAt int64
-	Size       int64
-	TimelineAt int64
+	Filename      string
+	ParentRelPath string
+	ImportedAt    int64
+	Size          int64
+	TimelineAt    int64
 }
+
+const assetGroupFolder = "folder"
 
 func (d *DB) UpsertAsset(ctx context.Context, p AssetUpsert) (id int64, added bool, updated bool, err error) {
 	result, err := d.UpsertAssetDetailed(ctx, p)
@@ -471,7 +481,7 @@ func (d *DB) LibraryAnchors(ctx context.Context, opts AssetListOptions) (Library
 		opts.PageSize = 100
 	}
 	where, args := assetFilterSQL(opts, false)
-	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.PageSize)
+	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.Group, opts.PageSize)
 }
 
 func (d *DB) SearchAnchors(ctx context.Context, opts AssetListOptions) (LibraryAnchorResult, error) {
@@ -479,7 +489,7 @@ func (d *DB) SearchAnchors(ctx context.Context, opts AssetListOptions) (LibraryA
 		opts.PageSize = 100
 	}
 	where, args := assetFilterSQL(opts, true)
-	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.PageSize)
+	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.Group, opts.PageSize)
 }
 
 func (d *DB) AssetPosition(ctx context.Context, assetID int64, opts AssetListOptions, timeline bool) (AssetPosition, error) {
@@ -487,14 +497,17 @@ func (d *DB) AssetPosition(ctx context.Context, assetID int64, opts AssetListOpt
 		opts.PageSize = 100
 	}
 	where, args := assetFilterSQL(opts, timeline)
-	return d.assetPositionForFilter(ctx, assetID, where, args, opts.Sort, opts.PageSize)
+	return d.assetPositionForFilter(ctx, assetID, where, args, opts.Sort, opts.Group, opts.PageSize)
 }
 
-func (d *DB) anchorsForFilter(ctx context.Context, where string, args []any, sort string, pageSize int) (LibraryAnchorResult, error) {
+func (d *DB) anchorsForFilter(ctx context.Context, where string, args []any, sort string, group string, pageSize int) (LibraryAnchorResult, error) {
 	if pageSize <= 0 {
 		pageSize = 100
 	}
-	query := "SELECT filename, size, imported_at, timeline_at FROM assets WHERE " + where + " ORDER BY " + sortSQL(sort)
+	query := "SELECT filename, parent_rel_path, size, imported_at, timeline_at FROM assets WHERE " + where + " ORDER BY " + sortSQL(sort)
+	if group == assetGroupFolder {
+		query = folderGroupedRankedSQL(where, sort) + "SELECT filename, parent_rel_path, size, imported_at, timeline_at FROM ranked ORDER BY " + folderGroupSortSQL(sort)
+	}
 	rows, err := d.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return LibraryAnchorResult{}, err
@@ -503,7 +516,7 @@ func (d *DB) anchorsForFilter(ctx context.Context, where string, args []any, sor
 	var items []libraryAnchorRow
 	for rows.Next() {
 		var item libraryAnchorRow
-		if err := rows.Scan(&item.Filename, &item.Size, &item.ImportedAt, &item.TimelineAt); err != nil {
+		if err := rows.Scan(&item.Filename, &item.ParentRelPath, &item.Size, &item.ImportedAt, &item.TimelineAt); err != nil {
 			return LibraryAnchorResult{}, err
 		}
 		items = append(items, item)
@@ -513,6 +526,9 @@ func (d *DB) anchorsForFilter(ctx context.Context, where string, args []any, sor
 	}
 	if len(items) == 0 {
 		return LibraryAnchorResult{}, nil
+	}
+	if group == assetGroupFolder {
+		return LibraryAnchorResult{Items: folderAnchors(items, pageSize), Total: len(items)}, nil
 	}
 	if usesUniformAnchors(sort) {
 		return LibraryAnchorResult{Items: uniformAnchors(sort, items, pageSize), Total: len(items)}, nil
@@ -554,7 +570,7 @@ func (d *DB) anchorsForFilter(ctx context.Context, where string, args []any, sor
 	return LibraryAnchorResult{Items: anchors, Total: len(items)}, nil
 }
 
-func (d *DB) assetPositionForFilter(ctx context.Context, assetID int64, where string, args []any, sort string, pageSize int) (AssetPosition, error) {
+func (d *DB) assetPositionForFilter(ctx context.Context, assetID int64, where string, args []any, sort string, group string, pageSize int) (AssetPosition, error) {
 	query := `
 SELECT item_index, total_count
 FROM (
@@ -563,6 +579,15 @@ FROM (
   WHERE ` + where + `
 ) ranked
 WHERE id = ?`
+	if group == assetGroupFolder {
+		query = folderGroupedRankedSQL(where, sort) + `
+SELECT item_index, total_count
+FROM (
+  SELECT id, ROW_NUMBER() OVER (ORDER BY ` + folderGroupSortSQL(sort) + `) - 1 AS item_index, COUNT(*) OVER () AS total_count
+  FROM ranked
+) positioned
+WHERE id = ?`
+	}
 	queryArgs := append([]any{}, args...)
 	queryArgs = append(queryArgs, assetID)
 	var index int
@@ -598,21 +623,19 @@ func uniformAnchors(sort string, items []libraryAnchorRow, pageSize int) []Libra
 		return nil
 	}
 	anchors := make([]LibraryAnchor, 0, count)
-	top := anchorScaleValue(sort, items[0])
-	bottom := anchorScaleValue(sort, items[len(items)-1])
 	for index := 0; index < count; index++ {
 		position := 0.0
 		if count > 1 {
 			position = float64(index) / float64(count-1)
 		}
-		value := int64(float64(top) + (float64(bottom)-float64(top))*position)
 		itemIndex := 0
 		if len(items) > 1 {
-			itemIndex = int(position * float64(len(items)-1))
+			itemIndex = int(math.Round(position * float64(len(items)-1)))
 		}
+		value := anchorScaleValue(sort, items[itemIndex])
 		label, kind := uniformAnchorLabel(sort, value)
 		anchors = append(anchors, LibraryAnchor{
-			Key:      fmt.Sprintf("scale:%s:%d", sort, index),
+			Key:      fmt.Sprintf("scale:%s:%d", sort, itemIndex),
 			Label:    label,
 			Kind:     kind,
 			Page:     itemIndex/pageSize + 1,
@@ -643,6 +666,40 @@ func uniformAnchorLabel(sort string, value int64) (string, string) {
 	}
 }
 
+func folderAnchors(items []libraryAnchorRow, pageSize int) []LibraryAnchor {
+	if len(items) == 0 {
+		return nil
+	}
+	anchors := make([]LibraryAnchor, 0)
+	seen := make(map[string]struct{})
+	for index, item := range items {
+		if _, ok := seen[item.ParentRelPath]; ok {
+			continue
+		}
+		seen[item.ParentRelPath] = struct{}{}
+		position := 0.0
+		if len(items) > 1 {
+			position = float64(index) / float64(len(items)-1)
+		}
+		anchors = append(anchors, LibraryAnchor{
+			Key:      "folder:" + item.ParentRelPath,
+			Label:    folderAnchorLabel(item.ParentRelPath),
+			Kind:     assetGroupFolder,
+			Page:     index/pageSize + 1,
+			Position: position,
+			Value:    0,
+		})
+	}
+	return anchors
+}
+
+func folderAnchorLabel(relPath string) string {
+	if relPath == "" {
+		return "全部存储"
+	}
+	return "/" + relPath
+}
+
 func (d *DB) ListTimelineAssets(ctx context.Context, opts AssetListOptions) (model.Page[model.Asset], error) {
 	opts.Sort = "timeline_desc"
 	return d.listAssets(ctx, opts, true)
@@ -667,7 +724,7 @@ func (d *DB) FolderAnchors(ctx context.Context, folderID int64, opts AssetListOp
 	}
 	opts.FolderRel = &folder.RelPath
 	where, args := assetFilterSQL(opts, false)
-	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.PageSize)
+	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.Group, opts.PageSize)
 }
 
 func (d *DB) FolderAssetPosition(ctx context.Context, folderID int64, assetID int64, opts AssetListOptions) (AssetPosition, error) {
@@ -680,7 +737,7 @@ func (d *DB) FolderAssetPosition(ctx context.Context, folderID int64, assetID in
 	}
 	opts.FolderRel = &folder.RelPath
 	where, args := assetFilterSQL(opts, false)
-	return d.assetPositionForFilter(ctx, assetID, where, args, opts.Sort, opts.PageSize)
+	return d.assetPositionForFilter(ctx, assetID, where, args, opts.Sort, opts.Group, opts.PageSize)
 }
 
 func (d *DB) listAssets(ctx context.Context, opts AssetListOptions, timeline bool) (model.Page[model.Asset], error) {
@@ -689,6 +746,9 @@ func (d *DB) listAssets(ctx context.Context, opts AssetListOptions, timeline boo
 	limit := opts.PageSize + 1
 	offset := (opts.Page - 1) * opts.PageSize
 	query := assetSelectSQL() + " WHERE " + where + " ORDER BY " + order + " LIMIT ? OFFSET ?"
+	if opts.Group == assetGroupFolder {
+		query = folderGroupedRankedSQL(where, opts.Sort) + assetSelectSQLFrom("ranked") + " ORDER BY " + folderGroupSortSQL(opts.Sort) + " LIMIT ? OFFSET ?"
+	}
 	args = append(args, limit, offset)
 	rows, err := d.conn.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -1003,10 +1063,11 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 		return Neighbors{}, err
 	}
 	filterOpts := AssetListOptions{
-		Type: opts.Type, Sort: opts.Sort, Query: opts.Query, From: opts.From, To: opts.To, VisibleOnly: true,
+		Type: opts.Type, Sort: opts.Sort, Group: opts.Group, Query: opts.Query, From: opts.From, To: opts.To, VisibleOnly: true,
 		NFOQuery: opts.NFOQuery, NFOActor: opts.NFOActor, NFOID: opts.NFOID, NFOTag: opts.NFOTag, NFOTitle: opts.NFOTitle, NFOYear: opts.NFOYear,
 		MinWidth: opts.MinWidth, MaxWidth: opts.MaxWidth, MinHeight: opts.MinHeight, MaxHeight: opts.MaxHeight, MatchAnyAxis: opts.MatchAnyAxis,
 		MinDuration: opts.MinDuration, MaxDuration: opts.MaxDuration, MinSize: opts.MinSize, MaxSize: opts.MaxSize, Orientation: opts.Orientation,
+		Rating: opts.Rating, AlbumUnassigned: opts.AlbumUnassigned,
 	}
 	if opts.Context == "folder" {
 		if opts.FolderID == nil {
@@ -1023,6 +1084,17 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 		filterOpts.Sort = "timeline_desc"
 	}
 	where, args := assetFilterSQL(filterOpts, opts.Context == "timeline" || opts.Context == "search")
+	if filterOpts.Group == assetGroupFolder {
+		previous, err := d.groupedNeighborSide(ctx, where, args, filterOpts.Sort, opts.AssetID, true, opts.Limit)
+		if err != nil {
+			return Neighbors{}, err
+		}
+		next, err := d.groupedNeighborSide(ctx, where, args, filterOpts.Sort, opts.AssetID, false, opts.Limit)
+		if err != nil {
+			return Neighbors{}, err
+		}
+		return Neighbors{Current: current, Previous: previous, Next: next}, nil
+	}
 	prevCond, prevArgs, prevOrder := neighborCondition(current, filterOpts.Sort, true)
 	nextCond, nextArgs, nextOrder := neighborCondition(current, filterOpts.Sort, false)
 	previous, err := d.neighborSide(ctx, where, args, prevCond, prevArgs, prevOrder, opts.Limit)
@@ -1034,6 +1106,33 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 		return Neighbors{}, err
 	}
 	return Neighbors{Current: current, Previous: previous, Next: next}, nil
+}
+
+func (d *DB) groupedNeighborSide(ctx context.Context, where string, args []any, sort string, assetID int64, previous bool, limit int) ([]model.Asset, error) {
+	comparator := ">"
+	order := "ASC"
+	if previous {
+		comparator = "<"
+		order = "DESC"
+	}
+	query := folderGroupedRankedSQL(where, sort) + `,
+ordered AS (
+  SELECT ranked.*, ROW_NUMBER() OVER (ORDER BY ` + folderGroupSortSQL(sort) + `) AS item_row
+  FROM ranked
+), current_row AS (
+  SELECT item_row FROM ordered WHERE id = ?
+) ` + assetSelectSQLFrom("ordered") + `
+WHERE ordered.item_row ` + comparator + ` (SELECT item_row FROM current_row)
+ORDER BY ordered.item_row ` + order + `
+LIMIT ?`
+	allArgs := append([]any{}, args...)
+	allArgs = append(allArgs, assetID, limit)
+	rows, err := d.conn.QueryContext(ctx, query, allArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAssetRows(rows)
 }
 
 func (d *DB) neighborSide(ctx context.Context, where string, args []any, condition string, conditionArgs []any, order string, limit int) ([]model.Asset, error) {
@@ -1063,6 +1162,13 @@ func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 	if opts.Query != "" {
 		where = append(where, "lower(filename) LIKE ? ESCAPE '\\'")
 		args = append(args, "%"+escapeLike(strings.ToLower(opts.Query))+"%")
+	}
+	if opts.Rating != nil {
+		where = append(where, assetRatingSQL("assets")+" = ?")
+		args = append(args, NormalizeRating(*opts.Rating))
+	}
+	if opts.AlbumUnassigned {
+		where = append(where, "NOT "+albumMembershipExistsSQL())
 	}
 	if opts.NFOQuery != "" {
 		where = append(where, "nfo_search_text IS NOT NULL AND lower(nfo_search_text) LIKE ? ESCAPE '\\'")
@@ -1236,6 +1342,44 @@ func sortSQL(sort string) string {
 	}
 }
 
+func folderGroupedRankedSQL(where string, sort string) string {
+	return `WITH filtered AS (
+  SELECT * FROM assets WHERE ` + where + `
+), ranked AS (
+  SELECT filtered.*,
+    FIRST_VALUE(timeline_at) OVER folder_window AS folder_timeline_at,
+    FIRST_VALUE(imported_at) OVER folder_window AS folder_imported_at,
+    FIRST_VALUE(size) OVER folder_window AS folder_size,
+    FIRST_VALUE(lower(filename)) OVER folder_window AS folder_filename,
+    FIRST_VALUE(id) OVER folder_window AS folder_id
+  FROM filtered
+  WINDOW folder_window AS (PARTITION BY parent_rel_path ORDER BY ` + sortSQL(sort) + `)
+) `
+}
+
+func folderGroupSortSQL(sort string) string {
+	var groupOrder string
+	switch sort {
+	case "timeline_asc":
+		groupOrder = "folder_timeline_at ASC, folder_id ASC"
+	case "filename", "filename_asc":
+		groupOrder = "folder_filename ASC, folder_id ASC"
+	case "filename_desc":
+		groupOrder = "folder_filename DESC, folder_id DESC"
+	case "size", "size_desc":
+		groupOrder = "folder_size DESC, folder_id DESC"
+	case "size_asc":
+		groupOrder = "folder_size ASC, folder_id ASC"
+	case "imported_asc":
+		groupOrder = "folder_imported_at ASC, folder_id ASC"
+	case "imported_desc":
+		groupOrder = "folder_imported_at DESC, folder_id DESC"
+	default:
+		groupOrder = "folder_timeline_at DESC, folder_id DESC"
+	}
+	return groupOrder + ", lower(parent_rel_path) ASC, parent_rel_path ASC, " + sortSQL(sort)
+}
+
 func anchorParts(sort string, item libraryAnchorRow) (string, string, string, int64) {
 	switch sort {
 	case "filename", "filename_asc", "filename_desc":
@@ -1376,11 +1520,20 @@ func neighborCondition(current model.Asset, sort string, previous bool) (string,
 }
 
 func assetSelectSQL() string {
+	return assetSelectSQLFrom("assets")
+}
+
+func assetSelectSQLFrom(source string) string {
 	return `SELECT id, rel_path, parent_rel_path, filename, ext, media_type, mime_type, size, mtime,
 width, height, duration, taken_at, imported_at, timeline_at, cache_key, browser_playable,
 scan_status, thumb_status, preview_status, video_poster_status, video_proxy_status,
-COALESCE((SELECT rotation FROM asset_preferences WHERE asset_id = assets.id), 0) AS rotation,
-metadata_json, nfo_json, nfo_search_text, error, deleted_at, created_at, updated_at FROM assets`
+COALESCE((SELECT rotation FROM asset_preferences WHERE asset_id = ` + source + `.id), 0) AS rotation,
+COALESCE((SELECT rating FROM asset_preferences WHERE asset_id = ` + source + `.id), 0) AS rating,
+metadata_json, nfo_json, nfo_search_text, error, deleted_at, created_at, updated_at FROM ` + source
+}
+
+func assetRatingSQL(source string) string {
+	return `COALESCE((SELECT rating FROM asset_preferences WHERE asset_id = ` + source + `.id), 0)`
 }
 
 func scanAsset(row interface{ Scan(dest ...any) error }) (model.Asset, error) {
@@ -1392,7 +1545,7 @@ func scanAsset(row interface{ Scan(dest ...any) error }) (model.Asset, error) {
 	err := row.Scan(&asset.ID, &asset.RelPath, &asset.ParentRelPath, &asset.Filename, &asset.Ext, &asset.MediaType, &mime, &asset.Size, &asset.Mtime,
 		&width, &height, &duration, &takenAt, &asset.ImportedAt, &asset.TimelineAt, &asset.CacheKey, &browserPlayable,
 		&asset.ScanStatus, &asset.ThumbStatus, &asset.PreviewStatus, &asset.VideoPosterStatus, &asset.VideoProxyStatus,
-		&asset.Rotation, &metadata, &nfoJSON, &nfoSearchText, &errorText, &deletedAt, &asset.CreatedAt, &asset.UpdatedAt)
+		&asset.Rotation, &asset.Rating, &metadata, &nfoJSON, &nfoSearchText, &errorText, &deletedAt, &asset.CreatedAt, &asset.UpdatedAt)
 	if err != nil {
 		return model.Asset{}, err
 	}
@@ -1408,6 +1561,7 @@ func scanAsset(row interface{ Scan(dest ...any) error }) (model.Asset, error) {
 	asset.DeletedAt = int64Ptr(deletedAt)
 	asset.BrowserPlayable = browserPlayable == 1
 	asset.Rotation = NormalizeRotation(asset.Rotation)
+	asset.Rating = NormalizeRating(asset.Rating)
 	return asset, nil
 }
 

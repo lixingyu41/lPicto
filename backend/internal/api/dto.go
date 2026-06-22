@@ -38,6 +38,7 @@ type AssetDTO struct {
 	VideoPosterStatus string   `json:"videoPosterStatus"`
 	VideoProxyStatus  string   `json:"videoProxyStatus"`
 	Rotation          int      `json:"rotation"`
+	Rating            int      `json:"rating"`
 }
 
 type FolderDTO struct {
@@ -225,6 +226,7 @@ type LibraryAnchorDTO struct {
 type AssetPreferenceDTO struct {
 	AssetID   int64 `json:"assetId"`
 	Rotation  int   `json:"rotation"`
+	Rating    int   `json:"rating"`
 	UpdatedAt int64 `json:"updatedAt"`
 }
 
@@ -280,6 +282,7 @@ func assetDTO(asset model.Asset) AssetDTO {
 		VideoPosterStatus: asset.VideoPosterStatus,
 		VideoProxyStatus:  asset.VideoProxyStatus,
 		Rotation:          asset.Rotation,
+		Rating:            asset.Rating,
 	}
 }
 
@@ -454,7 +457,7 @@ func libraryAnchorDTOs(anchors []db.LibraryAnchor) []LibraryAnchorDTO {
 }
 
 func assetPreferenceDTO(pref model.AssetPreference) AssetPreferenceDTO {
-	return AssetPreferenceDTO{AssetID: pref.AssetID, Rotation: pref.Rotation, UpdatedAt: pref.UpdatedAt}
+	return AssetPreferenceDTO{AssetID: pref.AssetID, Rotation: pref.Rotation, Rating: pref.Rating, UpdatedAt: pref.UpdatedAt}
 }
 
 func albumDTO(album model.Album) AlbumDTO {

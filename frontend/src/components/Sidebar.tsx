@@ -1,5 +1,5 @@
 import { type PointerEvent, type ReactNode, useCallback, useEffect } from 'react';
-import { FolderTree, Images, Library, Search, Settings } from 'lucide-react';
+import { FolderTree, Images, Library, Search, Settings, Star } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { useSidebarPanelValue, type SidebarPanelTarget } from './SidebarContext';
 import { isPrimarySidebarPanelTarget, primaryTargetForPath, type PrimarySidebarPanelTarget } from '../utils/sidebarPrefs';
@@ -10,6 +10,7 @@ interface Props {
   primaryWidth: number;
   secondaryWidth: number;
   onPrimaryWidthChange: (width: number) => void;
+  routePathname?: string;
   onSecondaryWidthChange: (width: number) => void;
   onToggleCollapsed: () => void;
   onToggleExpanded: (target: SidebarPanelTarget | null) => void;
@@ -22,6 +23,7 @@ const navItems: Array<{
   to: string;
 }> = [
   { Icon: Library, label: '图库', target: 'library', to: '/library' },
+  { Icon: Star, label: '星级', target: 'ratings', to: '/ratings' },
   { Icon: Search, label: '搜索', target: 'search', to: '/search' },
   { Icon: Images, label: '相册', target: 'albums', to: '/albums' },
   { Icon: FolderTree, label: '文件夹', target: 'folders', to: '/folders' },
@@ -34,13 +36,15 @@ export default function Sidebar({
   primaryWidth,
   secondaryWidth,
   onPrimaryWidthChange,
+  routePathname,
   onSecondaryWidthChange,
   onToggleCollapsed,
   onToggleExpanded,
 }: Props) {
   const location = useLocation();
+  const effectivePathname = routePathname ?? location.pathname;
   const panels = useSidebarPanelValue();
-  const routeTarget = primaryTargetForPath(location.pathname);
+  const routeTarget = primaryTargetForPath(effectivePathname);
 
   useEffect(() => {
     if (expanded && !isPrimarySidebarPanelTarget(expanded) && !panels[expanded]) {
@@ -126,7 +130,7 @@ export default function Sidebar({
           </div>
           <div className="nav-main">
             {navItems.map(({ Icon, label, target, to }) => (
-              <SidebarItem icon={<Icon size={18} />} key={target} label={label} to={to} />
+              <SidebarItem active={routeTarget === target} icon={<Icon size={18} />} key={target} label={label} to={to} />
             ))}
           </div>
           <div className="nav-bottom">
@@ -178,17 +182,19 @@ export default function Sidebar({
 }
 
 function SidebarItem({
+  active,
   icon,
   label,
   to,
 }: {
+  active: boolean;
   icon: ReactNode;
   label: string;
   to: string;
 }) {
   return (
     <div className="nav-item">
-      <NavLink to={to} className="nav-link">
+      <NavLink to={to} className={active ? 'nav-link active' : 'nav-link'}>
         {icon}
         <span>{label}</span>
       </NavLink>

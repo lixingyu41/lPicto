@@ -7,19 +7,21 @@ import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
+import SortControls from '../components/SortControls';
 import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { useAssetDeletedEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
+import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
 import type { Asset, AssetDeletedEvent, AssetKind, LibraryAnchor, NFOFilterField, OrientationFilter, SearchAssetsParams, SortKey } from '../types/api';
 import {
-  clearRestoreParamFromLocation,
+  appendViewerReturnParams,
   decodeReturnState,
-  encodeReturnState,
   resetGridState,
   savePageState,
   saveViewerReturnPath,
   type GridReturnState,
 } from '../utils/pageState';
+import { serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import { removeAssetById } from '../utils/assetSort';
 
 const pageSize = 100;
@@ -38,6 +40,7 @@ interface SearchPageState extends GridReturnState {
   nfoTitleQuery: string;
   nfoYearQuery: string;
   orientation: OrientationFilter;
+  groupMode: AssetGroupMode;
   query: string;
   resolutionRange?: string;
   resolutionXRange: string;
@@ -62,6 +65,7 @@ const defaultSearchState: SearchPageState = {
   nfoTitleQuery: '',
   nfoYearQuery: '',
   orientation: 'all',
+  groupMode: 'none',
   query: '',
   resolutionRange: '',
   resolutionXRange: '',
@@ -87,6 +91,11 @@ const emptyNFOOptions: Record<NFOFilterField, string[]> = {
   title: [],
   year: [],
 };
+
+const mediaGroupOptions: Array<{ value: AssetGroupMode; label: string }> = [
+  { value: 'none', label: '不分' },
+  { value: 'folder', label: '文件夹' },
+];
 
 export default function SearchPage() {
   const [searchParams] = useSearchParams();
@@ -114,35 +123,15 @@ export default function SearchPage() {
   const [durationMinMinutes, setDurationMinMinutes] = useState(initialDuration.min);
   const [durationMaxMinutes, setDurationMaxMinutes] = useState(initialDuration.max);
   const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
+  const [groupMode, setGroupMode] = useState<AssetGroupMode>(initialStateRef.current.groupMode);
   const [sizeMinMB, setSizeMinMB] = useState(initialStateRef.current.sizeMinMB);
   const [sizeMaxMB, setSizeMaxMB] = useState(initialStateRef.current.sizeMaxMB);
-  const [scrollTopTarget, setScrollTopTarget] = useState<{ scrollTop: number; signal: number } | undefined>(() =>
-    initialStateRef.current.scrollTop > 0 && !initialStateRef.current.focusAssetId
-      ? { scrollTop: initialStateRef.current.scrollTop, signal: 1 }
-      : undefined,
-  );
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
-  const [scrollTarget, setScrollTarget] = useState<{ ratio: number; signal: number } | undefined>();
-  const [scrollResetSignal, setScrollResetSignal] = useState(0);
-  const [scrollRatio, setScrollRatio] = useState(0);
-  const [loadedStartIndex, setLoadedStartIndex] = useState(0);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
-  const [, setGridUrlSignal] = useState(0);
-  const gridStateRef = useRef<GridReturnState>(initialStateRef.current);
   const sidebarState = useSidebarReturnState();
   const restoreSidebarState = useRestoreSidebarState();
-  const restoreRef = useRef({
-    jumped: false,
-    pending:
-      initialStateRef.current.scrollTop > 0 ||
-      initialStateRef.current.loadedItemCount > pageSize ||
-      initialStateRef.current.loadedStartIndex > 0 ||
-      Boolean(initialStateRef.current.focusAssetId),
-    signal: 0,
-  });
-  const indexPageRef = useRef(1);
-  const seekSignalRef = useRef(0);
+  const serverGroup = serverGroupForMode(groupMode);
 
   const searchRequest = useMemo<SearchAssetsParams>(
     () => ({
@@ -160,6 +149,7 @@ export default function SearchPage() {
       to: datetimeLocalToUnix(dateTo),
       ...parseDurationMinuteRange(durationMinMinutes, durationMaxMinutes),
       orientation,
+      group: serverGroup,
       sizeMin: mbToBytes(sizeMinMB),
       sizeMax: mbToBytes(sizeMaxMB),
     }),
@@ -178,6 +168,7 @@ export default function SearchPage() {
       query,
       resolutionXRange,
       resolutionYRange,
+      serverGroup,
       sizeMaxMB,
       sizeMinMB,
       sort,
@@ -195,8 +186,31 @@ export default function SearchPage() {
     [nfoActorQuery, nfoIDQuery, nfoTagQuery, nfoTitleQuery, nfoYearQuery],
   );
   const searchKey = useMemo(() => JSON.stringify(searchRequest), [searchRequest]);
+  const anchorSearchRequest = useMemo<SearchAssetsParams>(() => ({ ...searchRequest, group: undefined }), [searchRequest]);
   const loadAssets = useCallback((page: number) => api.searchAssets(page, pageSize, searchRequest), [searchRequest]);
   const { items, hasMore, loading, error, loadMore, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [searchKey]);
+  const {
+    focusAssetId,
+    getGridState,
+    handleGridScrollState,
+    loadedStartIndex,
+    scrollRatio,
+    scrollResetSignal,
+    scrollTarget,
+    scrollTopTarget,
+    seekIndex,
+    setScrollRatio,
+  } = useWaterfallGridState({
+    hasMore,
+    initialState: initialStateRef.current,
+    itemsLength: items.length,
+    jumpToPage,
+    loading,
+    loadMore,
+    pageSize,
+    resetKey: searchKey,
+    searchParams,
+  });
   const handleAssetDeleted = useCallback((event: AssetDeletedEvent) => mutateItems((current) => removeAssetById(current, event.id)), [mutateItems]);
   useAssetDeletedEvents(handleAssetDeleted, [handleAssetDeleted]);
 
@@ -204,7 +218,7 @@ export default function SearchPage() {
     let live = true;
     async function loadAnchors() {
       try {
-        const result = await api.searchAnchors(pageSize, searchRequest);
+        const result = await api.searchAnchors(pageSize, anchorSearchRequest);
         if (live) {
           setAnchors(result.items);
           setTotalCount(result.total);
@@ -220,7 +234,7 @@ export default function SearchPage() {
     return () => {
       live = false;
     };
-  }, [searchRequest]);
+  }, [anchorSearchRequest]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -242,14 +256,11 @@ export default function SearchPage() {
 
   const currentPageState = useCallback(
     (): SearchPageState => ({
-      ...gridStateRef.current,
+      ...getGridState(),
       dateFrom,
       dateTo,
       durationMaxMinutes,
       durationMinMinutes,
-      focusAssetId: null,
-      loadedItemCount: items.length,
-      loadedStartIndex,
       nfoActorQuery,
       nfoIDQuery,
       nfoQuery,
@@ -257,6 +268,7 @@ export default function SearchPage() {
       nfoTitleQuery,
       nfoYearQuery,
       orientation,
+      groupMode,
       query,
       resolutionXRange,
       resolutionYRange,
@@ -272,8 +284,8 @@ export default function SearchPage() {
       dateTo,
       durationMaxMinutes,
       durationMinMinutes,
-      items.length,
-      loadedStartIndex,
+      getGridState,
+      groupMode,
       nfoActorQuery,
       nfoIDQuery,
       nfoQuery,
@@ -297,58 +309,6 @@ export default function SearchPage() {
     savePageState<SearchPageState>(searchStateKey, currentPageState());
   }, [currentPageState]);
 
-  useEffect(() => {
-    if (!searchParams.has('restore')) return;
-    clearRestoreParamFromLocation();
-  }, [searchParams]);
-
-  useEffect(() => {
-    indexPageRef.current = 1;
-    setLoadedStartIndex(0);
-    setScrollTarget(undefined);
-    if (restoreRef.current.pending) return;
-    gridStateRef.current = resetGridState();
-    setScrollResetSignal((value) => value + 1);
-  }, [searchKey]);
-
-  useEffect(() => {
-    if (!restoreRef.current.pending || loading) return;
-    const startIndex = Math.max(0, initialStateRef.current.loadedStartIndex);
-    if (startIndex > 0 && !restoreRef.current.jumped) {
-      restoreRef.current.jumped = true;
-      const page = Math.floor(startIndex / pageSize) + 1;
-      indexPageRef.current = page;
-      setLoadedStartIndex(startIndex);
-      void jumpToPage(page);
-      return;
-    }
-    const targetCount = Math.max(pageSize, initialStateRef.current.loadedItemCount);
-    if (items.length < targetCount && hasMore) {
-      void loadMore();
-      return;
-    }
-    restoreRef.current.pending = false;
-    if (!initialStateRef.current.focusAssetId) {
-      restoreRef.current.signal += 1;
-      setScrollTopTarget({ scrollTop: initialStateRef.current.scrollTop, signal: restoreRef.current.signal });
-    }
-  }, [hasMore, items.length, jumpToPage, loadMore, loading]);
-
-  const handleGridScrollState = useCallback(
-    (state: { ratio: number; scrollTop: number }) => {
-      gridStateRef.current = {
-        ...gridStateRef.current,
-        focusAssetId: null,
-        loadedItemCount: items.length,
-        loadedStartIndex,
-        scrollRatio: state.ratio,
-        scrollTop: state.scrollTop,
-      };
-      setGridUrlSignal((value) => value + 1);
-    },
-    [items.length, loadedStartIndex],
-  );
-
   const handleOpenAsset = useCallback(() => {
     saveCurrentState();
     saveViewerReturnPath('/search');
@@ -359,24 +319,6 @@ export default function SearchPage() {
       navigate(viewerUrl, { state: { backgroundLocation: location, initialAsset: asset } });
     },
     [location, navigate],
-  );
-
-  const seekIndex = useCallback(
-    (_anchor: LibraryAnchor, page: number, ratio: number) => {
-      const signal = seekSignalRef.current + 1;
-      seekSignalRef.current = signal;
-      setScrollTarget({ ratio, signal });
-      if (page === indexPageRef.current) return;
-      indexPageRef.current = page;
-      setLoadedStartIndex((Math.max(1, page) - 1) * pageSize);
-      void jumpToPage(page).then(() => {
-        if (seekSignalRef.current !== signal) return;
-        const nextSignal = seekSignalRef.current + 1;
-        seekSignalRef.current = nextSignal;
-        setScrollTarget({ ratio, signal: nextSignal });
-      });
-    },
-    [jumpToPage],
   );
 
   const resetFilters = useCallback(() => {
@@ -396,6 +338,7 @@ export default function SearchPage() {
     setDurationMinMinutes('');
     setDurationMaxMinutes('');
     setOrientation('all');
+    setGroupMode('none');
     setSizeMinMB('');
     setSizeMaxMB('');
   }, []);
@@ -457,16 +400,21 @@ export default function SearchPage() {
         <span>NFO 全文</span>
         <input value={nfoQuery} onChange={(event) => setNFOQuery(event.target.value)} placeholder="任意 NFO 文本" />
       </label>
-      <label className="sidebar-field">
-        <span>排序</span>
-        <select value={sort} onChange={(event) => setSort(event.target.value as SortKey)}>
-          <option value="timeline_desc">时间新到旧</option>
-          <option value="timeline_asc">时间旧到新</option>
-          <option value="filename">文件名</option>
-          <option value="size">大小</option>
-          <option value="imported_desc">导入时间</option>
-        </select>
-      </label>
+      <SortControls sort={sort} onChange={setSort} />
+      <div className="sidebar-control-title">分组</div>
+      <div className="sidebar-list">
+        {mediaGroupOptions.map((option) => (
+          <button
+            className={groupMode === option.value ? 'sidebar-list-row active' : 'sidebar-list-row'}
+            key={option.value}
+            type="button"
+            onClick={() => setGroupMode(option.value)}
+          >
+            <span className="sidebar-list-marker" aria-hidden="true" />
+            <span>{option.label}</span>
+          </button>
+        ))}
+      </div>
       <label className="sidebar-field">
         <span>分辨率</span>
         <div className="sidebar-field-grid">
@@ -517,6 +465,7 @@ export default function SearchPage() {
       dateTo,
       durationMaxMinutes,
       durationMinMinutes,
+      groupMode,
       nfoOptionQueries,
       nfoOptions,
       nfoActorQuery,
@@ -568,7 +517,9 @@ export default function SearchPage() {
             onScrollStateChange={handleGridScrollState}
             totalCount={totalCount}
             loadedStartIndex={loadedStartIndex}
-            focusAssetId={initialStateRef.current.focusAssetId}
+            focusAssetId={focusAssetId}
+            groupMode={groupMode}
+            sort={sort}
             scrollSignal={scrollResetSignal}
             scrollTarget={scrollTarget}
             scrollTopTarget={scrollTopTarget}
@@ -622,8 +573,7 @@ function NFOFilterInput({
 function buildViewerUrl(asset: Asset, params: SearchAssetsParams, state: SearchPageState) {
   const query = new URLSearchParams(searchQueryEntries(params));
   query.set('context', 'search');
-  query.set('returnPath', '/search');
-  return `/viewer/${asset.id}?${query.toString()}&returnState=${encodeReturnState(state)}`;
+  return appendViewerReturnParams(`/viewer/${asset.id}?${query.toString()}`, '/search', state);
 }
 
 function searchQueryEntries(params: SearchAssetsParams) {

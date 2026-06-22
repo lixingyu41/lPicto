@@ -24,6 +24,7 @@ type Asset struct {
 	VideoPosterStatus string
 	VideoProxyStatus  string
 	Rotation          int
+	Rating            int
 	MetadataJSON      *string
 	NFOJSON           *string
 	NFOSearchText     *string
@@ -70,6 +71,7 @@ type TimelineGroup struct {
 type AssetPreference struct {
 	AssetID   int64
 	Rotation  int
+	Rating    int
 	UpdatedAt int64
 }
 

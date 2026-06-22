@@ -239,25 +239,35 @@ func unixTime(value any) *int64 {
 		return nil
 	}
 	text = strings.TrimSpace(text)
-	layouts := []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006:01:02 15:04:05",
-		"2006:01:02 15:04:05-07:00",
-		"2006:01:02 15:04:05Z07:00",
-		"2006-01-02 15:04:05",
-		"2006-01-02T15:04:05",
-		"2006-01-02T15:04:05Z0700",
-		"2006-01-02",
-		"2006/01/02",
-		"2006.01.02",
-		"2006-01",
-		"2006/01",
-		"2006.01",
-		"2006",
+	layouts := []struct {
+		layout string
+		local  bool
+	}{
+		{time.RFC3339Nano, false},
+		{time.RFC3339, false},
+		{"2006:01:02 15:04:05", true},
+		{"2006:01:02 15:04:05-07:00", false},
+		{"2006:01:02 15:04:05Z07:00", false},
+		{"2006-01-02 15:04:05", true},
+		{"2006-01-02T15:04:05", true},
+		{"2006-01-02T15:04:05Z0700", false},
+		{"2006-01-02", true},
+		{"2006/01/02", true},
+		{"2006.01.02", true},
+		{"2006-01", true},
+		{"2006/01", true},
+		{"2006.01", true},
+		{"2006", true},
 	}
-	for _, layout := range layouts {
-		if parsed, err := time.Parse(layout, text); err == nil {
+	for _, item := range layouts {
+		var parsed time.Time
+		var err error
+		if item.local {
+			parsed, err = time.ParseInLocation(item.layout, text, time.Local)
+		} else {
+			parsed, err = time.Parse(item.layout, text)
+		}
+		if err == nil {
 			unix := parsed.Unix()
 			return &unix
 		}

@@ -1,10 +1,12 @@
-import type { Asset, SortKey } from '../types/api';
+import type { Asset, AssetServerGroup, SortKey } from '../types/api';
 
-export type AssetGroupMode = 'none' | 'day' | 'month' | 'year' | 'size' | 'letter';
+export type AssetGroupMode = 'none' | 'day' | 'month' | 'year' | 'size' | 'letter' | 'folder';
 
 export function assetGroupLabel(asset: Asset, mode: AssetGroupMode, sort: SortKey): string {
   const time = sort === 'imported_desc' || sort === 'imported_asc' ? asset.importedAt : asset.timelineAt;
   switch (mode) {
+    case 'folder':
+      return folderGroupLabel(asset.parentRelPath);
     case 'day':
       return formatDateGroup(time, 'day');
     case 'month':
@@ -18,6 +20,14 @@ export function assetGroupLabel(asset: Asset, mode: AssetGroupMode, sort: SortKe
     default:
       return '';
   }
+}
+
+export function serverGroupForMode(mode: AssetGroupMode): AssetServerGroup | undefined {
+  return mode === 'folder' ? 'folder' : undefined;
+}
+
+export function folderGroupLabel(parentRelPath: string): string {
+  return parentRelPath ? `/${parentRelPath}` : '全部存储';
 }
 
 export function sizeGroupLabel(size: number): string {

@@ -10,6 +10,7 @@ export function usePagedLoader<T>(
   const [hasMore, setHasMore] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadingRef = useRef(false);
   const requestId = useRef(0);
   const loadPageRef = useRef(loadPage);
 
@@ -18,6 +19,7 @@ export function usePagedLoader<T>(
   }, [loadPage]);
 
   const load = useCallback(async (pageToLoad: number, replace: boolean, currentRequest: number) => {
+    loadingRef.current = true;
     setLoading(true);
     setError(null);
     try {
@@ -29,15 +31,17 @@ export function usePagedLoader<T>(
     } catch (err) {
       if (requestId.current !== currentRequest) return;
       setError(err instanceof Error ? err.message : '加载失败');
+      setHasMore(false);
     } finally {
       if (requestId.current === currentRequest) {
+        loadingRef.current = false;
         setLoading(false);
       }
     }
   }, []);
 
   const loadMore = useCallback(async () => {
-    if (loading || !hasMore) return;
+    if (loadingRef.current || loading || !hasMore) return;
     const currentRequest = requestId.current;
     await load(page, false, currentRequest);
   }, [hasMore, load, loading, page]);
@@ -46,6 +50,7 @@ export function usePagedLoader<T>(
     async (pageToLoad: number) => {
       const currentRequest = requestId.current + 1;
       requestId.current = currentRequest;
+      loadingRef.current = false;
       setItems([]);
       setPage(pageToLoad);
       setHasMore(true);
@@ -58,6 +63,7 @@ export function usePagedLoader<T>(
   const reset = useCallback(() => {
     const currentRequest = requestId.current + 1;
     requestId.current = currentRequest;
+    loadingRef.current = false;
     setItems([]);
     setPage(1);
     setHasMore(true);
