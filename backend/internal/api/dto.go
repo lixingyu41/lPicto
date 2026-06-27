@@ -41,6 +41,86 @@ type AssetDTO struct {
 	Rating            int      `json:"rating"`
 }
 
+type AssetDeleteEntryDTO struct {
+	RelPath string `json:"relPath"`
+	Name    string `json:"name"`
+	Kind    string `json:"kind"`
+	Size    int64  `json:"size"`
+	Reason  string `json:"reason"`
+	IsMedia bool   `json:"isMedia"`
+}
+
+type AssetDeletePlanDTO struct {
+	Asset          AssetDTO              `json:"asset"`
+	Mode           string                `json:"mode"`
+	Token          string                `json:"token"`
+	CanDelete      bool                  `json:"canDelete"`
+	Files          []AssetDeleteEntryDTO `json:"files"`
+	Folder         *AssetDeleteEntryDTO  `json:"folder"`
+	FolderContents []AssetDeleteEntryDTO `json:"folderContents"`
+	Warnings       []string              `json:"warnings"`
+	Blockers       []string              `json:"blockers"`
+}
+
+type AssetDeleteConfirmRequest struct {
+	Token string `json:"token"`
+}
+
+type AssetDeleteFailureDTO struct {
+	RelPath string `json:"relPath"`
+	Message string `json:"message"`
+}
+
+type AssetDeleteResultDTO struct {
+	Deleted         bool                    `json:"deleted"`
+	DeletedAssetIDs []int64                 `json:"deletedAssetIds"`
+	Failures        []AssetDeleteFailureDTO `json:"failures"`
+	Plan            *AssetDeletePlanDTO     `json:"plan,omitempty"`
+}
+
+type AssetDeleteConflictDTO struct {
+	Stale bool               `json:"stale"`
+	Plan  AssetDeletePlanDTO `json:"plan"`
+}
+
+type VideoProxyRuntimeDTO struct {
+	Required     bool    `json:"required"`
+	Cached       bool    `json:"cached"`
+	Transcoding  bool    `json:"transcoding"`
+	Queued       bool    `json:"queued"`
+	Active       bool    `json:"active"`
+	Status       string  `json:"status"`
+	Progress     float64 `json:"progress"`
+	SecondsDone  float64 `json:"secondsDone"`
+	Duration     float64 `json:"duration"`
+	Bytes        int64   `json:"bytes"`
+	ExpiresAt    int64   `json:"expiresAt"`
+	Error        string  `json:"error"`
+	UpdatedAt    int64   `json:"updatedAt"`
+	LeaseUntil   int64   `json:"leaseUntil"`
+	CacheTTL     int64   `json:"cacheTtl"`
+	KeepaliveTTL int64   `json:"keepaliveTtl"`
+	RuntimeKey   string  `json:"runtimeKey"`
+	ClientID     string  `json:"clientId"`
+	SessionID    string  `json:"sessionId"`
+	SessionState string  `json:"sessionState"`
+	ActiveUsers  int     `json:"activeUsers"`
+	PlayingUsers int     `json:"playingUsers"`
+	Command      string  `json:"command"`
+	Message      string  `json:"message"`
+	ServerTime   int64   `json:"serverTime"`
+}
+
+type VideoProxyHeartbeatRequest struct {
+	ClientID     string  `json:"clientId"`
+	SessionID    string  `json:"sessionId"`
+	State        string  `json:"state"`
+	CurrentTime  float64 `json:"currentTime"`
+	PlaybackRate float64 `json:"playbackRate"`
+	WantsStream  bool    `json:"wantsStream"`
+	Hidden       bool    `json:"hidden"`
+}
+
 type FolderDTO struct {
 	ID                  int64   `json:"id"`
 	RelPath             string  `json:"relPath"`
@@ -127,10 +207,12 @@ type QueueStatsDTO struct {
 }
 
 type CacheStatsDTO struct {
-	SizeBytes  int64 `json:"sizeBytes"`
-	FileCount  int   `json:"fileCount"`
-	UpdatedAt  int64 `json:"updatedAt"`
-	Refreshing bool  `json:"refreshing"`
+	SizeBytes     int64 `json:"sizeBytes"`
+	CacheBytes    int64 `json:"cacheBytes"`
+	DatabaseBytes int64 `json:"databaseBytes"`
+	FileCount     int   `json:"fileCount"`
+	UpdatedAt     int64 `json:"updatedAt"`
+	Refreshing    bool  `json:"refreshing"`
 }
 
 type ProcessingProgressDTO struct {
@@ -180,6 +262,7 @@ type ScanLibraryProgressDTO struct {
 	UnscannedFiles  int                 `json:"unscannedFiles"`
 	Thumb           WorkStatusCountsDTO `json:"thumb"`
 	Transcode       WorkStatusCountsDTO `json:"transcode"`
+	VideoProxy      WorkStatusCountsDTO `json:"videoProxy"`
 	Active          bool                `json:"active"`
 }
 

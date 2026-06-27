@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Play } from 'lucide-react';
 import type { Asset, SortKey } from '../types/api';
@@ -12,7 +12,9 @@ interface Props {
   assets: Asset[];
   loading: boolean;
   hasMore: boolean;
+  hasPrevious?: boolean;
   onLoadMore: () => void;
+  onLoadPrevious?: () => void;
   buildViewerUrl: (asset: Asset) => string;
   onOpenAsset?: (asset: Asset) => void;
   onOpenViewer?: (asset: Asset, viewerUrl: string) => void;
@@ -68,7 +70,9 @@ export default function AssetGrid({
   assets,
   loading,
   hasMore,
+  hasPrevious = false,
   onLoadMore,
+  onLoadPrevious,
   buildViewerUrl,
   onOpenAsset,
   onOpenViewer,
@@ -102,6 +106,11 @@ export default function AssetGrid({
   const hoverPreloadTimer = useRef(0);
   const lastPreviewID = useRef<number | null>(null);
   const gridRowsRef = useRef<GridRow[]>([]);
+  const prependAnchorRef = useRef<{ firstAssetId: number | null; loadedStartIndex: number; scrollTop: number }>({
+    firstAssetId: null,
+    loadedStartIndex: 0,
+    scrollTop: 0,
+  });
   const scrollMetaRef = useRef({ loadedStartIndex: 0, totalCount: assets.length });
   const appliedFocusAssetId = useRef<number | null>(null);
   const appliedScrollTopTargetSignal = useRef<number | null>(null);
@@ -237,8 +246,34 @@ export default function AssetGrid({
   }, [gridRows, loadedStartIndex, totalCount]);
 
   const rows = virtualizer.getVirtualItems();
+  useLayoutEffect(() => {
+    const element = parentRef.current;
+    const previous = prependAnchorRef.current;
+    if (element && loadedStartIndex < previous.loadedStartIndex && previous.firstAssetId !== null) {
+      const anchorTop = scrollTopForAssetTop(gridRowsRef.current, previous.firstAssetId);
+      if (anchorTop !== null) {
+        element.scrollTop = anchorTop + previous.scrollTop;
+        emitScrollState();
+      }
+    }
+    prependAnchorRef.current = {
+      firstAssetId: visibleAssets[0]?.id ?? null,
+      loadedStartIndex,
+      scrollTop: element?.scrollTop ?? 0,
+    };
+  }, [gridRows, loadedStartIndex, visibleAssets]);
+
   const lastRow = rows[rows.length - 1];
+  const firstRow = rows[0];
+  const firstRowIndex = firstRow?.index ?? -1;
   const lastRowIndex = lastRow?.index ?? -1;
+  useEffect(() => {
+    if (firstRowIndex < 0) return;
+    if (hasPrevious && !loading && firstRowIndex <= 2) {
+      onLoadPrevious?.();
+    }
+  }, [firstRowIndex, hasPrevious, loading, onLoadPrevious]);
+
   useEffect(() => {
     if (lastRowIndex < 0) return;
     if (hasMore && !loading && lastRowIndex >= gridRows.length - 3) {
@@ -453,6 +488,7 @@ export default function AssetGrid({
   function emitScrollState() {
     const element = parentRef.current;
     if (!element) return;
+    prependAnchorRef.current.scrollTop = element.scrollTop;
     const ratio = fullScrollRatio(element);
     const clamped = Math.min(1, Math.max(0, ratio));
     onScrollRatioChangeRef.current?.(clamped);
@@ -571,6 +607,17 @@ function scrollTopForAsset(element: HTMLDivElement, rows: GridRow[], assetId: nu
       const centered = offset - Math.max(0, (element.clientHeight - row.height) / 2);
       const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
       return Math.min(maxScroll, Math.max(0, centered));
+    }
+    offset += row.height + gap;
+  }
+  return null;
+}
+
+function scrollTopForAssetTop(rows: GridRow[], assetId: number) {
+  let offset = 0;
+  for (const row of rows) {
+    if (row.type === 'assets' && row.items.some((item) => item.asset.id === assetId)) {
+      return offset;
     }
     offset += row.height + gap;
   }

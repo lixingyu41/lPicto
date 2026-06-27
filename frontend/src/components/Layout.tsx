@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
 import { useLocation, type Location } from 'react-router-dom';
+import DesignGridOverlay from './DesignGridOverlay';
 import Sidebar from './Sidebar';
 import { SidebarPanelProvider, type SidebarPanelTarget } from './SidebarContext';
 import {
   isPrimarySidebarPanelTarget,
+  loadSidebarCollapsed,
   loadSidebarSecondaryExpanded,
   loadSidebarWidths,
   normalizeSidebarWidths,
   primaryTargetForPath,
+  saveSidebarCollapsed,
   saveSidebarSecondaryExpanded,
   saveSidebarWidths,
   type SidebarWidths,
@@ -22,41 +25,54 @@ interface Props {
 export default function Layout({ children, overlay = null, routeLocation }: Props) {
   const location = useLocation();
   const effectivePathname = routeLocation?.pathname ?? location.pathname;
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsedState] = useState(() => loadSidebarCollapsed());
   const [sidebarWidths, setSidebarWidths] = useState<SidebarWidths>(() => loadSidebarWidths());
+  const [routeEntering, setRouteEntering] = useState(false);
   const routeTarget = primaryTargetForPath(effectivePathname);
   const [sidebarExpanded, setSidebarExpandedState] = useState<SidebarPanelTarget | null>(() =>
-    routeTarget && loadSidebarSecondaryExpanded(routeTarget) ? routeTarget : null,
+    routeTarget && loadSidebarSecondaryExpanded() ? routeTarget : null,
   );
-  const sidebarPanelOpen = sidebarExpanded !== null && sidebarExpanded === routeTarget;
+  const viewerActive = overlay !== null || effectivePathname.startsWith('/viewer/');
+  const sidebarPanelOpen = (sidebarExpanded !== null && sidebarExpanded === routeTarget) || viewerActive;
   const shellClass = [
     'app-shell',
     sidebarCollapsed ? 'sidebar-primary-collapsed' : 'sidebar-primary-open',
+    sidebarCollapsed ? 'sidebar-primary-icon-only' : '',
     sidebarPanelOpen ? 'sidebar-panel-open' : 'sidebar-panel-closed',
-    sidebarCollapsed && !sidebarPanelOpen ? 'sidebar-collapsed' : '',
   ]
     .filter(Boolean)
     .join(' ');
   const setSidebarExpanded = useCallback(
     (target: SidebarPanelTarget | null) => {
       if (target === null) {
-        if (routeTarget) {
-          saveSidebarSecondaryExpanded(routeTarget, false);
-        }
+        saveSidebarSecondaryExpanded(false);
         setSidebarExpandedState(null);
         return;
       }
       if (isPrimarySidebarPanelTarget(target)) {
-        saveSidebarSecondaryExpanded(target, true);
+        saveSidebarSecondaryExpanded(true);
       }
       setSidebarExpandedState(target);
     },
-    [routeTarget],
+    [],
   );
+  const setSidebarCollapsed = useCallback((collapsed: boolean) => {
+    saveSidebarCollapsed(collapsed);
+    setSidebarCollapsedState(collapsed);
+  }, []);
+  useEffect(() => {
+    setSidebarExpandedState(routeTarget && loadSidebarSecondaryExpanded() ? routeTarget : null);
+  }, [routeTarget]);
 
   useEffect(() => {
-    setSidebarExpandedState(routeTarget && loadSidebarSecondaryExpanded(routeTarget) ? routeTarget : null);
-  }, [routeTarget]);
+    setRouteEntering(false);
+    const frame = window.requestAnimationFrame(() => setRouteEntering(true));
+    const timer = window.setTimeout(() => setRouteEntering(false), 180);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+    };
+  }, [effectivePathname]);
 
   const updateSidebarWidth = useCallback((kind: keyof SidebarWidths, width: number) => {
     setSidebarWidths((current) => {
@@ -65,6 +81,10 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
       return next;
     });
   }, []);
+
+  const togglePrimarySidebar = useCallback(() => {
+    setSidebarCollapsed(!sidebarCollapsed);
+  }, [setSidebarCollapsed, sidebarCollapsed]);
 
   const shellStyle = {
     '--sidebar-primary-width': `${sidebarWidths.primary}px`,
@@ -83,17 +103,16 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
           <Sidebar
             collapsed={sidebarCollapsed}
             expanded={sidebarExpanded}
-            primaryWidth={sidebarWidths.primary}
             routePathname={effectivePathname}
             secondaryWidth={sidebarWidths.secondary}
-            onToggleCollapsed={() => setSidebarCollapsed((value) => !value)}
+            onTogglePrimary={togglePrimarySidebar}
             onToggleExpanded={setSidebarExpanded}
-            onPrimaryWidthChange={(width) => updateSidebarWidth('primary', width)}
             onSecondaryWidthChange={(width) => updateSidebarWidth('secondary', width)}
           />
         </aside>
-        <main className="main-panel">{children}</main>
+        <main className={routeEntering ? 'main-panel route-entering' : 'main-panel'}>{children}</main>
         {overlay && <div className="viewer-shell-overlay">{overlay}</div>}
+        <DesignGridOverlay />
       </div>
     </SidebarPanelProvider>
   );

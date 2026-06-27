@@ -15,10 +15,16 @@ const viewerReturnKey = 'lpicto:viewer-return-path';
 export const viewerOverlayAssetFocusChanged = 'lpicto:viewer-overlay-asset-focus';
 export const assetRatingChanged = 'lpicto:asset-rating-changed';
 
+function loadStoredValue(key: string) {
+  const localValue = window.localStorage.getItem(key);
+  if (localValue !== null) return localValue;
+  return window.sessionStorage.getItem(key);
+}
+
 export function loadPageState<T extends object>(key: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
   try {
-    const raw = window.sessionStorage.getItem(pageStatePrefix + key);
+    const raw = loadStoredValue(pageStatePrefix + key);
     if (!raw) return fallback;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') return fallback;
@@ -31,7 +37,7 @@ export function loadPageState<T extends object>(key: string, fallback: T): T {
 export function savePageState<T extends object>(key: string, value: T) {
   if (typeof window === 'undefined') return;
   try {
-    window.sessionStorage.setItem(pageStatePrefix + key, JSON.stringify(value));
+    window.localStorage.setItem(pageStatePrefix + key, JSON.stringify(value));
   } catch {
     // Ignore storage failures; the viewer still has URL fallback.
   }
@@ -49,7 +55,7 @@ export function clearRestoreParamFromLocation() {
 export function saveViewerReturnPath(path: string) {
   if (typeof window === 'undefined') return;
   try {
-    window.sessionStorage.setItem(viewerReturnKey, path);
+    window.localStorage.setItem(viewerReturnKey, path);
   } catch {
     // Ignore storage failures.
   }
@@ -58,7 +64,7 @@ export function saveViewerReturnPath(path: string) {
 export function loadViewerReturnPath() {
   if (typeof window === 'undefined') return '';
   try {
-    return window.sessionStorage.getItem(viewerReturnKey) ?? '';
+    return loadStoredValue(viewerReturnKey) ?? '';
   } catch {
     return '';
   }

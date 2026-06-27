@@ -42,6 +42,7 @@ type Config struct {
 	PreviewLongEdge              int                  `json:"previewLongEdge"`
 	PreviewQuality               int                  `json:"previewQuality"`
 	VideoProxyEnabled            bool                 `json:"videoProxyEnabled"`
+	LiveVideoProxyMaxActive      int                  `json:"liveVideoProxyMaxActive"`
 	VideoProxyMaxHeight          int                  `json:"videoProxyMaxHeight"`
 	VideoProxyCRF                int                  `json:"videoProxyCrf"`
 	FFmpegHWAccel                string               `json:"ffmpegHwAccel"`
@@ -103,6 +104,7 @@ func Load() (Config, error) {
 		PreviewLongEdge:              intEnv("PREVIEW_LONG_EDGE", 2560),
 		PreviewQuality:               intEnv("PREVIEW_QUALITY", 82),
 		VideoProxyEnabled:            boolEnv("VIDEO_PROXY_ENABLED", true),
+		LiveVideoProxyMaxActive:      intEnv("LIVE_VIDEO_PROXY_MAX_ACTIVE", 10),
 		VideoProxyMaxHeight:          intEnv("VIDEO_PROXY_MAX_HEIGHT", 1080),
 		VideoProxyCRF:                intEnv("VIDEO_PROXY_CRF", 23),
 		FFmpegHWAccel:                hwAccelEnv("FFMPEG_HWACCEL", "none"),
@@ -131,6 +133,9 @@ func Load() (Config, error) {
 	}
 	if cfg.VideoProxyWorkers < 1 {
 		cfg.VideoProxyWorkers = 1
+	}
+	if cfg.LiveVideoProxyMaxActive < 1 {
+		cfg.LiveVideoProxyMaxActive = 1
 	}
 	if cfg.BackgroundMaxActive < 1 {
 		cfg.BackgroundMaxActive = 1
@@ -176,6 +181,7 @@ func (c Config) Log(logger *slog.Logger) {
 		"previewLongEdge", c.PreviewLongEdge,
 		"previewQuality", c.PreviewQuality,
 		"videoProxyEnabled", c.VideoProxyEnabled,
+		"liveVideoProxyMaxActive", c.LiveVideoProxyMaxActive,
 		"videoProxyMaxHeight", c.VideoProxyMaxHeight,
 		"videoProxyCrf", c.VideoProxyCRF,
 		"ffmpegHwAccel", c.FFmpegHWAccel,

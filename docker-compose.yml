@@ -34,7 +34,6 @@ services:
       - type: bind
         source: *media-source
         target: /Media
-        read_only: true
         bind:
           propagation: rslave
       - type: bind

@@ -61,7 +61,7 @@ type Processor struct {
 func (p Processor) Handle(ctx context.Context, task jobs.Task) error {
 	switch task.Type {
 	case "video_proxy":
-		return p.proxy(ctx, task.AssetID)
+		return nil
 	default:
 		return nil
 	}
@@ -139,6 +139,44 @@ func (p Processor) proxyArgs(source string, tmp string, filter string) []string 
 	}
 	args := append([]string{"-y", "-hide_banner", "-loglevel", "error"}, p.hwAccelArgs()...)
 	args = append(args, p.cpuProxyTail(source, tmp, filter)...)
+	return args
+}
+
+func StreamProxyArgs(source string, maxHeight int, crf int, hwAccel string, hwDevice string, startSeconds float64) []string {
+	filter := fmt.Sprintf("scale=-2:min(%d\\,trunc(ih/2)*2)", maxHeight)
+	inputArgs := streamInputArgs(source, startSeconds)
+	if hwAccel == "cuda" {
+		args := []string{
+			"-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:2",
+		}
+		args = append(args, inputArgs...)
+		return append(args,
+			"-map", "0:v:0", "-map", "0:a?",
+			"-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", strconv.Itoa(crf), "-b:v", "0",
+			"-g", "48", "-force_key_frames", "expr:gte(t,n_forced*2)",
+			"-vf", filter, "-pix_fmt", "yuv420p",
+			"-c:a", "aac", "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "-max_muxing_queue_size", "1024", "pipe:1",
+		)
+	}
+	processor := Processor{HWAccel: hwAccel, HWDevice: hwDevice, ProxyCRF: crf}
+	args := append([]string{"-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:2"}, processor.hwAccelArgs()...)
+	args = append(args, inputArgs...)
+	args = append(args,
+		"-map", "0:v:0", "-map", "0:a?",
+		"-c:v", "libx264", "-preset", "veryfast", "-crf", strconv.Itoa(crf),
+		"-g", "48", "-keyint_min", "24", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)",
+		"-vf", filter, "-pix_fmt", "yuv420p",
+		"-c:a", "aac", "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "-max_muxing_queue_size", "1024", "pipe:1",
+	)
+	return args
+}
+
+func streamInputArgs(source string, startSeconds float64) []string {
+	args := make([]string, 0, 5)
+	if startSeconds > 0 {
+		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
+	}
+	args = append(args, "-re", "-i", source)
 	return args
 }
 

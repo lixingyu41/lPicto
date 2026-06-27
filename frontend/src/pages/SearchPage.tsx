@@ -3,6 +3,7 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { RotateCcw } from 'lucide-react';
 import { api } from '../api/client';
 import AssetGrid from '../components/AssetGrid';
+import AssetGroupingControls, { normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
@@ -11,21 +12,47 @@ import SortControls from '../components/SortControls';
 import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { useAssetDeletedEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
+import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
 import type { Asset, AssetDeletedEvent, AssetKind, LibraryAnchor, NFOFilterField, OrientationFilter, SearchAssetsParams, SortKey } from '../types/api';
 import {
   appendViewerReturnParams,
   decodeReturnState,
+  loadPageState,
   resetGridState,
   savePageState,
   saveViewerReturnPath,
   type GridReturnState,
 } from '../utils/pageState';
-import { serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
+import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import { removeAssetById } from '../utils/assetSort';
+import { currentURLHasParam, currentURLLocation, currentURLPath, replaceURLState } from '../utils/urlState';
 
 const pageSize = 100;
 const searchStateKey = 'search';
+const searchURLKeys = [
+  'q',
+  'nfo',
+  'nfoActor',
+  'nfoId',
+  'nfoTag',
+  'nfoTitle',
+  'nfoYear',
+  'type',
+  'sort',
+  'orientation',
+  'group',
+  'widthMin',
+  'widthMax',
+  'heightMin',
+  'heightMax',
+  'durationMin',
+  'durationMax',
+  'sizeMin',
+  'sizeMax',
+  'from',
+  'to',
+];
 
 interface SearchPageState extends GridReturnState {
   dateFrom: string;
@@ -79,7 +106,7 @@ const defaultSearchState: SearchPageState = {
 const nfoFilterFields: Array<{ key: NFOFilterField; label: string; placeholder: string }> = [
   { key: 'actor', label: 'NFO 演员', placeholder: '选择或输入演员' },
   { key: 'id', label: 'NFO ID', placeholder: '选择或输入 ID' },
-  { key: 'tag', label: 'NFO 标签', placeholder: '选择或输入标签' },
+  { key: 'tag', label: 'NFO 标签/类型', placeholder: '选择或输入标签/类型' },
   { key: 'title', label: 'NFO 标题', placeholder: '选择或输入标题' },
   { key: 'year', label: 'NFO 年份', placeholder: '选择或输入年份' },
 ];
@@ -92,17 +119,13 @@ const emptyNFOOptions: Record<NFOFilterField, string[]> = {
   year: [],
 };
 
-const mediaGroupOptions: Array<{ value: AssetGroupMode; label: string }> = [
-  { value: 'none', label: '不分' },
-  { value: 'folder', label: '文件夹' },
-];
-
 export default function SearchPage() {
   const [searchParams] = useSearchParams();
   const location = useLocation();
   const navigate = useNavigate();
+  const persistedState = loadPageState<SearchPageState>(searchStateKey, defaultSearchState);
   const initialStateRef = useRef(
-    decodeReturnState<SearchPageState>(searchParams.get('restore'), defaultSearchState),
+    initialSearchState(searchParams, persistedState),
   );
   const initialResolution = initialResolutionRanges(initialStateRef.current);
   const initialDuration = initialDurationMinuteRanges(initialStateRef.current);
@@ -131,6 +154,7 @@ export default function SearchPage() {
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const sidebarState = useSidebarReturnState();
   const restoreSidebarState = useRestoreSidebarState();
+  const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const serverGroup = serverGroupForMode(groupMode);
 
   const searchRequest = useMemo<SearchAssetsParams>(
@@ -188,12 +212,13 @@ export default function SearchPage() {
   const searchKey = useMemo(() => JSON.stringify(searchRequest), [searchRequest]);
   const anchorSearchRequest = useMemo<SearchAssetsParams>(() => ({ ...searchRequest, group: undefined }), [searchRequest]);
   const loadAssets = useCallback((page: number) => api.searchAssets(page, pageSize, searchRequest), [searchRequest]);
-  const { items, hasMore, loading, error, loadMore, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [searchKey]);
+  const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [searchKey]);
   const {
     focusAssetId,
     getGridState,
     handleGridScrollState,
     loadedStartIndex,
+    loadPreviousPage,
     scrollRatio,
     scrollResetSignal,
     scrollTarget,
@@ -202,11 +227,13 @@ export default function SearchPage() {
     setScrollRatio,
   } = useWaterfallGridState({
     hasMore,
+    hasPrevious,
     initialState: initialStateRef.current,
     itemsLength: items.length,
     jumpToPage,
     loading,
     loadMore,
+    loadPrevious,
     pageSize,
     resetKey: searchKey,
     searchParams,
@@ -308,18 +335,82 @@ export default function SearchPage() {
   const saveCurrentState = useCallback(() => {
     savePageState<SearchPageState>(searchStateKey, currentPageState());
   }, [currentPageState]);
+  const scheduleCurrentStateSave = usePersistentPageState(saveCurrentState);
+
+  useEffect(() => {
+    if (currentURLHasParam(location, 'restore')) return;
+    replaceURLState(
+      navigate,
+      location,
+      {
+        durationMax: searchRequest.durationMax,
+        durationMin: searchRequest.durationMin,
+        from: searchRequest.from,
+        group: groupMode,
+        heightMax: searchRequest.heightMax,
+        heightMin: searchRequest.heightMin,
+        nfo: nfoQuery.trim(),
+        nfoActor: nfoActorQuery.trim(),
+        nfoId: nfoIDQuery.trim(),
+        nfoTag: nfoTagQuery.trim(),
+        nfoTitle: nfoTitleQuery.trim(),
+        nfoYear: nfoYearQuery.trim(),
+        orientation,
+        q: query.trim(),
+        sizeMax: searchRequest.sizeMax,
+        sizeMin: searchRequest.sizeMin,
+        sort,
+        to: searchRequest.to,
+        type,
+        widthMax: searchRequest.widthMax,
+        widthMin: searchRequest.widthMin,
+      },
+      searchURLKeys,
+    );
+  }, [
+    groupMode,
+    location,
+    navigate,
+    nfoActorQuery,
+    nfoIDQuery,
+    nfoQuery,
+    nfoTagQuery,
+    nfoTitleQuery,
+    nfoYearQuery,
+    orientation,
+    query,
+    searchParams,
+    searchRequest,
+    sort,
+    type,
+  ]);
+
+  const handlePersistentGridScrollState = useCallback(
+    (state: { ratio: number; scrollTop: number }) => {
+      handleGridScrollState(state);
+      scheduleCurrentStateSave();
+    },
+    [handleGridScrollState, scheduleCurrentStateSave],
+  );
 
   const handleOpenAsset = useCallback(() => {
     saveCurrentState();
-    saveViewerReturnPath('/search');
-  }, [saveCurrentState]);
+    saveViewerReturnPath(currentPageReturnPath());
+  }, [currentPageReturnPath, saveCurrentState]);
 
   const handleOpenViewer = useCallback(
     (asset: Asset, viewerUrl: string) => {
-      navigate(viewerUrl, { state: { backgroundLocation: location, initialAsset: asset } });
+      navigate(viewerUrl, { state: { backgroundLocation: currentURLLocation(location), initialAsset: asset } });
     },
     [location, navigate],
   );
+
+  useEffect(() => {
+    const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);
+    if (nextGroupMode !== groupMode) {
+      setGroupMode(nextGroupMode);
+    }
+  }, [groupMode, sort]);
 
   const resetFilters = useCallback(() => {
     setQuery('');
@@ -401,20 +492,7 @@ export default function SearchPage() {
         <input value={nfoQuery} onChange={(event) => setNFOQuery(event.target.value)} placeholder="任意 NFO 文本" />
       </label>
       <SortControls sort={sort} onChange={setSort} />
-      <div className="sidebar-control-title">分组</div>
-      <div className="sidebar-list">
-        {mediaGroupOptions.map((option) => (
-          <button
-            className={groupMode === option.value ? 'sidebar-list-row active' : 'sidebar-list-row'}
-            key={option.value}
-            type="button"
-            onClick={() => setGroupMode(option.value)}
-          >
-            <span className="sidebar-list-marker" aria-hidden="true" />
-            <span>{option.label}</span>
-          </button>
-        ))}
-      </div>
+      <AssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
       <label className="sidebar-field">
         <span>分辨率</span>
         <div className="sidebar-field-grid">
@@ -508,13 +586,15 @@ export default function SearchPage() {
             assets={items}
             loading={loading}
             hasMore={hasMore}
+            hasPrevious={hasPrevious}
             onLoadMore={loadMore}
+            onLoadPrevious={loadPreviousPage}
             onOpenAsset={handleOpenAsset}
             onOpenViewer={handleOpenViewer}
             onAssetMissing={(asset) => mutateItems((current) => removeAssetById(current, asset.id))}
             onPressPreviewChange={setPressPreviewAsset}
             onScrollRatioChange={setScrollRatio}
-            onScrollStateChange={handleGridScrollState}
+            onScrollStateChange={handlePersistentGridScrollState}
             totalCount={totalCount}
             loadedStartIndex={loadedStartIndex}
             focusAssetId={focusAssetId}
@@ -523,7 +603,7 @@ export default function SearchPage() {
             scrollSignal={scrollResetSignal}
             scrollTarget={scrollTarget}
             scrollTopTarget={scrollTopTarget}
-            buildViewerUrl={(asset) => buildViewerUrl(asset, searchRequest, currentPageState())}
+            buildViewerUrl={(asset) => buildViewerUrl(asset, searchRequest, currentPageState(), currentPageReturnPath())}
           />
           <LibraryIndexRail
             anchors={anchors}
@@ -570,10 +650,122 @@ function NFOFilterInput({
   );
 }
 
-function buildViewerUrl(asset: Asset, params: SearchAssetsParams, state: SearchPageState) {
+function initialSearchState(searchParams: URLSearchParams, persistedState: SearchPageState): SearchPageState {
+  if (searchParams.has('restore')) {
+    return decodeReturnState<SearchPageState>(searchParams.get('restore'), persistedState);
+  }
+  if (!hasSearchStateParams(searchParams)) {
+    return persistedState;
+  }
+  return {
+    ...defaultSearchState,
+    query: searchParams.get('q') ?? '',
+    nfoQuery: searchParams.get('nfo') ?? '',
+    nfoActorQuery: searchParams.get('nfoActor') ?? '',
+    nfoIDQuery: searchParams.get('nfoId') ?? '',
+    nfoTagQuery: searchParams.get('nfoTag') ?? '',
+    nfoTitleQuery: searchParams.get('nfoTitle') ?? '',
+    nfoYearQuery: searchParams.get('nfoYear') ?? '',
+    type: parseAssetKindParam(searchParams.get('type')),
+    sort: parseSortParam(searchParams.get('sort')),
+    orientation: parseOrientationParam(searchParams.get('orientation')),
+    groupMode: parseAssetGroupMode(searchParams.get('group'), 'none'),
+    resolutionXRange: rangeInputFromParams(searchParams.get('widthMin'), searchParams.get('widthMax')),
+    resolutionYRange: rangeInputFromParams(searchParams.get('heightMin'), searchParams.get('heightMax')),
+    durationMinMinutes: secondsParamToMinutes(searchParams.get('durationMin')),
+    durationMaxMinutes: secondsParamToMinutes(searchParams.get('durationMax')),
+    sizeMinMB: bytesParamToMB(searchParams.get('sizeMin')),
+    sizeMaxMB: bytesParamToMB(searchParams.get('sizeMax')),
+    dateFrom: unixParamToDatetimeLocal(searchParams.get('from')),
+    dateTo: unixParamToDatetimeLocal(searchParams.get('to')),
+  };
+}
+
+function hasSearchStateParams(searchParams: URLSearchParams) {
+  return [
+    'q',
+    'nfo',
+    'nfoActor',
+    'nfoId',
+    'nfoTag',
+    'nfoTitle',
+    'nfoYear',
+    'type',
+    'sort',
+    'orientation',
+    'group',
+    'widthMin',
+    'widthMax',
+    'heightMin',
+    'heightMax',
+    'durationMin',
+    'durationMax',
+    'sizeMin',
+    'sizeMax',
+    'from',
+    'to',
+  ].some((key) => searchParams.has(key));
+}
+
+function parseAssetKindParam(value: string | null): AssetKind {
+  return value === 'image' || value === 'video' ? value : 'all';
+}
+
+function parseOrientationParam(value: string | null): OrientationFilter {
+  return value === 'landscape' || value === 'portrait' ? value : 'all';
+}
+
+function parseSortParam(value: string | null): SortKey {
+  if (
+    value === 'timeline_desc' ||
+    value === 'timeline_asc' ||
+    value === 'imported_desc' ||
+    value === 'imported_asc' ||
+    value === 'filename' ||
+    value === 'filename_asc' ||
+    value === 'filename_desc' ||
+    value === 'size' ||
+    value === 'size_desc' ||
+    value === 'size_asc'
+  ) {
+    return value;
+  }
+  return 'timeline_desc';
+}
+
+function rangeInputFromParams(minValue: string | null, maxValue: string | null) {
+  const min = positiveNumber(minValue ?? '');
+  const max = positiveNumber(maxValue ?? '');
+  if (min === undefined && max === undefined) return '';
+  if (min !== undefined && max !== undefined && min === max) return String(min);
+  return `${min ?? ''}-${max ?? ''}`;
+}
+
+function secondsParamToMinutes(value: string | null) {
+  const seconds = positiveNumber(value ?? '');
+  if (seconds === undefined) return '';
+  return formatMinuteValue(seconds / 60);
+}
+
+function bytesParamToMB(value: string | null) {
+  const bytes = positiveNumber(value ?? '');
+  if (bytes === undefined) return '';
+  return formatMinuteValue(bytes / (1024 * 1024));
+}
+
+function unixParamToDatetimeLocal(value: string | null) {
+  const seconds = positiveNumber(value ?? '');
+  if (seconds === undefined) return '';
+  const date = new Date(seconds * 1000);
+  if (!Number.isFinite(date.getTime())) return '';
+  const pad = (part: number) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function buildViewerUrl(asset: Asset, params: SearchAssetsParams, state: SearchPageState, returnPath: string) {
   const query = new URLSearchParams(searchQueryEntries(params));
   query.set('context', 'search');
-  return appendViewerReturnParams(`/viewer/${asset.id}?${query.toString()}`, '/search', state);
+  return appendViewerReturnParams(`/viewer/${asset.id}?${query.toString()}`, returnPath, state);
 }
 
 function searchQueryEntries(params: SearchAssetsParams) {

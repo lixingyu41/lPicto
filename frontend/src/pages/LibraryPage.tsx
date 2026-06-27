@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Image as ImageIcon, Images, Video } from 'lucide-react';
 import AssetGrid from '../components/AssetGrid';
+import AssetGroupingControls, { normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
@@ -10,13 +11,15 @@ import SortControls, { isSortKey } from '../components/SortControls';
 import { api } from '../api/client';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
+import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
 import type { Asset, AssetDeletedEvent, AssetKind, LibraryAnchor, SortKey } from '../types/api';
 import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
-import { serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
+import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import {
   appendViewerReturnParams,
   decodeReturnState,
+  loadPageState,
   resetGridState,
   savePageState,
   saveViewerReturnPath,
@@ -24,9 +27,12 @@ import {
 } from '../utils/pageState';
 import { assetMatchesLibrary } from '../utils/assetFilters';
 import { mergeSortedAssets, removeAssetById } from '../utils/assetSort';
+import { currentURLHasParam, currentURLLocation, currentURLPath, replaceURLState } from '../utils/urlState';
 
 const pageSize = 100;
 const libraryStateKey = 'library';
+const libraryURLKeys = ['type', 'sort', 'group', 'q'];
+type LibraryControlState = Pick<LibraryPageState, 'groupMode' | 'query' | 'sort' | 'type'>;
 
 interface LibraryPageState extends GridReturnState {
   groupMode: AssetGroupMode;
@@ -48,13 +54,15 @@ export default function LibraryPage() {
   const [searchParams] = useSearchParams();
   const location = useLocation();
   const navigate = useNavigate();
+  const persistedState = loadPageState<LibraryPageState>(libraryStateKey, defaultLibraryState);
   const decodedInitialState = decodeReturnState<LibraryPageState>(
     searchParams.get('restore'),
-    defaultLibraryState,
+    persistedState,
   );
   const initialStateRef = useRef(
-    searchParams.has('restore') ? decodedInitialState : libraryStateFromSearchParams(searchParams, defaultLibraryState),
+    searchParams.has('restore') ? decodedInitialState : libraryStateFromSearchParams(searchParams, persistedState),
   );
+  const pendingControlStateRef = useRef<Partial<LibraryControlState> | null>(null);
   const [type, setType] = useState<AssetKind>(initialStateRef.current.type);
   const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
   const [query, setQuery] = useState(initialStateRef.current.query);
@@ -65,16 +73,18 @@ export default function LibraryPage() {
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const sidebarState = useSidebarReturnState();
   const restoreSidebarState = useRestoreSidebarState();
+  const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const loadAssets = useCallback(
     (page: number) => api.libraryAssets(page, pageSize, type, sort, query, serverGroup),
     [query, serverGroup, sort, type],
   );
-  const { items, hasMore, loading, error, loadMore, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [type, sort, query, serverGroup]);
+  const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [type, sort, query, serverGroup]);
   const {
     focusAssetId,
     getGridState,
     handleGridScrollState,
     loadedStartIndex,
+    loadPreviousPage,
     scrollRatio,
     scrollResetSignal,
     scrollTarget,
@@ -83,11 +93,13 @@ export default function LibraryPage() {
     setScrollRatio,
   } = useWaterfallGridState({
     hasMore,
+    hasPrevious,
     initialState: initialStateRef.current,
     itemsLength: items.length,
     jumpToPage,
     loading,
     loadMore,
+    loadPrevious,
     pageSize,
     resetKey: JSON.stringify([type, sort, query, groupMode]),
     searchParams,
@@ -110,7 +122,7 @@ export default function LibraryPage() {
     if (eventsConnected) return undefined;
     const timer = window.setInterval(() => {
       void api.libraryAssets(1, pageSize, type, sort, query, serverGroup).then((result) => mergeReadyAssets(result.items)).catch(() => undefined);
-    }, 8000);
+    }, 30000);
     return () => window.clearInterval(timer);
   }, [eventsConnected, mergeReadyAssets, query, serverGroup, sort, type]);
 
@@ -128,8 +140,80 @@ export default function LibraryPage() {
   );
 
   const saveCurrentState = useCallback(() => {
-    savePageState<LibraryPageState>(libraryStateKey, currentPageState());
+    savePageState<LibraryPageState>(libraryStateKey, { ...currentPageState(), ...(pendingControlStateRef.current ?? {}) });
   }, [currentPageState]);
+  const saveControlState = useCallback(
+    (patch: Partial<LibraryControlState>) => {
+      const controls: LibraryControlState = {
+        groupMode,
+        query,
+        sort,
+        type,
+        ...(pendingControlStateRef.current ?? {}),
+        ...patch,
+      };
+      pendingControlStateRef.current = controls;
+      const current = currentPageState();
+      const reset = resetGridState();
+      savePageState<LibraryPageState>(libraryStateKey, {
+        ...current,
+        ...reset,
+        groupMode: controls.groupMode,
+        query: controls.query,
+        sidebarCollapsed: current.sidebarCollapsed,
+        sidebarExpanded: current.sidebarExpanded,
+        sort: controls.sort,
+        type: controls.type,
+      });
+    },
+    [currentPageState, groupMode, query, sort, type],
+  );
+  const handleTypeChange = useCallback(
+    (nextType: AssetKind) => {
+      setType(nextType);
+      saveControlState({ type: nextType });
+    },
+    [saveControlState],
+  );
+  const handleSortChange = useCallback(
+    (nextSort: SortKey) => {
+      const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, nextSort);
+      setSort(nextSort);
+      if (nextGroupMode !== groupMode) {
+        setGroupMode(nextGroupMode);
+      }
+      saveControlState({ groupMode: nextGroupMode, sort: nextSort });
+    },
+    [groupMode, saveControlState],
+  );
+  const handleQueryChange = useCallback(
+    (nextQuery: string) => {
+      setQuery(nextQuery);
+      saveControlState({ query: nextQuery });
+    },
+    [saveControlState],
+  );
+  const handleGroupModeChange = useCallback(
+    (nextGroupMode: AssetGroupMode) => {
+      setGroupMode(nextGroupMode);
+      saveControlState({ groupMode: nextGroupMode });
+    },
+    [saveControlState],
+  );
+  const scheduleCurrentStateSave = usePersistentPageState(saveCurrentState);
+
+  useEffect(() => {
+    if (currentURLHasParam(location, 'restore')) return;
+    replaceURLState(navigate, location, { group: groupMode, q: query, sort, type }, libraryURLKeys);
+  }, [groupMode, location, navigate, query, searchParams, sort, type]);
+
+  const handlePersistentGridScrollState = useCallback(
+    (state: { ratio: number; scrollTop: number }) => {
+      handleGridScrollState(state);
+      scheduleCurrentStateSave();
+    },
+    [handleGridScrollState, scheduleCurrentStateSave],
+  );
 
   useEffect(() => {
     let live = true;
@@ -154,20 +238,20 @@ export default function LibraryPage() {
   }, [query, sort, type]);
 
   useEffect(() => {
-    const options = groupOptionsForSort(sort).map((option) => option.value);
-    if (!options.includes(groupMode)) {
-      setGroupMode('none');
+    const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);
+    if (nextGroupMode !== groupMode) {
+      setGroupMode(nextGroupMode);
     }
   }, [groupMode, sort]);
 
   const handleOpenAsset = useCallback(() => {
     saveCurrentState();
-    saveViewerReturnPath('/library');
-  }, [saveCurrentState]);
+    saveViewerReturnPath(currentPageReturnPath());
+  }, [currentPageReturnPath, saveCurrentState]);
 
   const handleOpenViewer = useCallback(
     (asset: Asset, viewerUrl: string) => {
-      navigate(viewerUrl, { state: { backgroundLocation: location, initialAsset: asset } });
+      navigate(viewerUrl, { state: { backgroundLocation: currentURLLocation(location), initialAsset: asset } });
     },
     [location, navigate],
   );
@@ -177,33 +261,20 @@ export default function LibraryPage() {
     <div className="sidebar-control-stack">
       <div className="sidebar-list">
         {(['all', 'image', 'video'] as AssetKind[]).map((value) => (
-          <button className={type === value ? 'sidebar-list-row active' : 'sidebar-list-row'} key={value} type="button" onClick={() => setType(value)}>
+          <button className={type === value ? 'sidebar-list-row active' : 'sidebar-list-row'} key={value} type="button" onClick={() => handleTypeChange(value)}>
             {value === 'all' ? <Images size={14} /> : value === 'image' ? <ImageIcon size={14} /> : <Video size={14} />}
             <span>{assetKindLabel(value)}</span>
           </button>
         ))}
       </div>
-      <SortControls sort={sort} onChange={setSort} />
+      <SortControls sort={sort} onChange={handleSortChange} />
       <label className="sidebar-field">
         <span>搜索</span>
-        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="文件名" />
+        <input value={query} onChange={(event) => handleQueryChange(event.target.value)} placeholder="文件名" />
       </label>
-      <div className="sidebar-control-title">分组</div>
-      <div className="sidebar-list">
-        {groupOptionsForSort(sort).map((option) => (
-          <button
-            className={groupMode === option.value ? 'sidebar-list-row active' : 'sidebar-list-row'}
-            key={option.value}
-            type="button"
-            onClick={() => setGroupMode(option.value)}
-          >
-            <span className="sidebar-list-marker" aria-hidden="true" />
-            <span>{option.label}</span>
-          </button>
-        ))}
-      </div>
+      <AssetGroupingControls groupMode={groupMode} sort={sort} onChange={handleGroupModeChange} />
     </div>,
-    [type, sort, query, groupMode],
+    [groupMode, handleGroupModeChange, handleQueryChange, handleSortChange, handleTypeChange, query, sort, type],
   );
 
   useSidebarPanel(
@@ -227,12 +298,14 @@ export default function LibraryPage() {
             assets={items}
             loading={loading}
             hasMore={hasMore}
+            hasPrevious={hasPrevious}
             onLoadMore={loadMore}
+            onLoadPrevious={loadPreviousPage}
             onOpenAsset={handleOpenAsset}
             onOpenViewer={handleOpenViewer}
             onAssetMissing={(asset) => mutateItems((current) => removeAssetById(current, asset.id))}
             onScrollRatioChange={setScrollRatio}
-            onScrollStateChange={handleGridScrollState}
+            onScrollStateChange={handlePersistentGridScrollState}
             totalCount={totalCount}
             loadedStartIndex={loadedStartIndex}
             focusAssetId={focusAssetId}
@@ -245,7 +318,7 @@ export default function LibraryPage() {
             buildViewerUrl={(asset) =>
               appendViewerReturnParams(
                 `/viewer/${asset.id}?context=library&type=${type}&sort=${sort}&q=${encodeURIComponent(query)}${serverGroup ? `&group=${serverGroup}` : ''}`,
-                '/library',
+                currentPageReturnPath(),
                 currentPageState(),
               )
             }
@@ -276,40 +349,15 @@ function assetKindLabel(value: AssetKind) {
   }
 }
 
-function groupOptionsForSort(sort: SortKey): Array<{ value: AssetGroupMode; label: string }> {
-  if (sort === 'filename' || sort === 'filename_asc' || sort === 'filename_desc') {
-    return [
-      { value: 'none', label: '不分' },
-      { value: 'folder', label: '文件夹' },
-      { value: 'letter', label: '首字母' },
-    ];
-  }
-  if (sort === 'size' || sort === 'size_asc' || sort === 'size_desc') {
-    return [
-      { value: 'none', label: '不分' },
-      { value: 'folder', label: '文件夹' },
-      { value: 'size', label: '大小' },
-    ];
-  }
-  return [
-    { value: 'none', label: '不分' },
-    { value: 'folder', label: '文件夹' },
-    { value: 'day', label: '日' },
-    { value: 'month', label: '月' },
-    { value: 'year', label: '年' },
-  ];
-}
-
 function libraryStateFromSearchParams(params: URLSearchParams, fallback: LibraryPageState): LibraryPageState {
   const type = params.get('type');
   const sort = params.get('sort');
-  const group = params.get('group');
   const q = params.get('q');
   const hasLibraryParams = params.has('type') || params.has('sort') || params.has('q') || params.has('group');
   const base = hasLibraryParams ? { ...fallback, ...resetGridState() } : fallback;
   return {
     ...base,
-    groupMode: group === 'folder' ? 'folder' : base.groupMode,
+    groupMode: parseAssetGroupMode(params.get('group'), base.groupMode),
     query: q ?? (hasLibraryParams ? '' : base.query),
     sort: isSortKey(sort) ? sort : base.sort,
     type: assetKinds.includes(type as AssetKind) ? (type as AssetKind) : base.type,

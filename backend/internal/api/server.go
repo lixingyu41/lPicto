@@ -61,6 +61,10 @@ type Server struct {
 	libraryCountsAt         time.Time
 	libraryCountsRefreshing bool
 
+	videoProxyMu     sync.Mutex
+	videoProxyStates map[string]*videoProxyRuntime
+	videoProxySlots  chan struct{}
+
 	staticDir string
 }
 
@@ -79,7 +83,17 @@ type ScanController interface {
 }
 
 func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan ScanController, queue *jobs.Manager, bus *events.Bus, logger *slog.Logger) http.Handler {
-	s := &Server{cfg: cfg, db: database, store: store, scanner: scan, jobs: queue, events: bus, logger: logger, staticDir: findStaticDir(cfg.StaticDir)}
+	liveVideoProxyMaxActive := cfg.LiveVideoProxyMaxActive
+	if liveVideoProxyMaxActive < 1 {
+		liveVideoProxyMaxActive = 1
+	}
+	s := &Server{
+		cfg: cfg, db: database, store: store, scanner: scan, jobs: queue, events: bus, logger: logger,
+		videoProxyStates: map[string]*videoProxyRuntime{},
+		videoProxySlots:  make(chan struct{}, liveVideoProxyMaxActive),
+		staticDir:        findStaticDir(cfg.StaticDir),
+	}
+	s.startVideoProxySweeper()
 	r := chi.NewRouter()
 	r.Use(foregroundActivity)
 	r.Get("/api/health", s.health)
@@ -129,6 +143,8 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Get("/api/folders/{id}/assets", s.folderAssets)
 	r.Get("/api/folders/{id}/anchors", s.folderAnchors)
 	r.Get("/api/assets/{id}", s.asset)
+	r.Get("/api/assets/{id}/delete-plan", s.assetDeletePlan)
+	r.Post("/api/assets/{id}/delete", s.deleteAsset)
 	r.Get("/api/assets/{id}/preferences", s.assetPreferences)
 	r.Put("/api/assets/{id}/preferences", s.updateAssetPreferences)
 	r.Get("/api/assets/{id}/sidecars", s.assetSidecars)
@@ -138,8 +154,12 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Get("/api/assets/{id}/thumb", s.thumb)
 	r.Get("/api/assets/{id}/preview", s.preview)
 	r.Get("/api/assets/{id}/original", s.original)
+	r.Head("/api/assets/{id}/original", s.original)
 	r.Get("/api/assets/{id}/video", s.video)
+	r.Head("/api/assets/{id}/video", s.video)
 	r.Get("/api/assets/{id}/video-poster", s.videoPoster)
+	r.Get("/api/assets/{id}/video-proxy/status", s.videoProxyStatus)
+	r.Post("/api/assets/{id}/video-proxy/keepalive", s.videoProxyKeepalive)
 	r.Get("/api/assets/{id}/video-proxy", s.videoProxy)
 	r.Get("/api/cache/thumbs/{name}", s.cacheThumb)
 	r.NotFound(s.static)
@@ -159,12 +179,19 @@ func foregroundActivity(next http.Handler) http.Handler {
 }
 
 func isForegroundRequest(path string) bool {
+	if isStreamingAssetRequest(path) {
+		return false
+	}
 	return strings.HasPrefix(path, "/api/library/") ||
 		strings.HasPrefix(path, "/api/albums") ||
 		strings.HasPrefix(path, "/api/search/") ||
 		strings.HasPrefix(path, "/api/folders") ||
 		strings.HasPrefix(path, "/api/assets/") ||
 		strings.HasPrefix(path, "/api/cache/")
+}
+
+func isStreamingAssetRequest(path string) bool {
+	return strings.HasSuffix(path, "/video") || strings.HasSuffix(path, "/video-proxy")
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -182,12 +209,13 @@ func scanCommandResponse(result scanner.CommandResult) map[string]any {
 
 func (s *Server) publicConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"pageSizeDefault":     s.cfg.PageSizeDefault,
-		"pageSizeMax":         s.cfg.PageSizeMax,
-		"thumbLongEdge":       s.cfg.ThumbLongEdge,
-		"previewLongEdge":     s.cfg.PreviewLongEdge,
-		"videoProxyEnabled":   s.cfg.VideoProxyEnabled,
-		"videoProxyMaxHeight": s.cfg.VideoProxyMaxHeight,
+		"pageSizeDefault":         s.cfg.PageSizeDefault,
+		"pageSizeMax":             s.cfg.PageSizeMax,
+		"thumbLongEdge":           s.cfg.ThumbLongEdge,
+		"previewLongEdge":         s.cfg.PreviewLongEdge,
+		"videoProxyEnabled":       s.cfg.VideoProxyEnabled,
+		"liveVideoProxyMaxActive": s.cfg.LiveVideoProxyMaxActive,
+		"videoProxyMaxHeight":     s.cfg.VideoProxyMaxHeight,
 	})
 }
 
@@ -383,13 +411,13 @@ func (s *Server) libraryAnchors(w http.ResponseWriter, r *http.Request) {
 		typeFilter = ""
 	}
 	opts := db.AssetListOptions{
-		PageSize:    pageSize,
-		Type:        typeFilter,
-		Sort:        safeSort(r.URL.Query().Get("sort")),
-		Group:       safeGroup(r.URL.Query().Get("group")),
-		Query:       strings.TrimSpace(r.URL.Query().Get("q")),
-		VisibleOnly: visibleOnly(r),
-		Rating:      ratingQueryPtr(r, "rating"),
+		PageSize:        pageSize,
+		Type:            typeFilter,
+		Sort:            safeSort(r.URL.Query().Get("sort")),
+		Group:           safeGroup(r.URL.Query().Get("group")),
+		Query:           strings.TrimSpace(r.URL.Query().Get("q")),
+		VisibleOnly:     visibleOnly(r),
+		Rating:          ratingQueryPtr(r, "rating"),
 		AlbumUnassigned: albumUnassignedQuery(r),
 	}
 	var anchorResult db.LibraryAnchorResult
@@ -595,8 +623,8 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		MatchAnyAxis: dimensionMode(r) == "both",
 		MinDuration:  float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
 		MinSize: int64QueryPtr(r, "sizeMin"), MaxSize: int64QueryPtr(r, "sizeMax"),
-		Orientation: searchOrientation(r),
-		Rating:      ratingQueryPtr(r, "rating"),
+		Orientation:     searchOrientation(r),
+		Rating:          ratingQueryPtr(r, "rating"),
 		AlbumUnassigned: albumUnassignedQuery(r),
 	}
 	var result db.Neighbors
@@ -742,10 +770,6 @@ func (s *Server) videoPoster(w http.ResponseWriter, r *http.Request) {
 	s.serveCache(w, r, "thumbs", "webp", "image/webp", "thumb")
 }
 
-func (s *Server) videoProxy(w http.ResponseWriter, r *http.Request) {
-	s.serveCache(w, r, "video-proxies", "mp4", "video/mp4", "video_proxy")
-}
-
 func (s *Server) original(w http.ResponseWriter, r *http.Request) {
 	asset, ok := s.assetByParam(w, r)
 	if !ok {
@@ -763,7 +787,7 @@ func (s *Server) video(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "not_video", "资源不是视频")
 		return
 	}
-	s.serveOriginalAsset(w, r, asset)
+	s.serveVideoAsset(w, r, asset)
 }
 
 func (s *Server) serveCache(w http.ResponseWriter, r *http.Request, kind string, ext string, contentType string, taskType string) {
@@ -807,6 +831,14 @@ func (s *Server) serveCacheAsset(w http.ResponseWriter, r *http.Request, asset m
 }
 
 func (s *Server) serveOriginalAsset(w http.ResponseWriter, r *http.Request, asset model.Asset) {
+	s.serveOriginalAssetFile(w, r, asset, false)
+}
+
+func (s *Server) serveVideoAsset(w http.ResponseWriter, r *http.Request, asset model.Asset) {
+	s.serveOriginalAssetFile(w, r, asset, false)
+}
+
+func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, asset model.Asset, _ bool) {
 	path, err := s.store.PhotoPath(asset.RelPath)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
@@ -912,8 +944,8 @@ func (s *Server) searchAssetOptions(r *http.Request, page int, pageSize int) db.
 		MatchAnyAxis: dimensionMode(r) == "both",
 		MinDuration:  float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
 		MinSize: int64QueryPtr(r, "sizeMin"), MaxSize: int64QueryPtr(r, "sizeMax"),
-		Orientation: searchOrientation(r),
-		Rating:      ratingQueryPtr(r, "rating"),
+		Orientation:     searchOrientation(r),
+		Rating:          ratingQueryPtr(r, "rating"),
 		AlbumUnassigned: albumUnassignedQuery(r),
 	}
 }

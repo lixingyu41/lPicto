@@ -1,6 +1,8 @@
 package api
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"lpicto/backend/internal/db"
@@ -93,5 +95,49 @@ func TestScanLibraryProgressUsesRootStatsDuringMultiRootScan(t *testing.T) {
 	}, status)
 	if !vid.Active || vid.ScannedFiles != 14421 || vid.DiscoveredFiles != 14421 || vid.UnscannedFiles != 0 {
 		t.Fatalf("vid progress = %#v, want existing database count preserved before root is reached", vid)
+	}
+}
+
+func TestScanLibraryProgressIncludesVideoProxyCounts(t *testing.T) {
+	progress := scanLibraryProgressDTO(
+		db.ScanLibrary{ID: "vid", Name: "VID", Roots: []string{"nas/VID"}},
+		scanLibraryProgressStats{
+			DiscoveredFiles: 3,
+			Progress: db.ProcessingProgress{
+				AssetTotal: 3,
+				VideoProxy: db.WorkStatusCounts{
+					Total:       3,
+					Ready:       2,
+					Pending:     1,
+					NotRequired: 4,
+				},
+			},
+		},
+		scanner.Status{},
+	)
+	if progress.VideoProxy.Ready != 2 || progress.VideoProxy.Total != 3 || progress.VideoProxy.NotRequired != 4 {
+		t.Fatalf("video proxy progress = %#v", progress.VideoProxy)
+	}
+}
+
+func TestComputeCacheStatsIncludesCacheFilesAndDatabaseSize(t *testing.T) {
+	root := t.TempDir()
+	writeSizedFile(t, filepath.Join(root, "thumbs", "a.webp"), 3)
+	writeSizedFile(t, filepath.Join(root, "video-proxies", "b.mp4"), 5)
+
+	stats := computeCacheStatsWithDatabase(root, 11)
+	if stats.CacheBytes != 8 || stats.DatabaseBytes != 11 || stats.SizeBytes != 19 || stats.FileCount != 2 {
+		t.Fatalf("cache stats = %#v", stats)
+	}
+}
+
+func writeSizedFile(t *testing.T, path string, size int) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, size)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

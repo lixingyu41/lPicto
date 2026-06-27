@@ -98,10 +98,13 @@ export function useSidebarPanel(target: SidebarPanelTarget, content: ReactNode, 
   const { setPanel } = context;
   useEffect(() => {
     setPanel(target, content);
-    return () => {
-      setPanel(target, null);
-    };
   }, [setPanel, target, ...deps]);
+  useEffect(
+    () => () => {
+      setPanel(target, null);
+    },
+    [setPanel, target],
+  );
 }
 
 function isSidebarPanelTarget(value: unknown): value is SidebarPanelTarget {

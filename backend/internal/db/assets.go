@@ -57,67 +57,67 @@ type AssetSignature struct {
 }
 
 type AssetListOptions struct {
-	Page         int
-	PageSize     int
-	Type         string
-	Sort         string
-	Group        string
-	Query        string
-	FolderID     *int64
-	From         *int64
-	To           *int64
-	FolderRel    *string
-	Recursive    bool
-	VisibleOnly  bool
-	NFOQuery     string
-	NFOActor     string
-	NFOID        string
-	NFOTag       string
-	NFOTitle     string
-	NFOYear      string
-	MinWidth     *int
-	MaxWidth     *int
-	MinHeight    *int
-	MaxHeight    *int
-	MatchAnyAxis bool
-	MinDuration  *float64
-	MaxDuration  *float64
-	MinSize      *int64
-	MaxSize      *int64
-	Orientation  string
-	Rating       *int
+	Page            int
+	PageSize        int
+	Type            string
+	Sort            string
+	Group           string
+	Query           string
+	FolderID        *int64
+	From            *int64
+	To              *int64
+	FolderRel       *string
+	Recursive       bool
+	VisibleOnly     bool
+	NFOQuery        string
+	NFOActor        string
+	NFOID           string
+	NFOTag          string
+	NFOTitle        string
+	NFOYear         string
+	MinWidth        *int
+	MaxWidth        *int
+	MinHeight       *int
+	MaxHeight       *int
+	MatchAnyAxis    bool
+	MinDuration     *float64
+	MaxDuration     *float64
+	MinSize         *int64
+	MaxSize         *int64
+	Orientation     string
+	Rating          *int
 	AlbumUnassigned bool
 }
 
 type NeighborOptions struct {
-	Context      string
-	AssetID      int64
-	Type         string
-	Sort         string
-	Group        string
-	Query        string
-	FolderID     *int64
-	From         *int64
-	To           *int64
-	Limit        int
-	Recursive    bool
-	NFOQuery     string
-	NFOActor     string
-	NFOID        string
-	NFOTag       string
-	NFOTitle     string
-	NFOYear      string
-	MinWidth     *int
-	MaxWidth     *int
-	MinHeight    *int
-	MaxHeight    *int
-	MatchAnyAxis bool
-	MinDuration  *float64
-	MaxDuration  *float64
-	MinSize      *int64
-	MaxSize      *int64
-	Orientation  string
-	Rating       *int
+	Context         string
+	AssetID         int64
+	Type            string
+	Sort            string
+	Group           string
+	Query           string
+	FolderID        *int64
+	From            *int64
+	To              *int64
+	Limit           int
+	Recursive       bool
+	NFOQuery        string
+	NFOActor        string
+	NFOID           string
+	NFOTag          string
+	NFOTitle        string
+	NFOYear         string
+	MinWidth        *int
+	MaxWidth        *int
+	MinHeight       *int
+	MaxHeight       *int
+	MatchAnyAxis    bool
+	MinDuration     *float64
+	MaxDuration     *float64
+	MinSize         *int64
+	MaxSize         *int64
+	Orientation     string
+	Rating          *int
 	AlbumUnassigned bool
 }
 
@@ -995,6 +995,7 @@ SET video_proxy_status = ?, proxy_ready = false, error_text = NULL, updated_at =
 WHERE deleted = false
   AND deleted_at IS NULL
   AND media_type = ?
+  AND browser_playable = false
   AND video_proxy_status = ?
 RETURNING id`,
 		model.StatusPending, unixTime(now), mediaTypeCode(model.MediaTypeVideo), model.StatusNotRequired)
@@ -1015,13 +1016,13 @@ RETURNING id`,
 }
 
 func (d *DB) PendingWork(ctx context.Context, videoProxyEnabled bool) ([]WorkItem, error) {
+	_ = videoProxyEnabled
 	rows, err := d.conn.QueryContext(ctx, `
-SELECT id, media_type, thumb_status, preview_status, video_poster_status, video_proxy_status
+SELECT id, media_type, thumb_status, preview_status, video_poster_status, video_proxy_status, browser_playable
 FROM assets
 WHERE deleted_at IS NULL AND (
   thumb_status IN ('pending','processing','error') OR
-  preview_status IN ('pending','processing','error') OR
-  video_proxy_status IN ('pending','processing','error')
+  preview_status IN ('pending','processing','error')
 )`)
 	if err != nil {
 		return nil, err
@@ -1031,7 +1032,8 @@ WHERE deleted_at IS NULL AND (
 	for rows.Next() {
 		var id int64
 		var mediaType, thumbStatus, previewStatus, posterStatus, proxyStatus string
-		if err := rows.Scan(&id, &mediaType, &thumbStatus, &previewStatus, &posterStatus, &proxyStatus); err != nil {
+		var browserPlayable int
+		if err := rows.Scan(&id, &mediaType, &thumbStatus, &previewStatus, &posterStatus, &proxyStatus, &browserPlayable); err != nil {
 			return nil, err
 		}
 		_ = posterStatus
@@ -1041,11 +1043,8 @@ WHERE deleted_at IS NULL AND (
 		if mediaType == model.MediaTypeImage && recoverableWorkStatus(previewStatus) {
 			items = append(items, WorkItem{Type: "preview", AssetID: id})
 		}
-		if mediaType == model.MediaTypeVideo {
-			if videoProxyEnabled && recoverableWorkStatus(proxyStatus) {
-				items = append(items, WorkItem{Type: "video_proxy", AssetID: id})
-			}
-		}
+		_ = proxyStatus
+		_ = browserPlayable
 	}
 	return items, rows.Err()
 }
@@ -1311,7 +1310,7 @@ func nfoFieldFilterSQL(field string) (string, bool) {
 	case "id":
 		return "lower(COALESCE(nfo_group.group_value->>'title', '')) = 'id' OR lower(COALESCE(nfo_item.item_value->>'key', '')) = 'uniqueid' OR lower(COALESCE(nfo_item.item_value->>'key', '')) LIKE 'uniqueid:%'", true
 	case "tag":
-		return "lower(COALESCE(nfo_group.group_value->>'title', '')) = '标记' OR lower(COALESCE(nfo_item.item_value->>'key', '')) IN ('tag', 'genre')", true
+		return "lower(COALESCE(nfo_group.group_value->>'title', '')) IN ('标记', '类型') OR lower(COALESCE(nfo_item.item_value->>'key', '')) IN ('tag', 'genre')", true
 	case "title":
 		return "lower(COALESCE(nfo_item.item_value->>'key', '')) IN ('title', 'originaltitle', 'sorttitle')", true
 	case "year":
@@ -1769,7 +1768,7 @@ func AssetStatuses(mediaType string, browserPlayable bool, proxyEnabled bool) (t
 	}
 	if mediaType == model.MediaTypeVideo {
 		proxyStatus := model.StatusNotRequired
-		if proxyEnabled {
+		if proxyEnabled && !browserPlayable {
 			proxyStatus = model.StatusPending
 		}
 		return model.StatusPending, model.StatusNotRequired, model.StatusNotRequired, proxyStatus

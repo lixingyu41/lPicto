@@ -1639,9 +1639,7 @@ func (s *Scanner) enqueueWork(assetID int64, mediaType string, previewStatus str
 	if !rebuild && mediaType == model.MediaTypeImage && previewStatus == model.StatusPending {
 		s.Jobs.Enqueue(jobs.Task{Type: "preview", AssetID: assetID})
 	}
-	if !rebuild && mediaType == model.MediaTypeVideo && proxyStatus == model.StatusPending {
-		s.Jobs.Enqueue(jobs.Task{Type: "video_proxy", AssetID: assetID})
-	}
+	_ = proxyStatus
 }
 
 func (s *Scanner) enqueuePendingWork(asset model.Asset) {
@@ -1653,9 +1651,6 @@ func (s *Scanner) enqueuePendingWork(asset model.Asset) {
 	}
 	if asset.MediaType == model.MediaTypeImage && recoverableWorkStatus(asset.PreviewStatus) {
 		s.Jobs.Enqueue(jobs.Task{Type: "preview", AssetID: asset.ID})
-	}
-	if asset.MediaType == model.MediaTypeVideo && s.VideoProxyEnabled && recoverableWorkStatus(asset.VideoProxyStatus) {
-		s.Jobs.Enqueue(jobs.Task{Type: "video_proxy", AssetID: asset.ID})
 	}
 }
 

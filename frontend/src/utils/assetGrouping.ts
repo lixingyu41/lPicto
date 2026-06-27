@@ -2,6 +2,8 @@ import type { Asset, AssetServerGroup, SortKey } from '../types/api';
 
 export type AssetGroupMode = 'none' | 'day' | 'month' | 'year' | 'size' | 'letter' | 'folder';
 
+const assetGroupModes: AssetGroupMode[] = ['none', 'day', 'month', 'year', 'size', 'letter', 'folder'];
+
 export function assetGroupLabel(asset: Asset, mode: AssetGroupMode, sort: SortKey): string {
   const time = sort === 'imported_desc' || sort === 'imported_asc' ? asset.importedAt : asset.timelineAt;
   switch (mode) {
@@ -24,6 +26,10 @@ export function assetGroupLabel(asset: Asset, mode: AssetGroupMode, sort: SortKe
 
 export function serverGroupForMode(mode: AssetGroupMode): AssetServerGroup | undefined {
   return mode === 'folder' ? 'folder' : undefined;
+}
+
+export function parseAssetGroupMode(value: string | null, fallback: AssetGroupMode = 'none'): AssetGroupMode {
+  return assetGroupModes.includes(value as AssetGroupMode) ? (value as AssetGroupMode) : fallback;
 }
 
 export function folderGroupLabel(parentRelPath: string): string {

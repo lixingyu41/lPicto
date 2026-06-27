@@ -321,6 +321,7 @@ export default function SettingsPage() {
 
   const liveProgress = status?.progress;
   const totalMedia = progress?.thumb.ready ?? libraries.reduce((sum, library) => sum + library.progress.thumb.ready, 0);
+  const proxiedVideos = progress?.videoProxy?.ready ?? libraries.reduce((sum, library) => sum + (library.progress.videoProxy?.ready ?? 0), 0);
   const scanRunning = Boolean(status?.running || optimisticScanLibraryId);
   const statusLabel = cleanup?.running ? '清理中' : scanRunning ? scanTaskLabel(liveProgress) : '空闲';
 
@@ -373,6 +374,7 @@ export default function SettingsPage() {
                   <div className="metric-grid scan-summary-grid">
                     <Metric label="状态" value={statusLabel} />
                     <Metric label="已建缩略图" value={String(totalMedia)} />
+                    <Metric label="已代理视频" value={String(proxiedVideos)} />
                     <Metric label="缓存" value={cacheSizeLabel(progress)} />
                     <Metric label="图库个数" value={String(libraries.length)} />
                   </div>
@@ -639,6 +641,7 @@ const emptyLibraryProgress: ScanLibraryProgress = {
   scannedFiles: 0,
   thumb: emptyCounts,
   transcode: emptyCounts,
+  videoProxy: emptyCounts,
   unscannedFiles: 0,
 };
 
@@ -654,6 +657,7 @@ function LibraryProgress({ progress }: { progress: ScanLibraryProgress }) {
   const discovered = Math.max(progress.discoveredFiles, progress.scannedFiles + progress.unscannedFiles, progress.scannedFiles);
   const scanned = Math.min(progress.scannedFiles, discovered);
   const mediaReady = progress.thumb.ready;
+  const proxiedVideos = progress.videoProxy?.ready ?? 0;
   const thumbTotal = Math.max(progress.thumb.total, progress.scannedFiles, mediaReady);
   const scanPercent = discovered > 0 ? Math.min(100, Math.round((scanned / discovered) * 100)) : 0;
   const thumbPercent = thumbTotal > 0 ? Math.min(100, Math.round((mediaReady / thumbTotal) * 100)) : 0;
@@ -671,6 +675,10 @@ function LibraryProgress({ progress }: { progress: ScanLibraryProgress }) {
         <span>
           <em>已建缩略图</em>
           <strong>{mediaReady}</strong>
+        </span>
+        <span>
+          <em>已代理视频</em>
+          <strong>{proxiedVideos}</strong>
         </span>
       </div>
       <div className="library-progress-bars">

@@ -4,9 +4,10 @@ export type PrimarySidebarPanelTarget = 'library' | 'ratings' | 'search' | 'albu
 
 const sidebarSecondaryKey = 'lpicto.sidebarSecondaryExpanded';
 const sidebarWidthsKey = 'lpicto.sidebarWidths';
-const sidebarWidthDefaults = { primary: 292, secondary: 260 };
+const sidebarCollapsedKey = 'lpicto.sidebarCollapsed';
+export const sidebarPrimaryWidth = 122;
+const sidebarWidthDefaults = { primary: sidebarPrimaryWidth, secondary: 260 };
 const sidebarWidthLimits = {
-  primary: { max: 520, min: 180 },
   secondary: { max: 640, min: 180 },
 };
 
@@ -29,18 +30,45 @@ export function primaryTargetForPath(pathname: string): PrimarySidebarPanelTarge
   return null;
 }
 
-export function loadSidebarSecondaryExpanded(target: PrimarySidebarPanelTarget) {
-  const state = loadSidebarSecondaryState();
-  if (target === 'search' && state.search === undefined) {
-    return true;
+export function loadSidebarSecondaryExpanded() {
+  try {
+    const raw = window.localStorage.getItem(sidebarSecondaryKey);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === 'boolean') return parsed;
+    if (!parsed || typeof parsed !== 'object') return false;
+    return (
+      parsed.library === true ||
+      parsed.ratings === true ||
+      parsed.search === true ||
+      parsed.albums === true ||
+      parsed.folders === true ||
+      parsed.settings === true
+    );
+  } catch {
+    return false;
   }
-  return state[target] === true;
 }
 
-export function saveSidebarSecondaryExpanded(target: PrimarySidebarPanelTarget, expanded: boolean) {
-  const next = { ...loadSidebarSecondaryState(), [target]: expanded };
+export function saveSidebarSecondaryExpanded(expanded: boolean) {
   try {
-    window.localStorage.setItem(sidebarSecondaryKey, JSON.stringify(next));
+    window.localStorage.setItem(sidebarSecondaryKey, JSON.stringify(expanded));
+  } catch {
+    // Ignore storage failures; the current session state still works.
+  }
+}
+
+export function loadSidebarCollapsed() {
+  try {
+    return window.localStorage.getItem(sidebarCollapsedKey) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function saveSidebarCollapsed(collapsed: boolean) {
+  try {
+    window.localStorage.setItem(sidebarCollapsedKey, String(collapsed));
   } catch {
     // Ignore storage failures; the current session state still works.
   }
@@ -63,8 +91,8 @@ export function loadSidebarWidths(): SidebarWidths {
 
 export function normalizeSidebarWidths(widths: Partial<SidebarWidths>): SidebarWidths {
   return {
-    primary: clampSidebarWidth('primary', widths.primary ?? sidebarWidthDefaults.primary),
-    secondary: clampSidebarWidth('secondary', widths.secondary ?? sidebarWidthDefaults.secondary),
+    primary: normalizePrimarySidebarWidth(widths.primary ?? sidebarWidthDefaults.primary),
+    secondary: clampSecondarySidebarWidth(widths.secondary ?? sidebarWidthDefaults.secondary),
   };
 }
 
@@ -76,27 +104,12 @@ export function saveSidebarWidths(widths: SidebarWidths) {
   }
 }
 
-function clampSidebarWidth(kind: keyof SidebarWidths, value: number) {
-  const limits = sidebarWidthLimits[kind];
-  if (!Number.isFinite(value)) return sidebarWidthDefaults[kind];
-  return Math.min(limits.max, Math.max(limits.min, Math.round(value)));
+function normalizePrimarySidebarWidth(value: number) {
+  return Number.isFinite(value) ? sidebarPrimaryWidth : sidebarWidthDefaults.primary;
 }
 
-function loadSidebarSecondaryState(): Partial<Record<PrimarySidebarPanelTarget, boolean>> {
-  try {
-    const raw = window.localStorage.getItem(sidebarSecondaryKey);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return {};
-    return {
-      library: parsed.library === true,
-      ratings: parsed.ratings === true,
-      search: parsed.search === true,
-      albums: parsed.albums === true,
-      folders: parsed.folders === true,
-      settings: parsed.settings === true,
-    };
-  } catch {
-    return {};
-  }
+function clampSecondarySidebarWidth(value: number) {
+  const limits = sidebarWidthLimits.secondary;
+  if (!Number.isFinite(value)) return sidebarWidthDefaults.secondary;
+  return Math.min(limits.max, Math.max(limits.min, Math.round(value)));
 }

@@ -228,12 +228,20 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
           }}
         />
       )}
-      <div className="image-control-zone" onMouseDown={(event) => event.stopPropagation()}>
+      <div className="image-control-zone" onClick={(event) => event.stopPropagation()} onMouseDown={(event) => event.stopPropagation()}>
         <div className="image-controls">
           <button type="button" title={`旋转 ${asset.rotation || 0}°`} onClick={onRotate}>
             <RotateCw size={18} />
           </button>
-          <button type="button" title={fullscreen ? '退出全屏' : '全屏'} onClick={onToggleFullscreen}>
+          <button
+            type="button"
+            title={fullscreen ? '退出全屏' : '全屏'}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onToggleFullscreen();
+            }}
+          >
             {fullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
           </button>
         </div>

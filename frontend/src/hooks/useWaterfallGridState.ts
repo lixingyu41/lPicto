@@ -10,11 +10,13 @@ import {
 
 interface UseWaterfallGridStateOptions {
   hasMore: boolean;
+  hasPrevious: boolean;
   initialState: GridReturnState;
   itemsLength: number;
   jumpToPage: (page: number) => Promise<void>;
   loading: boolean;
   loadMore: () => Promise<void>;
+  loadPrevious: (beforePrepend?: (result: { page: number; items: unknown[] }) => void) => Promise<{ page: number; items: unknown[] } | null>;
   pageSize: number;
   resetKey: string;
   restoreReady?: boolean;
@@ -23,11 +25,13 @@ interface UseWaterfallGridStateOptions {
 
 export function useWaterfallGridState({
   hasMore,
+  hasPrevious,
   initialState,
   itemsLength,
   jumpToPage,
   loading,
   loadMore,
+  loadPrevious,
   pageSize,
   resetKey,
   restoreReady = true,
@@ -57,6 +61,7 @@ export function useWaterfallGridState({
   });
   const indexPageRef = useRef(1);
   const seekSignalRef = useRef(0);
+  const previousLoadRef = useRef(false);
 
   useEffect(() => {
     if (!searchParams.has('restore')) return;
@@ -152,11 +157,27 @@ export function useWaterfallGridState({
     [jumpToPage, pageSize],
   );
 
+  const loadPreviousPage = useCallback(async () => {
+    if (!hasPrevious || loading || previousLoadRef.current) return;
+    previousLoadRef.current = true;
+    try {
+      await loadPrevious((result) => {
+        if (result.items.length === 0) return;
+        const nextStartIndex = Math.max(0, (Math.max(1, result.page) - 1) * pageSize);
+        indexPageRef.current = Math.max(1, result.page);
+        setLoadedStartIndex(nextStartIndex);
+      });
+    } finally {
+      previousLoadRef.current = false;
+    }
+  }, [hasPrevious, loadPrevious, loading, pageSize]);
+
   return {
     focusAssetId,
     getGridState,
     handleGridScrollState,
     loadedStartIndex,
+    loadPreviousPage,
     scrollRatio,
     scrollResetSignal,
     scrollTarget,

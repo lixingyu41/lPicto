@@ -29,3 +29,21 @@ func TestProxyArgsUseFastSeekKeyframes(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamProxyArgsUseFragmentedMP4(t *testing.T) {
+	got := StreamProxyArgs("in.mkv", 1080, 23, "none", "", 0)
+	for _, want := range []string{"-progress", "pipe:2", "-re", "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("stream args = %#v, missing %q", got, want)
+		}
+	}
+}
+
+func TestStreamProxyArgsUseStartOffset(t *testing.T) {
+	got := StreamProxyArgs("in.mkv", 1080, 23, "none", "", 12.345)
+	for _, want := range []string{"-ss", "12.345", "-re", "-i", "in.mkv"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("stream args = %#v, missing %q", got, want)
+		}
+	}
+}

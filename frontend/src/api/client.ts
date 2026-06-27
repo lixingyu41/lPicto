@@ -4,6 +4,8 @@ import type {
   AlbumSourceInput,
   AlbumsResponse,
   Asset,
+  AssetDeletePlan,
+  AssetDeleteResult,
   AlbumAssetFilter,
   AssetRating,
   AssetServerGroup,
@@ -28,6 +30,8 @@ import type {
   ScanStatus,
   SortKey,
   SourceFoldersResponse,
+  VideoProxyHeartbeat,
+  VideoProxyRuntime,
 } from '../types/api';
 
 interface APIErrorBody {
@@ -38,6 +42,11 @@ interface APIErrorBody {
 }
 
 const requestTimeoutMs = 30_000;
+
+export interface VideoProxySessionContext {
+  clientId?: string;
+  sessionId?: string;
+}
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
@@ -78,6 +87,41 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   } finally {
     window.clearTimeout(timeoutID);
     upstreamSignal?.removeEventListener('abort', abortFromUpstream);
+  }
+}
+
+async function requestDeleteAsset(url: string, token: string): Promise<AssetDeleteResult> {
+  const controller = new AbortController();
+  const timeoutID = window.setTimeout(() => controller.abort(), 120_000);
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+      signal: controller.signal,
+    });
+    if (response.status === 409) {
+      const body = (await response.json()) as { stale: boolean; plan: AssetDeletePlan };
+      return { deleted: false, deletedAssetIds: [], failures: [], stale: true, plan: body.plan };
+    }
+    if (!response.ok) {
+      let message = '删除失败';
+      try {
+        const body = (await response.json()) as APIErrorBody;
+        message = body.error?.message ?? message;
+      } catch {
+        message = response.statusText || message;
+      }
+      throw new Error(message);
+    }
+    return (await response.json()) as AssetDeleteResult;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error('删除超时');
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timeoutID);
   }
 }
 
@@ -207,6 +251,8 @@ export const api = {
   folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating) =>
     request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating })}`),
   asset: (id: number) => request<Asset>(`/api/assets/${id}`),
+  assetDeletePlan: (id: number) => request<AssetDeletePlan>(`/api/assets/${id}/delete-plan`),
+  deleteAsset: (id: number, token: string) => requestDeleteAsset(`/api/assets/${id}/delete`, token),
   assetPreferences: (id: number) => request<AssetPreference>(`/api/assets/${id}/preferences`),
   assetSidecars: (id: number) => request<AssetSidecars>(`/api/assets/${id}/sidecars`),
   updateAssetPreferences: (id: number, rotation: number) =>
@@ -220,6 +266,14 @@ export const api = {
       method: 'PUT',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ rating }),
+    }),
+  videoProxyStatus: (id: number, startSeconds = 0, session?: VideoProxySessionContext) =>
+    request<VideoProxyRuntime>(`/api/assets/${id}/video-proxy/status${videoProxyQuery(startSeconds, session)}`),
+  keepVideoProxyAlive: (id: number, startSeconds = 0, heartbeat?: VideoProxyHeartbeat) =>
+    request<VideoProxyRuntime>(`/api/assets/${id}/video-proxy/keepalive${videoProxyQuery(startSeconds, heartbeat)}`, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: heartbeat ? JSON.stringify(heartbeat) : undefined,
     }),
   neighbors: (id: number, params: Record<string, string | number | undefined | null>, signal?: AbortSignal) =>
     request<Neighbors>(`/api/assets/${id}/neighbors${qs(params)}`, { signal }),
@@ -246,11 +300,29 @@ export function assetOriginalUrl(asset: Asset): string {
 }
 
 export function assetVideoUrl(asset: Asset): string {
-  return `/api/assets/${asset.id}/video?v=${asset.cacheKey}`;
+  return `/api/assets/${asset.id}/video?v=${asset.cacheKey}#t=0.001`;
 }
 
-export function assetVideoProxyUrl(asset: Asset): string {
-  return `/api/assets/${asset.id}/video-proxy?v=${asset.cacheKey}`;
+export function assetVideoProxyUrl(asset: Asset, startSeconds = 0, session?: VideoProxySessionContext): string {
+  const query = new URLSearchParams({ v: asset.cacheKey, play: '1' });
+  if (Number.isFinite(startSeconds) && startSeconds > 0) {
+    query.set('start', Math.max(0, startSeconds).toFixed(2));
+  }
+  if (session?.clientId) {
+    query.set('clientId', session.clientId);
+  }
+  if (session?.sessionId) {
+    query.set('sessionId', session.sessionId);
+  }
+  return `/api/assets/${asset.id}/video-proxy?${query.toString()}`;
+}
+
+function videoProxyQuery(startSeconds: number, session?: VideoProxySessionContext) {
+  return qs({
+    start: Number.isFinite(startSeconds) && startSeconds > 0 ? Math.max(0, startSeconds).toFixed(2) : undefined,
+    clientId: session?.clientId,
+    sessionId: session?.sessionId,
+  });
 }
 
 export function assetSubtitleUrl(asset: Asset, subtitleId: string): string {

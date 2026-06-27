@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Captions, CaptionsOff, Gauge, Maximize2, Minimize2, Pause, Play, RotateCw, Volume2, VolumeX } from 'lucide-react';
-import type { Asset, SubtitleInfo } from '../types/api';
+import type { Asset, SubtitleInfo, VideoProxyHeartbeat, VideoProxyRuntime } from '../types/api';
 import { api, assetPreviewUrl, assetSubtitleUrl, assetVideoProxyUrl, assetVideoUrl } from '../api/client';
 import { formatDuration } from '../utils/format';
 import { normalizeRotation, rotatedContainStyle } from '../utils/rotation';
@@ -18,15 +18,19 @@ interface Props {
   onSelectedSubtitleChange: (value: string) => void;
   onSubtitlesEnabledChange: (value: boolean) => void;
   onToggleFullscreen: () => void;
+  onProxyRuntimeChange?: (runtime: VideoProxyRuntime | null) => void;
 }
 
 const autoplayDelayMs = 800;
 const proxyPollMs = 3000;
+const proxyKeepaliveMs = 15000;
 const videoAudioStorageKey = 'lpicto-video-audio';
+const videoProxyClientStorageKey = 'lpicto-video-proxy-client';
 
 interface VideoAudioPreference {
   lastVolume: number;
   muted: boolean;
+  version: number;
   volume: number;
 }
 
@@ -44,14 +48,20 @@ export default function VideoViewer({
   onSelectedSubtitleChange,
   onSubtitlesEnabledChange,
   onToggleFullscreen,
+  onProxyRuntimeChange,
 }: Props) {
   const ref = useRef<HTMLVideoElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
   const autoplayTimer = useRef<number | null>(null);
   const resumeTimer = useRef<number | null>(null);
   const proxyPollTimer = useRef<number | null>(null);
+  const proxyKeepaliveTimer = useRef<number | null>(null);
+  const proxyPlayPending = useRef(false);
+  const proxyClientId = useRef(loadVideoProxyClientId());
+  const skipNextAudioPreferenceSave = useRef(false);
   const wantsPlaying = useRef(false);
   const resumeAttempts = useRef(0);
+  const currentTimeRef = useRef(0);
   const [liveAsset, setLiveAsset] = useState(asset);
   const [audio, setAudio] = useState<VideoAudioPreference>(() => loadVideoAudioPreference());
   const [prefs, setPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
@@ -60,23 +70,30 @@ export default function VideoViewer({
   const [hasPlaybackStarted, setHasPlaybackStarted] = useState(false);
   const [playError, setPlayError] = useState('');
   const [paused, setPaused] = useState(true);
+  const [proxyStreamEnabled, setProxyStreamEnabled] = useState(false);
+  const [proxySessionId, setProxySessionId] = useState(() => createVideoProxySessionId());
+  const [proxyStartTime, setProxyStartTime] = useState(0);
+  const [proxyRuntime, setProxyRuntime] = useState<VideoProxyRuntime | null>(null);
   const [duration, setDuration] = useState(asset.duration ?? 0);
   const [currentTime, setCurrentTime] = useState(0);
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [frameSize, setFrameSize] = useState({ width: 0, height: 0 });
   const playbackAsset = liveAsset.id === asset.id && liveAsset.cacheKey === asset.cacheKey ? liveAsset : asset;
+  const usesProxy = !playbackAsset.browserPlayable && !proxyFailed;
   const source = useMemo(() => {
-    if (playbackAsset.videoProxyStatus === 'ready' && !proxyFailed) {
-      return assetVideoProxyUrl(playbackAsset);
+    if (usesProxy) {
+      return proxyStreamEnabled
+        ? assetVideoProxyUrl(playbackAsset, proxyStartTime, { clientId: proxyClientId.current, sessionId: proxySessionId })
+        : '';
     }
     return assetVideoUrl(asset);
-  }, [asset, playbackAsset, proxyFailed]);
+  }, [asset, playbackAsset, proxySessionId, proxyStartTime, proxyStreamEnabled, usesProxy]);
 
   const subtitleSource = subtitlesEnabled && selectedSubtitleId ? assetSubtitleUrl(asset, selectedSubtitleId) : '';
-  const canPlay = Boolean(source) && !sourceFailed;
+  const canPlay = !sourceFailed && (usesProxy || Boolean(source));
   const posterSource = asset.thumbStatus === 'ready' ? assetPreviewUrl(asset) : '';
   const showPosterLayer = Boolean(posterSource) && (!canPlay || (!hasPlaybackStarted && paused && currentTime <= 0.01));
-  const statusLabel = videoStatusLabel(playbackAsset, sourceFailed);
+  const statusLabel = videoStatusLabel(playbackAsset, sourceFailed, proxyRuntime);
   const displayedTime = scrubTime ?? currentTime;
   const hasSubtitles = subtitles.length > 0;
 
@@ -86,9 +103,52 @@ export default function VideoViewer({
     return { ...rotatedContainStyle(asset, frameSize), bottom: 'auto', right: 'auto' };
   }, [asset, frameSize.height, frameSize.width]);
 
+  const startProxyPlayback = () => {
+    wantsPlaying.current = true;
+    proxyPlayPending.current = true;
+    resumeAttempts.current = 0;
+    setPlayError('');
+    setSourceFailed(false);
+    setProxyStreamEnabled(true);
+  };
+
+  const proxyHeartbeat = (state: VideoProxyHeartbeat['state'], wantsStream: boolean): VideoProxyHeartbeat => ({
+    clientId: proxyClientId.current,
+    sessionId: proxySessionId,
+    state,
+    currentTime: currentTimeRef.current,
+    playbackRate,
+    wantsStream,
+    hidden: document.hidden,
+  });
+
+  const sendProxyHeartbeat = (state: VideoProxyHeartbeat['state'], wantsStream: boolean) => {
+    if (!usesProxy) return;
+    void api.keepVideoProxyAlive(asset.id, proxyStartTime, proxyHeartbeat(state, wantsStream)).catch(() => undefined);
+  };
+
+  const stopProxySession = (sessionId: string, startSeconds: number, stoppedAt: number) => {
+    void api
+      .keepVideoProxyAlive(asset.id, startSeconds, {
+        clientId: proxyClientId.current,
+        sessionId,
+        state: 'stopped',
+        currentTime: stoppedAt,
+        playbackRate,
+        wantsStream: false,
+        hidden: document.hidden,
+      })
+      .catch(() => undefined);
+  };
+
   const togglePlay = () => {
+    if (!canPlay) return;
+    if (usesProxy && !proxyStreamEnabled) {
+      startProxyPlayback();
+      return;
+    }
     const video = ref.current;
-    if (!video || !canPlay) return;
+    if (!video) return;
     if (video.paused) {
       wantsPlaying.current = true;
       resumeAttempts.current = 0;
@@ -97,6 +157,9 @@ export default function VideoViewer({
       wantsPlaying.current = false;
       clearResumeTimer();
       video.pause();
+      if (usesProxy) {
+        sendProxyHeartbeat('paused', false);
+      }
     }
   };
 
@@ -110,8 +173,9 @@ export default function VideoViewer({
     } catch (err) {
       let failure: unknown = err;
       if (!video.muted) {
+        skipNextAudioPreferenceSave.current = true;
         video.muted = true;
-        setAudio(saveVideoAudioPreference(video.volume, true));
+        setAudio({ ...loadVideoAudioPreference(), muted: true, volume: video.volume });
         try {
           await video.play();
           resumeAttempts.current = 0;
@@ -142,6 +206,19 @@ export default function VideoViewer({
   }, [playbackRate, source]);
 
   useEffect(() => {
+    currentTimeRef.current = currentTime;
+  }, [currentTime]);
+
+  useEffect(() => {
+    if (!usesProxy || !proxyStreamEnabled || !proxyPlayPending.current || !source) return;
+    const video = ref.current;
+    if (!video) return;
+    proxyPlayPending.current = false;
+    video.playbackRate = playbackRate;
+    void startPlayback(video);
+  }, [playbackRate, proxyStreamEnabled, source, usesProxy]);
+
+  useEffect(() => {
     function onPrefsChanged() {
       setPrefs(loadViewerPrefs());
     }
@@ -155,8 +232,16 @@ export default function VideoViewer({
 
   useEffect(() => {
     clearAutoplayTimer();
-    const video = ref.current;
     if (!canPlay) return clearAutoplayTimer;
+    if (usesProxy) {
+      if (!prefs.videoAutoplay || proxyStreamEnabled) return clearAutoplayTimer;
+      autoplayTimer.current = window.setTimeout(() => {
+        startProxyPlayback();
+        autoplayTimer.current = null;
+      }, autoplayDelayMs);
+      return clearAutoplayTimer;
+    }
+    const video = ref.current;
     if (!video) return clearAutoplayTimer;
     if (!prefs.videoAutoplay) {
       video.pause();
@@ -170,7 +255,7 @@ export default function VideoViewer({
       autoplayTimer.current = null;
     }, autoplayDelayMs);
     return clearAutoplayTimer;
-  }, [asset.id, canPlay, playbackRate, prefs.videoAutoplay, source]);
+  }, [asset.id, canPlay, playbackRate, prefs.videoAutoplay, proxyStreamEnabled, source, usesProxy]);
 
   useEffect(() => {
     const video = ref.current;
@@ -199,10 +284,16 @@ export default function VideoViewer({
     setPlayError('');
     setPaused(true);
     setCurrentTime(0);
+    currentTimeRef.current = 0;
     setScrubTime(null);
     setDuration(asset.duration ?? 0);
     setLiveAsset(asset);
     setProxyFailed(false);
+    setProxyStreamEnabled(false);
+    setProxySessionId(createVideoProxySessionId());
+    setProxyStartTime(0);
+    setProxyRuntime(null);
+    proxyPlayPending.current = false;
     wantsPlaying.current = false;
     resumeAttempts.current = 0;
     clearResumeTimer();
@@ -214,36 +305,86 @@ export default function VideoViewer({
   }, [source]);
 
   useEffect(() => {
-    if (playbackAsset.videoProxyStatus === 'ready' || playbackAsset.videoProxyStatus === 'error') {
-      clearProxyPollTimer();
+    clearProxyPollTimer();
+    if (!usesProxy) {
+      setProxyRuntime(null);
       return clearProxyPollTimer;
     }
-    clearProxyPollTimer();
     const poll = async () => {
-      let nextStatus = playbackAsset.videoProxyStatus;
       try {
-        const next = await api.asset(asset.id);
-        nextStatus = next.videoProxyStatus;
-        if (next.cacheKey === asset.cacheKey) {
-          if (!(next.videoProxyStatus === 'ready' && hasPlaybackStarted)) {
-            setLiveAsset(next);
-          }
+        const runtime = await api.videoProxyStatus(asset.id, proxyStartTime, {
+          clientId: proxyClientId.current,
+          sessionId: proxySessionId,
+        });
+        setProxyRuntime(runtime);
+        if (runtime.command === 'start_stream' && wantsPlaying.current && !proxyStreamEnabled) {
+          startProxyPlayback();
         }
       } catch {
-        // Keep the current source usable if the lightweight status poll fails.
+        // Keep playback usable if the lightweight status poll fails.
       } finally {
-        if (nextStatus !== 'ready' && nextStatus !== 'error') {
-          proxyPollTimer.current = window.setTimeout(poll, proxyPollMs);
-        }
+        proxyPollTimer.current = window.setTimeout(poll, proxyPollMs);
       }
     };
-    proxyPollTimer.current = window.setTimeout(poll, proxyPollMs);
+    void poll();
     return clearProxyPollTimer;
-  }, [asset.id, asset.cacheKey, hasPlaybackStarted, playbackAsset.videoProxyStatus]);
+  }, [asset.id, proxySessionId, proxyStartTime, proxyStreamEnabled, usesProxy]);
+
+  useEffect(() => {
+    onProxyRuntimeChange?.(usesProxy ? proxyRuntime : null);
+  }, [onProxyRuntimeChange, proxyRuntime, usesProxy]);
+
+  useEffect(() => {
+    if (!usesProxy || !proxyStreamEnabled) return undefined;
+    const releaseAssetID = asset.id;
+    const releaseStartTime = proxyStartTime;
+    const releaseSessionID = proxySessionId;
+    return () => {
+      void api
+        .keepVideoProxyAlive(releaseAssetID, releaseStartTime, {
+          clientId: proxyClientId.current,
+          sessionId: releaseSessionID,
+          state: 'stopped',
+          currentTime: currentTimeRef.current,
+          playbackRate,
+          wantsStream: false,
+          hidden: document.hidden,
+        })
+        .catch(() => undefined);
+    };
+  }, [asset.id, proxySessionId, proxyStartTime, proxyStreamEnabled, usesProxy]);
+
+  useEffect(() => {
+    clearProxyKeepaliveTimer();
+    if (!usesProxy || sourceFailed || !proxyStreamEnabled) {
+      return clearProxyKeepaliveTimer;
+    }
+    const shouldSync = wantsPlaying.current || proxyPlayPending.current || !paused || hasPlaybackStarted;
+    if (!shouldSync) {
+      return clearProxyKeepaliveTimer;
+    }
+    const keepalive = async () => {
+      const state: VideoProxyHeartbeat['state'] = !paused && hasPlaybackStarted ? 'playing' : 'preparing';
+      try {
+        const runtime = await api.keepVideoProxyAlive(asset.id, proxyStartTime, proxyHeartbeat(state, true));
+        setProxyRuntime(runtime);
+        if (runtime.command === 'start_stream' && wantsPlaying.current && !source) {
+          startProxyPlayback();
+        }
+      } catch {
+        // Playback owns the main request; keepalive failure should not interrupt it.
+      } finally {
+        proxyKeepaliveTimer.current = window.setTimeout(keepalive, proxyKeepaliveMs);
+      }
+    };
+    void keepalive();
+    return clearProxyKeepaliveTimer;
+  }, [asset.id, hasPlaybackStarted, paused, playbackRate, proxySessionId, proxyStartTime, proxyStreamEnabled, source, sourceFailed, usesProxy]);
 
   useEffect(() => () => {
     clearResumeTimer();
     clearProxyPollTimer();
+    clearProxyKeepaliveTimer();
   }, []);
 
   function clearAutoplayTimer() {
@@ -264,11 +405,34 @@ export default function VideoViewer({
     proxyPollTimer.current = null;
   }
 
+  function clearProxyKeepaliveTimer() {
+    if (proxyKeepaliveTimer.current === null) return;
+    window.clearTimeout(proxyKeepaliveTimer.current);
+    proxyKeepaliveTimer.current = null;
+  }
+
   function commitSeek(value = scrubTime) {
     if (value === null || !ref.current) return;
     const next = clampTime(value, duration || ref.current.duration || value);
+    if (usesProxy) {
+      const shouldResume = wantsPlaying.current || !ref.current.paused;
+      const previousSessionId = proxySessionId;
+      const previousStartTime = proxyStartTime;
+      wantsPlaying.current = shouldResume;
+      proxyPlayPending.current = shouldResume;
+      resumeAttempts.current = 0;
+      stopProxySession(previousSessionId, previousStartTime, currentTimeRef.current);
+      setProxySessionId(createVideoProxySessionId());
+      setProxyStreamEnabled(true);
+      setProxyStartTime(next);
+      setCurrentTime(next);
+      currentTimeRef.current = next;
+      setScrubTime(null);
+      return;
+    }
     ref.current.currentTime = next;
     setCurrentTime(next);
+    currentTimeRef.current = next;
     setScrubTime(null);
   }
 
@@ -291,18 +455,14 @@ export default function VideoViewer({
           <video
             ref={ref}
             className="viewer-video"
-            src={source}
+            src={source || undefined}
             poster={posterSource || undefined}
-            preload="auto"
+            preload={usesProxy ? 'none' : 'metadata'}
             playsInline
             style={mediaStyle}
             onClick={togglePlay}
-            onDurationChange={(event) => setDuration(event.currentTarget.duration || asset.duration || 0)}
+            onDurationChange={(event) => setDuration(usesProxy ? asset.duration || 0 : event.currentTarget.duration || asset.duration || 0)}
             onError={() => {
-              if (!proxyFailed && playbackAsset.videoProxyStatus === 'ready' && asset.browserPlayable) {
-                setProxyFailed(true);
-                return;
-              }
               setSourceFailed(true);
             }}
             onLoadedMetadata={(event) => {
@@ -310,22 +470,29 @@ export default function VideoViewer({
               event.currentTarget.volume = savedAudio.volume;
               event.currentTarget.muted = savedAudio.muted;
               setAudio(savedAudio);
-              setDuration(event.currentTarget.duration || asset.duration || 0);
+              setDuration(usesProxy ? asset.duration || 0 : event.currentTarget.duration || asset.duration || 0);
               setPaused(event.currentTarget.paused);
               event.currentTarget.playbackRate = playbackRate;
             }}
             onPause={(event) => {
               setPaused(true);
               scheduleResumeAfterUnexpectedPause(event.currentTarget);
+              if (usesProxy && !wantsPlaying.current) {
+                sendProxyHeartbeat('paused', false);
+              }
             }}
             onPlay={() => {
               setPlayError('');
               clearResumeTimer();
               setPaused(false);
               setHasPlaybackStarted(true);
+              if (usesProxy) {
+                sendProxyHeartbeat('playing', true);
+              }
             }}
             onTimeUpdate={(event) => {
-              const next = event.currentTarget.currentTime;
+              const next = clampTime((usesProxy ? proxyStartTime : 0) + event.currentTarget.currentTime, duration || asset.duration || 0);
+              currentTimeRef.current = next;
               if (scrubTime === null) {
                 setCurrentTime(next);
               }
@@ -333,6 +500,11 @@ export default function VideoViewer({
             }}
             onVolumeChange={(event) => {
               const video = event.currentTarget;
+              if (skipNextAudioPreferenceSave.current) {
+                skipNextAudioPreferenceSave.current = false;
+                setAudio({ ...loadVideoAudioPreference(), muted: video.muted, volume: video.volume });
+                return;
+              }
               setAudio(saveVideoAudioPreference(video.volume, video.muted));
             }}
           >
@@ -360,8 +532,14 @@ export default function VideoViewer({
           </button>
         )}
         {!posterSource && !canPlay && <div className="video-pending">{statusLabel}</div>}
+        {!posterSource && canPlay && usesProxy && !proxyStreamEnabled && (
+          <button className="video-pending video-pending-button" type="button" onClick={togglePlay}>
+            <Play size={34} fill="currentColor" />
+            <span>点击播放开始转码</span>
+          </button>
+        )}
       </div>
-      <div className="video-control-zone">
+      <div className="video-control-zone" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
         <div className="video-controls">
           <button type="button" disabled={!canPlay} onClick={togglePlay} title={paused ? '播放' : '暂停'}>
             {paused ? <Play size={18} /> : <Pause size={18} />}
@@ -457,7 +635,15 @@ export default function VideoViewer({
             <button type="button" title={`旋转 ${asset.rotation || 0}°`} onClick={onRotate}>
               <RotateCw size={18} />
             </button>
-            <button type="button" title={fullscreen ? '退出全屏' : '全屏'} onClick={onToggleFullscreen}>
+            <button
+              type="button"
+              title={fullscreen ? '退出全屏' : '全屏'}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                onToggleFullscreen();
+              }}
+            >
               {fullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
             </button>
           </div>
@@ -467,8 +653,18 @@ export default function VideoViewer({
   );
 }
 
-function videoStatusLabel(asset: Asset, sourceFailed: boolean) {
+function videoProxyRuntimeLabel(runtime: VideoProxyRuntime) {
+  if (runtime.message) return runtime.message;
+  if (runtime.status === 'cached' || runtime.cached) return '已缓存';
+  if (runtime.status === 'error') return '转码失败';
+  if (runtime.status === 'queued' || runtime.queued) return '等待转码槽位';
+  if (runtime.transcoding) return `实时转码 ${Math.round(Math.min(1, Math.max(0, runtime.progress || 0)) * 100)}%`;
+  return '准备转码';
+}
+
+function videoStatusLabel(asset: Asset, sourceFailed: boolean, runtime: VideoProxyRuntime | null) {
   if (sourceFailed) return '视频加载失败';
+  if (!asset.browserPlayable) return runtime ? videoProxyRuntimeLabel(runtime) : '准备转码';
   if (asset.videoProxyStatus === 'error') return '视频转码失败';
   if (!asset.browserPlayable && asset.videoProxyStatus !== 'ready') return '等待转码';
   return '无法播放';
@@ -491,11 +687,20 @@ function loadVideoAudioPreference(): VideoAudioPreference {
   }
   const volume = clampVolume(parsed?.volume ?? 1);
   const lastVolume = clampVolume(parsed?.lastVolume ?? (volume > 0 ? volume : 1));
+  const version = parsed?.version === 2 ? 2 : 1;
   sharedVideoAudio = {
     lastVolume: lastVolume > 0 ? lastVolume : 1,
-    muted: Boolean(parsed?.muted),
+    muted: version === 2 ? Boolean(parsed?.muted) : false,
+    version: 2,
     volume,
   };
+  if (version !== 2) {
+    try {
+      window.localStorage.setItem(videoAudioStorageKey, JSON.stringify(sharedVideoAudio));
+    } catch {
+      // localStorage can be unavailable in private or restricted browser contexts.
+    }
+  }
   return sharedVideoAudio;
 }
 
@@ -506,6 +711,7 @@ function saveVideoAudioPreference(volumeValue: number, muted: boolean): VideoAud
   const next = {
     lastVolume: lastVolume > 0 ? lastVolume : 1,
     muted: muted || volume === 0,
+    version: 2,
     volume,
   };
   sharedVideoAudio = next;
@@ -515,6 +721,25 @@ function saveVideoAudioPreference(volumeValue: number, muted: boolean): VideoAud
     // localStorage can be unavailable in private or restricted browser contexts.
   }
   return next;
+}
+
+function loadVideoProxyClientId() {
+  try {
+    const existing = window.sessionStorage.getItem(videoProxyClientStorageKey);
+    if (existing) return existing;
+    const next = createVideoProxySessionId();
+    window.sessionStorage.setItem(videoProxyClientStorageKey, next);
+    return next;
+  } catch {
+    return createVideoProxySessionId();
+  }
+}
+
+function createVideoProxySessionId() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function clampVolume(value: number) {

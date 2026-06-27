@@ -2,15 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Check, ChevronRight, FolderPlus, Images, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-react';
 import AssetGrid from '../components/AssetGrid';
+import AssetGroupingControls, { normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
-import SortControls from '../components/SortControls';
+import SortControls, { isSortKey } from '../components/SortControls';
 import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { api } from '../api/client';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
+import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
 import type {
   Album,
@@ -28,21 +30,20 @@ import type {
 import {
   appendViewerReturnParams,
   decodeReturnState,
+  loadPageState,
   resetGridState,
   savePageState,
   saveViewerReturnPath,
   type GridReturnState,
 } from '../utils/pageState';
-import { serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
+import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import { assetMatchesAlbum } from '../utils/assetFilters';
 import { mergeSortedAssets, removeAssetById } from '../utils/assetSort';
+import { currentURLHasParam, currentURLLocation, currentURLPath, positiveIntParam, replaceURLState } from '../utils/urlState';
 
 const pageSize = 100;
 const albumsStateKey = 'albums';
-const mediaGroupOptions: Array<{ value: AssetGroupMode; label: string }> = [
-  { value: 'none', label: '不分' },
-  { value: 'folder', label: '文件夹' },
-];
+const albumsURLKeys = ['albumId', 'album', 'sort', 'group', 'q'];
 
 interface AlbumsPageState extends GridReturnState {
   collapsedGroupKeys: string[];
@@ -65,9 +66,12 @@ export default function AlbumsPage() {
   const [searchParams] = useSearchParams();
   const location = useLocation();
   const navigate = useNavigate();
+  const persistedState = loadPageState<AlbumsPageState>(albumsStateKey, defaultAlbumsState);
+  const decodedInitialState = decodeReturnState<AlbumsPageState>(searchParams.get('restore'), persistedState);
   const initialStateRef = useRef(
-    decodeReturnState<AlbumsPageState>(searchParams.get('restore'), defaultAlbumsState),
+    searchParams.has('restore') ? decodedInitialState : albumsStateFromSearchParams(searchParams, persistedState),
   );
+  const initialAlbumNameRef = useRef(searchParams.get('album') ?? '');
   const [albums, setAlbums] = useState<Album[]>([]);
   const [groups, setGroups] = useState<AlbumGroup[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(initialStateRef.current.selectedId);
@@ -86,6 +90,7 @@ export default function AlbumsPage() {
   const [totalCount, setTotalCount] = useState(0);
   const sidebarState = useSidebarReturnState();
   const restoreSidebarState = useRestoreSidebarState();
+  const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const serverGroup = serverGroupForMode(groupMode);
 
@@ -100,7 +105,12 @@ export default function AlbumsPage() {
       const result = await api.albums();
       setAlbums(result.items);
       setGroups(result.groups ?? []);
-      setSelectedId((current) => (current && result.items.some((album) => album.id === current) ? current : result.items[0]?.id ?? null));
+      setSelectedId((current) => {
+        if (current && result.items.some((album) => album.id === current)) return current;
+        const requestedName = initialAlbumNameRef.current.trim();
+        const byName = requestedName && !positiveIntParam(requestedName) ? result.items.find((album) => album.name === requestedName)?.id : null;
+        return byName ?? result.items[0]?.id ?? null;
+      });
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : '读取相册失败');
@@ -121,7 +131,7 @@ export default function AlbumsPage() {
     [query, selectedAlbum, serverGroup, sort],
   );
 
-  const { items, hasMore, loading, error: loadError, loadMore, reset, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
+  const { items, hasMore, hasPrevious, loading, error: loadError, loadMore, loadPrevious, reset, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     groupMode,
     selectedAlbum?.id,
     sort,
@@ -132,6 +142,7 @@ export default function AlbumsPage() {
     getGridState,
     handleGridScrollState,
     loadedStartIndex,
+    loadPreviousPage,
     scrollRatio,
     scrollResetSignal,
     scrollTarget,
@@ -140,11 +151,13 @@ export default function AlbumsPage() {
     setScrollRatio,
   } = useWaterfallGridState({
     hasMore,
+    hasPrevious,
     initialState: initialStateRef.current,
     itemsLength: items.length,
     jumpToPage,
     loading,
     loadMore,
+    loadPrevious,
     pageSize,
     resetKey: JSON.stringify([selectedAlbum?.id ?? null, sort, query, groupMode]),
     restoreReady: Boolean(selectedAlbum),
@@ -168,7 +181,7 @@ export default function AlbumsPage() {
     if (eventsConnected || !selectedAlbum) return undefined;
     const timer = window.setInterval(() => {
       void api.albumAssets(selectedAlbum.id, 1, pageSize, sort, query, serverGroup).then((result) => mergeReadyAssets(result.items)).catch(() => undefined);
-    }, 2000);
+    }, 30000);
     return () => window.clearInterval(timer);
   }, [eventsConnected, mergeReadyAssets, query, selectedAlbum, serverGroup, sort]);
 
@@ -216,18 +229,49 @@ export default function AlbumsPage() {
   const saveCurrentState = useCallback(() => {
     savePageState<AlbumsPageState>(albumsStateKey, currentPageState());
   }, [currentPageState]);
+  const scheduleCurrentStateSave = usePersistentPageState(saveCurrentState);
+
+  useEffect(() => {
+    if (currentURLHasParam(location, 'restore') || !selectedAlbum) return;
+    replaceURLState(
+      navigate,
+      location,
+      {
+        album: selectedAlbum.name,
+        albumId: selectedAlbum.id,
+        group: groupMode,
+        q: query,
+        sort,
+      },
+      albumsURLKeys,
+    );
+  }, [groupMode, location, navigate, query, searchParams, selectedAlbum, sort]);
+  const handlePersistentGridScrollState = useCallback(
+    (state: { ratio: number; scrollTop: number }) => {
+      handleGridScrollState(state);
+      scheduleCurrentStateSave();
+    },
+    [handleGridScrollState, scheduleCurrentStateSave],
+  );
 
   const handleOpenAsset = useCallback(() => {
     saveCurrentState();
-    saveViewerReturnPath('/albums');
-  }, [saveCurrentState]);
+    saveViewerReturnPath(currentPageReturnPath());
+  }, [currentPageReturnPath, saveCurrentState]);
 
   const handleOpenViewer = useCallback(
     (asset: Asset, viewerUrl: string) => {
-      navigate(viewerUrl, { state: { backgroundLocation: location, initialAsset: asset } });
+      navigate(viewerUrl, { state: { backgroundLocation: currentURLLocation(location), initialAsset: asset } });
     },
     [location, navigate],
   );
+
+  useEffect(() => {
+    const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);
+    if (nextGroupMode !== groupMode) {
+      setGroupMode(nextGroupMode);
+    }
+  }, [groupMode, sort]);
 
   const toggleAlbumGroup = useCallback((key: string) => {
     setCollapsedGroupKeys((value) => {
@@ -374,20 +418,7 @@ export default function AlbumsPage() {
             <span>{albumFilterLabel(selectedAlbum)}</span>
           </div>
           <SortControls sort={sort} onChange={setSort} />
-          <div className="sidebar-control-title">分组</div>
-          <div className="sidebar-list">
-            {mediaGroupOptions.map((option) => (
-              <button
-                className={groupMode === option.value ? 'sidebar-list-row active' : 'sidebar-list-row'}
-                key={option.value}
-                type="button"
-                onClick={() => setGroupMode(option.value)}
-              >
-                <span className="sidebar-list-marker" aria-hidden="true" />
-                <span>{option.label}</span>
-              </button>
-            ))}
-          </div>
+          <AssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
           <label className="sidebar-field">
             <span>搜索</span>
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="文件名" />
@@ -438,13 +469,15 @@ export default function AlbumsPage() {
             assets={items}
             loading={loading}
             hasMore={hasMore}
+            hasPrevious={hasPrevious}
             onLoadMore={loadMore}
+            onLoadPrevious={loadPreviousPage}
             onOpenAsset={handleOpenAsset}
             onOpenViewer={handleOpenViewer}
             onAssetMissing={(asset) => mutateItems((current) => removeAssetById(current, asset.id))}
             onPressPreviewChange={setPressPreviewAsset}
             onScrollRatioChange={setScrollRatio}
-            onScrollStateChange={handleGridScrollState}
+            onScrollStateChange={handlePersistentGridScrollState}
             totalCount={totalCount}
             loadedStartIndex={loadedStartIndex}
             focusAssetId={focusAssetId}
@@ -456,7 +489,7 @@ export default function AlbumsPage() {
             buildViewerUrl={(asset) =>
               appendViewerReturnParams(
                 `/viewer/${asset.id}?context=album&albumId=${selectedAlbum.id}&sort=${sort}&q=${encodeURIComponent(query)}${serverGroup ? `&group=${serverGroup}` : ''}`,
-                '/albums',
+                currentPageReturnPath(),
                 currentPageState(),
               )
             }
@@ -799,6 +832,20 @@ function buildAlbumBuckets(albums: Album[], groups: AlbumGroup[]): AlbumBucket[]
 
 function albumGroupKey(groupId: number | null) {
   return groupId === null ? 'ungrouped' : `group-${groupId}`;
+}
+
+function albumsStateFromSearchParams(params: URLSearchParams, fallback: AlbumsPageState): AlbumsPageState {
+  const selectedId = positiveIntParam(params.get('albumId')) ?? positiveIntParam(params.get('album'));
+  const sort = params.get('sort');
+  const hasAlbumParams = albumsURLKeys.some((key) => params.has(key));
+  const base = hasAlbumParams ? { ...fallback, ...resetGridState() } : fallback;
+  return {
+    ...base,
+    groupMode: parseAssetGroupMode(params.get('group'), base.groupMode),
+    query: params.get('q') ?? (hasAlbumParams ? '' : base.query),
+    selectedId: selectedId ?? base.selectedId,
+    sort: isSortKey(sort) ? sort : base.sort,
+  };
 }
 
 function albumFilterLabel(album: Album) {

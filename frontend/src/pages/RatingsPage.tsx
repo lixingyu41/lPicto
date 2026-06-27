@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { FolderOpen, FolderX, Image as ImageIcon, Images, Star, StarOff, Video } from 'lucide-react';
 import AssetGrid from '../components/AssetGrid';
+import AssetGroupingControls, { normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
@@ -10,15 +11,17 @@ import SortControls, { isSortKey } from '../components/SortControls';
 import { api } from '../api/client';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
+import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
 import type { Album, AlbumAssetFilter, Asset, AssetDeletedEvent, AssetKind, AssetRating, LibraryAnchor, SortKey } from '../types/api';
 import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
-import { serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
+import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import {
   appendViewerReturnParams,
   assetRatingChanged,
   assetRatingChangeDetail,
   decodeReturnState,
+  loadPageState,
   resetGridState,
   savePageState,
   saveViewerReturnPath,
@@ -27,9 +30,11 @@ import {
 import { assetMatchesAlbum, assetMatchesAnyAlbum, assetMatchesRating } from '../utils/assetFilters';
 import { mergeSortedAssets, removeAssetById } from '../utils/assetSort';
 import { ratingLabel } from '../components/RatingStars';
+import { currentURLHasParam, currentURLLocation, currentURLPath, positiveIntParam, replaceURLState } from '../utils/urlState';
 
 const pageSize = 100;
 const ratingsStateKey = 'ratings';
+const ratingsURLKeys = ['rating', 'type', 'sort', 'group', 'q', 'albumFilter', 'albumId', 'album'];
 const assetKinds: AssetKind[] = ['all', 'image', 'video'];
 const ratingValues: AssetRating[] = [0, 1, 2, 3, 4, 5];
 type RatingAlbumFilter = 'all' | 'none' | `album:${number}`;
@@ -57,9 +62,10 @@ export default function RatingsPage() {
   const [searchParams] = useSearchParams();
   const location = useLocation();
   const navigate = useNavigate();
-  const decodedInitialState = decodeReturnState<RatingsPageState>(searchParams.get('restore'), defaultRatingsState);
+  const persistedState = loadPageState<RatingsPageState>(ratingsStateKey, defaultRatingsState);
+  const decodedInitialState = decodeReturnState<RatingsPageState>(searchParams.get('restore'), persistedState);
   const initialStateRef = useRef(
-    searchParams.has('restore') ? decodedInitialState : ratingsStateFromSearchParams(searchParams, defaultRatingsState),
+    searchParams.has('restore') ? decodedInitialState : ratingsStateFromSearchParams(searchParams, persistedState),
   );
   const [rating, setRating] = useState<AssetRating>(initialStateRef.current.rating);
   const [type, setType] = useState<AssetKind>(initialStateRef.current.type);
@@ -73,10 +79,12 @@ export default function RatingsPage() {
   const [groupMode, setGroupMode] = useState<AssetGroupMode>(initialStateRef.current.groupMode);
   const serverGroup = serverGroupForMode(groupMode);
   const selectedAlbumId = albumIdFromFilter(albumFilter);
+  const selectedAlbum = useMemo(() => (selectedAlbumId === null ? null : albums.find((album) => album.id === selectedAlbumId) ?? null), [albums, selectedAlbumId]);
   const albumApiFilter: AlbumAssetFilter | undefined = albumFilter === 'none' ? 'none' : undefined;
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const sidebarState = useSidebarReturnState();
   const restoreSidebarState = useRestoreSidebarState();
+  const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
 
   useEffect(() => {
     let live = true;
@@ -103,7 +111,7 @@ export default function RatingsPage() {
     (page: number) => api.libraryAssets(page, pageSize, type, sort, query, serverGroup, rating, selectedAlbumId ?? undefined, albumApiFilter),
     [albumApiFilter, query, rating, selectedAlbumId, serverGroup, sort, type],
   );
-  const { items, hasMore, loading, error, loadMore, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
+  const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     type,
     sort,
     query,
@@ -116,6 +124,7 @@ export default function RatingsPage() {
     getGridState,
     handleGridScrollState,
     loadedStartIndex,
+    loadPreviousPage,
     scrollRatio,
     scrollResetSignal,
     scrollTarget,
@@ -124,11 +133,13 @@ export default function RatingsPage() {
     setScrollRatio,
   } = useWaterfallGridState({
     hasMore,
+    hasPrevious,
     initialState: initialStateRef.current,
     itemsLength: items.length,
     jumpToPage,
     loading,
     loadMore,
+    loadPrevious,
     pageSize,
     resetKey: JSON.stringify([rating, type, sort, query, groupMode, albumFilter]),
     searchParams,
@@ -174,7 +185,7 @@ export default function RatingsPage() {
         .libraryAssets(1, pageSize, type, sort, query, serverGroup, rating, selectedAlbumId ?? undefined, albumApiFilter)
         .then((result) => mergeReadyAssets(result.items))
         .catch(() => undefined);
-    }, 8000);
+    }, 30000);
     return () => window.clearInterval(timer);
   }, [albumApiFilter, eventsConnected, mergeReadyAssets, query, rating, selectedAlbumId, serverGroup, sort, type]);
 
@@ -196,6 +207,34 @@ export default function RatingsPage() {
   const saveCurrentState = useCallback(() => {
     savePageState<RatingsPageState>(ratingsStateKey, currentPageState());
   }, [currentPageState]);
+  const scheduleCurrentStateSave = usePersistentPageState(saveCurrentState);
+
+  useEffect(() => {
+    if (currentURLHasParam(location, 'restore')) return;
+    replaceURLState(
+      navigate,
+      location,
+      {
+        album: selectedAlbum?.name,
+        albumFilter: albumFilter === 'all' || albumFilter === 'none' ? albumFilter : undefined,
+        albumId: selectedAlbum?.id,
+        group: groupMode,
+        q: query,
+        rating,
+        sort,
+        type,
+      },
+      ratingsURLKeys,
+    );
+  }, [albumFilter, groupMode, location, navigate, query, rating, searchParams, selectedAlbum, sort, type]);
+
+  const handlePersistentGridScrollState = useCallback(
+    (state: { ratio: number; scrollTop: number }) => {
+      handleGridScrollState(state);
+      scheduleCurrentStateSave();
+    },
+    [handleGridScrollState, scheduleCurrentStateSave],
+  );
 
   useEffect(() => {
     let live = true;
@@ -220,20 +259,20 @@ export default function RatingsPage() {
   }, [albumApiFilter, query, rating, selectedAlbumId, serverGroup, sort, type]);
 
   useEffect(() => {
-    const options = groupOptionsForSort(sort).map((option) => option.value);
-    if (!options.includes(groupMode)) {
-      setGroupMode('none');
+    const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);
+    if (nextGroupMode !== groupMode) {
+      setGroupMode(nextGroupMode);
     }
   }, [groupMode, sort]);
 
   const handleOpenAsset = useCallback(() => {
     saveCurrentState();
-    saveViewerReturnPath('/ratings');
-  }, [saveCurrentState]);
+    saveViewerReturnPath(currentPageReturnPath());
+  }, [currentPageReturnPath, saveCurrentState]);
 
   const handleOpenViewer = useCallback(
     (asset: Asset, viewerUrl: string) => {
-      navigate(viewerUrl, { state: { backgroundLocation: location, initialAsset: asset } });
+      navigate(viewerUrl, { state: { backgroundLocation: currentURLLocation(location), initialAsset: asset } });
     },
     [location, navigate],
   );
@@ -286,20 +325,7 @@ export default function RatingsPage() {
         <span>搜索</span>
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="文件名" />
       </label>
-      <div className="sidebar-control-title">分组</div>
-      <div className="sidebar-list">
-        {groupOptionsForSort(sort).map((option) => (
-          <button
-            className={groupMode === option.value ? 'sidebar-list-row active' : 'sidebar-list-row'}
-            key={option.value}
-            type="button"
-            onClick={() => setGroupMode(option.value)}
-          >
-            <span className="sidebar-list-marker" aria-hidden="true" />
-            <span>{option.label}</span>
-          </button>
-        ))}
-      </div>
+      <AssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
     </div>,
     [albumFilter, albums, type, sort, query, groupMode, rating],
   );
@@ -325,12 +351,14 @@ export default function RatingsPage() {
             assets={items}
             loading={loading}
             hasMore={hasMore}
+            hasPrevious={hasPrevious}
             onLoadMore={loadMore}
+            onLoadPrevious={loadPreviousPage}
             onOpenAsset={handleOpenAsset}
             onOpenViewer={handleOpenViewer}
             onAssetMissing={(asset) => mutateItems((current) => removeAssetById(current, asset.id))}
             onScrollRatioChange={setScrollRatio}
-            onScrollStateChange={handleGridScrollState}
+            onScrollStateChange={handlePersistentGridScrollState}
             totalCount={totalCount}
             loadedStartIndex={loadedStartIndex}
             focusAssetId={focusAssetId}
@@ -345,7 +373,7 @@ export default function RatingsPage() {
                 `/viewer/${asset.id}?context=rating&rating=${rating}&type=${type}&sort=${sort}&q=${encodeURIComponent(query)}${
                   serverGroup ? `&group=${serverGroup}` : ''
                 }${albumViewerParams(albumFilter)}`,
-                '/ratings',
+                currentPageReturnPath(),
                 currentPageState(),
               )
             }
@@ -367,30 +395,6 @@ function assetKindLabel(value: AssetKind) {
     default:
       return '全部';
   }
-}
-
-function groupOptionsForSort(sort: SortKey): Array<{ value: AssetGroupMode; label: string }> {
-  if (sort === 'filename' || sort === 'filename_asc' || sort === 'filename_desc') {
-    return [
-      { value: 'none', label: '不分' },
-      { value: 'folder', label: '文件夹' },
-      { value: 'letter', label: '首字母' },
-    ];
-  }
-  if (sort === 'size' || sort === 'size_asc' || sort === 'size_desc') {
-    return [
-      { value: 'none', label: '不分' },
-      { value: 'folder', label: '文件夹' },
-      { value: 'size', label: '大小' },
-    ];
-  }
-  return [
-    { value: 'none', label: '不分' },
-    { value: 'folder', label: '文件夹' },
-    { value: 'day', label: '日' },
-    { value: 'month', label: '月' },
-    { value: 'year', label: '年' },
-  ];
 }
 
 function albumFilterForId(id: number): RatingAlbumFilter {
@@ -437,7 +441,7 @@ function ratingsStateFromSearchParams(params: URLSearchParams, fallback: Ratings
   return {
     ...base,
     albumFilter: albumFilter ?? base.albumFilter,
-    groupMode: group === 'folder' ? 'folder' : base.groupMode,
+    groupMode: parseAssetGroupMode(group, base.groupMode),
     query: q ?? (hasRatingParams ? '' : base.query),
     rating: rating ?? base.rating,
     sort: isSortKey(sort) ? sort : base.sort,
@@ -447,9 +451,10 @@ function ratingsStateFromSearchParams(params: URLSearchParams, fallback: Ratings
 
 function albumFilterFromSearchParams(params: URLSearchParams): RatingAlbumFilter | null {
   const mode = (params.get('albumFilter') ?? params.get('album') ?? '').trim().toLowerCase();
+  if (mode === 'all') return 'all';
   if (mode === 'none' || mode === 'unassigned') return 'none';
-  const parsed = Number(params.get('albumId'));
-  if (Number.isInteger(parsed) && parsed > 0) return albumFilterForId(parsed);
+  const parsed = positiveIntParam(params.get('albumId')) ?? positiveIntParam(params.get('album'));
+  if (parsed) return albumFilterForId(parsed);
   return null;
 }
 

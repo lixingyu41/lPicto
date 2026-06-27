@@ -42,10 +42,82 @@ export interface Asset {
   rating: AssetRating;
 }
 
+export interface VideoProxyRuntime {
+  required: boolean;
+  cached: boolean;
+  transcoding: boolean;
+  queued: boolean;
+  active: boolean;
+  status: string;
+  progress: number;
+  secondsDone: number;
+  duration: number;
+  bytes: number;
+  expiresAt: number;
+  error: string;
+  updatedAt: number;
+  leaseUntil: number;
+  cacheTtl: number;
+  keepaliveTtl: number;
+  runtimeKey: string;
+  clientId: string;
+  sessionId: string;
+  sessionState: string;
+  activeUsers: number;
+  playingUsers: number;
+  command: string;
+  message: string;
+  serverTime: number;
+}
+
+export interface VideoProxyHeartbeat {
+  clientId: string;
+  sessionId: string;
+  state: 'preparing' | 'playing' | 'paused' | 'stopped';
+  currentTime: number;
+  playbackRate: number;
+  wantsStream: boolean;
+  hidden: boolean;
+}
+
 export interface AssetDeletedEvent {
   id: number;
   relPath: string;
   cacheKey: string;
+}
+
+export interface AssetDeleteEntry {
+  relPath: string;
+  name: string;
+  kind: 'file' | 'folder' | 'symlink';
+  size: number;
+  reason: string;
+  isMedia: boolean;
+}
+
+export interface AssetDeletePlan {
+  asset: Asset;
+  mode: 'files' | 'folder';
+  token: string;
+  canDelete: boolean;
+  files: AssetDeleteEntry[];
+  folder: AssetDeleteEntry | null;
+  folderContents: AssetDeleteEntry[];
+  warnings: string[];
+  blockers: string[];
+}
+
+export interface AssetDeleteFailure {
+  relPath: string;
+  message: string;
+}
+
+export interface AssetDeleteResult {
+  deleted: boolean;
+  deletedAssetIds: number[];
+  failures: AssetDeleteFailure[];
+  plan?: AssetDeletePlan;
+  stale?: boolean;
 }
 
 export interface SearchAssetsParams {
@@ -166,6 +238,8 @@ export interface QueueStats {
 
 export interface CacheStats {
   sizeBytes: number;
+  cacheBytes: number;
+  databaseBytes: number;
   fileCount: number;
   updatedAt: number;
   refreshing: boolean;
@@ -224,6 +298,7 @@ export interface ScanLibraryProgress {
   unscannedFiles: number;
   thumb: WorkStatusCounts;
   transcode: WorkStatusCounts;
+  videoProxy: WorkStatusCounts;
   active: boolean;
 }
 
@@ -367,5 +442,6 @@ export interface PublicConfig {
   thumbLongEdge: number;
   previewLongEdge: number;
   videoProxyEnabled: boolean;
+  liveVideoProxyMaxActive: number;
   videoProxyMaxHeight: number;
 }

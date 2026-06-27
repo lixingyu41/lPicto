@@ -213,7 +213,7 @@ func TestUpdateAlbumAndGroups(t *testing.T) {
 	}
 }
 
-func TestPendingWorkRecoversProcessingVideoProxy(t *testing.T) {
+func TestPendingWorkDoesNotRecoverProcessingVideoProxy(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
 	if err != nil {
@@ -226,7 +226,7 @@ func TestPendingWorkRecoversProcessingVideoProxy(t *testing.T) {
 	asset.ThumbStatus = model.StatusNotRequired
 	asset.PreviewStatus = model.StatusNotRequired
 	asset.VideoPosterStatus = model.StatusReady
-	assetID, _, _, err := database.UpsertAsset(ctx, asset)
+	_, _, _, err = database.UpsertAsset(ctx, asset)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,8 +234,8 @@ func TestPendingWorkRecoversProcessingVideoProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 1 || items[0].Type != "video_proxy" || items[0].AssetID != assetID {
-		t.Fatalf("PendingWork processing proxy = %#v, want video_proxy for %d", items, assetID)
+	if len(items) != 0 {
+		t.Fatalf("PendingWork processing proxy = %#v, want no background video_proxy work", items)
 	}
 }
 

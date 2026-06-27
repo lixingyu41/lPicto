@@ -21,7 +21,7 @@ export default function App() {
 
   return (
     <Layout routeLocation={routeLocation} overlay={showingViewerOverlay ? <ViewerPage overlay /> : null}>
-      <Routes location={routeLocation} key={routeLocation.key}>
+      <Routes location={routeLocation}>
         <Route index element={<Navigate to="/library" replace />} />
         <Route path="/timeline" element={<Navigate to="/library" replace />} />
         <Route path="/library" element={<LibraryPage />} />

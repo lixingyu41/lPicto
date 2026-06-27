@@ -1,4 +1,4 @@
-import { type PointerEvent, type ReactNode, useCallback, useEffect } from 'react';
+import { type KeyboardEvent, type PointerEvent, type ReactNode, useCallback, useEffect } from 'react';
 import { FolderTree, Images, Library, Search, Settings, Star } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { useSidebarPanelValue, type SidebarPanelTarget } from './SidebarContext';
@@ -7,12 +7,10 @@ import { isPrimarySidebarPanelTarget, primaryTargetForPath, type PrimarySidebarP
 interface Props {
   collapsed: boolean;
   expanded: SidebarPanelTarget | null;
-  primaryWidth: number;
   secondaryWidth: number;
-  onPrimaryWidthChange: (width: number) => void;
   routePathname?: string;
   onSecondaryWidthChange: (width: number) => void;
-  onToggleCollapsed: () => void;
+  onTogglePrimary: () => void;
   onToggleExpanded: (target: SidebarPanelTarget | null) => void;
 }
 
@@ -33,12 +31,10 @@ const navItems: Array<{
 export default function Sidebar({
   collapsed,
   expanded,
-  primaryWidth,
   secondaryWidth,
-  onPrimaryWidthChange,
   routePathname,
   onSecondaryWidthChange,
-  onToggleCollapsed,
+  onTogglePrimary,
   onToggleExpanded,
 }: Props) {
   const location = useLocation();
@@ -52,30 +48,41 @@ export default function Sidebar({
     }
   }, [expanded, onToggleExpanded, panels]);
 
-  const renderBottomPanel = (target: SidebarPanelTarget) =>
-    panels[target] ? <div className={`sidebar-panel sidebar-panel-${target}`}>{panels[target]}</div> : null;
-  const activeSecondaryTarget = routeTarget && expanded === routeTarget ? routeTarget : null;
-  const secondaryPanel = activeSecondaryTarget ? panels[activeSecondaryTarget] : null;
-  const routeSecondaryLabel = routeTarget ? sidebarLabel(routeTarget) : '';
-  const canToggleRouteSecondary = routeTarget !== null && Boolean(panels[routeTarget]);
+  const viewerPanel = panels.viewer ? <div className="sidebar-panel sidebar-panel-viewer">{panels.viewer}</div> : null;
+  const activeRouteSecondaryTarget = routeTarget && expanded === routeTarget ? routeTarget : null;
+  const viewerOnlySecondary = !activeRouteSecondaryTarget && Boolean(viewerPanel);
+  const activeSecondaryTarget = activeRouteSecondaryTarget ?? (viewerOnlySecondary ? 'viewer' : null);
+  const secondaryPanel = activeRouteSecondaryTarget ? panels[activeRouteSecondaryTarget] : null;
+  const routeSecondaryLabel = activeRouteSecondaryTarget ? sidebarLabel(activeRouteSecondaryTarget) : viewerOnlySecondary ? '查看器' : routeTarget ? sidebarLabel(routeTarget) : '';
   const routeSecondaryOpen = activeSecondaryTarget !== null;
-  const routeSecondaryToggleLabel = `${routeSecondaryOpen ? '折叠' : '展开'}${routeSecondaryLabel}`;
-  const showPrimarySecondaryButton = !collapsed && canToggleRouteSecondary && !routeSecondaryOpen;
-  const showFloatingSecondaryButton = collapsed && canToggleRouteSecondary && !routeSecondaryOpen;
-  const toggleRouteSecondary = () => {
+  const toggleRouteSecondary = useCallback(() => {
     if (!routeTarget) return;
     onToggleExpanded(routeSecondaryOpen ? null : routeTarget);
-  };
+  }, [onToggleExpanded, routeSecondaryOpen, routeTarget]);
+  const handleSecondaryHeaderKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      toggleRouteSecondary();
+    },
+    [toggleRouteSecondary],
+  );
+  const toggleSecondaryForNav = useCallback(
+    (target: PrimarySidebarPanelTarget) => {
+      if (!panels[target]) return;
+      onToggleExpanded(target);
+    },
+    [onToggleExpanded, panels],
+  );
   const startResize = useCallback(
-    (kind: 'primary' | 'secondary', event: PointerEvent<HTMLButtonElement>) => {
+    (event: PointerEvent<HTMLButtonElement>) => {
       if (event.button !== 0) return;
       event.preventDefault();
       const startX = event.clientX;
-      const startWidth = kind === 'primary' ? primaryWidth : secondaryWidth;
-      const onWidthChange = kind === 'primary' ? onPrimaryWidthChange : onSecondaryWidthChange;
+      const startWidth = secondaryWidth;
       document.body.classList.add('sidebar-resizing');
       const onPointerMove = (moveEvent: globalThis.PointerEvent) => {
-        onWidthChange(startWidth + moveEvent.clientX - startX);
+        onSecondaryWidthChange(startWidth + moveEvent.clientX - startX);
       };
       const endResize = () => {
         document.body.classList.remove('sidebar-resizing');
@@ -87,94 +94,56 @@ export default function Sidebar({
       window.addEventListener('pointerup', endResize);
       window.addEventListener('pointercancel', endResize);
     },
-    [onPrimaryWidthChange, onSecondaryWidthChange, primaryWidth, secondaryWidth],
+    [onSecondaryWidthChange, secondaryWidth],
   );
 
   return (
     <>
-      {collapsed && !routeSecondaryOpen && (
-        <div className={showFloatingSecondaryButton ? 'sidebar-floating-controls is-joined' : 'sidebar-floating-controls'}>
-          <button className="sidebar-floating-button sidebar-floating-primary" type="button" onClick={onToggleCollapsed} aria-label="展开一级侧栏">
-            LPicto
+      <nav className="nav">
+        <div className="brand-row">
+          <button className="brand" type="button" title={collapsed ? '展开一级侧栏' : '折叠一级侧栏'} aria-label={collapsed ? '展开一级侧栏' : '折叠一级侧栏'} onClick={onTogglePrimary}>
+            <span className="brand-mark brand-mark-full">LPicto</span>
+            <span className="brand-mark brand-mark-compact">P</span>
           </button>
-          {showFloatingSecondaryButton && routeTarget && (
-            <button
-              className="sidebar-floating-button sidebar-floating-secondary"
-              type="button"
-              title={routeSecondaryToggleLabel}
-              aria-label={routeSecondaryToggleLabel}
-              onClick={toggleRouteSecondary}
-            >
-              {routeSecondaryLabel}
-            </button>
-          )}
         </div>
-      )}
-      {!collapsed && (
-        <nav className="nav">
-          <div className={showPrimarySecondaryButton ? 'brand-row has-secondary-toggle' : 'brand-row'}>
-            <button className="brand" type="button" onClick={onToggleCollapsed} aria-label="折叠一级侧栏">
-              LPicto
-            </button>
-            {showPrimarySecondaryButton && routeTarget && (
-              <button
-                className="brand-secondary-button"
-                type="button"
-                title={routeSecondaryToggleLabel}
-                aria-label={routeSecondaryToggleLabel}
-                onClick={toggleRouteSecondary}
-              >
-                {routeSecondaryLabel}
-              </button>
-            )}
-          </div>
-          <div className="nav-main">
-            {navItems.map(({ Icon, label, target, to }) => (
-              <SidebarItem active={routeTarget === target} icon={<Icon size={18} />} key={target} label={label} to={to} />
-            ))}
-          </div>
-          <div className="nav-bottom">
-            <div className="nav-bottom-panels">{renderBottomPanel('viewer')}</div>
-          </div>
-        </nav>
-      )}
+        <div className="nav-main">
+          {navItems.map(({ Icon, label, target, to }) => (
+            <SidebarItem active={routeTarget === target} icon={<Icon size={18} />} key={target} label={label} to={to} onActivate={() => toggleSecondaryForNav(target)} />
+          ))}
+        </div>
+        <div className="nav-bottom">
+          <div className="nav-bottom-panels" />
+        </div>
+      </nav>
       {activeSecondaryTarget && (
-        <aside className={`sidebar-secondary sidebar-secondary-${activeSecondaryTarget}`}>
-          <div className={collapsed ? 'sidebar-secondary-header has-primary-toggle' : 'sidebar-secondary-header'}>
-            {collapsed && (
-              <button className="sidebar-secondary-primary-button" type="button" onClick={onToggleCollapsed} aria-label="展开一级侧栏">
-                LPicto
-              </button>
-            )}
-            <button
-              className="sidebar-secondary-title-button"
-              type="button"
-              title={routeSecondaryToggleLabel}
-              aria-label={routeSecondaryToggleLabel}
-              onClick={toggleRouteSecondary}
-            >
-              {routeSecondaryLabel}
-            </button>
-          </div>
-          {secondaryPanel && <div className={`sidebar-panel sidebar-panel-${activeSecondaryTarget}`}>{secondaryPanel}</div>}
+        <aside className={`sidebar-secondary sidebar-secondary-${activeSecondaryTarget}${viewerPanel ? ' has-viewer-panel' : ''}${viewerOnlySecondary ? ' viewer-only' : ''}`}>
+          {activeRouteSecondaryTarget && (
+            <div className="sidebar-secondary-main">
+              <div
+                aria-label="折叠二级栏"
+                className="sidebar-secondary-header"
+                role="button"
+                tabIndex={0}
+                title="折叠二级栏"
+                onClick={toggleRouteSecondary}
+                onKeyDown={handleSecondaryHeaderKeyDown}
+              >
+                <span className="sidebar-secondary-title">{routeSecondaryLabel}</span>
+              </div>
+              {secondaryPanel && <div className={`sidebar-panel sidebar-panel-${activeRouteSecondaryTarget}`}>{secondaryPanel}</div>}
+            </div>
+          )}
+          {viewerPanel && <div className="sidebar-secondary-viewer">{viewerPanel}</div>}
         </aside>
       )}
-      {!collapsed && (
-        <button
-          aria-label="调整一级栏宽度"
-          className="sidebar-resize-handle sidebar-resize-primary"
-          title="调整一级栏宽度"
-          type="button"
-          onPointerDown={(event) => startResize('primary', event)}
-        />
-      )}
+      <div aria-hidden="true" className="sidebar-resize-handle sidebar-resize-primary sidebar-resize-static" />
       {activeSecondaryTarget && (
         <button
           aria-label="调整二级栏宽度"
           className="sidebar-resize-handle sidebar-resize-secondary"
           title="调整二级栏宽度"
           type="button"
-          onPointerDown={(event) => startResize('secondary', event)}
+          onPointerDown={startResize}
         />
       )}
     </>
@@ -185,16 +154,18 @@ function SidebarItem({
   active,
   icon,
   label,
+  onActivate,
   to,
 }: {
   active: boolean;
   icon: ReactNode;
   label: string;
+  onActivate: () => void;
   to: string;
 }) {
   return (
     <div className="nav-item">
-      <NavLink to={to} className={active ? 'nav-link active' : 'nav-link'}>
+      <NavLink to={to} className={active ? 'nav-link active' : 'nav-link'} title={label} onClick={onActivate}>
         {icon}
         <span>{label}</span>
       </NavLink>

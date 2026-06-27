@@ -123,7 +123,7 @@ func TestAssetStatusesSkipsPreviewForBrowserPlayableImages(t *testing.T) {
 		t.Fatalf("non-browser video statuses = %q %q %q %q", thumb, preview, poster, proxy)
 	}
 	thumb, preview, poster, proxy = AssetStatuses(model.MediaTypeVideo, true, true)
-	if thumb != model.StatusPending || preview != model.StatusNotRequired || poster != model.StatusNotRequired || proxy != model.StatusPending {
+	if thumb != model.StatusPending || preview != model.StatusNotRequired || poster != model.StatusNotRequired || proxy != model.StatusNotRequired {
 		t.Fatalf("browser video statuses = %q %q %q %q", thumb, preview, poster, proxy)
 	}
 	_, _, _, proxy = AssetStatuses(model.MediaTypeVideo, true, false)
@@ -132,7 +132,7 @@ func TestAssetStatusesSkipsPreviewForBrowserPlayableImages(t *testing.T) {
 	}
 }
 
-func TestEnableVideoProxiesMarksPlayableVideosPending(t *testing.T) {
+func TestEnableVideoProxiesMarksOnlyUnplayableVideosPending(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
 	if err != nil {
@@ -146,18 +146,61 @@ func TestEnableVideoProxiesMarksPlayableVideosPending(t *testing.T) {
 		ThumbStatus: model.StatusReady, PreviewStatus: model.StatusNotRequired,
 		VideoPosterStatus: model.StatusNotRequired, VideoProxyStatus: model.StatusNotRequired,
 	}
-	id, _, _, err := database.UpsertAsset(ctx, asset)
+	playableID, _, _, err := database.UpsertAsset(ctx, asset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asset.RelPath = "unplayable.mkv"
+	asset.Filename = "unplayable.mkv"
+	asset.Ext = "mkv"
+	asset.CacheKey = "unplayable"
+	asset.BrowserPlayable = false
+	unplayableID, _, _, err := database.UpsertAsset(ctx, asset)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := database.EnableVideoProxies(ctx); err != nil {
 		t.Fatal(err)
 	}
+	_ = unplayableID
 	items, err := database.PendingWork(ctx, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 1 || items[0].Type != "video_proxy" || items[0].AssetID != id {
-		t.Fatalf("pending work = %#v, want video proxy for %d", items, id)
+	if len(items) != 0 {
+		t.Fatalf("pending work = %#v, want no background video proxy work", items)
+	}
+	playable, err := database.GetAsset(ctx, playableID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if playable.VideoProxyStatus != model.StatusNotRequired {
+		t.Fatalf("playable proxy status = %q, want not_required", playable.VideoProxyStatus)
+	}
+}
+
+func TestPendingWorkSkipsPlayableVideoProxy(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	asset := AssetUpsert{
+		RelPath: "playable.mp4", ParentRelPath: "", Filename: "playable.mp4", Ext: "mp4", MediaType: model.MediaTypeVideo,
+		Size: 10, Mtime: 10, ImportedAt: 10, TimelineAt: 10, CacheKey: "playable", BrowserPlayable: true,
+		ThumbStatus: model.StatusReady, PreviewStatus: model.StatusNotRequired,
+		VideoPosterStatus: model.StatusNotRequired, VideoProxyStatus: model.StatusProcessing,
+	}
+	if _, _, _, err := database.UpsertAsset(ctx, asset); err != nil {
+		t.Fatal(err)
+	}
+	items, err := database.PendingWork(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("pending work = %#v, want none", items)
 	}
 }

@@ -125,7 +125,13 @@ func (s *Server) cachedCacheStats() CacheStatsDTO {
 }
 
 func (s *Server) refreshCacheStats() {
-	stats := computeCacheStats(filepath.Join(s.store.DataRoot, "cache"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	databaseBytes, err := s.db.DatabaseSize(ctx)
+	if err != nil {
+		s.logger.Warn("database size refresh failed", "error", err)
+	}
+	stats := computeCacheStatsWithDatabase(s.store.CacheRoot, databaseBytes)
 	stats.UpdatedAt = time.Now().Unix()
 	s.cacheMu.Lock()
 	s.cacheStats = stats
@@ -135,6 +141,10 @@ func (s *Server) refreshCacheStats() {
 }
 
 func computeCacheStats(root string) CacheStatsDTO {
+	return computeCacheStatsWithDatabase(root, 0)
+}
+
+func computeCacheStatsWithDatabase(root string, databaseBytes int64) CacheStatsDTO {
 	var stats CacheStatsDTO
 	err := filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
@@ -145,12 +155,17 @@ func computeCacheStats(root string) CacheStatsDTO {
 			return nil
 		}
 		stats.FileCount++
-		stats.SizeBytes += info.Size()
+		stats.CacheBytes += info.Size()
 		return nil
 	})
 	if err != nil {
-		return CacheStatsDTO{}
+		stats.CacheBytes = 0
+		stats.FileCount = 0
 	}
+	if databaseBytes > 0 {
+		stats.DatabaseBytes = databaseBytes
+	}
+	stats.SizeBytes = stats.CacheBytes + stats.DatabaseBytes
 	return stats
 }
 
@@ -697,6 +712,7 @@ func scanLibraryProgressDTO(library db.ScanLibrary, stats scanLibraryProgressSta
 		UnscannedFiles:  unscannedFiles,
 		Thumb:           workStatusCountsDTO(stats.Progress.Thumb),
 		Transcode:       workStatusCountsDTO(stats.Progress.Transcode),
+		VideoProxy:      workStatusCountsDTO(stats.Progress.VideoProxy),
 		Active:          active,
 	}
 }
