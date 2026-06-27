@@ -14,7 +14,7 @@ import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
 import type { Album, AlbumAssetFilter, Asset, AssetDeletedEvent, AssetKind, AssetRating, LibraryAnchor, SortKey } from '../types/api';
-import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
+import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import {
   appendViewerReturnParams,
@@ -83,7 +83,6 @@ export default function RatingsPage() {
   const albumApiFilter: AlbumAssetFilter | undefined = albumFilter === 'none' ? 'none' : undefined;
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const sidebarState = useSidebarReturnState();
-  const restoreSidebarState = useRestoreSidebarState();
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
 
   useEffect(() => {
@@ -196,12 +195,11 @@ export default function RatingsPage() {
       groupMode,
       query,
       rating,
-      sidebarCollapsed: sidebarState.sidebarCollapsed,
       sidebarExpanded: sidebarState.sidebarExpanded,
       sort,
       type,
     }),
-    [albumFilter, getGridState, groupMode, query, rating, sidebarState.sidebarCollapsed, sidebarState.sidebarExpanded, sort, type],
+    [albumFilter, getGridState, groupMode, query, rating, sidebarState.sidebarExpanded, sort, type],
   );
 
   const saveCurrentState = useCallback(() => {
@@ -335,10 +333,6 @@ export default function RatingsPage() {
     pressPreviewAsset ? <AssetInfoPanel asset={pressPreviewAsset} title="快速预览" /> : null,
     [pressPreviewAsset?.id],
   );
-
-  useEffect(() => {
-    restoreSidebarState({ sidebarCollapsed: initialStateRef.current.sidebarCollapsed });
-  }, [restoreSidebarState]);
 
   return (
     <section className="page media-page">

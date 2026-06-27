@@ -201,26 +201,9 @@ func (p Processor) deleteIfSourceMissing(ctx context.Context, asset model.Asset,
 	if !missing {
 		return false, nil
 	}
-	deleted, err := p.DB.MarkDeletedWithCache(ctx, asset.RelPath, util.UnixNow())
-	if err != nil {
-		return false, err
+	if p.Logger != nil {
+		p.Logger.Warn("skip thumbnail work because source is unavailable", "assetID", asset.ID, "relPath", asset.RelPath, "reason", reason)
 	}
-	if deleted == nil {
-		return true, nil
-	}
-	if deleted.CacheKey != "" {
-		if err := p.Store.RemoveCache(deleted.CacheKey); err != nil && p.Logger != nil {
-			p.Logger.Warn("remove cache after missing source failed", "relPath", asset.RelPath, "reason", reason, "error", err)
-		}
-	}
-	if p.Events != nil {
-		p.Events.Publish(events.Event{Type: "asset_deleted", Payload: asset})
-	}
-	go func() {
-		if err := p.DB.RefreshFolders(context.Background()); err != nil && p.Logger != nil {
-			p.Logger.Warn("refresh folders after missing source failed", "relPath", asset.RelPath, "reason", reason, "error", err)
-		}
-	}()
 	return true, nil
 }
 

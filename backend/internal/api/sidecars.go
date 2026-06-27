@@ -16,7 +16,7 @@ import (
 )
 
 const maxNFOBytes = 256 * 1024
-const maxSubtitleBytes = 4 * 1024 * 1024
+const maxSubtitleBytes = 16 * 1024 * 1024
 
 type AssetSidecarsDTO struct {
 	NFO               *NFODTO       `json:"nfo"`
@@ -87,6 +87,11 @@ func (s *Server) assetSubtitle(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
+	if strings.EqualFold(selected.Format, "bilibili") {
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		_, _ = w.Write(data)
+		return
+	}
 	if strings.EqualFold(selected.Format, "srt") {
 		_, _ = w.Write([]byte(srtToVTT(string(data))))
 		return
@@ -152,6 +157,7 @@ func (s *Server) subtitleFiles(asset model.Asset) ([]sidecarFile, error) {
 		".srt": "srt",
 		".ssa": "ssa",
 		".vtt": "vtt",
+		".xml": "bilibili",
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {

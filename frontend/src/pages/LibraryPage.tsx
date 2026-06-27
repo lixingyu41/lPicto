@@ -14,7 +14,7 @@ import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
 import type { Asset, AssetDeletedEvent, AssetKind, LibraryAnchor, SortKey } from '../types/api';
-import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
+import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import {
   appendViewerReturnParams,
@@ -72,7 +72,6 @@ export default function LibraryPage() {
   const serverGroup = serverGroupForMode(groupMode);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const sidebarState = useSidebarReturnState();
-  const restoreSidebarState = useRestoreSidebarState();
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const loadAssets = useCallback(
     (page: number) => api.libraryAssets(page, pageSize, type, sort, query, serverGroup),
@@ -131,12 +130,11 @@ export default function LibraryPage() {
       ...getGridState(),
       groupMode,
       query,
-      sidebarCollapsed: sidebarState.sidebarCollapsed,
       sidebarExpanded: sidebarState.sidebarExpanded,
       sort,
       type,
     }),
-    [getGridState, groupMode, query, sidebarState.sidebarCollapsed, sidebarState.sidebarExpanded, sort, type],
+    [getGridState, groupMode, query, sidebarState.sidebarExpanded, sort, type],
   );
 
   const saveCurrentState = useCallback(() => {
@@ -160,7 +158,6 @@ export default function LibraryPage() {
         ...reset,
         groupMode: controls.groupMode,
         query: controls.query,
-        sidebarCollapsed: current.sidebarCollapsed,
         sidebarExpanded: current.sidebarExpanded,
         sort: controls.sort,
         type: controls.type,
@@ -282,10 +279,6 @@ export default function LibraryPage() {
     pressPreviewAsset ? <AssetInfoPanel asset={pressPreviewAsset} title="快速预览" /> : null,
     [pressPreviewAsset?.id],
   );
-
-  useEffect(() => {
-    restoreSidebarState({ sidebarCollapsed: initialStateRef.current.sidebarCollapsed });
-  }, [restoreSidebarState]);
 
   return (
     <section className="page media-page">

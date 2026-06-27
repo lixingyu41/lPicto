@@ -152,30 +152,6 @@ a {
   --sidebar-current-width: var(--sidebar-primary-collapsed-width);
 }
 
-/* Design grid overlay: remove this block and DesignGridOverlay.tsx to disable. */
-.design-grid-overlay {
-  position: fixed;
-  z-index: 3000;
-  inset: 0;
-  pointer-events: none;
-  background-image:
-    linear-gradient(rgba(0, 113, 227, 0.13) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(0, 113, 227, 0.13) 1px, transparent 1px),
-    linear-gradient(rgba(0, 113, 227, 0.24) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(0, 113, 227, 0.24) 1px, transparent 1px);
-  background-size: 8px 8px, 8px 8px, 40px 40px, 40px 40px;
-  opacity: 0.36;
-}
-
-:root[data-theme='dark'] .design-grid-overlay {
-  background-image:
-    linear-gradient(rgba(10, 132, 255, 0.2) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(10, 132, 255, 0.2) 1px, transparent 1px),
-    linear-gradient(rgba(10, 132, 255, 0.34) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(10, 132, 255, 0.34) 1px, transparent 1px);
-  opacity: 0.32;
-}
-
 .sidebar {
   position: relative;
   display: grid;
@@ -315,7 +291,13 @@ body.sidebar-resizing .app-shell {
 }
 
 .brand:hover {
-  background: var(--hover-bg);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text);
+}
+
+.brand:active {
+  transform: none;
 }
 
 .brand-row.has-primary-toggle .brand {
@@ -684,11 +666,6 @@ body.sidebar-resizing .app-shell {
   max-height: calc(50% - 5px);
   min-height: 0;
   overflow: hidden;
-}
-
-.sidebar-secondary.viewer-only .sidebar-secondary-viewer {
-  flex: 1 1 auto;
-  height: 100%;
 }
 
 .sidebar-secondary-viewer {
@@ -2194,6 +2171,88 @@ input {
   object-fit: contain;
   background: #000;
   transform-origin: center;
+}
+
+.video-danmaku-layer {
+  --danmaku-lane-height: 32px;
+  position: absolute;
+  inset: 0 0 var(--video-controls-space) 0;
+  z-index: 5;
+  overflow: hidden;
+  pointer-events: none;
+  contain: layout paint style;
+}
+
+.video-danmaku-item {
+  position: absolute;
+  max-width: none;
+  color: var(--danmaku-color);
+  font-size: var(--danmaku-font-size);
+  font-weight: 800;
+  line-height: 1.12;
+  letter-spacing: 0;
+  white-space: nowrap;
+  text-shadow:
+    1px 0 1px rgba(0, 0, 0, 0.86),
+    -1px 0 1px rgba(0, 0, 0, 0.86),
+    0 1px 1px rgba(0, 0, 0, 0.86),
+    0 -1px 1px rgba(0, 0, 0, 0.86),
+    0 2px 3px rgba(0, 0, 0, 0.62);
+  -webkit-text-stroke: 1px rgba(0, 0, 0, 0.72);
+  paint-order: stroke fill;
+  will-change: transform, opacity;
+  animation-duration: var(--danmaku-duration);
+  animation-delay: var(--danmaku-delay);
+  animation-fill-mode: both;
+  animation-timing-function: linear;
+}
+
+.video-danmaku-layer.paused .video-danmaku-item {
+  animation-play-state: paused;
+}
+
+.video-danmaku-scroll,
+.video-danmaku-top {
+  top: calc(8px + var(--danmaku-lane) * var(--danmaku-lane-height));
+}
+
+.video-danmaku-scroll {
+  left: 100%;
+  animation-name: video-danmaku-scroll;
+}
+
+.video-danmaku-top,
+.video-danmaku-bottom {
+  right: 0;
+  left: 0;
+  text-align: center;
+  animation-name: video-danmaku-fixed;
+}
+
+.video-danmaku-bottom {
+  bottom: calc(8px + var(--danmaku-lane) * var(--danmaku-lane-height));
+}
+
+@keyframes video-danmaku-scroll {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(calc(-100vw - 100%));
+  }
+}
+
+@keyframes video-danmaku-fixed {
+  0%,
+  100% {
+    opacity: 0;
+  }
+
+  8%,
+  92% {
+    opacity: 1;
+  }
 }
 
 .video-poster-layer {

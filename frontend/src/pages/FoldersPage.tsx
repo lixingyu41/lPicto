@@ -14,7 +14,7 @@ import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
 import type { Asset, AssetDeletedEvent, Folder, LibraryAnchor, SortKey } from '../types/api';
-import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
+import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import {
   appendViewerReturnParams,
   decodeReturnState,
@@ -71,7 +71,6 @@ export default function FoldersPage() {
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const sidebarState = useSidebarReturnState();
-  const restoreSidebarState = useRestoreSidebarState();
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const serverGroup = serverGroupForMode(groupMode);
@@ -186,11 +185,10 @@ export default function FoldersPage() {
       groupMode,
       includeSubfolders,
       query,
-      sidebarCollapsed: sidebarState.sidebarCollapsed,
       sidebarExpanded: sidebarState.sidebarExpanded,
       sort,
     }),
-    [currentId, expandedRelPaths, getGridState, groupMode, includeSubfolders, query, sidebarState.sidebarCollapsed, sidebarState.sidebarExpanded, sort],
+    [currentId, expandedRelPaths, getGridState, groupMode, includeSubfolders, query, sidebarState.sidebarExpanded, sort],
   );
 
   const saveCurrentState = useCallback(() => {
@@ -381,10 +379,6 @@ export default function FoldersPage() {
     pressPreviewAsset ? <AssetInfoPanel asset={pressPreviewAsset} title="快速预览" /> : null,
     [pressPreviewAsset?.id],
   );
-
-  useEffect(() => {
-    restoreSidebarState({ sidebarCollapsed: initialStateRef.current.sidebarCollapsed });
-  }, [restoreSidebarState]);
 
   return (
     <section className="page media-page">

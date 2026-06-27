@@ -8,7 +8,7 @@ import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
 import SortControls, { isSortKey } from '../components/SortControls';
-import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
+import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { api } from '../api/client';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
@@ -89,7 +89,6 @@ export default function AlbumsPage() {
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const sidebarState = useSidebarReturnState();
-  const restoreSidebarState = useRestoreSidebarState();
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const serverGroup = serverGroupForMode(groupMode);
@@ -219,11 +218,10 @@ export default function AlbumsPage() {
       groupMode,
       query,
       selectedId: selectedAlbum?.id ?? selectedId,
-      sidebarCollapsed: sidebarState.sidebarCollapsed,
       sidebarExpanded: sidebarState.sidebarExpanded,
       sort,
     }),
-    [collapsedGroupKeys, getGridState, groupMode, query, selectedAlbum?.id, selectedId, sidebarState.sidebarCollapsed, sidebarState.sidebarExpanded, sort],
+    [collapsedGroupKeys, getGridState, groupMode, query, selectedAlbum?.id, selectedId, sidebarState.sidebarExpanded, sort],
   );
 
   const saveCurrentState = useCallback(() => {
@@ -451,10 +449,6 @@ export default function AlbumsPage() {
     pressPreviewAsset ? <AssetInfoPanel asset={pressPreviewAsset} title="快速预览" /> : null,
     [pressPreviewAsset?.id],
   );
-
-  useEffect(() => {
-    restoreSidebarState({ sidebarCollapsed: initialStateRef.current.sidebarCollapsed });
-  }, [restoreSidebarState]);
 
   return (
     <section className="page media-page">

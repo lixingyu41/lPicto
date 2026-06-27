@@ -6,7 +6,6 @@ export interface GridReturnState {
   loadedStartIndex: number;
   scrollRatio: number;
   scrollTop: number;
-  sidebarCollapsed: boolean;
   sidebarExpanded: SidebarPanelTarget | null;
 }
 
@@ -77,7 +76,6 @@ export function resetGridState(): GridReturnState {
     loadedStartIndex: 0,
     scrollRatio: 0,
     scrollTop: 0,
-    sidebarCollapsed: false,
     sidebarExpanded: null,
   };
 }

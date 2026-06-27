@@ -740,11 +740,6 @@ func (s *Server) cacheThumb(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	asset, hasAsset := s.assetByCacheKey(r.Context(), cacheKey)
-	if hasAsset && s.deleteAssetIfSourceMissing(r.Context(), asset, "thumb_source_missing") {
-		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
-		return
-	}
 	file, err := os.Open(path)
 	if err != nil {
 		http.NotFound(w, r)
@@ -804,10 +799,6 @@ func (s *Server) serveCacheAsset(w http.ResponseWriter, r *http.Request, asset m
 		writeError(w, http.StatusInternalServerError, "cache_path_failed", "读取缓存失败")
 		return
 	}
-	if s.deleteAssetIfSourceMissing(r.Context(), asset, "cache_source_missing") {
-		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
-		return
-	}
 	file, err := os.Open(path)
 	if err != nil {
 		_ = taskType
@@ -846,8 +837,8 @@ func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, 
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) && s.deleteAssetIfSourceMissing(r.Context(), asset, "original_open_missing") {
-			writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
 			return
 		}
 		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
@@ -856,10 +847,7 @@ func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, 
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || info.IsDir() {
-		if errors.Is(err, os.ErrNotExist) || info != nil && info.IsDir() {
-			_ = s.deleteAssetIfSourceMissing(r.Context(), asset, "original_stat_missing")
-		}
-		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
+		writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
 		return
 	}
 	if asset.MimeType != nil && *asset.MimeType != "" {

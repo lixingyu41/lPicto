@@ -5,7 +5,6 @@ export type SidebarPanelTarget = 'library' | 'ratings' | 'search' | 'albums' | '
 type SidebarPanels = Partial<Record<SidebarPanelTarget, ReactNode>>;
 
 export interface SidebarReturnState {
-  sidebarCollapsed: boolean;
   sidebarExpanded: SidebarPanelTarget | null;
 }
 
@@ -45,8 +44,8 @@ export function SidebarPanelProvider({
     });
   }, []);
   const sidebarState = useMemo(
-    () => ({ sidebarCollapsed, sidebarExpanded }),
-    [sidebarCollapsed, sidebarExpanded],
+    () => ({ sidebarExpanded }),
+    [sidebarExpanded],
   );
   const value = useMemo(
     () => ({ panels, setPanel, setSidebarCollapsed, setSidebarExpanded, sidebarState }),
@@ -76,17 +75,14 @@ export function useRestoreSidebarState() {
   if (!context) {
     throw new Error('useRestoreSidebarState must be used inside SidebarPanelProvider');
   }
-  const { setSidebarCollapsed, setSidebarExpanded } = context;
+  const { setSidebarExpanded } = context;
   return useCallback(
     (state: Partial<SidebarReturnState>) => {
-      if (typeof state.sidebarCollapsed === 'boolean') {
-        setSidebarCollapsed(state.sidebarCollapsed);
-      }
       if (state.sidebarExpanded === null || isSidebarPanelTarget(state.sidebarExpanded)) {
         setSidebarExpanded(state.sidebarExpanded);
       }
     },
-    [setSidebarCollapsed, setSidebarExpanded],
+    [setSidebarExpanded],
   );
 }
 

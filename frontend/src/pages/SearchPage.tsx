@@ -9,7 +9,7 @@ import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
 import SortControls from '../components/SortControls';
-import { useRestoreSidebarState, useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
+import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { useAssetDeletedEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
@@ -153,7 +153,6 @@ export default function SearchPage() {
   const [totalCount, setTotalCount] = useState(0);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const sidebarState = useSidebarReturnState();
-  const restoreSidebarState = useRestoreSidebarState();
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const serverGroup = serverGroupForMode(groupMode);
 
@@ -299,7 +298,6 @@ export default function SearchPage() {
       query,
       resolutionXRange,
       resolutionYRange,
-      sidebarCollapsed: sidebarState.sidebarCollapsed,
       sidebarExpanded: sidebarState.sidebarExpanded,
       sizeMaxMB,
       sizeMinMB,
@@ -323,7 +321,6 @@ export default function SearchPage() {
       query,
       resolutionXRange,
       resolutionYRange,
-      sidebarState.sidebarCollapsed,
       sidebarState.sidebarExpanded,
       sizeMaxMB,
       sizeMinMB,
@@ -570,10 +567,6 @@ export default function SearchPage() {
     pressPreviewAsset ? <AssetInfoPanel asset={pressPreviewAsset} title="快速预览" /> : null,
     [pressPreviewAsset?.id],
   );
-
-  useEffect(() => {
-    restoreSidebarState({ sidebarCollapsed: initialStateRef.current.sidebarCollapsed });
-  }, [restoreSidebarState]);
 
   return (
     <section className="page media-page">

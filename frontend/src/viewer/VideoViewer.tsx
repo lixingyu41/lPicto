@@ -5,6 +5,7 @@ import { api, assetPreviewUrl, assetSubtitleUrl, assetVideoProxyUrl, assetVideoU
 import { formatDuration } from '../utils/format';
 import { normalizeRotation, rotatedContainStyle } from '../utils/rotation';
 import { loadViewerPrefs, nextPlaybackRate, viewerPrefsChanged, type ViewerPrefs } from '../utils/viewerPrefs';
+import DanmakuLayer from './DanmakuLayer';
 
 interface Props {
   asset: Asset;
@@ -96,6 +97,10 @@ export default function VideoViewer({
   const statusLabel = videoStatusLabel(playbackAsset, sourceFailed, proxyRuntime);
   const displayedTime = scrubTime ?? currentTime;
   const hasSubtitles = subtitles.length > 0;
+  const selectedSubtitle = useMemo(
+    () => subtitles.find((subtitle) => subtitle.id === selectedSubtitleId),
+    [selectedSubtitleId, subtitles],
+  );
 
   const mediaStyle = useMemo(() => {
     const rotation = normalizeRotation(asset.rotation);
@@ -256,14 +261,6 @@ export default function VideoViewer({
     }, autoplayDelayMs);
     return clearAutoplayTimer;
   }, [asset.id, canPlay, playbackRate, prefs.videoAutoplay, proxyStreamEnabled, source, usesProxy]);
-
-  useEffect(() => {
-    const video = ref.current;
-    if (!video) return;
-    for (const track of Array.from(video.textTracks)) {
-      track.mode = subtitlesEnabled && selectedSubtitleId ? 'showing' : 'disabled';
-    }
-  }, [selectedSubtitleId, subtitlesEnabled, subtitleSource]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -507,10 +504,18 @@ export default function VideoViewer({
               }
               setAudio(saveVideoAudioPreference(video.volume, video.muted));
             }}
-          >
-            {subtitleSource && <track key={subtitleSource} kind="subtitles" src={subtitleSource} label="字幕" default />}
-          </video>
+          />
         )}
+        <DanmakuLayer
+          currentTime={displayedTime}
+          enabled={Boolean(subtitleSource) && canPlay && !showPosterLayer}
+          format={selectedSubtitle?.format ?? ''}
+          frameHeight={frameSize.height}
+          frameWidth={frameSize.width}
+          paused={paused || scrubTime !== null}
+          playbackRate={playbackRate}
+          source={subtitleSource}
+        />
         {showPosterLayer && (
           <button
             className={canPlay ? 'video-poster-layer playable' : 'video-poster-layer'}
@@ -612,7 +617,7 @@ export default function VideoViewer({
             <button
               className={subtitlesEnabled && hasSubtitles ? 'active' : ''}
               type="button"
-              title={hasSubtitles ? (subtitlesEnabled ? '关闭字幕' : '开启字幕') : '无字幕'}
+              title={hasSubtitles ? (subtitlesEnabled ? '关闭弹幕' : '开启弹幕') : '无弹幕'}
               disabled={!hasSubtitles}
               onClick={() => onSubtitlesEnabledChange(!subtitlesEnabled)}
             >
@@ -621,7 +626,7 @@ export default function VideoViewer({
             {hasSubtitles && (
               <select
                 className="video-subtitle-select"
-                aria-label="字幕选择"
+                aria-label="弹幕选择"
                 value={selectedSubtitleId}
                 onChange={(event) => onSelectedSubtitleChange(event.target.value)}
               >

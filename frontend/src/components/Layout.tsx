@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
 import { useLocation, type Location } from 'react-router-dom';
-import DesignGridOverlay from './DesignGridOverlay';
 import Sidebar from './Sidebar';
 import { SidebarPanelProvider, type SidebarPanelTarget } from './SidebarContext';
 import {
@@ -32,8 +31,7 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
   const [sidebarExpanded, setSidebarExpandedState] = useState<SidebarPanelTarget | null>(() =>
     routeTarget && loadSidebarSecondaryExpanded() ? routeTarget : null,
   );
-  const viewerActive = overlay !== null || effectivePathname.startsWith('/viewer/');
-  const sidebarPanelOpen = (sidebarExpanded !== null && sidebarExpanded === routeTarget) || viewerActive;
+  const sidebarPanelOpen = sidebarExpanded !== null && sidebarExpanded === routeTarget;
   const shellClass = [
     'app-shell',
     sidebarCollapsed ? 'sidebar-primary-collapsed' : 'sidebar-primary-open',
@@ -112,7 +110,6 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
         </aside>
         <main className={routeEntering ? 'main-panel route-entering' : 'main-panel'}>{children}</main>
         {overlay && <div className="viewer-shell-overlay">{overlay}</div>}
-        <DesignGridOverlay />
       </div>
     </SidebarPanelProvider>
   );

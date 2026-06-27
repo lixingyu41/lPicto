@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type PointerEvent, type ReactNode, useCallback, useEffect } from 'react';
+import { type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, useCallback, useEffect } from 'react';
 import { FolderTree, Images, Library, Search, Settings, Star } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { useSidebarPanelValue, type SidebarPanelTarget } from './SidebarContext';
@@ -50,10 +50,9 @@ export default function Sidebar({
 
   const viewerPanel = panels.viewer ? <div className="sidebar-panel sidebar-panel-viewer">{panels.viewer}</div> : null;
   const activeRouteSecondaryTarget = routeTarget && expanded === routeTarget ? routeTarget : null;
-  const viewerOnlySecondary = !activeRouteSecondaryTarget && Boolean(viewerPanel);
-  const activeSecondaryTarget = activeRouteSecondaryTarget ?? (viewerOnlySecondary ? 'viewer' : null);
+  const activeSecondaryTarget = activeRouteSecondaryTarget;
   const secondaryPanel = activeRouteSecondaryTarget ? panels[activeRouteSecondaryTarget] : null;
-  const routeSecondaryLabel = activeRouteSecondaryTarget ? sidebarLabel(activeRouteSecondaryTarget) : viewerOnlySecondary ? '查看器' : routeTarget ? sidebarLabel(routeTarget) : '';
+  const routeSecondaryLabel = activeRouteSecondaryTarget ? sidebarLabel(activeRouteSecondaryTarget) : routeTarget ? sidebarLabel(routeTarget) : '';
   const routeSecondaryOpen = activeSecondaryTarget !== null;
   const toggleRouteSecondary = useCallback(() => {
     if (!routeTarget) return;
@@ -116,7 +115,7 @@ export default function Sidebar({
         </div>
       </nav>
       {activeSecondaryTarget && (
-        <aside className={`sidebar-secondary sidebar-secondary-${activeSecondaryTarget}${viewerPanel ? ' has-viewer-panel' : ''}${viewerOnlySecondary ? ' viewer-only' : ''}`}>
+        <aside className={`sidebar-secondary sidebar-secondary-${activeSecondaryTarget}${viewerPanel ? ' has-viewer-panel' : ''}`}>
           {activeRouteSecondaryTarget && (
             <div className="sidebar-secondary-main">
               <div
@@ -160,12 +159,22 @@ function SidebarItem({
   active: boolean;
   icon: ReactNode;
   label: string;
-  onActivate: () => void;
+  onActivate: (event: MouseEvent<HTMLAnchorElement>) => void;
   to: string;
 }) {
   return (
     <div className="nav-item">
-      <NavLink to={to} className={active ? 'nav-link active' : 'nav-link'} title={label} onClick={onActivate}>
+      <NavLink
+        to={to}
+        className={active ? 'nav-link active' : 'nav-link'}
+        title={label}
+        onClick={(event) => {
+          if (active) {
+            event.preventDefault();
+          }
+          onActivate(event);
+        }}
+      >
         {icon}
         <span>{label}</span>
       </NavLink>

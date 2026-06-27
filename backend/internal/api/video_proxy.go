@@ -87,8 +87,10 @@ func (s *Server) videoProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "video_proxy_not_started", "视频未开始播放")
 		return
 	}
-	if s.deleteAssetIfSourceMissing(r.Context(), asset, "video_proxy_source_missing") {
-		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
+	if missing, err := s.assetSourceMissing(asset); err != nil {
+		s.logger.Warn("check video proxy source failed", "assetID", asset.ID, "relPath", asset.RelPath, "error", err)
+	} else if missing {
+		writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
 		return
 	}
 	startSeconds := videoProxyStartSeconds(r, asset)
