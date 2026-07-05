@@ -1,5 +1,6 @@
 import type { SortKey } from '../types/api';
 import type { AssetGroupMode } from '../utils/assetGrouping';
+import { SidebarSelect } from './SidebarControls';
 
 interface GroupOption {
   label: string;
@@ -16,42 +17,19 @@ export default function AssetGroupingControls({
   sort: SortKey;
 }) {
   const section = groupSectionForSort(sort);
+  const options = [
+    { value: 'none', label: '无分组' },
+    ...section.options,
+    { value: 'folder', label: '按文件夹' },
+  ];
   return (
-    <>
-      <div className="sidebar-control-title">分组</div>
-      <div className="sidebar-list">
-        <GroupButton active={groupMode === 'none'} label="无分组" onClick={() => onChange('none')} />
-      </div>
-      <div className="sidebar-group-section">
-        <div className="sidebar-control-subtitle">{section.title}</div>
-        <div className="sidebar-list">
-          {section.options.map((option) => (
-            <GroupButton active={groupMode === option.value} key={option.value} label={option.label} onClick={() => onChange(option.value)} />
-          ))}
-        </div>
-      </div>
-      <div className="sidebar-group-section">
-        <div className="sidebar-control-subtitle">文件夹分组</div>
-        <div className="sidebar-list">
-          <GroupButton active={groupMode === 'folder'} label="按文件夹" onClick={() => onChange(groupMode === 'folder' ? 'none' : 'folder')} />
-        </div>
-      </div>
-    </>
+    <SidebarSelect label="分组" value={groupMode} options={options} onChange={(value) => onChange(value as AssetGroupMode)} />
   );
 }
 
 export function normalizeAssetGroupModeForSort(mode: AssetGroupMode, sort: SortKey): AssetGroupMode {
   if (mode === 'none' || mode === 'folder') return mode;
   return groupSectionForSort(sort).options.some((option) => option.value === mode) ? mode : 'none';
-}
-
-function GroupButton({ active, label, onClick }: { active: boolean; label: string; onClick: () => void }) {
-  return (
-    <button className={active ? 'sidebar-list-row active' : 'sidebar-list-row'} type="button" onClick={onClick}>
-      <span className="sidebar-list-marker" aria-hidden="true" />
-      <span>{label}</span>
-    </button>
-  );
 }
 
 function groupSectionForSort(sort: SortKey): { title: string; options: GroupOption[] } {

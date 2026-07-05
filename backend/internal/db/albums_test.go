@@ -213,6 +213,93 @@ func TestUpdateAlbumAndGroups(t *testing.T) {
 	}
 }
 
+func TestLibraryAlbumIDFilters(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	for _, asset := range []AssetUpsert{
+		testAlbumAsset("a/one.jpg", "a", model.MediaTypeImage, 100, 100),
+		testAlbumAsset("b/two.jpg", "b", model.MediaTypeImage, 100, 100),
+		testAlbumAsset("c/three.jpg", "c", model.MediaTypeImage, 100, 100),
+	} {
+		if _, _, _, err := database.UpsertAsset(ctx, asset); err != nil {
+			t.Fatal(err)
+		}
+	}
+	albumA, err := database.CreateAlbum(ctx, AlbumCreate{
+		Name: "A",
+		Sources: []AlbumSourceCreate{{
+			RelPath:           "a",
+			Recursive:         true,
+			MediaTypeFilter:   AlbumMediaAll,
+			OrientationFilter: AlbumOrientationAll,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	albumB, err := database.CreateAlbum(ctx, AlbumCreate{
+		Name: "B",
+		Sources: []AlbumSourceCreate{{
+			RelPath:           "b",
+			Recursive:         true,
+			MediaTypeFilter:   AlbumMediaAll,
+			OrientationFilter: AlbumOrientationAll,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	albumA2, err := database.CreateAlbum(ctx, AlbumCreate{
+		Name: "A2",
+		Sources: []AlbumSourceCreate{{
+			RelPath:           "a",
+			Recursive:         true,
+			MediaTypeFilter:   AlbumMediaAll,
+			OrientationFilter: AlbumOrientationAll,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := database.ListLibraryAssets(ctx, AssetListOptions{Page: 1, PageSize: 10, Sort: "filename", VisibleOnly: true, AlbumIDs: []int64{albumA.ID, albumB.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := albumRelPaths(page.Items); len(got) != 2 || got[0] != "a/one.jpg" || got[1] != "b/two.jpg" {
+		t.Fatalf("multi album filter = %#v, want a/one.jpg and b/two.jpg", got)
+	}
+
+	page, err = database.ListLibraryAssets(ctx, AssetListOptions{Page: 1, PageSize: 10, Sort: "filename", VisibleOnly: true, AlbumIDs: []int64{albumA.ID, albumA2.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := albumRelPaths(page.Items); len(got) != 1 || got[0] != "a/one.jpg" {
+		t.Fatalf("overlapping album filter = %#v, want a/one.jpg once", got)
+	}
+
+	page, err = database.ListLibraryAssets(ctx, AssetListOptions{Page: 1, PageSize: 10, Sort: "filename", VisibleOnly: true, AlbumUnassigned: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := albumRelPaths(page.Items); len(got) != 1 || got[0] != "c/three.jpg" {
+		t.Fatalf("unassigned album filter = %#v, want c/three.jpg", got)
+	}
+
+	page, err = database.ListAlbumAssets(ctx, albumA.ID, AssetListOptions{Page: 1, PageSize: 10, Sort: "filename", VisibleOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := albumRelPaths(page.Items); len(got) != 1 || got[0] != "a/one.jpg" {
+		t.Fatalf("single album compatibility = %#v, want a/one.jpg", got)
+	}
+}
+
 func TestPendingWorkDoesNotRecoverProcessingVideoProxy(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
@@ -230,7 +317,7 @@ func TestPendingWorkDoesNotRecoverProcessingVideoProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	items, err := database.PendingWork(ctx, true)
+	items, err := database.PendingWork(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

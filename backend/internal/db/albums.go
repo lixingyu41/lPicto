@@ -50,11 +50,23 @@ WHERE album_sources.album_id = ?
 )`
 
 func albumMembershipExistsSQL() string {
+	return albumMembershipExistsWhereSQL("")
+}
+
+func albumMembershipExistsForAlbumIDsSQL(count int) string {
+	if count <= 0 {
+		return albumMembershipExistsSQL()
+	}
+	return albumMembershipExistsWhereSQL("  AND album_filter.id IN (" + sqlPlaceholders(count) + ")\n")
+}
+
+func albumMembershipExistsWhereSQL(albumFilterCondition string) string {
 	return `EXISTS (
 SELECT 1
 FROM albums album_filter
 JOIN album_sources album_source_filter ON album_source_filter.album_id = album_filter.id
 WHERE album_source_filter.source_type = 'folder'
+` + albumFilterCondition + `
   AND (
     (
       album_source_filter.recursive = true
@@ -88,6 +100,13 @@ WHERE album_source_filter.source_type = 'folder'
     OR (album_filter.orientation_filter = 'portrait' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveHeightSQL() + ` > ` + effectiveWidthSQL() + `)
   )
 )`
+}
+
+func sqlPlaceholders(count int) string {
+	if count <= 0 {
+		return ""
+	}
+	return strings.TrimRight(strings.Repeat("?,", count), ",")
 }
 
 type AlbumSourceCreate struct {
@@ -380,7 +399,10 @@ func (d *DB) AlbumNeighbors(ctx context.Context, albumID int64, opts NeighborOpt
 	if err != nil {
 		return Neighbors{}, err
 	}
-	filterOpts := AssetListOptions{Type: opts.Type, Sort: opts.Sort, Group: opts.Group, Query: opts.Query, VisibleOnly: true, Rating: opts.Rating}
+	filterOpts := AssetListOptions{
+		Type: opts.Type, Sort: opts.Sort, Group: opts.Group, Query: opts.Query, VisibleOnly: true,
+		Orientation: opts.Orientation, Rating: opts.Rating,
+	}
 	where, args := albumAssetFilterSQL(album, filterOpts)
 	if filterOpts.Group == assetGroupFolder {
 		previous, err := d.groupedNeighborSide(ctx, where, args, filterOpts.Sort, opts.AssetID, true, opts.Limit)
@@ -514,6 +536,12 @@ func albumAssetFilterSQL(album model.Album, opts AssetListOptions) (string, []an
 	if opts.Rating != nil {
 		where = append(where, assetRatingSQL("assets")+" = ?")
 		args = append(args, NormalizeRating(*opts.Rating))
+	}
+	switch normalizeAlbumOrientationFilter(opts.Orientation) {
+	case AlbumOrientationWide:
+		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveWidthSQL()+" > "+effectiveHeightSQL())
+	case AlbumOrientationTall:
+		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveHeightSQL()+" > "+effectiveWidthSQL())
 	}
 	switch normalizeAlbumOrientationFilter(album.OrientationFilter) {
 	case AlbumOrientationWide:

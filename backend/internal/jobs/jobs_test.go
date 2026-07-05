@@ -11,15 +11,11 @@ func TestVideoPosterQueueHasWorker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	handled := make(chan Task, 1)
-	videoHandled := make(chan Task, 1)
 	manager := New(slog.Default(), func(ctx context.Context, task Task) error {
 		handled <- task
 		return nil
-	}, func(ctx context.Context, task Task) error {
-		videoHandled <- task
-		return nil
 	})
-	manager.Start(ctx, WorkerConfig{Image: 1, VideoPoster: 1, VideoProxy: 1})
+	manager.Start(ctx, WorkerConfig{Image: 1, VideoPoster: 1})
 	defer func() {
 		cancel()
 		manager.Stop()
@@ -34,11 +30,5 @@ func TestVideoPosterQueueHasWorker(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("video_poster task was not consumed")
-	}
-
-	select {
-	case task := <-videoHandled:
-		t.Fatalf("video handler received %#v", task)
-	default:
 	}
 }

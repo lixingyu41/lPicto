@@ -30,6 +30,11 @@ func main() {
 		logger.Error("config failed", "error", err)
 		os.Exit(1)
 	}
+
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg.FFmpegHWAccel = video.ResolveHWAccel(rootCtx, cfg.FFmpegHWAccel, cfg.FFmpegHWDevice, logger)
 	cfg.Log(logger)
 
 	store, err := storage.NewWithRootsAndCache(cfg.PhotoRoots, cfg.DataRoot, cfg.CacheRoot)
@@ -37,9 +42,6 @@ func main() {
 		logger.Error("storage init failed", "error", err)
 		os.Exit(1)
 	}
-
-	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	database, err := db.Open(rootCtx, cfg.DatabaseURL, cfg.MigrationsDir)
 	if err != nil {
@@ -58,12 +60,7 @@ func main() {
 		DB: database, Store: store, ThumbLongEdge: cfg.ThumbLongEdge, PreviewLongEdge: cfg.PreviewLongEdge,
 		PreviewQuality: cfg.PreviewQuality, Events: eventBus, Logger: logger,
 	}
-	videoProcessor := video.Processor{
-		DB: database, Store: store, ProxyEnabled: cfg.VideoProxyEnabled, ProxyMaxHeight: cfg.VideoProxyMaxHeight,
-		ProxyCRF: cfg.VideoProxyCRF, HWAccel: video.ResolveHWAccel(rootCtx, cfg.FFmpegHWAccel, logger), HWDevice: cfg.FFmpegHWDevice,
-		HWFallback: cfg.FFmpegHWFallback, Events: eventBus, Logger: logger,
-	}
-	queue, err := jobs.NewRedis(rootCtx, logger, cfg.RedisURL, thumbProcessor.Handle, videoProcessor.Handle, jobs.ResourcePolicy{
+	queue, err := jobs.NewRedis(rootCtx, logger, cfg.RedisURL, thumbProcessor.Handle, jobs.ResourcePolicy{
 		MaxActive:          cfg.BackgroundMaxActive,
 		LoadTarget:         cfg.BackgroundLoadTarget,
 		MinFreeMemoryBytes: uint64(cfg.BackgroundMinFreeMB) * 1024 * 1024,
@@ -119,11 +116,13 @@ func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *j
 	}
 	scan.StartPeriodicCount(ctx, cfg.FileCountScanInterval)
 	queue.ResetRuntimeState(ctx)
-	enqueuePendingWork(ctx, database, queue, cfg.VideoProxyEnabled, logger)
+	if err := database.ResetBackgroundVideoProxyWork(ctx); err != nil {
+		logger.Warn("reset background video proxy work failed", "error", err)
+	}
+	enqueuePendingWork(ctx, database, queue, logger)
 	queue.Start(ctx, jobs.WorkerConfig{
 		Image:       cfg.ThumbWorkers,
 		VideoPoster: cfg.VideoPosterWorkers,
-		VideoProxy:  cfg.VideoProxyWorkers,
 	})
 }
 
@@ -156,13 +155,8 @@ func scanTaskHandler(scan *scanner.Scanner) jobs.Handler {
 	}
 }
 
-func enqueuePendingWork(ctx context.Context, database *db.DB, queue *jobs.Manager, videoProxyEnabled bool, logger *slog.Logger) {
-	if videoProxyEnabled {
-		if err := database.EnableVideoProxies(ctx); err != nil {
-			logger.Warn("enable video proxy work failed", "error", err)
-		}
-	}
-	items, err := database.PendingWork(ctx, videoProxyEnabled)
+func enqueuePendingWork(ctx context.Context, database *db.DB, queue *jobs.Manager, logger *slog.Logger) {
+	items, err := database.PendingWork(ctx)
 	if err != nil {
 		logger.Warn("load pending work failed", "error", err)
 		return

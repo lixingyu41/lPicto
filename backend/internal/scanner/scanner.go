@@ -1431,7 +1431,7 @@ func (st *scanState) writeAsset(write scanWrite) {
 	}
 	st.updateProgress(rel)
 	if result.Added || result.Updated {
-		s.enqueueWork(result.ID, write.detection.MediaType, write.previewStatus, write.proxyStatus, false)
+		s.enqueueWork(result.ID, write.detection.MediaType, write.previewStatus, false)
 		return
 	}
 	if asset, err := s.DB.GetAsset(ctx, result.ID); err == nil {
@@ -1629,7 +1629,7 @@ func (s *Scanner) adjustProgressTotal(delta int) {
 	s.publishStatus()
 }
 
-func (s *Scanner) enqueueWork(assetID int64, mediaType string, previewStatus string, proxyStatus string, rebuild bool) {
+func (s *Scanner) enqueueWork(assetID int64, mediaType string, previewStatus string, rebuild bool) {
 	if s.Jobs == nil {
 		return
 	}
@@ -1639,7 +1639,6 @@ func (s *Scanner) enqueueWork(assetID int64, mediaType string, previewStatus str
 	if !rebuild && mediaType == model.MediaTypeImage && previewStatus == model.StatusPending {
 		s.Jobs.Enqueue(jobs.Task{Type: "preview", AssetID: assetID})
 	}
-	_ = proxyStatus
 }
 
 func (s *Scanner) enqueuePendingWork(asset model.Asset) {

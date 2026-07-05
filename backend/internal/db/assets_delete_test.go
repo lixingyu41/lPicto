@@ -119,7 +119,7 @@ func TestAssetStatusesSkipsPreviewForBrowserPlayableImages(t *testing.T) {
 		t.Fatalf("non-browser image preview = %q, want pending", preview)
 	}
 	thumb, preview, poster, proxy = AssetStatuses(model.MediaTypeVideo, false, true)
-	if thumb != model.StatusPending || preview != model.StatusNotRequired || poster != model.StatusNotRequired || proxy != model.StatusPending {
+	if thumb != model.StatusPending || preview != model.StatusNotRequired || poster != model.StatusNotRequired || proxy != model.StatusNotRequired {
 		t.Fatalf("non-browser video statuses = %q %q %q %q", thumb, preview, poster, proxy)
 	}
 	thumb, preview, poster, proxy = AssetStatuses(model.MediaTypeVideo, true, true)
@@ -132,7 +132,7 @@ func TestAssetStatusesSkipsPreviewForBrowserPlayableImages(t *testing.T) {
 	}
 }
 
-func TestEnableVideoProxiesMarksOnlyUnplayableVideosPending(t *testing.T) {
+func TestResetBackgroundVideoProxyWorkClearsStaleStatuses(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
 	if err != nil {
@@ -155,15 +155,15 @@ func TestEnableVideoProxiesMarksOnlyUnplayableVideosPending(t *testing.T) {
 	asset.Ext = "mkv"
 	asset.CacheKey = "unplayable"
 	asset.BrowserPlayable = false
+	asset.VideoProxyStatus = model.StatusProcessing
 	unplayableID, _, _, err := database.UpsertAsset(ctx, asset)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := database.EnableVideoProxies(ctx); err != nil {
+	if err := database.ResetBackgroundVideoProxyWork(ctx); err != nil {
 		t.Fatal(err)
 	}
-	_ = unplayableID
-	items, err := database.PendingWork(ctx, true)
+	items, err := database.PendingWork(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,6 +176,13 @@ func TestEnableVideoProxiesMarksOnlyUnplayableVideosPending(t *testing.T) {
 	}
 	if playable.VideoProxyStatus != model.StatusNotRequired {
 		t.Fatalf("playable proxy status = %q, want not_required", playable.VideoProxyStatus)
+	}
+	unplayable, err := database.GetAsset(ctx, unplayableID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unplayable.VideoProxyStatus != model.StatusNotRequired {
+		t.Fatalf("unplayable proxy status = %q, want not_required", unplayable.VideoProxyStatus)
 	}
 }
 
@@ -196,7 +203,7 @@ func TestPendingWorkSkipsPlayableVideoProxy(t *testing.T) {
 	if _, _, _, err := database.UpsertAsset(ctx, asset); err != nil {
 		t.Fatal(err)
 	}
-	items, err := database.PendingWork(ctx, true)
+	items, err := database.PendingWork(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { Check, ChevronRight, FolderPlus, Images, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-react';
+import { Check, ChevronRight, FolderPlus, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-react';
 import AssetGrid from '../components/AssetGrid';
 import AssetGroupingControls, { normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
+import { SidebarAlbumList, SidebarButtonGroup, SidebarMediaTypeList, SidebarRatingFilter, sidebarOrientationOptions } from '../components/SidebarControls';
 import SortControls, { isSortKey } from '../components/SortControls';
 import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { api } from '../api/client';
@@ -23,7 +24,10 @@ import type {
   AlbumSourceInput,
   Asset,
   AssetDeletedEvent,
+  AssetKind,
+  AssetRating,
   LibraryAnchor,
+  OrientationFilter,
   SortKey,
   SourceFolder,
 } from '../types/api';
@@ -39,27 +43,36 @@ import {
 import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import { assetMatchesAlbum } from '../utils/assetFilters';
 import { mergeSortedAssets, removeAssetById } from '../utils/assetSort';
-import { currentURLHasParam, currentURLLocation, currentURLPath, positiveIntParam, replaceURLState } from '../utils/urlState';
+import { assetRatingParam, currentURLHasParam, currentURLLocation, currentURLPath, orientationParam, positiveIntParam, replaceURLState } from '../utils/urlState';
 
 const pageSize = 100;
 const albumsStateKey = 'albums';
-const albumsURLKeys = ['albumId', 'album', 'sort', 'group', 'q'];
+const albumsURLKeys = ['albumId', 'album', 'type', 'rating', 'orientation', 'sort', 'group', 'q'];
+const assetKinds: AssetKind[] = ['all', 'image', 'video'];
 
 interface AlbumsPageState extends GridReturnState {
+  albumListCollapsed: boolean;
   collapsedGroupKeys: string[];
   groupMode: AssetGroupMode;
+  orientation: OrientationFilter;
   query: string;
+  rating: AssetRating;
   selectedId: number | null;
   sort: SortKey;
+  type: AssetKind;
 }
 
 const defaultAlbumsState: AlbumsPageState = {
   ...resetGridState(),
+  albumListCollapsed: false,
   collapsedGroupKeys: [],
   groupMode: 'none',
+  orientation: 'all',
   query: '',
+  rating: 0,
   selectedId: null,
   sort: 'timeline_desc',
+  type: 'all',
 };
 
 export default function AlbumsPage() {
@@ -74,17 +87,19 @@ export default function AlbumsPage() {
   const initialAlbumNameRef = useRef(searchParams.get('album') ?? '');
   const [albums, setAlbums] = useState<Album[]>([]);
   const [groups, setGroups] = useState<AlbumGroup[]>([]);
+  const [type, setType] = useState<AssetKind>(initialStateRef.current.type);
   const [selectedId, setSelectedId] = useState<number | null>(initialStateRef.current.selectedId);
   const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
   const [groupMode, setGroupMode] = useState<AssetGroupMode>(initialStateRef.current.groupMode);
   const [query, setQuery] = useState(initialStateRef.current.query);
+  const [rating, setRating] = useState<AssetRating>(initialStateRef.current.rating ?? 0);
+  const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
   const [addOpen, setAddOpen] = useState(false);
   const [editingAlbum, setEditingAlbum] = useState<Album | null>(null);
   const [groupDraftOpen, setGroupDraftOpen] = useState(false);
   const [groupName, setGroupName] = useState('');
-  const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Set<string>>(
-    () => new Set(initialStateRef.current.collapsedGroupKeys),
-  );
+  const [albumListCollapsed, setAlbumListCollapsed] = useState(initialStateRef.current.albumListCollapsed);
+  const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Set<string>>(() => new Set(initialStateRef.current.collapsedGroupKeys));
   const [error, setError] = useState<string | null>(null);
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
@@ -97,8 +112,6 @@ export default function AlbumsPage() {
     () => albums.find((album) => album.id === selectedId) ?? albums[0] ?? null,
     [albums, selectedId],
   );
-  const albumBuckets = useMemo(() => buildAlbumBuckets(albums, groups), [albums, groups]);
-
   const loadAlbums = useCallback(async () => {
     try {
       const result = await api.albums();
@@ -125,15 +138,18 @@ export default function AlbumsPage() {
       if (!selectedAlbum) {
         return Promise.resolve({ items: [], page, pageSize, hasMore: false });
       }
-      return api.albumAssets(selectedAlbum.id, page, pageSize, sort, query, serverGroup);
+      return api.albumAssets(selectedAlbum.id, page, pageSize, sort, query, serverGroup, rating, orientation, type);
     },
-    [query, selectedAlbum, serverGroup, sort],
+    [orientation, query, rating, selectedAlbum, serverGroup, sort, type],
   );
 
   const { items, hasMore, hasPrevious, loading, error: loadError, loadMore, loadPrevious, reset, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     groupMode,
+    orientation,
+    rating,
     selectedAlbum?.id,
     sort,
+    type,
     query,
   ]);
   const {
@@ -158,18 +174,18 @@ export default function AlbumsPage() {
     loadMore,
     loadPrevious,
     pageSize,
-    resetKey: JSON.stringify([selectedAlbum?.id ?? null, sort, query, groupMode]),
+    resetKey: JSON.stringify([selectedAlbum?.id ?? null, type, rating, orientation, sort, query, groupMode]),
     restoreReady: Boolean(selectedAlbum),
     searchParams,
   });
 
   const mergeReadyAssets = useCallback(
     (incoming: Asset[]) => {
-      const filtered = incoming.filter((asset) => assetMatchesAlbum(asset, selectedAlbum, query));
+      const filtered = incoming.filter((asset) => assetMatchesAlbum(asset, selectedAlbum, query, rating, orientation, type));
       if (filtered.length === 0) return;
       mutateItems((current) => mergeSortedAssets(current, filtered, sort, { hasMore, loadedStartIndex, groupMode }));
     },
-    [groupMode, hasMore, loadedStartIndex, mutateItems, query, selectedAlbum, sort],
+    [groupMode, hasMore, loadedStartIndex, mutateItems, orientation, query, rating, selectedAlbum, sort, type],
   );
 
   const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
@@ -179,16 +195,19 @@ export default function AlbumsPage() {
   useEffect(() => {
     if (eventsConnected || !selectedAlbum) return undefined;
     const timer = window.setInterval(() => {
-      void api.albumAssets(selectedAlbum.id, 1, pageSize, sort, query, serverGroup).then((result) => mergeReadyAssets(result.items)).catch(() => undefined);
+      void api
+        .albumAssets(selectedAlbum.id, 1, pageSize, sort, query, serverGroup, rating, orientation, type)
+        .then((result) => mergeReadyAssets(result.items))
+        .catch(() => undefined);
     }, 30000);
     return () => window.clearInterval(timer);
-  }, [eventsConnected, mergeReadyAssets, query, selectedAlbum, serverGroup, sort]);
+  }, [eventsConnected, mergeReadyAssets, orientation, query, rating, selectedAlbum, serverGroup, sort, type]);
 
   useEffect(() => {
     let live = true;
     async function loadAnchors(albumId: number) {
       try {
-        const result = await api.albumAnchors(albumId, pageSize, sort, query);
+        const result = await api.albumAnchors(albumId, pageSize, sort, query, serverGroup, rating, orientation, type);
         if (live) {
           setAnchors(result.items);
           setTotalCount(result.total);
@@ -209,19 +228,23 @@ export default function AlbumsPage() {
     return () => {
       live = false;
     };
-  }, [query, selectedAlbum?.id, sort]);
+  }, [orientation, query, rating, selectedAlbum?.id, serverGroup, sort, type]);
 
   const currentPageState = useCallback(
     (): AlbumsPageState => ({
       ...getGridState(),
+      albumListCollapsed,
       collapsedGroupKeys: Array.from(collapsedGroupKeys),
       groupMode,
+      orientation,
       query,
+      rating,
       selectedId: selectedAlbum?.id ?? selectedId,
       sidebarExpanded: sidebarState.sidebarExpanded,
       sort,
+      type,
     }),
-    [collapsedGroupKeys, getGridState, groupMode, query, selectedAlbum?.id, selectedId, sidebarState.sidebarExpanded, sort],
+    [albumListCollapsed, collapsedGroupKeys, getGridState, groupMode, orientation, query, rating, selectedAlbum?.id, selectedId, sidebarState.sidebarExpanded, sort, type],
   );
 
   const saveCurrentState = useCallback(() => {
@@ -238,12 +261,15 @@ export default function AlbumsPage() {
         album: selectedAlbum.name,
         albumId: selectedAlbum.id,
         group: groupMode,
+        orientation: orientation === 'all' ? undefined : orientation,
         q: query,
+        rating,
         sort,
+        type,
       },
       albumsURLKeys,
     );
-  }, [groupMode, location, navigate, query, searchParams, selectedAlbum, sort]);
+  }, [groupMode, location, navigate, orientation, query, rating, searchParams, selectedAlbum, sort, type]);
   const handlePersistentGridScrollState = useCallback(
     (state: { ratio: number; scrollTop: number }) => {
       handleGridScrollState(state);
@@ -264,21 +290,25 @@ export default function AlbumsPage() {
     [location, navigate],
   );
 
+  const handleRatingChange = useCallback((nextRating: AssetRating) => {
+    setRating(nextRating);
+  }, []);
+
+  const handleToggleAlbumGroup = useCallback((key: string) => {
+    setCollapsedGroupKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);
     if (nextGroupMode !== groupMode) {
       setGroupMode(nextGroupMode);
     }
   }, [groupMode, sort]);
-
-  const toggleAlbumGroup = useCallback((key: string) => {
-    setCollapsedGroupKeys((value) => {
-      const next = new Set(value);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  }, []);
 
   async function createAlbum(
     name: string,
@@ -319,13 +349,13 @@ export default function AlbumsPage() {
     try {
       const group = await api.createAlbumGroup(name);
       setGroups((value) => [...value, group]);
-      setGroupName('');
-      setGroupDraftOpen(false);
       setCollapsedGroupKeys((value) => {
         const next = new Set(value);
-        next.delete(albumGroupKey(group.id));
+        next.delete(`group-${group.id}`);
         return next;
       });
+      setGroupName('');
+      setGroupDraftOpen(false);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : '创建相册组失败');
@@ -353,54 +383,37 @@ export default function AlbumsPage() {
 
   useSidebarPanel(
     'albums',
-      <div className="sidebar-control-stack">
-        <div className="album-toolbar">
-          <button className="sidebar-command" type="button" onClick={() => setAddOpen(true)}>
-            <Plus size={16} />
-            添加相册
-          </button>
-          <button className="sidebar-command" type="button" onClick={() => setGroupDraftOpen((value) => !value)}>
-            <FolderPlus size={16} />
-            新建组
+    <div className="sidebar-control-stack">
+      <div className="album-toolbar">
+        <button className="sidebar-command" type="button" onClick={() => setAddOpen(true)}>
+          <Plus size={16} />
+          添加相册
+        </button>
+        <button className="sidebar-command" type="button" onClick={() => setGroupDraftOpen((value) => !value)}>
+          <FolderPlus size={16} />
+          新建组
+        </button>
+      </div>
+      {groupDraftOpen && (
+        <div className="album-group-create">
+          <input value={groupName} placeholder="组名称" onChange={(event) => setGroupName(event.target.value)} />
+          <button type="button" title="创建" disabled={groupName.trim().length === 0} onClick={() => void createAlbumGroup()}>
+            <Check size={15} />
           </button>
         </div>
-        {groupDraftOpen && (
-          <div className="album-group-create">
-            <input value={groupName} placeholder="组名称" onChange={(event) => setGroupName(event.target.value)} />
-            <button type="button" title="创建" disabled={groupName.trim().length === 0} onClick={() => void createAlbumGroup()}>
-              <Check size={15} />
-            </button>
-          </div>
-        )}
-        <div className="album-list">
-          {albumBuckets.map((bucket) => {
-            const collapsed = collapsedGroupKeys.has(bucket.key);
-            return (
-              <div className="album-group-block" key={bucket.key}>
-                <button className="album-group-row" type="button" onClick={() => toggleAlbumGroup(bucket.key)}>
-                  <span className={collapsed ? 'folder-expand-button' : 'folder-expand-button expanded'}>
-                    <ChevronRight size={15} />
-                  </span>
-                  <span>{bucket.name}</span>
-                  <small>{bucket.albums.length}</small>
-                </button>
-                {!collapsed &&
-                  bucket.albums.map((album) => (
-                    <button
-                      className={selectedAlbum?.id === album.id ? 'album-row active' : 'album-row'}
-                      key={album.id}
-                      type="button"
-                      onClick={() => setSelectedId(album.id)}
-                    >
-                      <Images size={15} />
-                      <span>{album.name}</span>
-                    </button>
-                  ))}
-              </div>
-            );
-          })}
-          {albums.length === 0 && groups.length === 0 && <div className="muted-line">暂无相册</div>}
-        </div>
+      )}
+      <SidebarAlbumList
+        albums={albums}
+        collapsed={albumListCollapsed}
+        collapsedGroupKeys={Array.from(collapsedGroupKeys)}
+        collapsible
+        forceGroupHeaders
+        groups={groups}
+        selectedIds={selectedAlbum ? [selectedAlbum.id] : []}
+        onSelectAlbum={(album) => setSelectedId(album.id)}
+        onToggleCollapsed={() => setAlbumListCollapsed((value) => !value)}
+        onToggleGroup={handleToggleAlbumGroup}
+      />
       {selectedAlbum && (
         <>
           <div className="sidebar-icon-actions">
@@ -415,6 +428,9 @@ export default function AlbumsPage() {
             </button>
             <span>{albumFilterLabel(selectedAlbum)}</span>
           </div>
+          <SidebarMediaTypeList value={type} onChange={setType} />
+          <SidebarRatingFilter value={rating} onChange={handleRatingChange} />
+          <SidebarButtonGroup columns={3} label="方向" value={orientation} options={sidebarOrientationOptions} onChange={setOrientation} />
           <SortControls sort={sort} onChange={setSort} />
           <AssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
           <label className="sidebar-field">
@@ -428,19 +444,24 @@ export default function AlbumsPage() {
           </div>
         </>
       )}
-      </div>,
+    </div>,
     [
-      albumBuckets,
+      albums,
+      albumListCollapsed,
       collapsedGroupKeys,
+      groups,
       groupDraftOpen,
       groupName,
-      groups.length,
       groupMode,
+      handleRatingChange,
+      handleToggleAlbumGroup,
+      orientation,
       query,
+      rating,
       selectedAlbum?.id,
       selectedAlbum?.updatedAt,
       sort,
-      toggleAlbumGroup,
+      type,
     ],
   );
 
@@ -482,20 +503,24 @@ export default function AlbumsPage() {
             scrollTopTarget={scrollTopTarget}
             buildViewerUrl={(asset) =>
               appendViewerReturnParams(
-                `/viewer/${asset.id}?context=album&albumId=${selectedAlbum.id}&sort=${sort}&q=${encodeURIComponent(query)}${serverGroup ? `&group=${serverGroup}` : ''}`,
+                `/viewer/${asset.id}?context=album&albumId=${selectedAlbum.id}&type=${type}&sort=${sort}&q=${encodeURIComponent(query)}${ratingViewerParam(
+                  rating,
+                )}${orientationViewerParam(orientation)}${serverGroup ? `&group=${serverGroup}` : ''}`,
                 currentPageReturnPath(),
                 currentPageState(),
               )
             }
           />
-          <LibraryIndexRail
-            anchors={anchors}
-            sort={sort}
-            scrollRatio={scrollRatio}
-            totalCount={totalCount}
-            pageSize={pageSize}
-            onSeek={seekIndex}
-          />
+          {groupMode !== 'folder' && (
+            <LibraryIndexRail
+              anchors={anchors}
+              sort={sort}
+              scrollRatio={scrollRatio}
+              totalCount={totalCount}
+              pageSize={pageSize}
+              onSeek={seekIndex}
+            />
+          )}
           <PressPreviewOverlay asset={pressPreviewAsset} />
         </div>
       )}
@@ -791,55 +816,30 @@ function AlbumFolderTreeNode({
   );
 }
 
-interface AlbumBucket {
-  key: string;
-  name: string;
-  albums: Album[];
-}
-
-function buildAlbumBuckets(albums: Album[], groups: AlbumGroup[]): AlbumBucket[] {
-  const byGroup = new Map<number | null, Album[]>();
-  albums.forEach((album) => {
-    const key = album.groupId ?? null;
-    const items = byGroup.get(key) ?? [];
-    items.push(album);
-    byGroup.set(key, items);
-  });
-  const buckets = groups.map((group) => ({
-    key: albumGroupKey(group.id),
-    name: group.name,
-    albums: byGroup.get(group.id) ?? [],
-  }));
-  const knownGroupIds = new Set(groups.map((group) => group.id));
-  const orphanGroupIds = Array.from(
-    new Set(albums.map((album) => album.groupId).filter((id): id is number => id !== null && !knownGroupIds.has(id))),
-  );
-  orphanGroupIds.forEach((id) => {
-    buckets.push({ key: albumGroupKey(id), name: '未命名组', albums: byGroup.get(id) ?? [] });
-  });
-  const ungrouped = byGroup.get(null) ?? [];
-  if (ungrouped.length > 0 || groups.length === 0) {
-    buckets.push({ key: albumGroupKey(null), name: '未分组', albums: ungrouped });
-  }
-  return buckets;
-}
-
-function albumGroupKey(groupId: number | null) {
-  return groupId === null ? 'ungrouped' : `group-${groupId}`;
-}
-
 function albumsStateFromSearchParams(params: URLSearchParams, fallback: AlbumsPageState): AlbumsPageState {
   const selectedId = positiveIntParam(params.get('albumId')) ?? positiveIntParam(params.get('album'));
   const sort = params.get('sort');
+  const type = params.get('type');
   const hasAlbumParams = albumsURLKeys.some((key) => params.has(key));
   const base = hasAlbumParams ? { ...fallback, ...resetGridState() } : fallback;
   return {
     ...base,
     groupMode: parseAssetGroupMode(params.get('group'), base.groupMode),
+    orientation: params.has('orientation') ? orientationParam(params.get('orientation')) : base.orientation,
     query: params.get('q') ?? (hasAlbumParams ? '' : base.query),
+    rating: params.has('rating') ? assetRatingParam(params.get('rating')) ?? base.rating : base.rating,
     selectedId: selectedId ?? base.selectedId,
     sort: isSortKey(sort) ? sort : base.sort,
+    type: assetKinds.includes(type as AssetKind) ? (type as AssetKind) : base.type,
   };
+}
+
+function ratingViewerParam(rating: AssetRating) {
+  return `&rating=${rating}`;
+}
+
+function orientationViewerParam(orientation: OrientationFilter) {
+  return orientation === 'all' ? '' : `&orientation=${orientation}`;
 }
 
 function albumFilterLabel(album: Album) {

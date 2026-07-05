@@ -87,6 +87,7 @@ type AssetListOptions struct {
 	Orientation     string
 	Rating          *int
 	AlbumUnassigned bool
+	AlbumIDs        []int64
 }
 
 type NeighborOptions struct {
@@ -119,6 +120,7 @@ type NeighborOptions struct {
 	Orientation     string
 	Rating          *int
 	AlbumUnassigned bool
+	AlbumIDs        []int64
 }
 
 type NFOOptionOptions struct {
@@ -987,36 +989,29 @@ func (d *DB) ThumbnailWorkForRoots(ctx context.Context, roots []string) ([]WorkI
 	return items, rows.Err()
 }
 
-func (d *DB) EnableVideoProxies(ctx context.Context) error {
+func (d *DB) ResetBackgroundVideoProxyWork(ctx context.Context) error {
 	now := util.UnixNow()
-	rows, err := d.conn.QueryContext(ctx, `
+	_, err := d.conn.ExecContext(ctx, `
 UPDATE media_asset
 SET video_proxy_status = ?, proxy_ready = false, error_text = NULL, updated_at = ?
 WHERE deleted = false
   AND deleted_at IS NULL
   AND media_type = ?
-  AND browser_playable = false
-  AND video_proxy_status = ?
-RETURNING id`,
-		model.StatusPending, unixTime(now), mediaTypeCode(model.MediaTypeVideo), model.StatusNotRequired)
+  AND video_proxy_status IN (?, ?, ?)`,
+		model.StatusNotRequired, unixTime(now), mediaTypeCode(model.MediaTypeVideo), model.StatusPending, model.StatusProcessing, model.StatusError)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var assetID int64
-		if err := rows.Scan(&assetID); err != nil {
-			return err
-		}
-		if err := d.upsertMediaJob(ctx, assetID, "video_proxy_status", model.StatusPending, nil, now); err != nil {
-			return err
-		}
-	}
-	return rows.Err()
+	_, err = d.conn.ExecContext(ctx, `
+UPDATE media_job
+SET status = ?, error_text = NULL, started_at = NULL, finished_at = ?
+WHERE job_type = 'video_proxy'
+  AND status IN (?, ?, ?)`,
+		model.StatusNotRequired, unixTime(now), model.StatusPending, model.StatusProcessing, model.StatusError)
+	return err
 }
 
-func (d *DB) PendingWork(ctx context.Context, videoProxyEnabled bool) ([]WorkItem, error) {
-	_ = videoProxyEnabled
+func (d *DB) PendingWork(ctx context.Context) ([]WorkItem, error) {
 	rows, err := d.conn.QueryContext(ctx, `
 SELECT id, media_type, thumb_status, preview_status, video_poster_status, video_proxy_status, browser_playable
 FROM assets
@@ -1066,7 +1061,7 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 		NFOQuery: opts.NFOQuery, NFOActor: opts.NFOActor, NFOID: opts.NFOID, NFOTag: opts.NFOTag, NFOTitle: opts.NFOTitle, NFOYear: opts.NFOYear,
 		MinWidth: opts.MinWidth, MaxWidth: opts.MaxWidth, MinHeight: opts.MinHeight, MaxHeight: opts.MaxHeight, MatchAnyAxis: opts.MatchAnyAxis,
 		MinDuration: opts.MinDuration, MaxDuration: opts.MaxDuration, MinSize: opts.MinSize, MaxSize: opts.MaxSize, Orientation: opts.Orientation,
-		Rating: opts.Rating, AlbumUnassigned: opts.AlbumUnassigned,
+		Rating: opts.Rating, AlbumUnassigned: opts.AlbumUnassigned, AlbumIDs: opts.AlbumIDs,
 	}
 	if opts.Context == "folder" {
 		if opts.FolderID == nil {
@@ -1168,6 +1163,11 @@ func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 	}
 	if opts.AlbumUnassigned {
 		where = append(where, "NOT "+albumMembershipExistsSQL())
+	} else if len(opts.AlbumIDs) > 0 {
+		where = append(where, albumMembershipExistsForAlbumIDsSQL(len(opts.AlbumIDs)))
+		for _, albumID := range opts.AlbumIDs {
+			args = append(args, albumID)
+		}
 	}
 	if opts.NFOQuery != "" {
 		where = append(where, "nfo_search_text IS NOT NULL AND lower(nfo_search_text) LIKE ? ESCAPE '\\'")
@@ -1215,9 +1215,9 @@ func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 	}
 	switch opts.Orientation {
 	case "landscape":
-		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND width > height")
+		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveWidthSQL()+" > "+effectiveHeightSQL())
 	case "portrait":
-		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND height > width")
+		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveHeightSQL()+" > "+effectiveWidthSQL())
 	}
 	if opts.FolderRel != nil {
 		if opts.Recursive {
@@ -1767,11 +1767,9 @@ func AssetStatuses(mediaType string, browserPlayable bool, proxyEnabled bool) (t
 		return model.StatusPending, previewStatus, model.StatusNotRequired, model.StatusNotRequired
 	}
 	if mediaType == model.MediaTypeVideo {
-		proxyStatus := model.StatusNotRequired
-		if proxyEnabled && !browserPlayable {
-			proxyStatus = model.StatusPending
-		}
-		return model.StatusPending, model.StatusNotRequired, model.StatusNotRequired, proxyStatus
+		_ = proxyEnabled
+		_ = browserPlayable
+		return model.StatusPending, model.StatusNotRequired, model.StatusNotRequired, model.StatusNotRequired
 	}
 	return model.StatusNotRequired, model.StatusNotRequired, model.StatusNotRequired, model.StatusNotRequired
 }

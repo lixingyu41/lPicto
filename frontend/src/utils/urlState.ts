@@ -1,4 +1,5 @@
 import type { NavigateFunction, Location } from 'react-router-dom';
+import type { AssetRating, OrientationFilter } from '../types/api';
 
 type URLStateValue = string | number | boolean | null | undefined;
 
@@ -80,4 +81,16 @@ export function booleanParam(value: string | null, fallback: boolean) {
   if (normalized === '1' || normalized === 'true' || normalized === 'yes') return true;
   if (normalized === '0' || normalized === 'false' || normalized === 'no') return false;
   return fallback;
+}
+
+export function assetRatingParam(value: string | null): AssetRating | null {
+  const parsed = Number(value);
+  if (parsed === 0 || parsed === 1 || parsed === 2 || parsed === 3 || parsed === 4 || parsed === 5) {
+    return parsed;
+  }
+  return null;
+}
+
+export function orientationParam(value: string | null): OrientationFilter {
+  return value === 'landscape' || value === 'portrait' ? value : 'all';
 }

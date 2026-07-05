@@ -41,6 +41,29 @@ func int64QueryPtr(r *http.Request, key string) *int64 {
 	return &parsed
 }
 
+func int64ListQuery(r *http.Request, key string) []int64 {
+	values := r.URL.Query()[key]
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[int64]struct{}{}
+	var result []int64
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			parsed, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+			if err != nil || parsed <= 0 {
+				continue
+			}
+			if _, ok := seen[parsed]; ok {
+				continue
+			}
+			seen[parsed] = struct{}{}
+			result = append(result, parsed)
+		}
+	}
+	return result
+}
+
 func intQueryPtr(r *http.Request, key string) *int {
 	value := strings.TrimSpace(r.URL.Query().Get(key))
 	if value == "" {

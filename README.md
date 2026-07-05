@@ -87,21 +87,22 @@ curl http://localhost:18080/api/scan/status
 
 ## 缩略图/预览图/视频代理说明
 
-图片使用 `vipsthumbnail` 生成 WebP thumb 和 preview；视频使用 FFmpeg 生成 poster；浏览器不稳定或不支持的视频生成 H.264/AAC MP4 proxy。后台媒体任务由 Redis 分发，并由应用内置并发策略限速。缓存写入 `/cache`，URL 带 `cacheKey` 并使用 immutable 缓存。
+图片使用 `vipsthumbnail` 生成 WebP thumb 和 preview；视频使用 FFmpeg 生成 poster；浏览器不稳定或不支持的视频在 Viewer 点击播放后实时生成 H.264/AAC MP4 proxy，并按短 TTL 写入 `/cache/video-proxies`。后台媒体任务由 Redis 分发，并由应用内置并发策略限速；图片缓存 URL 带 `cacheKey` 并使用 immutable 缓存。
 
-## GPU 视频抽帧
+## GPU 实时视频转码
 
-默认 compose 不请求 GPU，保证无 GPU 机器可启动。NVIDIA Docker 环境可用：
+默认 compose 不请求 GPU，保证无 GPU 机器可启动。Intel/AMD 核显或集显环境可用 VAAPI，把宿主机 `/dev/dri` 挂进 `api` 后，Viewer 实时 video proxy 会优先使用硬件 H.264 编码：
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 ```
 
 图片缩略图仍由 libvips 处理，不走 GPU。
+`VIDEO_PROXY_MAX_HEIGHT=0` 表示实时 proxy 保持原始分辨率；只有显式设置大于 0 的高度上限时才会降分辨率。
 
 ## 浏览器视频格式限制说明
 
-浏览器原生优先播放 MP4/M4V H.264 + AAC/MP3/无音频，或 WebM VP8/VP9/AV1 + Opus/Vorbis/无音频；其他格式走 proxy，proxy 未就绪时显示 poster 和“视频预览生成中”。
+浏览器原生优先播放 MP4/M4V H.264 + AAC/MP3/无音频，或 WebM VP8/VP9/AV1 + Opus/Vorbis/无音频；其他格式在点击播放后走实时 proxy。
 
 ## 原图访问说明
 

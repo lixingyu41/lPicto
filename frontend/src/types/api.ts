@@ -43,6 +43,7 @@ export interface Asset {
 }
 
 export interface VideoProxyRuntime {
+  assetId: number;
   required: boolean;
   cached: boolean;
   transcoding: boolean;
@@ -60,6 +61,7 @@ export interface VideoProxyRuntime {
   cacheTtl: number;
   keepaliveTtl: number;
   runtimeKey: string;
+  startSeconds: number;
   clientId: string;
   sessionId: string;
   sessionState: string;
@@ -144,6 +146,8 @@ export interface SearchAssetsParams {
   dimensionMode?: 'both';
   group?: AssetServerGroup;
   rating?: AssetRating;
+  albumFilter?: AlbumAssetFilter;
+  albumIds?: string;
 }
 
 export interface Folder {

@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	videoProxyCacheTTL     = 20 * time.Minute
+	videoProxyCacheTTL     = 72 * time.Hour
 	videoProxyKeepaliveTTL = 45 * time.Second
 	videoProxySweepEvery   = 1 * time.Minute
 	videoProxyReadDelay    = 250 * time.Millisecond
@@ -613,7 +613,7 @@ func (s *Server) finishVideoProxyTranscode(asset model.Asset, runtimeKey string,
 	status := model.StatusReady
 	idleStop := errors.Is(err, errVideoProxyIdle)
 	if idleStop {
-		status = model.StatusPending
+		status = model.StatusNotRequired
 		_ = os.Remove(tmp)
 	} else if err != nil {
 		text := videoProxyPublicError(err)
@@ -756,12 +756,13 @@ func (s *Server) touchVideoProxyRuntime(asset model.Asset, keepalive bool, start
 	if keepalive && dest != "" {
 		_ = touchFile(dest, now)
 	}
-	return s.snapshotVideoProxyRuntime(asset, required, runtimeKey, dest, heartbeat.SessionID), nil
+	return s.snapshotVideoProxyRuntime(asset, required, runtimeKey, startSeconds, dest, heartbeat.SessionID), nil
 }
 
-func (s *Server) snapshotVideoProxyRuntime(asset model.Asset, required bool, runtimeKey string, dest string, sessionID string) VideoProxyRuntimeDTO {
+func (s *Server) snapshotVideoProxyRuntime(asset model.Asset, required bool, runtimeKey string, startSeconds float64, dest string, sessionID string) VideoProxyRuntimeDTO {
 	now := time.Now()
 	dto := VideoProxyRuntimeDTO{
+		AssetID:      asset.ID,
 		Required:     required,
 		Status:       "not_required",
 		Duration:     assetDuration(asset),
@@ -769,6 +770,7 @@ func (s *Server) snapshotVideoProxyRuntime(asset model.Asset, required bool, run
 		CacheTTL:     int64(videoProxyCacheTTL.Seconds()),
 		KeepaliveTTL: int64(videoProxyKeepaliveTTL.Seconds()),
 		RuntimeKey:   runtimeKey,
+		StartSeconds: startSeconds,
 		SessionID:    sessionID,
 		Command:      "none",
 		Message:      "",
@@ -982,7 +984,7 @@ func (s *Server) sweepVideoProxyCache() {
 	for _, state := range expired {
 		_ = os.Remove(state.DestPath)
 		_ = os.Remove(state.TempPath)
-		_ = s.db.SetAssetWorkStatus(context.Background(), state.AssetID, "video_proxy_status", model.StatusPending, nil)
+		_ = s.db.SetAssetWorkStatus(context.Background(), state.AssetID, "video_proxy_status", model.StatusNotRequired, nil)
 	}
 	s.sweepUntrackedVideoProxyFiles(now)
 }

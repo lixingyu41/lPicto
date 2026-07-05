@@ -32,7 +32,10 @@ RUN set -eux; \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
     ffmpeg \
+    intel-media-va-driver \
     libimage-exiftool-perl \
+    mesa-va-drivers \
+    vainfo \
     libvips-tools \
     tzdata \
   && rm -rf /var/lib/apt/lists/*

@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Maximize2, Minimize2, RotateCw } from 'lucide-react';
 import type { Asset } from '../types/api';
 import { assetOriginalUrl, assetThumbUrl } from '../api/client';
-import { loadViewerPrefs, viewerPrefsChanged, type ViewerPrefs } from '../utils/viewerPrefs';
+import { loadViewerPrefs, saveViewerPrefs, viewerPrefsChanged, zoomPixelAreaRange, zoomScaleRange, type ViewerPrefs } from '../utils/viewerPrefs';
 import { rotatedContainStyle } from '../utils/rotation';
 import { viewerImageUrl } from '../utils/imagePreload';
 
@@ -48,6 +48,7 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
     () => rotatedContainStyle(asset, stageSize),
     [asset, stageSize.height, stageSize.width],
   );
+  const zoomPointer = useRef({ clientX: 0, clientY: 0 });
 
   useEffect(() => {
     function onPrefsChanged() {
@@ -116,10 +117,11 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
     animatedPressTimer.current = 0;
   }
 
-  function updateZoom(clientX: number, clientY: number) {
+  function updateZoom(clientX: number, clientY: number, nextPrefs = prefs) {
     const image = imageRef.current;
     const stage = stageRef.current;
     if (!image || !stage) return;
+    zoomPointer.current = { clientX, clientY };
     const stageRect = stage.getBoundingClientRect();
     const naturalWidth = image.naturalWidth || asset.width || stageRect.width;
     const naturalHeight = image.naturalHeight || asset.height || stageRect.height;
@@ -133,9 +135,9 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
     const stageX = clientX - stageRect.left;
     const stageY = clientY - stageRect.top;
     const pixelsPerSourcePixel =
-      prefs.zoomMode === 'pixels'
-        ? Math.min(stageRect.width, stageRect.height) / prefs.zoomPixelArea
-        : (imageRect.width * prefs.zoomScale) / naturalWidth;
+      nextPrefs.zoomMode === 'pixels'
+        ? Math.min(stageRect.width, stageRect.height) / nextPrefs.zoomPixelArea
+        : (imageRect.width * nextPrefs.zoomScale) / naturalWidth;
     const backgroundWidth = naturalWidth * pixelsPerSourcePixel;
     const backgroundHeight = naturalHeight * pixelsPerSourcePixel;
 
@@ -147,6 +149,35 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
       backgroundY: stageY - sourceY * pixelsPerSourcePixel,
     }));
   }
+
+  const adjustZoomByWheel = useCallback((event: WheelEvent) => {
+    if (!zoom.active) return;
+    if (event.deltaY === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const direction = event.deltaY < 0 ? 1 : -1;
+    const currentPrefs = loadViewerPrefs();
+    const nextPrefs =
+      currentPrefs.zoomMode === 'pixels'
+        ? {
+            ...currentPrefs,
+            zoomPixelArea: clampNumber(currentPrefs.zoomPixelArea - direction * 50, zoomPixelAreaRange.min, zoomPixelAreaRange.max),
+          }
+        : {
+            ...currentPrefs,
+            zoomScale: roundNumber(clampNumber(currentPrefs.zoomScale + direction * 0.2, zoomScaleRange.min, zoomScaleRange.max), 1),
+          };
+    saveViewerPrefs(nextPrefs);
+    setPrefs(nextPrefs);
+    updateZoom(zoomPointer.current.clientX, zoomPointer.current.clientY, nextPrefs);
+  }, [asset.height, asset.width, prefs, zoom.active]);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    stage.addEventListener('wheel', adjustZoomByWheel, { passive: false });
+    return () => stage.removeEventListener('wheel', adjustZoomByWheel);
+  }, [adjustZoomByWheel]);
 
   return (
     <div
@@ -258,6 +289,11 @@ function isAnimatedImage(asset: Asset) {
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+function roundNumber(value: number, decimals: number) {
+  const scale = 10 ** decimals;
+  return Math.round(value * scale) / scale;
 }
 
 function containRect(container: DOMRect, naturalWidth: number, naturalHeight: number) {

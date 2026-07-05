@@ -1,4 +1,5 @@
 import type { SortKey } from '../types/api';
+import { SidebarButtonGroup, SidebarSelect } from './SidebarControls';
 
 export type SortField = 'timeline' | 'imported' | 'size' | 'filename';
 export type SortDirection = 'asc' | 'desc';
@@ -32,26 +33,14 @@ export default function SortControls({ sort, onChange }: { sort: SortKey; onChan
   const parts = sortPartsFromKey(sort);
   return (
     <>
-      <label className="sidebar-field">
-        <span>排序</span>
-        <select value={parts.field} onChange={(event) => onChange(sortKeyFromParts(event.target.value as SortField, parts.direction))}>
-          {sortFields.map((field) => (
-            <option key={field.value} value={field.value}>
-              {field.label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="sidebar-field">
-        <span>顺序</span>
-        <select value={parts.direction} onChange={(event) => onChange(sortKeyFromParts(parts.field, event.target.value as SortDirection))}>
-          {sortDirections.map((direction) => (
-            <option key={direction.value} value={direction.value}>
-              {direction.label}
-            </option>
-          ))}
-        </select>
-      </label>
+      <SidebarSelect label="排序" value={parts.field} options={sortFields} onChange={(value) => onChange(sortKeyFromParts(value as SortField, parts.direction))} />
+      <SidebarButtonGroup
+        columns={2}
+        label="顺序"
+        value={parts.direction}
+        options={sortDirections}
+        onChange={(value) => onChange(sortKeyFromParts(parts.field, value))}
+      />
     </>
   );
 }

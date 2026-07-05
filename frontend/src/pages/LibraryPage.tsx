@@ -1,19 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { Image as ImageIcon, Images, Video } from 'lucide-react';
 import AssetGrid from '../components/AssetGrid';
 import AssetGroupingControls, { normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
+import { SidebarButtonGroup, SidebarMediaTypeList, SidebarRatingFilter, sidebarOrientationOptions } from '../components/SidebarControls';
 import SortControls, { isSortKey } from '../components/SortControls';
 import { api } from '../api/client';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
-import type { Asset, AssetDeletedEvent, AssetKind, LibraryAnchor, SortKey } from '../types/api';
+import type { Asset, AssetDeletedEvent, AssetKind, AssetRating, LibraryAnchor, OrientationFilter, SortKey } from '../types/api';
 import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import {
@@ -27,16 +27,18 @@ import {
 } from '../utils/pageState';
 import { assetMatchesLibrary } from '../utils/assetFilters';
 import { mergeSortedAssets, removeAssetById } from '../utils/assetSort';
-import { currentURLHasParam, currentURLLocation, currentURLPath, replaceURLState } from '../utils/urlState';
+import { assetRatingParam, currentURLHasParam, currentURLLocation, currentURLPath, orientationParam, replaceURLState } from '../utils/urlState';
 
 const pageSize = 100;
 const libraryStateKey = 'library';
-const libraryURLKeys = ['type', 'sort', 'group', 'q'];
-type LibraryControlState = Pick<LibraryPageState, 'groupMode' | 'query' | 'sort' | 'type'>;
+const libraryURLKeys = ['type', 'rating', 'orientation', 'sort', 'group', 'q'];
+type LibraryControlState = Pick<LibraryPageState, 'groupMode' | 'orientation' | 'query' | 'rating' | 'sort' | 'type'>;
 
 interface LibraryPageState extends GridReturnState {
   groupMode: AssetGroupMode;
+  orientation: OrientationFilter;
   query: string;
+  rating: AssetRating;
   sort: SortKey;
   type: AssetKind;
 }
@@ -44,7 +46,9 @@ interface LibraryPageState extends GridReturnState {
 const defaultLibraryState: LibraryPageState = {
   ...resetGridState(),
   groupMode: 'none',
+  orientation: 'all',
   query: '',
+  rating: 0,
   sort: 'timeline_desc',
   type: 'all',
 };
@@ -64,6 +68,8 @@ export default function LibraryPage() {
   );
   const pendingControlStateRef = useRef<Partial<LibraryControlState> | null>(null);
   const [type, setType] = useState<AssetKind>(initialStateRef.current.type);
+  const [rating, setRating] = useState<AssetRating>(initialStateRef.current.rating ?? 0);
+  const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
   const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
   const [query, setQuery] = useState(initialStateRef.current.query);
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
@@ -74,10 +80,17 @@ export default function LibraryPage() {
   const sidebarState = useSidebarReturnState();
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const loadAssets = useCallback(
-    (page: number) => api.libraryAssets(page, pageSize, type, sort, query, serverGroup),
-    [query, serverGroup, sort, type],
+    (page: number) => api.libraryAssets(page, pageSize, type, sort, query, serverGroup, rating, undefined, undefined, undefined, orientation),
+    [orientation, query, rating, serverGroup, sort, type],
   );
-  const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [type, sort, query, serverGroup]);
+  const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
+    type,
+    rating,
+    orientation,
+    sort,
+    query,
+    serverGroup,
+  ]);
   const {
     focusAssetId,
     getGridState,
@@ -100,17 +113,17 @@ export default function LibraryPage() {
     loadMore,
     loadPrevious,
     pageSize,
-    resetKey: JSON.stringify([type, sort, query, groupMode]),
+    resetKey: JSON.stringify([type, rating, orientation, sort, query, groupMode]),
     searchParams,
   });
 
   const mergeReadyAssets = useCallback(
     (incoming: Asset[]) => {
-      const filtered = incoming.filter((asset) => assetMatchesLibrary(asset, type, query));
+      const filtered = incoming.filter((asset) => assetMatchesLibrary(asset, type, query, rating, orientation));
       if (filtered.length === 0) return;
       mutateItems((current) => mergeSortedAssets(current, filtered, sort, { hasMore, loadedStartIndex, groupMode }));
     },
-    [groupMode, hasMore, loadedStartIndex, mutateItems, query, sort, type],
+    [groupMode, hasMore, loadedStartIndex, mutateItems, orientation, query, rating, sort, type],
   );
 
   const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
@@ -120,21 +133,26 @@ export default function LibraryPage() {
   useEffect(() => {
     if (eventsConnected) return undefined;
     const timer = window.setInterval(() => {
-      void api.libraryAssets(1, pageSize, type, sort, query, serverGroup).then((result) => mergeReadyAssets(result.items)).catch(() => undefined);
+      void api
+        .libraryAssets(1, pageSize, type, sort, query, serverGroup, rating, undefined, undefined, undefined, orientation)
+        .then((result) => mergeReadyAssets(result.items))
+        .catch(() => undefined);
     }, 30000);
     return () => window.clearInterval(timer);
-  }, [eventsConnected, mergeReadyAssets, query, serverGroup, sort, type]);
+  }, [eventsConnected, mergeReadyAssets, orientation, query, rating, serverGroup, sort, type]);
 
   const currentPageState = useCallback(
     (): LibraryPageState => ({
       ...getGridState(),
       groupMode,
+      orientation,
       query,
+      rating,
       sidebarExpanded: sidebarState.sidebarExpanded,
       sort,
       type,
     }),
-    [getGridState, groupMode, query, sidebarState.sidebarExpanded, sort, type],
+    [getGridState, groupMode, orientation, query, rating, sidebarState.sidebarExpanded, sort, type],
   );
 
   const saveCurrentState = useCallback(() => {
@@ -144,7 +162,9 @@ export default function LibraryPage() {
     (patch: Partial<LibraryControlState>) => {
       const controls: LibraryControlState = {
         groupMode,
+        orientation,
         query,
+        rating,
         sort,
         type,
         ...(pendingControlStateRef.current ?? {}),
@@ -157,13 +177,15 @@ export default function LibraryPage() {
         ...current,
         ...reset,
         groupMode: controls.groupMode,
+        orientation: controls.orientation,
         query: controls.query,
+        rating: controls.rating,
         sidebarExpanded: current.sidebarExpanded,
         sort: controls.sort,
         type: controls.type,
       });
     },
-    [currentPageState, groupMode, query, sort, type],
+    [currentPageState, groupMode, orientation, query, rating, sort, type],
   );
   const handleTypeChange = useCallback(
     (nextType: AssetKind) => {
@@ -183,6 +205,20 @@ export default function LibraryPage() {
     },
     [groupMode, saveControlState],
   );
+  const handleRatingChange = useCallback(
+    (nextRating: AssetRating) => {
+      setRating(nextRating);
+      saveControlState({ rating: nextRating });
+    },
+    [saveControlState],
+  );
+  const handleOrientationChange = useCallback(
+    (nextOrientation: OrientationFilter) => {
+      setOrientation(nextOrientation);
+      saveControlState({ orientation: nextOrientation });
+    },
+    [saveControlState],
+  );
   const handleQueryChange = useCallback(
     (nextQuery: string) => {
       setQuery(nextQuery);
@@ -201,8 +237,13 @@ export default function LibraryPage() {
 
   useEffect(() => {
     if (currentURLHasParam(location, 'restore')) return;
-    replaceURLState(navigate, location, { group: groupMode, q: query, sort, type }, libraryURLKeys);
-  }, [groupMode, location, navigate, query, searchParams, sort, type]);
+    replaceURLState(
+      navigate,
+      location,
+      { group: groupMode, orientation: orientation === 'all' ? undefined : orientation, q: query, rating, sort, type },
+      libraryURLKeys,
+    );
+  }, [groupMode, location, navigate, orientation, query, rating, searchParams, sort, type]);
 
   const handlePersistentGridScrollState = useCallback(
     (state: { ratio: number; scrollTop: number }) => {
@@ -216,7 +257,7 @@ export default function LibraryPage() {
     let live = true;
     async function loadAnchors() {
       try {
-        const result = await api.libraryAnchors(pageSize, type, sort, query);
+        const result = await api.libraryAnchors(pageSize, type, sort, query, serverGroup, rating, undefined, undefined, undefined, orientation);
         if (live) {
           setAnchors(result.items);
           setTotalCount(result.total);
@@ -232,7 +273,7 @@ export default function LibraryPage() {
     return () => {
       live = false;
     };
-  }, [query, sort, type]);
+  }, [orientation, query, rating, serverGroup, sort, type]);
 
   useEffect(() => {
     const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);
@@ -256,14 +297,9 @@ export default function LibraryPage() {
   useSidebarPanel(
     'library',
     <div className="sidebar-control-stack">
-      <div className="sidebar-list">
-        {(['all', 'image', 'video'] as AssetKind[]).map((value) => (
-          <button className={type === value ? 'sidebar-list-row active' : 'sidebar-list-row'} key={value} type="button" onClick={() => handleTypeChange(value)}>
-            {value === 'all' ? <Images size={14} /> : value === 'image' ? <ImageIcon size={14} /> : <Video size={14} />}
-            <span>{assetKindLabel(value)}</span>
-          </button>
-        ))}
-      </div>
+      <SidebarMediaTypeList value={type} onChange={handleTypeChange} />
+      <SidebarRatingFilter value={rating} onChange={handleRatingChange} />
+      <SidebarButtonGroup columns={3} label="方向" value={orientation} options={sidebarOrientationOptions} onChange={handleOrientationChange} />
       <SortControls sort={sort} onChange={handleSortChange} />
       <label className="sidebar-field">
         <span>搜索</span>
@@ -271,7 +307,20 @@ export default function LibraryPage() {
       </label>
       <AssetGroupingControls groupMode={groupMode} sort={sort} onChange={handleGroupModeChange} />
     </div>,
-    [groupMode, handleGroupModeChange, handleQueryChange, handleSortChange, handleTypeChange, query, sort, type],
+    [
+      groupMode,
+      handleGroupModeChange,
+      handleOrientationChange,
+      handleQueryChange,
+      handleRatingChange,
+      handleSortChange,
+      handleTypeChange,
+      orientation,
+      query,
+      rating,
+      sort,
+      type,
+    ],
   );
 
   useSidebarPanel(
@@ -310,20 +359,24 @@ export default function LibraryPage() {
             onPressPreviewChange={setPressPreviewAsset}
             buildViewerUrl={(asset) =>
               appendViewerReturnParams(
-                `/viewer/${asset.id}?context=library&type=${type}&sort=${sort}&q=${encodeURIComponent(query)}${serverGroup ? `&group=${serverGroup}` : ''}`,
+                `/viewer/${asset.id}?context=library&type=${type}&sort=${sort}&q=${encodeURIComponent(query)}${ratingViewerParam(rating)}${orientationViewerParam(
+                  orientation,
+                )}${serverGroup ? `&group=${serverGroup}` : ''}`,
                 currentPageReturnPath(),
                 currentPageState(),
               )
             }
           />
-          <LibraryIndexRail
-            anchors={anchors}
-            sort={sort}
-            scrollRatio={scrollRatio}
-            totalCount={totalCount}
-            pageSize={pageSize}
-            onSeek={seekIndex}
-          />
+          {groupMode !== 'folder' && (
+            <LibraryIndexRail
+              anchors={anchors}
+              sort={sort}
+              scrollRatio={scrollRatio}
+              totalCount={totalCount}
+              pageSize={pageSize}
+              onSeek={seekIndex}
+            />
+          )}
           <PressPreviewOverlay asset={pressPreviewAsset} />
         </div>
       )}
@@ -331,28 +384,27 @@ export default function LibraryPage() {
   );
 }
 
-function assetKindLabel(value: AssetKind) {
-  switch (value) {
-    case 'image':
-      return '照片';
-    case 'video':
-      return '视频';
-    default:
-      return '全部';
-  }
-}
-
 function libraryStateFromSearchParams(params: URLSearchParams, fallback: LibraryPageState): LibraryPageState {
   const type = params.get('type');
   const sort = params.get('sort');
   const q = params.get('q');
-  const hasLibraryParams = params.has('type') || params.has('sort') || params.has('q') || params.has('group');
+  const hasLibraryParams = libraryURLKeys.some((key) => params.has(key));
   const base = hasLibraryParams ? { ...fallback, ...resetGridState() } : fallback;
   return {
     ...base,
     groupMode: parseAssetGroupMode(params.get('group'), base.groupMode),
+    orientation: params.has('orientation') ? orientationParam(params.get('orientation')) : base.orientation,
     query: q ?? (hasLibraryParams ? '' : base.query),
+    rating: params.has('rating') ? assetRatingParam(params.get('rating')) ?? base.rating : base.rating,
     sort: isSortKey(sort) ? sort : base.sort,
     type: assetKinds.includes(type as AssetKind) ? (type as AssetKind) : base.type,
   };
+}
+
+function ratingViewerParam(rating: AssetRating) {
+  return `&rating=${rating}`;
+}
+
+function orientationViewerParam(orientation: OrientationFilter) {
+  return orientation === 'all' ? '' : `&orientation=${orientation}`;
 }

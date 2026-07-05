@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams, useSearchParams, type Location } from 'react-router-dom';
-import { Check, LogOut, Trash2, X } from 'lucide-react';
+import { Check, FolderOpen, LogOut, Trash2, X } from 'lucide-react';
 import { api } from '../api/client';
 import type { Asset, AssetDeleteEntry, AssetDeletePlan, AssetDeleteResult, AssetRating, AssetSidecars, Neighbors, NFOField, NFOFilterField, VideoProxyRuntime } from '../types/api';
 import RatingStars, { normalizeAssetRating } from '../components/RatingStars';
@@ -22,6 +22,7 @@ import { loadViewerPrefs, saveViewerPrefs, viewerPrefsChanged } from '../utils/v
 import { preloadViewerAsset, preloadViewerAssets } from '../utils/imagePreload';
 
 interface WheelBase {
+  current: Asset;
   next: Asset[];
   offset: number;
   previous: Asset[];
@@ -36,7 +37,6 @@ interface ViewerLocationState {
   initialAsset?: Asset;
 }
 
-const wheelStepCooldownMs = 220;
 const wheelStepThreshold = 60;
 const viewerReturnPageSize = 100;
 
@@ -61,8 +61,6 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const [fullscreen, setFullscreen] = useState(false);
   const wheelBase = useRef<WheelBase | null>(null);
   const wheelDelta = useRef(0);
-  const wheelLastStepAt = useRef(0);
-  const wheelResetTimer = useRef<number | null>(null);
   const viewerRef = useRef<HTMLElement | null>(null);
   const viewerReturnStateRef = useRef(decodeReturnState<Partial<SidebarReturnState>>(searchParams.get('returnState'), {}));
   const restoreSidebarState = useRestoreSidebarState();
@@ -70,6 +68,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const backgroundLocation = viewerLocationState?.backgroundLocation;
   const assetId = Number(params.assetId || assetIdFromPath(location.pathname) || 0);
   const initialAsset = viewerLocationState?.initialAsset?.id === assetId ? viewerLocationState.initialAsset : undefined;
+  const currentAssetIdRef = useRef<number | null>(null);
 
   const query = useMemo(() => {
     const result: Record<string, string> = {};
@@ -102,7 +101,10 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   }, [assetId, query]);
 
   const activeNeighbors = neighbors?.current.id === assetId ? neighbors : null;
+  const activeNeighborAssetId = activeNeighbors?.current.id ?? null;
   const current = activeNeighbors?.current ?? initialAsset;
+  const currentAssetId = current?.id ?? null;
+  currentAssetIdRef.current = currentAssetId;
 
   useEffect(() => {
     if (!overlay || !current) return;
@@ -124,6 +126,29 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     setDeletePlan(null);
     setDeleteError(null);
   }, [current?.id]);
+
+  useEffect(() => {
+    if (activeNeighborAssetId === null) return;
+    wheelBase.current = null;
+    wheelDelta.current = 0;
+  }, [activeNeighborAssetId]);
+
+  const currentVideoProxyRuntime =
+    videoProxyRuntime && currentAssetId !== null && videoProxyRuntime.assetId === currentAssetId ? videoProxyRuntime : null;
+  const handleProxyRuntimeChange = useCallback(
+    (sourceAssetId: number, runtime: VideoProxyRuntime | null) => {
+      if (sourceAssetId !== currentAssetIdRef.current) return;
+      setVideoProxyRuntime(runtime && runtime.assetId === sourceAssetId ? runtime : null);
+    },
+    [],
+  );
+  const handleCurrentProxyRuntimeChange = useCallback(
+    (runtime: VideoProxyRuntime | null) => {
+      if (currentAssetId === null) return;
+      handleProxyRuntimeChange(currentAssetId, runtime);
+    },
+    [currentAssetId, handleProxyRuntimeChange],
+  );
 
   useEffect(() => {
     let live = true;
@@ -192,14 +217,6 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     }
   }, []);
 
-  useEffect(() => {
-    return () => {
-      if (wheelResetTimer.current !== null) {
-        window.clearTimeout(wheelResetTimer.current);
-      }
-    };
-  }, []);
-
   const goAsset = useCallback(
     (asset: Asset | undefined) => {
       if (!asset) return;
@@ -215,48 +232,42 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   );
 
   const goWheelStep = useCallback(
-    (direction: 1 | -1, now = Date.now()) => {
-      if (now - wheelLastStepAt.current < wheelStepCooldownMs) return;
+    (direction: 1 | -1) => {
       const base =
         wheelBase.current ??
         (activeNeighbors
-          ? { next: activeNeighbors.next, offset: 0, previous: activeNeighbors.previous }
+          ? { current: activeNeighbors.current, next: activeNeighbors.next, offset: 0, previous: activeNeighbors.previous }
           : null);
       if (!base) return;
 
       const nextOffset = base.offset + direction;
-      const target = nextOffset > 0 ? base.next[nextOffset - 1] : base.previous[Math.abs(nextOffset) - 1];
+      const target = wheelTargetAtOffset(base, nextOffset);
       if (!target) return;
 
-      wheelLastStepAt.current = now;
       base.offset = nextOffset;
       wheelBase.current = base;
       goAsset(target);
-      if (wheelResetTimer.current !== null) {
-        window.clearTimeout(wheelResetTimer.current);
-      }
-      wheelResetTimer.current = window.setTimeout(() => {
-        wheelBase.current = null;
-        wheelResetTimer.current = null;
-      }, 320);
     },
     [activeNeighbors, goAsset],
   );
 
   useEffect(() => {
-    const element = viewerRef.current;
-    if (!element) return;
     const handleWheel = (event: WheelEvent) => {
+      if (!wheelBelongsToViewer(event, viewerRef.current)) return;
+      if (isImageZoomWheel(event)) {
+        wheelDelta.current = 0;
+        return;
+      }
       if (event.cancelable) event.preventDefault();
       wheelDelta.current += event.deltaY;
       if (Math.abs(wheelDelta.current) < wheelStepThreshold) return;
       const direction = wheelDelta.current > 0 ? 1 : -1;
       wheelDelta.current = 0;
-      goWheelStep(direction, Date.now());
+      goWheelStep(direction);
     };
-    element.addEventListener('wheel', handleWheel, { passive: false });
+    window.addEventListener('wheel', handleWheel, { capture: true, passive: false });
     return () => {
-      element.removeEventListener('wheel', handleWheel);
+      window.removeEventListener('wheel', handleWheel, true);
     };
   }, [goWheelStep]);
 
@@ -372,6 +383,16 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     [navigate],
   );
 
+  const openAssetFolder = useCallback(
+    (asset: Asset) => {
+      const query = new URLSearchParams();
+      query.set('folder', asset.parentRelPath);
+      query.set('recursive', '0');
+      navigate({ pathname: '/folders', search: query.toString() });
+    },
+    [navigate],
+  );
+
   const toggleFullscreen = useCallback(() => {
     const target = fullscreenTarget(viewerRef.current);
     if (document.fullscreenElement) {
@@ -416,9 +437,10 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       error={error}
       sidecarError={sidecarError}
       sidecars={sidecars}
-      videoProxyRuntime={videoProxyRuntime}
+      videoProxyRuntime={currentVideoProxyRuntime}
       onLeave={leave}
       onDelete={openDeleteDialog}
+      onOpenFolder={openAssetFolder}
       onNFOSearch={searchByNFOValue}
       onRatingChange={(rating) => void rateCurrentAsset(rating)}
       deleting={deleteLoading || deleteSubmitting}
@@ -430,9 +452,10 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       error,
       sidecarError,
       sidecars,
-      videoProxyRuntime,
+      currentVideoProxyRuntime,
       leave,
       openDeleteDialog,
+      openAssetFolder,
       searchByNFOValue,
       rateCurrentAsset,
       deleteLoading,
@@ -462,6 +485,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
               />
             ) : (
               <VideoViewer
+                key={current.id}
                 asset={current}
                 fullscreen={fullscreen}
                 playbackRate={playbackRate}
@@ -473,7 +497,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
                 onSelectedSubtitleChange={updateSelectedSubtitle}
                 onSubtitlesEnabledChange={updateSubtitlesEnabled}
                 onToggleFullscreen={toggleFullscreen}
-                onProxyRuntimeChange={setVideoProxyRuntime}
+                onProxyRuntimeChange={handleCurrentProxyRuntimeChange}
               />
             ))}
         </div>
@@ -503,6 +527,21 @@ function fullscreenTarget(viewer: HTMLElement | null) {
 function assetIdFromPath(pathname: string) {
   const match = pathname.match(/^\/viewer\/(\d+)/);
   return match?.[1] ?? '';
+}
+
+function isImageZoomWheel(event: WheelEvent) {
+  return event.target instanceof Element && Boolean(event.target.closest('.image-stage.zooming'));
+}
+
+function wheelTargetAtOffset(base: WheelBase, offset: number) {
+  if (offset === 0) return base.current;
+  return offset > 0 ? base.next[offset - 1] : base.previous[Math.abs(offset) - 1];
+}
+
+function wheelBelongsToViewer(event: WheelEvent, viewer: HTMLElement | null) {
+  if (!viewer) return false;
+  if (event.composedPath().includes(viewer)) return true;
+  return event.target instanceof Node && viewer.contains(event.target);
 }
 
 async function returnStateForCurrentAsset(searchParams: URLSearchParams, assetId: number | undefined) {
@@ -557,6 +596,7 @@ function ViewerSidebarPanel({
   videoProxyRuntime,
   onLeave,
   onDelete,
+  onOpenFolder,
   onNFOSearch,
   onRatingChange,
   deleting,
@@ -568,6 +608,7 @@ function ViewerSidebarPanel({
   videoProxyRuntime: VideoProxyRuntime | null;
   onLeave: () => void;
   onDelete: () => void;
+  onOpenFolder: (asset: Asset) => void;
   onNFOSearch: (field: NFOFilterField | 'nfo', value: string) => void;
   onRatingChange: (rating: AssetRating) => void;
   deleting: boolean;
@@ -603,6 +644,10 @@ function ViewerSidebarPanel({
           <div className="sidebar-asset-info">
             <strong>{asset.filename}</strong>
             <span>{asset.relPath}</span>
+            <button className="sidebar-asset-folder-link" type="button" onClick={() => onOpenFolder(asset)}>
+              <FolderOpen size={14} />
+              <span>{assetFolderLabel(asset)}</span>
+            </button>
             <div className="sidebar-info-chips">
               {assetInfoChips(asset).map((value) => (
                 <span className="sidebar-info-chip" key={value}>
@@ -788,6 +833,10 @@ function assetInfoChips(asset: Asset) {
   if (asset.duration !== null) chips.push(formatDuration(asset.duration));
   if (asset.mediaType === 'video') chips.push(`${asset.rotation || 0}°`);
   return chips;
+}
+
+function assetFolderLabel(asset: Asset) {
+  return asset.parentRelPath || '全部存储';
 }
 
 function NFOValue({

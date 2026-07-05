@@ -307,12 +307,17 @@ export default function VideoViewer({
       setProxyRuntime(null);
       return clearProxyPollTimer;
     }
+    let active = true;
+    const pollAssetId = asset.id;
+    const pollSessionId = proxySessionId;
+    const pollStartTime = proxyStartTime;
     const poll = async () => {
       try {
-        const runtime = await api.videoProxyStatus(asset.id, proxyStartTime, {
+        const runtime = await api.videoProxyStatus(pollAssetId, pollStartTime, {
           clientId: proxyClientId.current,
-          sessionId: proxySessionId,
+          sessionId: pollSessionId,
         });
+        if (!active || !videoProxyRuntimeMatches(runtime, pollAssetId, pollSessionId, pollStartTime)) return;
         setProxyRuntime(runtime);
         if (runtime.command === 'start_stream' && wantsPlaying.current && !proxyStreamEnabled) {
           startProxyPlayback();
@@ -320,16 +325,23 @@ export default function VideoViewer({
       } catch {
         // Keep playback usable if the lightweight status poll fails.
       } finally {
-        proxyPollTimer.current = window.setTimeout(poll, proxyPollMs);
+        if (active) proxyPollTimer.current = window.setTimeout(poll, proxyPollMs);
       }
     };
     void poll();
-    return clearProxyPollTimer;
+    return () => {
+      active = false;
+      clearProxyPollTimer();
+    };
   }, [asset.id, proxySessionId, proxyStartTime, proxyStreamEnabled, usesProxy]);
 
   useEffect(() => {
-    onProxyRuntimeChange?.(usesProxy ? proxyRuntime : null);
-  }, [onProxyRuntimeChange, proxyRuntime, usesProxy]);
+    const visibleRuntime =
+      usesProxy && proxyRuntime && videoProxyRuntimeMatches(proxyRuntime, asset.id, proxySessionId, proxyStartTime)
+        ? proxyRuntime
+        : null;
+    onProxyRuntimeChange?.(visibleRuntime);
+  }, [asset.id, onProxyRuntimeChange, proxyRuntime, proxySessionId, proxyStartTime, usesProxy]);
 
   useEffect(() => {
     if (!usesProxy || !proxyStreamEnabled) return undefined;
@@ -360,10 +372,18 @@ export default function VideoViewer({
     if (!shouldSync) {
       return clearProxyKeepaliveTimer;
     }
+    let active = true;
+    const keepaliveAssetId = asset.id;
+    const keepaliveSessionId = proxySessionId;
+    const keepaliveStartTime = proxyStartTime;
     const keepalive = async () => {
       const state: VideoProxyHeartbeat['state'] = !paused && hasPlaybackStarted ? 'playing' : 'preparing';
       try {
-        const runtime = await api.keepVideoProxyAlive(asset.id, proxyStartTime, proxyHeartbeat(state, true));
+        const runtime = await api.keepVideoProxyAlive(keepaliveAssetId, keepaliveStartTime, {
+          ...proxyHeartbeat(state, true),
+          sessionId: keepaliveSessionId,
+        });
+        if (!active || !videoProxyRuntimeMatches(runtime, keepaliveAssetId, keepaliveSessionId, keepaliveStartTime)) return;
         setProxyRuntime(runtime);
         if (runtime.command === 'start_stream' && wantsPlaying.current && !source) {
           startProxyPlayback();
@@ -371,11 +391,14 @@ export default function VideoViewer({
       } catch {
         // Playback owns the main request; keepalive failure should not interrupt it.
       } finally {
-        proxyKeepaliveTimer.current = window.setTimeout(keepalive, proxyKeepaliveMs);
+        if (active) proxyKeepaliveTimer.current = window.setTimeout(keepalive, proxyKeepaliveMs);
       }
     };
     void keepalive();
-    return clearProxyKeepaliveTimer;
+    return () => {
+      active = false;
+      clearProxyKeepaliveTimer();
+    };
   }, [asset.id, hasPlaybackStarted, paused, playbackRate, proxySessionId, proxyStartTime, proxyStreamEnabled, source, sourceFailed, usesProxy]);
 
   useEffect(() => () => {
@@ -665,6 +688,14 @@ function videoProxyRuntimeLabel(runtime: VideoProxyRuntime) {
   if (runtime.status === 'queued' || runtime.queued) return '等待转码槽位';
   if (runtime.transcoding) return `实时转码 ${Math.round(Math.min(1, Math.max(0, runtime.progress || 0)) * 100)}%`;
   return '准备转码';
+}
+
+function videoProxyRuntimeMatches(runtime: VideoProxyRuntime, assetId: number, sessionId: string, startSeconds: number) {
+  return (
+    runtime.assetId === assetId &&
+    runtime.sessionId === sessionId &&
+    Math.abs((runtime.startSeconds || 0) - startSeconds) < 0.01
+  );
 }
 
 function videoStatusLabel(asset: Asset, sourceFailed: boolean, runtime: VideoProxyRuntime | null) {

@@ -28,7 +28,6 @@ type Handler func(ctx context.Context, task Task) error
 const (
 	imageQueueCapacity       = 131072
 	videoPosterQueueCapacity = 65536
-	videoProxyQueueCapacity  = 8192
 	redisQueuePrefix         = "lpicto:jobs:v2"
 	legacyRedisQueue         = "lpicto:jobs"
 	redisDedupSet            = redisQueuePrefix + ":queued"
@@ -39,9 +38,8 @@ var (
 	redisControlTaskTypes = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_metadata", "scan_metadata_paths", "thumb_rebuild"}
 	redisImageTaskTypes   = []string{"thumb", "preview"}
 	redisPosterTaskTypes  = []string{"video_poster"}
-	redisVideoTaskTypes   = []string{"video_proxy"}
 	redisMediaTaskTypes   = []string{"thumb", "preview", "video_poster", "video_proxy"}
-	redisAllTaskTypes     = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_metadata", "scan_metadata_paths", "thumb_rebuild", "thumb", "preview", "video_poster", "video_proxy"}
+	redisAllTaskTypes     = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_metadata", "scan_metadata_paths", "thumb_rebuild", "thumb", "preview", "video_poster"}
 )
 
 type QueueStats struct {
@@ -64,15 +62,12 @@ type QueueStats struct {
 type WorkerConfig struct {
 	Image       int
 	VideoPoster int
-	VideoProxy  int
 }
 
 type Manager struct {
 	imageQueue       chan Task
 	videoPosterQueue chan Task
-	videoProxyQueue  chan Task
 	thumb            Handler
-	video            Handler
 	scan             Handler
 	redis            *redis.Client
 	redisQueue       string
@@ -89,7 +84,7 @@ type queuedTask struct {
 	Task Task  `json:"task"`
 }
 
-func New(logger *slog.Logger, thumb Handler, video Handler, policies ...ResourcePolicy) *Manager {
+func New(logger *slog.Logger, thumb Handler, policies ...ResourcePolicy) *Manager {
 	var resources *ResourceLimiter
 	if len(policies) > 0 {
 		resources = NewResourceLimiter(policies[0])
@@ -97,9 +92,7 @@ func New(logger *slog.Logger, thumb Handler, video Handler, policies ...Resource
 	return &Manager{
 		imageQueue:       make(chan Task, imageQueueCapacity),
 		videoPosterQueue: make(chan Task, videoPosterQueueCapacity),
-		videoProxyQueue:  make(chan Task, videoProxyQueueCapacity),
 		thumb:            thumb,
-		video:            video,
 		resources:        resources,
 		logger:           logger,
 		queued:           map[string]int{},
@@ -107,8 +100,8 @@ func New(logger *slog.Logger, thumb Handler, video Handler, policies ...Resource
 	}
 }
 
-func NewRedis(ctx context.Context, logger *slog.Logger, redisURL string, thumb Handler, video Handler, policies ...ResourcePolicy) (*Manager, error) {
-	manager := New(logger, thumb, video, policies...)
+func NewRedis(ctx context.Context, logger *slog.Logger, redisURL string, thumb Handler, policies ...ResourcePolicy) (*Manager, error) {
+	manager := New(logger, thumb, policies...)
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {
 		return nil, err
@@ -132,7 +125,6 @@ func (m *Manager) Start(ctx context.Context, cfg WorkerConfig) {
 		m.startRedisWorkers(ctx, "control", 1, redisControlTaskTypes, nil)
 		m.startRedisWorkers(ctx, "image", cfg.Image, redisImageTaskTypes, nil)
 		m.startRedisWorkers(ctx, "video_poster", cfg.VideoPoster, redisPosterTaskTypes, redisImageTaskTypes)
-		m.startRedisWorkers(ctx, "video_proxy", cfg.VideoProxy, redisVideoTaskTypes, append(redisImageTaskTypes, redisPosterTaskTypes...))
 		return
 	}
 	for i := 0; i < cfg.Image; i++ {
@@ -142,10 +134,6 @@ func (m *Manager) Start(ctx context.Context, cfg WorkerConfig) {
 	for i := 0; i < cfg.VideoPoster; i++ {
 		m.wg.Add(1)
 		go m.worker(ctx, "video_poster", m.videoPosterQueue, m.thumb)
-	}
-	for i := 0; i < cfg.VideoProxy; i++ {
-		m.wg.Add(1)
-		go m.worker(ctx, "video_proxy", m.videoProxyQueue, m.video)
 	}
 }
 
@@ -207,14 +195,14 @@ func (m *Manager) Stats() QueueStats {
 			ThumbQueued:       redisQueued["thumb"],
 			PreviewQueued:     redisQueued["preview"],
 			VideoPosterQueued: redisQueued["video_poster"],
-			VideoProxyQueued:  redisQueued["video_proxy"],
-			VideoQueued:       redisQueued["video_proxy"],
+			VideoProxyQueued:  0,
+			VideoProxyCap:     0,
+			VideoQueued:       0,
+			VideoCap:          0,
 			ActiveThumb:       redisActive["thumb"] + redisActive["video_poster"],
-			ActiveTranscode:   redisActive["preview"] + redisActive["video_proxy"],
+			ActiveTranscode:   redisActive["preview"],
 		}
 	}
-	videoQueued := queued["video_proxy"]
-	videoCap := cap(m.videoProxyQueue)
 	return QueueStats{
 		ImageQueued:       len(m.imageQueue),
 		ImageCap:          cap(m.imageQueue),
@@ -224,17 +212,21 @@ func (m *Manager) Stats() QueueStats {
 		PreviewCap:        cap(m.imageQueue),
 		VideoPosterQueued: queued["video_poster"],
 		VideoPosterCap:    cap(m.videoPosterQueue),
-		VideoProxyQueued:  queued["video_proxy"],
-		VideoProxyCap:     cap(m.videoProxyQueue),
-		VideoQueued:       videoQueued,
-		VideoCap:          videoCap,
+		VideoProxyQueued:  0,
+		VideoProxyCap:     0,
+		VideoQueued:       0,
+		VideoCap:          0,
 		ActiveThumb:       active["thumb"] + active["video_poster"],
-		ActiveTranscode:   active["preview"] + active["video_proxy"],
+		ActiveTranscode:   active["preview"],
 	}
 }
 
 func (m *Manager) Enqueue(task Task) {
 	if m == nil {
+		return
+	}
+	if !knownQueueTask(task.Type) {
+		m.logger.Warn("unknown task type", "type", task.Type, "assetID", task.AssetID)
 		return
 	}
 	if m.redis != nil {
@@ -247,17 +239,21 @@ func (m *Manager) Enqueue(task Task) {
 		queue = m.imageQueue
 	case "video_poster":
 		queue = m.videoPosterQueue
-	case "video_proxy":
-		queue = m.videoProxyQueue
-	default:
-		m.logger.Warn("unknown task type", "type", task.Type, "assetID", task.AssetID)
-		return
 	}
 	select {
 	case queue <- task:
 		m.markQueued(task.Type)
 	default:
 		m.logger.Warn("job queue full", "type", task.Type, "assetID", task.AssetID)
+	}
+}
+
+func knownQueueTask(taskType string) bool {
+	switch taskType {
+	case "thumb", "preview", "video_poster", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_metadata", "scan_metadata_paths", "thumb_rebuild", "scan_stop":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -462,7 +458,7 @@ func resourceManagedTypes(taskTypes []string) bool {
 
 func resourceManagedTask(taskType string) bool {
 	switch taskType {
-	case "thumb", "preview", "video_poster", "video_proxy":
+	case "thumb", "preview", "video_poster":
 		return true
 	default:
 		return false
@@ -473,8 +469,6 @@ func (m *Manager) handlerFor(taskType string) Handler {
 	switch taskType {
 	case "thumb", "preview", "video_poster":
 		return m.thumb
-	case "video_proxy":
-		return m.video
 	case "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_metadata", "scan_metadata_paths", "thumb_rebuild", "scan_stop":
 		return m.scan
 	default:
@@ -552,9 +546,6 @@ func normalizeWorkerConfig(cfg WorkerConfig) WorkerConfig {
 	}
 	if cfg.VideoPoster < 1 {
 		cfg.VideoPoster = 1
-	}
-	if cfg.VideoProxy < 1 {
-		cfg.VideoProxy = 1
 	}
 	return cfg
 }

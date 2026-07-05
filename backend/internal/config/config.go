@@ -27,9 +27,7 @@ type Config struct {
 	FileCountScanIntervalMinutes int                  `json:"fileCountScanIntervalMinutes"`
 	ScanWorkers                  int                  `json:"scanWorkers"`
 	ThumbWorkers                 int                  `json:"thumbWorkers"`
-	VideoWorkers                 int                  `json:"videoWorkers"`
 	VideoPosterWorkers           int                  `json:"videoPosterWorkers"`
-	VideoProxyWorkers            int                  `json:"videoProxyWorkers"`
 	BackgroundMaxActive          int                  `json:"backgroundMaxActive"`
 	BackgroundLoadTarget         float64              `json:"backgroundLoadTarget"`
 	BackgroundMinFreeMB          int                  `json:"backgroundMinFreeMb"`
@@ -65,14 +63,10 @@ func Load() (Config, error) {
 	thumbWorkers := intEnv("THUMB_WORKERS", boundedInt(cpus, 2, 8))
 	videoWorkersOverride := intEnv("VIDEO_WORKERS", 0)
 	videoPosterDefault := boundedInt((cpus+1)/2, 1, 4)
-	videoProxyDefault := 1
 	if videoWorkersOverride > 0 {
 		videoPosterDefault = videoWorkersOverride
-		videoProxyDefault = maxInt(1, videoWorkersOverride/2)
 	}
 	videoPosterWorkers := intEnv("VIDEO_POSTER_WORKERS", videoPosterDefault)
-	videoProxyWorkers := intEnv("VIDEO_PROXY_WORKERS", videoProxyDefault)
-	videoWorkers := videoPosterWorkers + videoProxyWorkers
 	backgroundMaxActive := intEnv("BACKGROUND_MAX_ACTIVE", boundedInt(cpus, 2, 8))
 	backgroundStartGapMS := intEnv("BACKGROUND_START_SPACING_MS", 50)
 	cfg := Config{
@@ -89,9 +83,7 @@ func Load() (Config, error) {
 		FileCountScanInterval:        time.Duration(fileCountScanMinutes) * time.Minute,
 		ScanWorkers:                  scanWorkers,
 		ThumbWorkers:                 thumbWorkers,
-		VideoWorkers:                 videoWorkers,
 		VideoPosterWorkers:           videoPosterWorkers,
-		VideoProxyWorkers:            videoProxyWorkers,
 		BackgroundMaxActive:          backgroundMaxActive,
 		BackgroundLoadTarget:         floatEnv("BACKGROUND_LOAD_TARGET", float64(maxInt(cpus*2, backgroundMaxActive))),
 		BackgroundMinFreeMB:          intEnv("BACKGROUND_MIN_FREE_MB", 512),
@@ -105,7 +97,7 @@ func Load() (Config, error) {
 		PreviewQuality:               intEnv("PREVIEW_QUALITY", 82),
 		VideoProxyEnabled:            boolEnv("VIDEO_PROXY_ENABLED", true),
 		LiveVideoProxyMaxActive:      intEnv("LIVE_VIDEO_PROXY_MAX_ACTIVE", 10),
-		VideoProxyMaxHeight:          intEnv("VIDEO_PROXY_MAX_HEIGHT", 1080),
+		VideoProxyMaxHeight:          intEnv("VIDEO_PROXY_MAX_HEIGHT", 0),
 		VideoProxyCRF:                intEnv("VIDEO_PROXY_CRF", 23),
 		FFmpegHWAccel:                hwAccelEnv("FFMPEG_HWACCEL", "none"),
 		FFmpegHWDevice:               stringEnv("FFMPEG_HWACCEL_DEVICE", ""),
@@ -125,14 +117,8 @@ func Load() (Config, error) {
 	if cfg.ThumbWorkers < 1 {
 		cfg.ThumbWorkers = 1
 	}
-	if cfg.VideoWorkers < 1 {
-		cfg.VideoWorkers = 1
-	}
 	if cfg.VideoPosterWorkers < 1 {
 		cfg.VideoPosterWorkers = 1
-	}
-	if cfg.VideoProxyWorkers < 1 {
-		cfg.VideoProxyWorkers = 1
 	}
 	if cfg.LiveVideoProxyMaxActive < 1 {
 		cfg.LiveVideoProxyMaxActive = 1
@@ -167,9 +153,7 @@ func (c Config) Log(logger *slog.Logger) {
 		"fileCountScanIntervalMinutes", c.FileCountScanIntervalMinutes,
 		"scanWorkers", c.ScanWorkers,
 		"thumbWorkers", c.ThumbWorkers,
-		"videoWorkers", c.VideoWorkers,
 		"videoPosterWorkers", c.VideoPosterWorkers,
-		"videoProxyWorkers", c.VideoProxyWorkers,
 		"backgroundMaxActive", c.BackgroundMaxActive,
 		"backgroundLoadTarget", c.BackgroundLoadTarget,
 		"backgroundMinFreeMB", c.BackgroundMinFreeMB,

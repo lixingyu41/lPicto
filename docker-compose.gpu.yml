@@ -1,9 +1,24 @@
 services:
-  worker:
-    gpus: all
+  api:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${LPICTO_VIDEO_GID:-44}"
+      - "${LPICTO_RENDER_GID:-109}"
     environment:
-      - FFMPEG_HWACCEL=cuda
-      - FFMPEG_HWACCEL_DEVICE=
+      - FFMPEG_HWACCEL=auto
+      - FFMPEG_HWACCEL_DEVICE=/dev/dri/renderD128
       - FFMPEG_HWACCEL_FALLBACK=true
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - LIBVA_DRIVER_NAME=${LIBVA_DRIVER_NAME:-iHD}
+
+  worker:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${LPICTO_VIDEO_GID:-44}"
+      - "${LPICTO_RENDER_GID:-109}"
+    environment:
+      - FFMPEG_HWACCEL=auto
+      - FFMPEG_HWACCEL_DEVICE=/dev/dri/renderD128
+      - FFMPEG_HWACCEL_FALLBACK=true
+      - LIBVA_DRIVER_NAME=${LIBVA_DRIVER_NAME:-iHD}

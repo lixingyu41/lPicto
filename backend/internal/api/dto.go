@@ -84,6 +84,7 @@ type AssetDeleteConflictDTO struct {
 }
 
 type VideoProxyRuntimeDTO struct {
+	AssetID      int64   `json:"assetId"`
 	Required     bool    `json:"required"`
 	Cached       bool    `json:"cached"`
 	Transcoding  bool    `json:"transcoding"`
@@ -101,6 +102,7 @@ type VideoProxyRuntimeDTO struct {
 	CacheTTL     int64   `json:"cacheTtl"`
 	KeepaliveTTL int64   `json:"keepaliveTtl"`
 	RuntimeKey   string  `json:"runtimeKey"`
+	StartSeconds float64 `json:"startSeconds"`
 	ClientID     string  `json:"clientId"`
 	SessionID    string  `json:"sessionId"`
 	SessionState string  `json:"sessionState"`

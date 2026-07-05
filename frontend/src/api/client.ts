@@ -17,6 +17,7 @@ import type {
   LibraryAnchorsResponse,
   Neighbors,
   NFOFilterField,
+  OrientationFilter,
   Page,
   PublicConfig,
   ProcessingProgress,
@@ -210,10 +211,19 @@ export const api = {
     }),
   deleteAlbum: (id: number) => request<{ deleted: boolean }>(`/api/albums/${id}`, { method: 'DELETE' }),
   refreshAlbum: (id: number) => request<ScanCommandResponse>(`/api/albums/${id}/refresh`, { method: 'POST' }),
-  albumAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating) =>
-    request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q, group, rating })}`),
-  albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating) =>
-    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, sort, q, group, rating })}`),
+  albumAssets: (
+    id: number,
+    page: number,
+    pageSize: number,
+    sort: SortKey,
+    q: string,
+    group?: AssetServerGroup,
+    rating?: AssetRating,
+    orientation?: OrientationFilter,
+    type?: AssetKind,
+  ) => request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q, group, rating, orientation, type })}`),
+  albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind) =>
+    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, sort, q, group, rating, orientation, type })}`),
   albumSourceFolders: (parentRelPath: string) =>
     request<SourceFoldersResponse>(`/api/albums/source-folders${qs({ parentRelPath })}`),
   libraryAssets: (
@@ -226,7 +236,12 @@ export const api = {
     rating?: AssetRating,
     albumId?: number,
     albumFilter?: AlbumAssetFilter,
-  ) => request<Page<Asset>>(`/api/library/assets${qs({ page, pageSize, type, sort, q, group, rating, albumId, albumFilter })}`),
+    albumIds?: number[],
+    orientation?: OrientationFilter,
+  ) =>
+    request<Page<Asset>>(
+      `/api/library/assets${qs({ page, pageSize, type, sort, q, group, rating, albumId, albumFilter, albumIds: albumIds?.join(','), orientation })}`,
+    ),
   libraryAnchors: (
     pageSize: number,
     type: AssetKind,
@@ -236,7 +251,12 @@ export const api = {
     rating?: AssetRating,
     albumId?: number,
     albumFilter?: AlbumAssetFilter,
-  ) => request<LibraryAnchorsResponse>(`/api/library/anchors${qs({ pageSize, type, sort, q, group, rating, albumId, albumFilter })}`),
+    albumIds?: number[],
+    orientation?: OrientationFilter,
+  ) =>
+    request<LibraryAnchorsResponse>(
+      `/api/library/anchors${qs({ pageSize, type, sort, q, group, rating, albumId, albumFilter, albumIds: albumIds?.join(','), orientation })}`,
+    ),
   searchAssets: (page: number, pageSize: number, params: SearchAssetsParams) =>
     request<Page<Asset>>(`/api/search/assets${qs({ page, pageSize, ...params })}`),
   searchAnchors: (pageSize: number, params: SearchAssetsParams) =>
@@ -245,11 +265,12 @@ export const api = {
     request<{ items: string[] }>(`/api/search/nfo-options${qs({ field, q, limit: 40 })}`, { signal }),
   folders: (parentId: number) => request<{ items: Folder[] }>(`/api/folders${qs({ parentId })}`),
   folderTree: () => request<{ items: Folder[] }>('/api/folders/tree'),
+  folderByPath: (relPath: string) => request<Folder>(`/api/folders/by-path${qs({ relPath })}`),
   folder: (id: number) => request<Folder>(`/api/folders/${id}`),
-  folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating) =>
-    request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating })}`),
-  folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating) =>
-    request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating })}`),
+  folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter) =>
+    request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation })}`),
+  folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter) =>
+    request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation })}`),
   asset: (id: number) => request<Asset>(`/api/assets/${id}`),
   assetDeletePlan: (id: number) => request<AssetDeletePlan>(`/api/assets/${id}/delete-plan`),
   deleteAsset: (id: number, token: string) => requestDeleteAsset(`/api/assets/${id}/delete`, token),
