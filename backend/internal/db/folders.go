@@ -252,6 +252,30 @@ func (d *DB) FolderTreeWithRoots(ctx context.Context, includedRoots []string) ([
 	return filterFoldersWithAssets(folders, includedRoots), nil
 }
 
+
+func (d *DB) DescendantFolderIDs(ctx context.Context, folderRel string) ([]int64, error) {
+	rows, err := d.conn.QueryContext(ctx, `
+WITH RECURSIVE tree AS (
+  SELECT id, rel_path FROM folder WHERE rel_path = ?
+  UNION ALL
+  SELECT f.id, f.rel_path FROM folder f JOIN tree t ON f.parent_rel_path = t.rel_path
+)
+SELECT id FROM tree`, folderRel)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func folderSelectSQL() string {
 	return `SELECT f.id, f.rel_path, f.name, p.rel_path AS parent_rel_path, f.depth, f.asset_count, f.recursive_asset_count, f.cover_asset_id, EXTRACT(EPOCH FROM f.updated_at)::BIGINT AS updated_at FROM folder f LEFT JOIN folder p ON p.id = f.parent_id`
 }

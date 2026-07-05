@@ -53,25 +53,19 @@ func (d *DB) AssetCountForRoots(ctx context.Context, roots []string) (int, error
 func (d *DB) AssetCountsForLibraries(ctx context.Context, libraries []ScanLibrary) (map[string]int, error) {
 	counts := make(map[string]int, len(libraries))
 	for _, library := range libraries {
-		counts[library.ID] = 0
-	}
-	rows, err := d.conn.QueryContext(ctx, `SELECT rel_path FROM assets WHERE deleted_at IS NULL`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var rel string
-		if err := rows.Scan(&rel); err != nil {
-			return nil, err
+		where, args, err := assetRootsWhere(library.Roots)
+		if err != nil {
+			counts[library.ID] = 0
+			continue
 		}
-		for _, library := range libraries {
-			if AssetInScanFolders(rel, library.Roots) {
-				counts[library.ID]++
-			}
+		var count int
+		if err := d.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM assets WHERE `+where, args...).Scan(&count); err != nil {
+			counts[library.ID] = 0
+			continue
 		}
+		counts[library.ID] = count
 	}
-	return counts, rows.Err()
+	return counts, nil
 }
 
 func (d *DB) processingProgress(ctx context.Context, where string, args []any) (ProcessingProgress, error) {

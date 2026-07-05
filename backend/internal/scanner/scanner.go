@@ -260,6 +260,13 @@ func (s *Scanner) submitCommand(cmd scanCommand) CommandResult {
 }
 
 func (s *Scanner) commandLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.Logger != nil {
+				s.Logger.Error("scanner command loop panicked", "panic", r)
+			}
+		}
+	}()
 	var cancel context.CancelFunc
 	var done <-chan struct{}
 	var activeStart *scanRequest

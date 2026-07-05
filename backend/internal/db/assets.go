@@ -1,4 +1,4 @@
-package db
+﻿package db
 
 import (
 	"context"
@@ -67,6 +67,7 @@ type AssetListOptions struct {
 	From            *int64
 	To              *int64
 	FolderRel       *string
+	FolderIDs       []int64
 	Recursive       bool
 	VisibleOnly     bool
 	NFOQuery        string
@@ -712,7 +713,15 @@ func (d *DB) ListFolderAssets(ctx context.Context, folderID int64, opts AssetLis
 	if err != nil {
 		return model.Page[model.Asset]{}, err
 	}
-	opts.FolderRel = &folder.RelPath
+	if opts.Recursive {
+		ids, err := d.DescendantFolderIDs(ctx, folder.RelPath)
+		if err != nil {
+			return model.Page[model.Asset]{}, err
+		}
+		opts.FolderIDs = ids
+	} else {
+		opts.FolderRel = &folder.RelPath
+	}
 	return d.listAssets(ctx, opts, false)
 }
 
@@ -724,7 +733,15 @@ func (d *DB) FolderAnchors(ctx context.Context, folderID int64, opts AssetListOp
 	if err != nil {
 		return LibraryAnchorResult{}, err
 	}
-	opts.FolderRel = &folder.RelPath
+	if opts.Recursive {
+		ids, err := d.DescendantFolderIDs(ctx, folder.RelPath)
+		if err != nil {
+			return LibraryAnchorResult{}, err
+		}
+		opts.FolderIDs = ids
+	} else {
+		opts.FolderRel = &folder.RelPath
+	}
 	where, args := assetFilterSQL(opts, false)
 	return d.anchorsForFilter(ctx, where, args, opts.Sort, opts.Group, opts.PageSize)
 }
@@ -737,7 +754,15 @@ func (d *DB) FolderAssetPosition(ctx context.Context, folderID int64, assetID in
 	if err != nil {
 		return AssetPosition{}, err
 	}
-	opts.FolderRel = &folder.RelPath
+	if opts.Recursive {
+		ids, err := d.DescendantFolderIDs(ctx, folder.RelPath)
+		if err != nil {
+			return AssetPosition{}, err
+		}
+		opts.FolderIDs = ids
+	} else {
+		opts.FolderRel = &folder.RelPath
+	}
 	where, args := assetFilterSQL(opts, false)
 	return d.assetPositionForFilter(ctx, assetID, where, args, opts.Sort, opts.Group, opts.PageSize)
 }
@@ -1071,7 +1096,15 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 		if err != nil {
 			return Neighbors{}, err
 		}
-		filterOpts.FolderRel = &folder.RelPath
+		if opts.Recursive {
+			ids, err := d.DescendantFolderIDs(ctx, folder.RelPath)
+			if err != nil {
+				return Neighbors{}, err
+			}
+			filterOpts.FolderIDs = ids
+		} else {
+			filterOpts.FolderRel = &folder.RelPath
+		}
 		filterOpts.Recursive = opts.Recursive
 	}
 	if opts.Context == "timeline" {
@@ -1219,16 +1252,16 @@ func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 	case "portrait":
 		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveHeightSQL()+" > "+effectiveWidthSQL())
 	}
-	if opts.FolderRel != nil {
-		if opts.Recursive {
-			if *opts.FolderRel != "" {
-				where = append(where, "(parent_rel_path = ? OR parent_rel_path LIKE ? ESCAPE '\\')")
-				args = append(args, *opts.FolderRel, descendantPathLike(*opts.FolderRel))
-			}
-		} else {
-			where = append(where, "parent_rel_path = ?")
-			args = append(args, *opts.FolderRel)
+	if len(opts.FolderIDs) > 0 {
+		placeholders := make([]string, len(opts.FolderIDs))
+		for i, id := range opts.FolderIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
 		}
+		where = append(where, "folder_id IN ("+strings.Join(placeholders, ",")+")")
+	} else if opts.FolderRel != nil {
+		where = append(where, "parent_rel_path = ?")
+		args = append(args, *opts.FolderRel)
 	}
 	if timeline {
 		if opts.From != nil {

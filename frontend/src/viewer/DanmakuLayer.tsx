@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { layoutDanmaku, parseDanmakuText, type PositionedDanmakuCue } from './danmaku';
 
 interface Props {
@@ -12,14 +12,6 @@ interface Props {
   source: string;
 }
 
-type DanmakuStyle = CSSProperties & {
-  '--danmaku-color': string;
-  '--danmaku-delay': string;
-  '--danmaku-duration': string;
-  '--danmaku-font-size': string;
-  '--danmaku-lane': number;
-};
-
 export default function DanmakuLayer({
   currentTime,
   enabled,
@@ -30,6 +22,10 @@ export default function DanmakuLayer({
   playbackRate,
   source,
 }: Props) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const itemsRef = useRef<Map<string, HTMLSpanElement>>(new Map());
+  const rafRef = useRef<number | null>(null);
+  const containerWidthRef = useRef(0);
   const [cues, setCues] = useState<PositionedDanmakuCue[]>([]);
 
   useEffect(() => {
@@ -58,18 +54,90 @@ export default function DanmakuLayer({
   const activeCues = useMemo(
     () =>
       cues
-        .filter((cue) => currentTime >= cue.start && currentTime <= cue.start + cue.displayDuration)
+        .filter(
+          (cue) =>
+            currentTime >= cue.start &&
+            currentTime <= cue.start + cue.displayDuration,
+        )
         .slice(-140),
     [cues, currentTime],
   );
 
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        containerWidthRef.current = entry.contentRect.width;
+      }
+    });
+    ro.observe(el);
+    containerWidthRef.current = el.clientWidth;
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!enabled || !source || activeCues.length === 0) {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      activeCues.forEach((cue) => itemsRef.current.delete(cue.id));
+      return;
+    }
+
+    const activeIds = new Set(activeCues.map((c) => c.id));
+    for (const [id] of itemsRef.current) {
+      if (!activeIds.has(id)) itemsRef.current.delete(id);
+    }
+
+    const rate = normalizePlaybackRate(playbackRate);
+
+    function tick() {
+      rafRef.current = requestAnimationFrame(tick);
+      for (const cue of activeCues) {
+        const el = itemsRef.current.get(cue.id);
+        if (!el || cue.mode !== 'scroll') continue;
+        const elapsed = Math.max(0, currentTime - cue.start) / rate;
+        const progress = Math.min(1, elapsed / (cue.displayDuration / rate));
+        const distance = containerWidthRef.current + el.offsetWidth;
+        el.style.transform = `translateX(${-(progress * distance)}px)`;
+      }
+    }
+
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [activeCues, currentTime, enabled, playbackRate, paused, source]);
+
+  const setItemRef = useCallback(
+    (id: string) =>
+      (el: HTMLSpanElement | null) => {
+        if (el) itemsRef.current.set(id, el);
+        else itemsRef.current.delete(id);
+      },
+    [],
+  );
+
   if (!enabled || !source || activeCues.length === 0) return null;
 
-  const rate = normalizePlaybackRate(playbackRate);
   return (
-    <div className={paused ? 'video-danmaku-layer paused' : 'video-danmaku-layer'} aria-hidden="true">
+    <div
+      ref={containerRef}
+      className={paused ? 'video-danmaku-layer paused' : 'video-danmaku-layer'}
+      aria-hidden="true"
+    >
       {activeCues.map((cue) => (
-        <span className={danmakuClassName(cue)} key={cue.id} style={danmakuStyle(cue, currentTime, rate)}>
+        <span
+          ref={setItemRef(cue.id)}
+          className={danmakuClassName(cue)}
+          key={cue.id}
+          style={danmakuItemStyle(cue)}
+        >
           {cue.text}
         </span>
       ))}
@@ -81,12 +149,9 @@ function danmakuClassName(cue: PositionedDanmakuCue) {
   return `video-danmaku-item video-danmaku-${cue.mode}`;
 }
 
-function danmakuStyle(cue: PositionedDanmakuCue, currentTime: number, playbackRate: number): DanmakuStyle {
-  const elapsed = Math.max(0, currentTime - cue.start) / playbackRate;
+function danmakuItemStyle(cue: PositionedDanmakuCue): CSSProperties {
   return {
     '--danmaku-color': cue.color,
-    '--danmaku-delay': `${-elapsed}s`,
-    '--danmaku-duration': `${cue.displayDuration / playbackRate}s`,
     '--danmaku-font-size': `${cue.fontSize}px`,
     '--danmaku-lane': cue.lane,
   };
@@ -95,7 +160,7 @@ function danmakuStyle(cue: PositionedDanmakuCue, currentTime: number, playbackRa
 function laneCount(width: number, height: number) {
   const controlSpace = width <= 720 ? 112 : 76;
   const available = Math.max(96, height - controlSpace - 18);
-  return Math.max(4, Math.floor(available / 32));
+  return Math.max(4, Math.floor(available / 28));
 }
 
 function normalizePlaybackRate(value: number) {

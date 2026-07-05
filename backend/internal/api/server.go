@@ -65,6 +65,8 @@ type Server struct {
 	videoProxyStates map[string]*videoProxyRuntime
 	videoProxySlots  chan struct{}
 
+	folderRefreshSem chan struct{}
+
 	staticDir string
 }
 
@@ -89,12 +91,14 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	}
 	s := &Server{
 		cfg: cfg, db: database, store: store, scanner: scan, jobs: queue, events: bus, logger: logger,
-		videoProxyStates: map[string]*videoProxyRuntime{},
-		videoProxySlots:  make(chan struct{}, liveVideoProxyMaxActive),
-		staticDir:        findStaticDir(cfg.StaticDir),
+		videoProxyStates:  map[string]*videoProxyRuntime{},
+		videoProxySlots:   make(chan struct{}, liveVideoProxyMaxActive),
+		folderRefreshSem:  make(chan struct{}, 4),
+		staticDir:         findStaticDir(cfg.StaticDir),
 	}
 	s.startVideoProxySweeper()
 	r := chi.NewRouter()
+	r.Use(requestLogger(logger))
 	r.Use(foregroundActivity)
 	r.Get("/api/health", s.health)
 	r.Get("/api/config/public", s.publicConfig)
@@ -1128,6 +1132,13 @@ func (s *Server) markDeletedAsset(ctx context.Context, asset model.Asset, reason
 		s.events.Publish(events.Event{Type: "asset_deleted", Payload: asset})
 	}
 	go func() {
+		s.folderRefreshSem <- struct{}{}
+		defer func() { <-s.folderRefreshSem }()
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("folder refresh goroutine panicked", "panic", r, "assetID", asset.ID)
+			}
+		}()
 		if err := s.db.RefreshFolders(context.Background()); err != nil {
 			s.logger.Warn("refresh folders after asset deletion failed", "assetID", asset.ID, "relPath", asset.RelPath, "reason", reason, "error", err)
 		}
@@ -1162,6 +1173,20 @@ func findStaticDir(preferred string) string {
 		}
 	}
 	return preferred
+}
+
+func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/api/events") || strings.HasPrefix(r.URL.Path, "/api/assets/") && (strings.Contains(r.URL.Path, "/thumb") || strings.Contains(r.URL.Path, "/preview") || strings.Contains(r.URL.Path, "/original") || strings.Contains(r.URL.Path, "/video")) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			start := time.Now()
+			next.ServeHTTP(w, r)
+			logger.Info("http", "method", r.Method, "path", r.URL.Path, "elapsed", time.Since(start).String())
+		})
+	}
 }
 
 func Start(ctx context.Context, addr string, handler http.Handler, logger *slog.Logger) error {

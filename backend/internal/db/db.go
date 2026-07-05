@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -74,8 +76,9 @@ func (d *DB) Close() error {
 	}
 	err := d.raw.Close()
 	if d.testAdminURL != "" && d.testDatabase != "" {
-		if dropErr := dropTestDatabase(context.Background(), d.testAdminURL, d.testDatabase); err == nil {
-			err = dropErr
+		dropErr := dropTestDatabase(context.Background(), d.testAdminURL, d.testDatabase)
+		if dropErr != nil {
+			slog.Warn("failed to drop test database after close", "database", d.testDatabase, "error", dropErr)
 		}
 	}
 	return err
@@ -85,6 +88,9 @@ func (d *DB) Conn() *sql.DB {
 	return d.raw
 }
 
+// Checkpoint is a no-op for PostgreSQL — WAL checkpointing is managed automatically by the database.
+// This method exists for interface compatibility with SQLite-backed deployments where explicit WAL
+// checkpointing is required to prevent the write-ahead log from growing unbounded.
 func (d *DB) Checkpoint(ctx context.Context) error {
 	_ = ctx
 	return nil
@@ -209,7 +215,9 @@ func createTestDatabase(ctx context.Context, seed string) (string, string, strin
 		return "", "", "", err
 	}
 	defer admin.Close()
-	if _, err := admin.ExecContext(ctx, `CREATE DATABASE `+name); err != nil {
+	// Safety: name is derived from SHA1 hex output and a literal prefix, containing only [0-9a-f_].
+	// Still using fmt.Sprintf with double-quote to guard against future refactoring of the name generation.
+	if _, err := admin.ExecContext(ctx, fmt.Sprintf(`CREATE DATABASE %q`, name)); err != nil {
 		return "", "", "", err
 	}
 	testURL, err := databaseURLWithName(base, name)
@@ -227,7 +235,7 @@ func dropTestDatabase(ctx context.Context, adminURL string, name string) error {
 	}
 	defer admin.Close()
 	_, _ = admin.ExecContext(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, name)
-	_, err = admin.ExecContext(ctx, `DROP DATABASE IF EXISTS `+name)
+	_, err = admin.ExecContext(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q`, name))
 	return err
 }
 
@@ -288,7 +296,12 @@ func (t *sqlTx) Rollback() error {
 	return t.tx.Rollback()
 }
 
+var rebindCache sync.Map
+
 func rebindPostgres(query string) string {
+	if cached, ok := rebindCache.Load(query); ok {
+		return cached.(string)
+	}
 	var b strings.Builder
 	b.Grow(len(query) + 8)
 	inString := false
@@ -313,7 +326,9 @@ func rebindPostgres(query string) string {
 		}
 		b.WriteByte(ch)
 	}
-	return b.String()
+	result := b.String()
+	rebindCache.Store(query, result)
+	return result
 }
 
 func nullString(value *string) sql.NullString {

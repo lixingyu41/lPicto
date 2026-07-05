@@ -20,6 +20,13 @@ const watchPathBatchLimit = 100
 
 func (s *Scanner) StartWatcher(ctx context.Context, debounce time.Duration) {
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if s.Logger != nil {
+					s.Logger.Error("fsnotify watcher panicked", "panic", r)
+				}
+			}
+		}()
 		watcher, err := fsnotify.NewWatcher()
 		if err != nil {
 			s.Logger.Warn("fsnotify disabled", "error", err)

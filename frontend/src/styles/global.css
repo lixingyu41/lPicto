@@ -2322,7 +2322,7 @@ input {
 }
 
 .video-danmaku-layer {
-  --danmaku-lane-height: 32px;
+  --danmaku-lane-height: 28px;
   position: absolute;
   inset: 0 0 var(--video-controls-space) 0;
   z-index: 5;
@@ -2336,18 +2336,16 @@ input {
   max-width: none;
   color: var(--danmaku-color);
   font-size: var(--danmaku-font-size);
-  font-weight: 800;
-  line-height: 1.12;
+  font-weight: normal;
+  line-height: 1.125;
   letter-spacing: 0;
   white-space: nowrap;
+  font-family: SimHei, "Microsoft JhengHei", "Heiti SC", Arial, Helvetica, sans-serif;
   text-shadow:
-    1px 0 1px rgba(0, 0, 0, 0.86),
-    -1px 0 1px rgba(0, 0, 0, 0.86),
-    0 1px 1px rgba(0, 0, 0, 0.86),
-    0 -1px 1px rgba(0, 0, 0, 0.86),
-    0 2px 3px rgba(0, 0, 0, 0.62);
-  -webkit-text-stroke: 1px rgba(0, 0, 0, 0.72);
-  paint-order: stroke fill;
+    rgb(0, 0, 0) 1px 0px 1px,
+    rgb(0, 0, 0) 0px 1px 1px,
+    rgb(0, 0, 0) 0px -1px 1px,
+    rgb(0, 0, 0) -1px 0px 1px;
   will-change: transform, opacity;
   animation-duration: var(--danmaku-duration);
   animation-delay: var(--danmaku-delay);
@@ -2361,7 +2359,7 @@ input {
 
 .video-danmaku-scroll,
 .video-danmaku-top {
-  top: calc(8px + var(--danmaku-lane) * var(--danmaku-lane-height));
+  top: calc(4px + var(--danmaku-lane) * var(--danmaku-lane-height));
 }
 
 .video-danmaku-scroll {
@@ -2378,7 +2376,7 @@ input {
 }
 
 .video-danmaku-bottom {
-  bottom: calc(8px + var(--danmaku-lane) * var(--danmaku-lane-height));
+  bottom: calc(4px + var(--danmaku-lane) * var(--danmaku-lane-height));
 }
 
 @keyframes video-danmaku-scroll {
