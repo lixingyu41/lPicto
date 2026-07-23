@@ -31,6 +31,7 @@ RUN set -eux; \
   && apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     ffmpeg \
     intel-media-va-driver \
     libimage-exiftool-perl \

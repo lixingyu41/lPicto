@@ -29,7 +29,7 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, totalCoun
   const visibleAnchors = useMemo(() => anchors.filter((anchor) => anchor.position >= 0 && anchor.position <= 1), [anchors]);
 
   if (visibleAnchors.length === 0) return null;
-  const thumbPosition = clampRatio(active?.position ?? scrollRatio);
+  const thumbPosition = clampRatio(dragging && active ? active.position : scrollRatio);
 
   function pick(clientY: number): PickResult | null {
     const rect = railRef.current?.getBoundingClientRect();
@@ -47,11 +47,18 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, totalCoun
     return { anchor: best, page: pageForRatio(visibleAnchors, ratio, totalCount, pageSize), position: ratio };
   }
 
-  function activate(clientY: number) {
+  function activate(clientY: number, seek: boolean) {
     const result = pick(clientY);
     if (!result) return;
     setActive({ label: result.anchor.label, position: result.position });
-    onSeek(result.anchor, result.page, result.position);
+    if (seek) {
+      onSeek(result.anchor, result.page, result.position);
+    }
+  }
+
+  function isInsideRail(clientX: number, clientY: number) {
+    const rect = railRef.current?.getBoundingClientRect();
+    return Boolean(rect && clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom);
   }
 
   return (
@@ -63,23 +70,31 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, totalCoun
         event.currentTarget.setPointerCapture(event.pointerId);
         draggingRef.current = true;
         setDragging(true);
-        activate(event.clientY);
+        activate(event.clientY, true);
+      }}
+      onPointerEnter={(event) => {
+        activate(event.clientY, false);
       }}
       onPointerMove={(event) => {
-        if (!draggingRef.current) return;
-        activate(event.clientY);
+        activate(event.clientY, draggingRef.current);
       }}
       onPointerUp={(event) => {
-        event.currentTarget.releasePointerCapture(event.pointerId);
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }
         draggingRef.current = false;
         setDragging(false);
+        if (!isInsideRail(event.clientX, event.clientY)) {
+          setActive(null);
+        }
       }}
       onPointerCancel={() => {
         draggingRef.current = false;
         setDragging(false);
+        setActive(null);
       }}
       onPointerLeave={() => {
-        if (!dragging) {
+        if (!draggingRef.current) {
           setActive(null);
         }
       }}
@@ -93,7 +108,6 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, totalCoun
           style={railPositionStyle(anchor.position)}
           title={anchor.label}
           type="button"
-          onMouseEnter={() => setActive({ label: anchor.label, position: anchor.position })}
         >
           {showInlineLabel(sort) && <span>{anchor.label}</span>}
         </button>

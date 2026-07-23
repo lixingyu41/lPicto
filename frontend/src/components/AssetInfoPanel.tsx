@@ -44,12 +44,10 @@ export default function AssetInfoPanel({ asset, title }: Props) {
               <dd>{formatDuration(asset.duration)}</dd>
             </div>
           )}
-          {asset.mediaType === 'video' && (
-            <div>
-              <dt>旋转</dt>
-              <dd>{asset.rotation || 0}°</dd>
-            </div>
-          )}
+          <div>
+            <dt>旋转</dt>
+            <dd>{asset.rotation || 0}°</dd>
+          </div>
         </dl>
       </div>
     </div>

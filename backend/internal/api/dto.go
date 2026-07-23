@@ -1,6 +1,10 @@
 package api
 
 import (
+	"encoding/json"
+	"strconv"
+	"strings"
+
 	"lpicto/backend/internal/db"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/model"
@@ -17,28 +21,44 @@ type APIError struct {
 }
 
 type AssetDTO struct {
-	ID                int64    `json:"id"`
-	Filename          string   `json:"filename"`
-	RelPath           string   `json:"relPath"`
-	ParentRelPath     string   `json:"parentRelPath"`
-	MediaType         string   `json:"mediaType"`
-	MimeType          *string  `json:"mimeType"`
-	Size              int64    `json:"size"`
-	Mtime             int64    `json:"mtime"`
-	Width             *int     `json:"width"`
-	Height            *int     `json:"height"`
-	Duration          *float64 `json:"duration"`
-	TakenAt           *int64   `json:"takenAt"`
-	TimelineAt        int64    `json:"timelineAt"`
-	ImportedAt        int64    `json:"importedAt"`
-	CacheKey          string   `json:"cacheKey"`
-	BrowserPlayable   bool     `json:"browserPlayable"`
-	ThumbStatus       string   `json:"thumbStatus"`
-	PreviewStatus     string   `json:"previewStatus"`
-	VideoPosterStatus string   `json:"videoPosterStatus"`
-	VideoProxyStatus  string   `json:"videoProxyStatus"`
-	Rotation          int      `json:"rotation"`
-	Rating            int      `json:"rating"`
+	ID                int64      `json:"id"`
+	Filename          string     `json:"filename"`
+	FilenameSortKey   string     `json:"filenameSortKey"`
+	RelPath           string     `json:"relPath"`
+	ParentRelPath     string     `json:"parentRelPath"`
+	MediaType         string     `json:"mediaType"`
+	MimeType          *string    `json:"mimeType"`
+	Size              int64      `json:"size"`
+	Mtime             int64      `json:"mtime"`
+	Width             *int       `json:"width"`
+	Height            *int       `json:"height"`
+	Duration          *float64   `json:"duration"`
+	TakenAt           *int64     `json:"takenAt"`
+	TimelineAt        int64      `json:"timelineAt"`
+	ImportedAt        int64      `json:"importedAt"`
+	CacheKey          string     `json:"cacheKey"`
+	BrowserPlayable   bool       `json:"browserPlayable"`
+	ThumbStatus       string     `json:"thumbStatus"`
+	PreviewStatus     string     `json:"previewStatus"`
+	VideoPosterStatus string     `json:"videoPosterStatus"`
+	VideoProxyStatus  string     `json:"videoProxyStatus"`
+	Rotation          int        `json:"rotation"`
+	Rating            int        `json:"rating"`
+	Hidden            bool       `json:"hidden"`
+	SHA256            *string    `json:"sha256"`
+	HasSubtitle       bool       `json:"hasSubtitle"`
+	HasDanmaku        bool       `json:"hasDanmaku"`
+	FPS               *float64   `json:"fps"`
+	VideoCodec        *string    `json:"videoCodec"`
+	AudioCodec        *string    `json:"audioCodec"`
+	Container         *string    `json:"container"`
+	VideoBitrate      *int64     `json:"videoBitrate"`
+	AudioBitrate      *int64     `json:"audioBitrate"`
+	OverallBitrate    *int64     `json:"overallBitrate"`
+	AIDescription     *string    `json:"aiDescription,omitempty"`
+	AITags            []db.AITag `json:"aiTags,omitempty"`
+	Palette           []db.AIColor `json:"palette,omitempty"`
+	ManualTags        []AssetTagDTO `json:"manualTags,omitempty"`
 }
 
 type AssetDeleteEntryDTO struct {
@@ -113,6 +133,35 @@ type VideoProxyRuntimeDTO struct {
 	ServerTime   int64   `json:"serverTime"`
 }
 
+type VideoSegmentStatusDTO struct {
+	AssetID             int64   `json:"assetId"`
+	SessionID           string  `json:"sessionId"`
+	SegmentIndex        int     `json:"segmentIndex"`
+	State               string  `json:"state"`
+	Status              string  `json:"status"`
+	Cached              bool    `json:"cached"`
+	Transcoding         bool    `json:"transcoding"`
+	Queued              bool    `json:"queued"`
+	Progress            float64 `json:"progress"`
+	SecondsDone         float64 `json:"secondsDone"`
+	Duration            float64 `json:"duration"`
+	Bytes               int64   `json:"bytes"`
+	CachedBytes         int64   `json:"cachedBytes"`
+	CachedSegments      int     `json:"cachedSegments"`
+	SegmentCount        int     `json:"segmentCount"`
+	EstimatedTotalBytes int64   `json:"estimatedTotalBytes"`
+	SourceBytes         int64   `json:"sourceBytes"`
+	Error               string  `json:"error"`
+	Message             string  `json:"message"`
+	UpdatedAt           int64   `json:"updatedAt"`
+	ServerTime          int64   `json:"serverTime"`
+}
+
+type VideoProxySettingsDTO struct {
+	CacheTTLSeconds int64 `json:"cacheTtlSeconds"`
+	MaxCacheBytes   int64 `json:"maxCacheBytes"`
+}
+
 type VideoProxyHeartbeatRequest struct {
 	ClientID     string  `json:"clientId"`
 	SessionID    string  `json:"sessionId"`
@@ -121,6 +170,43 @@ type VideoProxyHeartbeatRequest struct {
 	PlaybackRate float64 `json:"playbackRate"`
 	WantsStream  bool    `json:"wantsStream"`
 	Hidden       bool    `json:"hidden"`
+}
+
+type AssetTagDTO struct {
+	AssetID   int64  `json:"assetId"`
+	Tag       string `json:"tag"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+type TagSummaryDTO struct {
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	AssetCount int    `json:"assetCount"`
+	CreatedAt  int64  `json:"createdAt"`
+}
+
+type CollectionDTO struct {
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	Kind       string          `json:"kind"`
+	SystemKind string          `json:"systemKind,omitempty"`
+	AssetCount int             `json:"assetCount"`
+	Rule       json.RawMessage `json:"rule,omitempty"`
+	CreatedAt  int64           `json:"createdAt"`
+	UpdatedAt  int64           `json:"updatedAt"`
+}
+
+type BatchOperationResultDTO struct {
+	UpdatedAssetIDs []int64                 `json:"updatedAssetIds"`
+	DeletedAssetIDs []int64                 `json:"deletedAssetIds,omitempty"`
+	Failures        []AssetDeleteFailureDTO `json:"failures"`
+}
+
+type DuplicateGroupDTO struct {
+	Key    string     `json:"key"`
+	Size   int64      `json:"size"`
+	SHA256 string     `json:"sha256"`
+	Items  []AssetDTO `json:"items"`
 }
 
 type FolderDTO struct {
@@ -205,6 +291,8 @@ type QueueStatsDTO struct {
 	VideoQueued       int `json:"videoQueued"`
 	VideoCap          int `json:"videoCap"`
 	ActiveThumb       int `json:"activeThumb"`
+	ActivePreview     int `json:"activePreview"`
+	ActiveVideoPoster int `json:"activeVideoPoster"`
 	ActiveTranscode   int `json:"activeTranscode"`
 }
 
@@ -251,6 +339,7 @@ type ScanFolderDTO struct {
 type ScanLibraryDTO struct {
 	ID       string                 `json:"id"`
 	Name     string                 `json:"name"`
+	AIFocus  string                 `json:"aiFocus"`
 	Folders  []ScanFolderDTO        `json:"folders"`
 	Exists   bool                   `json:"exists"`
 	Progress ScanLibraryProgressDTO `json:"progress"`
@@ -275,15 +364,6 @@ type SourceFolderDTO struct {
 	Depth         int     `json:"depth"`
 	Selected      bool    `json:"selected"`
 	Included      bool    `json:"included"`
-}
-
-type TimelineGroupDTO struct {
-	Key          string `json:"key"`
-	Label        string `json:"label"`
-	Start        int64  `json:"start"`
-	End          int64  `json:"end"`
-	Count        int    `json:"count"`
-	CoverAssetID *int64 `json:"coverAssetId"`
 }
 
 type PageDTO[T any] struct {
@@ -345,9 +425,11 @@ type AlbumSourceDTO struct {
 }
 
 func assetDTO(asset model.Asset) AssetDTO {
+	mediaDetails := parseAssetMediaDetails(asset.MetadataJSON)
 	return AssetDTO{
 		ID:                asset.ID,
 		Filename:          asset.Filename,
+		FilenameSortKey:   asset.FilenameSortKey,
 		RelPath:           asset.RelPath,
 		ParentRelPath:     asset.ParentRelPath,
 		MediaType:         asset.MediaType,
@@ -368,13 +450,169 @@ func assetDTO(asset model.Asset) AssetDTO {
 		VideoProxyStatus:  asset.VideoProxyStatus,
 		Rotation:          asset.Rotation,
 		Rating:            asset.Rating,
+		Hidden:            asset.Hidden,
+		SHA256:            asset.SHA256,
+		HasSubtitle:       asset.HasSubtitle,
+		HasDanmaku:        asset.HasDanmaku,
+		FPS:               mediaDetails.FPS,
+		VideoCodec:        mediaDetails.VideoCodec,
+		AudioCodec:        mediaDetails.AudioCodec,
+		Container:         mediaDetails.Container,
+		VideoBitrate:      mediaDetails.VideoBitrate,
+		AudioBitrate:      mediaDetails.AudioBitrate,
+		OverallBitrate:    mediaDetails.OverallBitrate,
 	}
+}
+
+type assetMediaDetails struct {
+	FPS            *float64
+	VideoCodec     *string
+	AudioCodec     *string
+	Container      *string
+	VideoBitrate   *int64
+	AudioBitrate   *int64
+	OverallBitrate *int64
+}
+
+type assetProbeMetadata struct {
+	Streams []struct {
+		CodecType    string `json:"codec_type"`
+		CodecName    string `json:"codec_name"`
+		Profile      string `json:"profile"`
+		BitRate      string `json:"bit_rate"`
+		AvgFrameRate string `json:"avg_frame_rate"`
+		RFrameRate   string `json:"r_frame_rate"`
+	} `json:"streams"`
+	Format struct {
+		FormatName string `json:"format_name"`
+		BitRate    string `json:"bit_rate"`
+	} `json:"format"`
+}
+
+func parseAssetMediaDetails(raw *string) assetMediaDetails {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return assetMediaDetails{}
+	}
+	var probe assetProbeMetadata
+	if err := json.Unmarshal([]byte(*raw), &probe); err != nil {
+		return assetMediaDetails{}
+	}
+	details := assetMediaDetails{
+		Container:      nonEmptyStringPtr(probe.Format.FormatName),
+		OverallBitrate: positiveInt64Ptr(probe.Format.BitRate),
+	}
+	hasAudio := false
+	for _, stream := range probe.Streams {
+		switch stream.CodecType {
+		case "video":
+			if details.VideoCodec == nil {
+				details.VideoCodec = nonEmptyStringPtr(codecLabel(stream.CodecName, stream.Profile))
+				details.VideoBitrate = positiveInt64Ptr(stream.BitRate)
+				details.FPS = frameRatePtr(stream.AvgFrameRate)
+				if details.FPS == nil {
+					details.FPS = frameRatePtr(stream.RFrameRate)
+				}
+			}
+		case "audio":
+			hasAudio = true
+			if details.AudioCodec == nil {
+				details.AudioCodec = nonEmptyStringPtr(codecLabel(stream.CodecName, stream.Profile))
+				details.AudioBitrate = positiveInt64Ptr(stream.BitRate)
+			}
+		}
+	}
+	if details.OverallBitrate != nil {
+		streamBitrate := int64(0)
+		if details.VideoBitrate != nil {
+			streamBitrate += *details.VideoBitrate
+		}
+		if details.AudioBitrate != nil {
+			streamBitrate += *details.AudioBitrate
+		}
+		if streamBitrate > 0 && streamBitrate*4 < *details.OverallBitrate {
+			details.VideoBitrate = nil
+			details.AudioBitrate = nil
+		}
+	}
+	if details.OverallBitrate != nil {
+		switch {
+		case details.VideoBitrate == nil && details.AudioBitrate != nil && *details.OverallBitrate > *details.AudioBitrate:
+			value := *details.OverallBitrate - *details.AudioBitrate
+			details.VideoBitrate = &value
+		case details.AudioBitrate == nil && details.VideoBitrate != nil && *details.OverallBitrate > *details.VideoBitrate:
+			value := *details.OverallBitrate - *details.VideoBitrate
+			details.AudioBitrate = &value
+		case details.VideoBitrate == nil && !hasAudio:
+			value := *details.OverallBitrate
+			details.VideoBitrate = &value
+		}
+	}
+	return details
+}
+
+func codecLabel(codec, profile string) string {
+	codec = strings.TrimSpace(codec)
+	profile = strings.TrimSpace(profile)
+	if codec == "" || profile == "" || strings.EqualFold(codec, profile) {
+		return codec
+	}
+	return codec + " (" + profile + ")"
+}
+
+func nonEmptyStringPtr(value string) *string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func positiveInt64Ptr(value string) *int64 {
+	parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || parsed <= 0 {
+		return nil
+	}
+	return &parsed
+}
+
+func frameRatePtr(value string) *float64 {
+	parts := strings.Split(strings.TrimSpace(value), "/")
+	if len(parts) == 0 || len(parts) > 2 {
+		return nil
+	}
+	numerator, err := strconv.ParseFloat(parts[0], 64)
+	if err != nil || numerator <= 0 {
+		return nil
+	}
+	result := numerator
+	if len(parts) == 2 {
+		denominator, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil || denominator <= 0 {
+			return nil
+		}
+		result /= denominator
+	}
+	return &result
 }
 
 func assetDTOs(assets []model.Asset) []AssetDTO {
 	result := make([]AssetDTO, 0, len(assets))
 	for _, asset := range assets {
 		result = append(result, assetDTO(asset))
+	}
+	return result
+}
+
+func assetDTOsWithListSummaries(assets []model.Asset, summaries map[int64]db.AISummary, manualTags map[int64][]db.AssetTag) []AssetDTO {
+	result := assetDTOs(assets)
+	for i := range result {
+		if summary, ok := summaries[result[i].ID]; ok {
+			description := summary.Description
+			result[i].AIDescription = &description
+			result[i].AITags = summary.Tags
+			result[i].Palette = summary.Palette
+		}
+		result[i].ManualTags = assetTagDTOs(result[i].ID, manualTags[result[i].ID])
 	}
 	return result
 }
@@ -474,7 +712,7 @@ func workStatusCountsDTO(counts db.WorkStatusCounts) WorkStatusCountsDTO {
 }
 
 func processingProgressDTO(progress db.ProcessingProgress, queue jobs.QueueStats, cache CacheStatsDTO, updatedAt int64, refreshing bool) ProcessingProgressDTO {
-	active := queue.ActiveThumb+queue.ActiveTranscode+queue.ThumbQueued+queue.PreviewQueued+queue.VideoProxyQueued > 0
+	active := queue.ActiveThumb+queue.ActivePreview+queue.ActiveVideoPoster+queue.ActiveTranscode+queue.ThumbQueued+queue.PreviewQueued+queue.VideoPosterQueued+queue.VideoProxyQueued > 0
 	return ProcessingProgressDTO{
 		AssetTotal:  progress.AssetTotal,
 		ImageTotal:  progress.ImageTotal,
@@ -498,6 +736,8 @@ func processingProgressDTO(progress db.ProcessingProgress, queue jobs.QueueStats
 			VideoQueued:       queue.VideoQueued,
 			VideoCap:          queue.VideoCap,
 			ActiveThumb:       queue.ActiveThumb,
+			ActivePreview:     queue.ActivePreview,
+			ActiveVideoPoster: queue.ActiveVideoPoster,
 			ActiveTranscode:   queue.ActiveTranscode,
 		},
 		Cache:      cache,
@@ -505,25 +745,6 @@ func processingProgressDTO(progress db.ProcessingProgress, queue jobs.QueueStats
 		UpdatedAt:  updatedAt,
 		Refreshing: refreshing,
 	}
-}
-
-func timelineGroupDTO(group model.TimelineGroup) TimelineGroupDTO {
-	return TimelineGroupDTO{
-		Key:          group.Key,
-		Label:        group.Label,
-		Start:        group.Start,
-		End:          group.End,
-		Count:        group.Count,
-		CoverAssetID: group.CoverAssetID,
-	}
-}
-
-func timelineGroupDTOs(groups []model.TimelineGroup) []TimelineGroupDTO {
-	result := make([]TimelineGroupDTO, 0, len(groups))
-	for _, group := range groups {
-		result = append(result, timelineGroupDTO(group))
-	}
-	return result
 }
 
 func libraryAnchorDTOs(anchors []db.LibraryAnchor) []LibraryAnchorDTO {
@@ -590,6 +811,41 @@ func albumSourceDTOs(sources []model.AlbumSource) []AlbumSourceDTO {
 			Recursive:         source.Recursive,
 			MediaTypeFilter:   source.MediaTypeFilter,
 			OrientationFilter: source.OrientationFilter,
+		})
+	}
+	return result
+}
+
+func collectionDTO(item model.Collection) CollectionDTO {
+	var raw json.RawMessage
+	if item.RuleJSON != nil && *item.RuleJSON != "" {
+		raw = json.RawMessage(*item.RuleJSON)
+	}
+	return CollectionDTO{
+		ID:         item.ID,
+		Name:       item.Name,
+		Kind:       item.Kind,
+		SystemKind: item.SystemKind,
+		AssetCount: item.AssetCount,
+		Rule:       raw,
+		CreatedAt:  item.CreatedAt,
+		UpdatedAt:  item.UpdatedAt,
+	}
+}
+
+func collectionDTOs(items []model.Collection) []CollectionDTO {
+	result := make([]CollectionDTO, 0, len(items))
+	for _, item := range items {
+		result = append(result, collectionDTO(item))
+	}
+	return result
+}
+
+func duplicateGroupDTOs(groups []model.DuplicateGroup) []DuplicateGroupDTO {
+	result := make([]DuplicateGroupDTO, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, DuplicateGroupDTO{
+			Key: group.Key, Size: group.Size, SHA256: group.SHA256, Items: assetDTOs(group.Items),
 		})
 	}
 	return result

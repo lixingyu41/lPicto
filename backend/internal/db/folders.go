@@ -59,7 +59,10 @@ func (d *DB) RefreshFolders(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return d.writeFolderStats(ctx, folders, activeFolders)
+	if err := d.writeFolderStats(ctx, folders, activeFolders); err != nil {
+		return err
+	}
+	return d.RefreshAlbumStats(ctx)
 }
 
 func (d *DB) folderStatsSnapshot(ctx context.Context) ([]model.Folder, error) {
@@ -252,13 +255,12 @@ func (d *DB) FolderTreeWithRoots(ctx context.Context, includedRoots []string) ([
 	return filterFoldersWithAssets(folders, includedRoots), nil
 }
 
-
 func (d *DB) DescendantFolderIDs(ctx context.Context, folderRel string) ([]int64, error) {
 	rows, err := d.conn.QueryContext(ctx, `
 WITH RECURSIVE tree AS (
   SELECT id, rel_path FROM folder WHERE rel_path = ?
   UNION ALL
-  SELECT f.id, f.rel_path FROM folder f JOIN tree t ON f.parent_rel_path = t.rel_path
+  SELECT f.id, f.rel_path FROM folder f JOIN tree t ON f.parent_id = t.id
 )
 SELECT id FROM tree`, folderRel)
 	if err != nil {
@@ -285,7 +287,7 @@ func (d *DB) populateFolderStat(ctx context.Context, folder model.Folder) (model
 	countQuery := `SELECT
 COALESCE(SUM(CASE WHEN parent_rel_path = ? THEN 1 ELSE 0 END), 0),
 COUNT(*)
-FROM assets WHERE deleted_at IS NULL AND thumb_status = 'ready'`
+FROM assets WHERE deleted_at IS NULL`
 	args := []any{folder.RelPath}
 	if recursiveWhere != "" {
 		countQuery += " AND " + recursiveWhere
@@ -350,9 +352,6 @@ func (d *DB) populateFolderStats(ctx context.Context, folders []model.Folder) ([
 		if err := rows.Scan(&id, &parent, &timelineAt, &thumbStatus); err != nil {
 			return nil, err
 		}
-		if thumbStatus != model.StatusReady {
-			continue
-		}
 		if index, ok := relIndex[parent]; ok {
 			folders[index].AssetCount++
 		}
@@ -362,6 +361,9 @@ func (d *DB) populateFolderStats(ctx context.Context, folders []model.Folder) ([
 				continue
 			}
 			folders[index].RecursiveAssetCount++
+			if thumbStatus != model.StatusReady {
+				continue
+			}
 			currentTimeline, hasCover := coverTimeline[rel]
 			if !hasCover || timelineAt > currentTimeline || (timelineAt == currentTimeline && id > coverIDs[rel]) {
 				coverTimeline[rel] = timelineAt

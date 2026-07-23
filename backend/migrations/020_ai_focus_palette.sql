@@ -1,0 +1,5 @@
+ALTER TABLE scan_library
+  ADD COLUMN IF NOT EXISTS ai_focus TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE asset_ai_result
+  ADD COLUMN IF NOT EXISTS palette JSONB NOT NULL DEFAULT '[]'::jsonb;

@@ -2,11 +2,54 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 
 	"lpicto/backend/internal/model"
 )
+
+func TestPurgeAssetIDsDeletesAssetAndCascadesFileInstances(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	assetID, _, _, err := database.UpsertAsset(ctx, AssetUpsert{
+		RelPath: "purge.jpg", ParentRelPath: "", Filename: "purge.jpg", Ext: "jpg", MediaType: model.MediaTypeImage,
+		Size: 10, Mtime: 10, ImportedAt: 10, TimelineAt: 10, CacheKey: "purge-cache",
+		ThumbStatus: model.StatusReady, PreviewStatus: model.StatusReady,
+		VideoPosterStatus: model.StatusNotRequired, VideoProxyStatus: model.StatusNotRequired,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Conn().ExecContext(ctx, `UPDATE file_instance SET missing = true WHERE asset_id = $1`, assetID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.GetAssetRecordIncludingDeleted(ctx, assetID); err != nil {
+		t.Fatalf("missing asset record lookup failed: %v", err)
+	}
+	purged, err := database.PurgeAssetIDs(ctx, []int64{assetID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(purged) != 1 || purged[0].ID != assetID || purged[0].CacheKey != "purge-cache" {
+		t.Fatalf("purged = %#v", purged)
+	}
+	if _, err := database.GetAssetIncludingDeleted(ctx, assetID); err != sql.ErrNoRows {
+		t.Fatalf("asset lookup error = %v, want sql.ErrNoRows", err)
+	}
+	var fileInstances int
+	if err := database.Conn().QueryRowContext(ctx, `SELECT COUNT(*) FROM file_instance WHERE asset_id = $1`, assetID).Scan(&fileInstances); err != nil {
+		t.Fatal(err)
+	}
+	if fileInstances != 0 {
+		t.Fatalf("file instances = %d, want 0", fileInstances)
+	}
+}
 
 func TestMarkDeletedWithCacheReturnsCacheKey(t *testing.T) {
 	ctx := context.Background()
@@ -111,7 +154,7 @@ func TestUpsertAssetDetailedReportsOldCacheKey(t *testing.T) {
 
 func TestAssetStatusesSkipsPreviewForBrowserPlayableImages(t *testing.T) {
 	thumb, preview, poster, proxy := AssetStatuses(model.MediaTypeImage, true, true)
-	if thumb != model.StatusPending || preview != model.StatusNotRequired || poster != model.StatusNotRequired || proxy != model.StatusNotRequired {
+	if thumb != model.StatusPending || preview != model.StatusNotRequired || poster != model.StatusPending || proxy != model.StatusNotRequired {
 		t.Fatalf("browser image statuses = %q %q %q %q", thumb, preview, poster, proxy)
 	}
 	_, preview, _, _ = AssetStatuses(model.MediaTypeImage, false, true)
@@ -119,7 +162,7 @@ func TestAssetStatusesSkipsPreviewForBrowserPlayableImages(t *testing.T) {
 		t.Fatalf("non-browser image preview = %q, want pending", preview)
 	}
 	thumb, preview, poster, proxy = AssetStatuses(model.MediaTypeVideo, false, true)
-	if thumb != model.StatusPending || preview != model.StatusNotRequired || poster != model.StatusNotRequired || proxy != model.StatusNotRequired {
+	if thumb != model.StatusPending || preview != model.StatusNotRequired || poster != model.StatusPending || proxy != model.StatusNotRequired {
 		t.Fatalf("non-browser video statuses = %q %q %q %q", thumb, preview, poster, proxy)
 	}
 	thumb, preview, poster, proxy = AssetStatuses(model.MediaTypeVideo, true, true)

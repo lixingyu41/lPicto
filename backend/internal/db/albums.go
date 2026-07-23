@@ -44,8 +44,8 @@ WHERE album_sources.album_id = ?
   )
   AND (
     album_sources.orientation_filter = 'all'
-    OR (album_sources.orientation_filter = 'landscape' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveWidthSQL() + ` >= ` + effectiveHeightSQL() + `)
-    OR (album_sources.orientation_filter = 'portrait' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveHeightSQL() + ` > ` + effectiveWidthSQL() + `)
+    OR (album_sources.orientation_filter = 'landscape' AND orientation IN (1, 3))
+    OR (album_sources.orientation_filter = 'portrait' AND orientation = 2)
   )
 )`
 
@@ -64,40 +64,53 @@ func albumMembershipExistsWhereSQL(albumFilterCondition string) string {
 	return `EXISTS (
 SELECT 1
 FROM albums album_filter
-JOIN album_sources album_source_filter ON album_source_filter.album_id = album_filter.id
-WHERE album_source_filter.source_type = 'folder'
+WHERE 1 = 1
 ` + albumFilterCondition + `
   AND (
-    (
-      album_source_filter.recursive = true
-      AND (
-        album_source_filter.rel_path = ''
-        OR assets.parent_rel_path = album_source_filter.rel_path
-        OR assets.parent_rel_path LIKE replace(replace(replace(album_source_filter.rel_path, '\', '\\'), '%', '\%'), '_', '\_') || '/%' ESCAPE '\'
-      )
+    EXISTS (
+      SELECT 1
+      FROM album_sources album_source_filter
+      WHERE album_source_filter.album_id = album_filter.id
+        AND album_source_filter.source_type = 'folder'
+        AND (
+          (
+            album_source_filter.recursive = true
+            AND (
+              album_source_filter.rel_path = ''
+              OR assets.parent_rel_path = album_source_filter.rel_path
+              OR assets.parent_rel_path LIKE replace(replace(replace(album_source_filter.rel_path, '\', '\\'), '%', '\%'), '_', '\_') || '/%' ESCAPE '\'
+            )
+          )
+          OR (
+            album_source_filter.recursive = false
+            AND assets.parent_rel_path = album_source_filter.rel_path
+          )
+        )
+        AND (
+          album_source_filter.media_type_filter = 'all'
+          OR assets.media_type = album_source_filter.media_type_filter
+        )
+        AND (
+          album_source_filter.orientation_filter = 'all'
+          OR (album_source_filter.orientation_filter = 'landscape' AND orientation IN (1, 3))
+          OR (album_source_filter.orientation_filter = 'portrait' AND orientation = 2)
+        )
     )
-    OR (
-      album_source_filter.recursive = false
-      AND assets.parent_rel_path = album_source_filter.rel_path
+    OR EXISTS (
+      SELECT 1
+      FROM album_asset album_asset_filter
+      WHERE album_asset_filter.album_id = album_filter.id
+        AND album_asset_filter.asset_id = assets.id
     )
-  )
-  AND (
-    album_source_filter.media_type_filter = 'all'
-    OR assets.media_type = album_source_filter.media_type_filter
   )
   AND (
     album_filter.media_type_filter = 'all'
     OR assets.media_type = album_filter.media_type_filter
   )
   AND (
-    album_source_filter.orientation_filter = 'all'
-    OR (album_source_filter.orientation_filter = 'landscape' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveWidthSQL() + ` >= ` + effectiveHeightSQL() + `)
-    OR (album_source_filter.orientation_filter = 'portrait' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveHeightSQL() + ` > ` + effectiveWidthSQL() + `)
-  )
-  AND (
     album_filter.orientation_filter = 'all'
-    OR (album_filter.orientation_filter = 'landscape' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveWidthSQL() + ` >= ` + effectiveHeightSQL() + `)
-    OR (album_filter.orientation_filter = 'portrait' AND width IS NOT NULL AND height IS NOT NULL AND ` + effectiveHeightSQL() + ` > ` + effectiveWidthSQL() + `)
+    OR (album_filter.orientation_filter = 'landscape' AND orientation IN (1, 3))
+    OR (album_filter.orientation_filter = 'portrait' AND orientation = 2)
   )
 )`
 }
@@ -130,6 +143,27 @@ type AlbumGroupCreate struct {
 }
 
 func (d *DB) ListAlbums(ctx context.Context) ([]model.Album, error) {
+	albums, err := d.listAlbumsWithSources(ctx)
+	if err != nil {
+		return nil, err
+	}
+	needsStats := false
+	for _, album := range albums {
+		if album.StatsUpdatedAt == 0 {
+			needsStats = true
+			break
+		}
+	}
+	if !needsStats {
+		return albums, nil
+	}
+	if err := d.RefreshAlbumStats(ctx); err != nil {
+		return nil, err
+	}
+	return d.listAlbumsWithSources(ctx)
+}
+
+func (d *DB) listAlbumsWithSources(ctx context.Context) ([]model.Album, error) {
 	rows, err := d.conn.QueryContext(ctx, albumSelectSQL()+` ORDER BY group_id IS NULL, group_id, updated_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
@@ -195,10 +229,13 @@ func (d *DB) GetAlbum(ctx context.Context, id int64) (model.Album, error) {
 	if err != nil {
 		return model.Album{}, err
 	}
-	if err := d.loadAlbumStats(ctx, &album); err != nil {
+	if album.StatsUpdatedAt != 0 {
+		return album, nil
+	}
+	if err := d.RefreshAlbumStatsForAlbum(ctx, id); err != nil {
 		return model.Album{}, err
 	}
-	return album, nil
+	return d.getAlbumWithSources(ctx, id)
 }
 
 func (d *DB) getAlbumWithSources(ctx context.Context, id int64) (model.Album, error) {
@@ -260,6 +297,9 @@ VALUES (?, 'folder', ?, ?, ?, ?, ?)`,
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		return model.Album{}, err
+	}
+	if err := d.RefreshAlbumStatsForAlbum(ctx, albumID); err != nil {
 		return model.Album{}, err
 	}
 	return d.GetAlbum(ctx, albumID)
@@ -324,6 +364,9 @@ VALUES (?, 'folder', ?, ?, ?, ?, ?)`,
 	if err := tx.Commit(); err != nil {
 		return model.Album{}, err
 	}
+	if err := d.RefreshAlbumStatsForAlbum(ctx, id); err != nil {
+		return model.Album{}, err
+	}
 	return d.GetAlbum(ctx, id)
 }
 
@@ -337,6 +380,89 @@ func (d *DB) TouchAlbum(ctx context.Context, id int64) error {
 	return err
 }
 
+func (d *DB) AddAlbumAssets(ctx context.Context, albumID int64, assetIDs []int64) ([]int64, error) {
+	if len(assetIDs) == 0 {
+		return nil, nil
+	}
+	if _, err := d.GetAlbum(ctx, albumID); err != nil {
+		return nil, err
+	}
+	now := util.UnixNow()
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	updated := make([]int64, 0, len(assetIDs))
+	for _, assetID := range uniqueInt64s(assetIDs) {
+		result, err := tx.ExecContext(ctx, `
+INSERT INTO album_asset (album_id, asset_id, created_at)
+SELECT ?, id, ?
+FROM media_asset
+WHERE id = ? AND deleted_at IS NULL
+ON CONFLICT(album_id, asset_id) DO NOTHING`, albumID, now, assetID)
+		if err != nil {
+			return nil, err
+		}
+		if affected, _ := result.RowsAffected(); affected > 0 {
+			updated = append(updated, assetID)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if err := d.RefreshAlbumStatsForAlbum(ctx, albumID); err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+func (d *DB) RemoveAlbumAssets(ctx context.Context, albumID int64, assetIDs []int64) ([]int64, error) {
+	if len(assetIDs) == 0 {
+		return nil, nil
+	}
+	if _, err := d.GetAlbum(ctx, albumID); err != nil {
+		return nil, err
+	}
+	ids := uniqueInt64s(assetIDs)
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, albumID)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	_, err := d.conn.ExecContext(ctx, `DELETE FROM album_asset WHERE album_id = ? AND asset_id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.RefreshAlbumStatsForAlbum(ctx, albumID); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (d *DB) RefreshAlbumStats(ctx context.Context) error {
+	albums, err := d.listAlbumsWithSources(ctx)
+	if err != nil {
+		return err
+	}
+	for _, album := range albums {
+		if err := d.refreshAlbumStats(ctx, album); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *DB) RefreshAlbumStatsForAlbum(ctx context.Context, id int64) error {
+	album, err := d.getAlbumWithSources(ctx, id)
+	if err != nil {
+		return err
+	}
+	return d.refreshAlbumStats(ctx, album)
+}
+
 func (d *DB) ListAlbumAssets(ctx context.Context, albumID int64, opts AssetListOptions) (model.Page[model.Asset], error) {
 	album, err := d.getAlbumWithSources(ctx, albumID)
 	if err != nil {
@@ -345,7 +471,7 @@ func (d *DB) ListAlbumAssets(ctx context.Context, albumID int64, opts AssetListO
 	where, args := albumAssetFilterSQL(album, opts)
 	limit := opts.PageSize + 1
 	offset := (opts.Page - 1) * opts.PageSize
-	query := assetSelectSQL() + " WHERE " + where + " ORDER BY " + sortSQL(opts.Sort) + " LIMIT ? OFFSET ?"
+	query := assetSelectSQL() + " WHERE " + where + " ORDER BY " + groupedSortSQL(opts.Group, opts.Sort) + " LIMIT ? OFFSET ?"
 	if opts.Group == assetGroupFolder {
 		query = folderGroupedRankedSQL(where, opts.Sort) + assetSelectSQLFrom("ranked") + " ORDER BY " + folderGroupSortSQL(opts.Sort) + " LIMIT ? OFFSET ?"
 	}
@@ -399,17 +525,14 @@ func (d *DB) AlbumNeighbors(ctx context.Context, albumID int64, opts NeighborOpt
 	if err != nil {
 		return Neighbors{}, err
 	}
-	filterOpts := AssetListOptions{
-		Type: opts.Type, Sort: opts.Sort, Group: opts.Group, Query: opts.Query, VisibleOnly: true,
-		Orientation: opts.Orientation, Rating: opts.Rating,
-	}
+	filterOpts := assetListOptionsFromNeighbor(opts)
 	where, args := albumAssetFilterSQL(album, filterOpts)
-	if filterOpts.Group == assetGroupFolder {
-		previous, err := d.groupedNeighborSide(ctx, where, args, filterOpts.Sort, opts.AssetID, true, opts.Limit)
+	if filterOpts.Group != "" || !legacyNeighborSort(filterOpts.Sort) {
+		previous, err := d.groupedNeighborSide(ctx, where, args, filterOpts.Group, filterOpts.Sort, opts.AssetID, true, opts.Limit)
 		if err != nil {
 			return Neighbors{}, err
 		}
-		next, err := d.groupedNeighborSide(ctx, where, args, filterOpts.Sort, opts.AssetID, false, opts.Limit)
+		next, err := d.groupedNeighborSide(ctx, where, args, filterOpts.Group, filterOpts.Sort, opts.AssetID, false, opts.Limit)
 		if err != nil {
 			return Neighbors{}, err
 		}
@@ -452,12 +575,16 @@ func (d *DB) loadAlbumDetails(ctx context.Context, album *model.Album) error {
 }
 
 func (d *DB) loadAlbumStats(ctx context.Context, album *model.Album) error {
-	count, cover, err := d.albumCountCover(ctx, *album)
+	if err := d.RefreshAlbumStatsForAlbum(ctx, album.ID); err != nil {
+		return err
+	}
+	refreshed, err := d.getAlbumWithSources(ctx, album.ID)
 	if err != nil {
 		return err
 	}
-	album.AssetCount = count
-	album.CoverAssetID = cover
+	album.AssetCount = refreshed.AssetCount
+	album.CoverAssetID = refreshed.CoverAssetID
+	album.StatsUpdatedAt = refreshed.StatsUpdatedAt
 	return nil
 }
 
@@ -494,12 +621,13 @@ ORDER BY id ASC`, albumID)
 }
 
 func (d *DB) albumCountCover(ctx context.Context, album model.Album) (int, *int64, error) {
-	where, args := albumAssetFilterSQL(album, AssetListOptions{VisibleOnly: true})
+	where, args := albumAssetFilterSQL(album, AssetListOptions{})
 	var count int
 	if err := d.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM assets WHERE "+where, args...).Scan(&count); err != nil {
 		return 0, nil, err
 	}
-	row := d.conn.QueryRowContext(ctx, "SELECT id FROM assets WHERE "+where+" ORDER BY timeline_at DESC, id DESC LIMIT 1", args...)
+	coverWhere, coverArgs := albumAssetFilterSQL(album, AssetListOptions{VisibleOnly: true})
+	row := d.conn.QueryRowContext(ctx, "SELECT id FROM assets WHERE "+coverWhere+" ORDER BY timeline_at DESC, id DESC LIMIT 1", coverArgs...)
 	var cover sql.NullInt64
 	err := row.Scan(&cover)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -511,13 +639,36 @@ func (d *DB) albumCountCover(ctx context.Context, album model.Album) (int, *int6
 	return count, int64Ptr(cover), nil
 }
 
+func (d *DB) refreshAlbumStats(ctx context.Context, album model.Album) error {
+	count, cover, err := d.albumCountCover(ctx, album)
+	if err != nil {
+		return err
+	}
+	_, err = d.conn.ExecContext(ctx, `
+UPDATE albums
+SET asset_count = ?, cover_asset_id = ?, stats_updated_at = ?
+WHERE id = ?`, count, nullInt64(cover), util.UnixNow(), album.ID)
+	return err
+}
+
 func albumAssetFilterSQL(album model.Album, opts AssetListOptions) (string, []any) {
 	sourceWhere, sourceArgs := albumSourceFilterSQL(album.Sources)
-	if sourceWhere == "" {
+	memberWhere := `assets.id IN (SELECT asset_id FROM album_asset WHERE album_id = ?)`
+	if sourceWhere == "" && album.ID == 0 {
 		return "0 = 1", nil
 	}
-	where := []string{"deleted_at IS NULL", "(" + sourceWhere + ")"}
-	args := append([]any{}, sourceArgs...)
+	memberRules := make([]string, 0, 2)
+	args := make([]any, 0, len(sourceArgs)+1)
+	if sourceWhere != "" {
+		memberRules = append(memberRules, "("+sourceWhere+")")
+		args = append(args, sourceArgs...)
+	}
+	memberRules = append(memberRules, memberWhere)
+	args = append(args, album.ID)
+	where := []string{"is_live = true", "(" + strings.Join(memberRules, " OR ") + ")"}
+	if !opts.IncludeHidden {
+		where = append(where, "hidden = false")
+	}
 	if opts.VisibleOnly {
 		where = append(where, "thumb_status = 'ready'")
 	}
@@ -526,8 +677,8 @@ func albumAssetFilterSQL(album model.Album, opts AssetListOptions) (string, []an
 		mediaFilter = opts.Type
 	}
 	if mediaFilter == model.MediaTypeImage || mediaFilter == model.MediaTypeVideo {
-		where = append(where, "media_type = ?")
-		args = append(args, mediaFilter)
+		where = append(where, "assets.id IN (SELECT id FROM media_asset WHERE media_type = ?)")
+		args = append(args, mediaTypeCode(mediaFilter))
 	}
 	if opts.Query != "" {
 		where = append(where, "lower(filename) LIKE ? ESCAPE '\\'")
@@ -539,15 +690,15 @@ func albumAssetFilterSQL(album model.Album, opts AssetListOptions) (string, []an
 	}
 	switch normalizeAlbumOrientationFilter(opts.Orientation) {
 	case AlbumOrientationWide:
-		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveWidthSQL()+" > "+effectiveHeightSQL())
+		where = append(where, "orientation = 1")
 	case AlbumOrientationTall:
-		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveHeightSQL()+" > "+effectiveWidthSQL())
+		where = append(where, "orientation = 2")
 	}
 	switch normalizeAlbumOrientationFilter(album.OrientationFilter) {
 	case AlbumOrientationWide:
-		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveWidthSQL()+" >= "+effectiveHeightSQL())
+		where = append(where, "orientation IN (1, 3)")
 	case AlbumOrientationTall:
-		where = append(where, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveHeightSQL()+" > "+effectiveWidthSQL())
+		where = append(where, "orientation = 2")
 	}
 	return strings.Join(where, " AND "), args
 }
@@ -562,23 +713,33 @@ func albumSourceFilterSQL(sources []model.AlbumSource) (string, []any) {
 		var parts []string
 		if source.Recursive {
 			if source.RelPath != "" {
-				parts = append(parts, `(assets.parent_rel_path = ? OR assets.parent_rel_path LIKE ? ESCAPE '\')`)
+				parts = append(parts, `assets.id IN (
+SELECT ma.id
+FROM media_asset ma
+JOIN folder f ON f.id = ma.folder_id
+WHERE f.rel_path = ? OR f.rel_path LIKE ? ESCAPE '\'
+)`)
 				args = append(args, source.RelPath, descendantPathLike(source.RelPath))
 			}
 		} else {
-			parts = append(parts, `assets.parent_rel_path = ?`)
+			parts = append(parts, `assets.id IN (
+SELECT ma.id
+FROM media_asset ma
+JOIN folder f ON f.id = ma.folder_id
+WHERE f.rel_path = ?
+)`)
 			args = append(args, source.RelPath)
 		}
 		switch normalizeAlbumMediaFilter(source.MediaTypeFilter) {
 		case model.MediaTypeImage, model.MediaTypeVideo:
-			parts = append(parts, `assets.media_type = ?`)
-			args = append(args, normalizeAlbumMediaFilter(source.MediaTypeFilter))
+			parts = append(parts, `assets.id IN (SELECT id FROM media_asset WHERE media_type = ?)`)
+			args = append(args, mediaTypeCode(normalizeAlbumMediaFilter(source.MediaTypeFilter)))
 		}
 		switch normalizeAlbumOrientationFilter(source.OrientationFilter) {
 		case AlbumOrientationWide:
-			parts = append(parts, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveWidthSQL()+" >= "+effectiveHeightSQL())
+			parts = append(parts, "orientation IN (1, 3)")
 		case AlbumOrientationTall:
-			parts = append(parts, "width IS NOT NULL AND height IS NOT NULL AND "+effectiveHeightSQL()+" > "+effectiveWidthSQL())
+			parts = append(parts, "orientation = 2")
 		}
 		if len(parts) == 0 {
 			rules = append(rules, "1 = 1")
@@ -630,11 +791,11 @@ func normalizeAlbumSourceCreates(p AlbumCreate) ([]AlbumSourceCreate, error) {
 }
 
 func effectiveWidthSQL() string {
-	return `CASE WHEN COALESCE((SELECT rotation FROM asset_preferences WHERE asset_id = assets.id), 0) IN (90, 270) THEN height ELSE width END`
+	return `CASE WHEN rotation IN (90, 270) THEN height ELSE width END`
 }
 
 func effectiveHeightSQL() string {
-	return `CASE WHEN COALESCE((SELECT rotation FROM asset_preferences WHERE asset_id = assets.id), 0) IN (90, 270) THEN width ELSE height END`
+	return `CASE WHEN rotation IN (90, 270) THEN width ELSE height END`
 }
 
 func normalizeAlbumMediaFilter(value string) string {
@@ -656,19 +817,32 @@ func normalizeAlbumOrientationFilter(value string) string {
 }
 
 func albumSelectSQL() string {
-	return `SELECT id, name, group_id, media_type_filter, orientation_filter, created_at, updated_at FROM albums`
+	return `SELECT id, name, group_id, media_type_filter, orientation_filter, asset_count, cover_asset_id, stats_updated_at, created_at, updated_at FROM albums`
 }
 
 func scanAlbum(row interface{ Scan(dest ...any) error }) (model.Album, error) {
 	var album model.Album
 	var groupID sql.NullInt64
-	err := row.Scan(&album.ID, &album.Name, &groupID, &album.MediaTypeFilter, &album.OrientationFilter, &album.CreatedAt, &album.UpdatedAt)
+	var cover sql.NullInt64
+	err := row.Scan(
+		&album.ID,
+		&album.Name,
+		&groupID,
+		&album.MediaTypeFilter,
+		&album.OrientationFilter,
+		&album.AssetCount,
+		&cover,
+		&album.StatsUpdatedAt,
+		&album.CreatedAt,
+		&album.UpdatedAt,
+	)
 	if err != nil {
 		return model.Album{}, err
 	}
 	if groupID.Valid {
 		album.GroupID = int64Ptr(groupID)
 	}
+	album.CoverAssetID = int64Ptr(cover)
 	return album, nil
 }
 
@@ -714,4 +888,20 @@ func nullableInt64(value *int64) any {
 		return nil
 	}
 	return *value
+}
+
+func uniqueInt64s(values []int64) []int64 {
+	seen := make(map[int64]struct{}, len(values))
+	result := make([]int64, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }

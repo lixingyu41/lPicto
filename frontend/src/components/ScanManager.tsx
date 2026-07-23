@@ -1,17 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, ChevronRight, FolderPlus, Pencil, Square, Trash2, X } from 'lucide-react';
-import type { ScanLibrary, ScanLibraryProgress, SourceFolder, WorkStatusCounts } from '../types/api';
+import { Check, ChevronRight, FolderPlus, Pencil, Trash2, X } from 'lucide-react';
+import type { ScanLibrary, ScanLibraryProgress, SourceFolder } from '../types/api';
 import { api } from '../api/client';
 
 export interface ScanManagerProps {
   libraries: ScanLibrary[];
-  scanRunning: boolean;
-  stoppingScan: boolean;
-  optimisticScanLibraryId: string | null;
   addOpen: boolean;
   editingLibrary: ScanLibrary | null;
-  onLibraryScan: (id: string, action: 'count' | 'metadata' | 'thumbnails') => void;
-  onStopScan: () => void;
   onRemoveLibrary: (id: string) => void;
   onSetEditingLibrary: (library: ScanLibrary | null) => void;
   onSetAddOpen: (open: boolean) => void;
@@ -21,13 +16,8 @@ export interface ScanManagerProps {
 
 export function ScanManager({
   libraries,
-  scanRunning,
-  stoppingScan,
-  optimisticScanLibraryId,
   addOpen,
   editingLibrary,
-  onLibraryScan,
-  onStopScan,
   onRemoveLibrary,
   onSetEditingLibrary,
   onSetAddOpen,
@@ -37,16 +27,10 @@ export function ScanManager({
   return (
     <>
       <div className="settings-panel">
-        <div className="settings-panel-title">图库</div>
+        <div className="settings-panel-title">图库来源</div>
         <div className="library-list">
-          {libraries.map((library) => {
-            const libraryActive = library.progress.active || optimisticScanLibraryId === library.id;
-            const displayedProgress =
-              optimisticScanLibraryId === library.id && !library.progress.active
-                ? optimisticLibraryProgress(library.progress)
-                : library.progress;
-            return (
-            <div className={libraryActive ? 'library-row active-scan' : 'library-row'} key={library.id}>
+          {libraries.map((library) => (
+            <div className="library-row" key={library.id}>
               <div className="library-info">
                 <strong>{displayLibraryName(library.name)}</strong>
                 <small>{library.exists ? '已连接' : '不可访问'} · {library.folders.length} 个文件夹</small>
@@ -55,41 +39,16 @@ export function ScanManager({
                     <span key={folder.relPath || 'root'}>{displayRelPath(folder.relPath)}</span>
                   ))}
                 </div>
-                <LibraryProgress progress={displayedProgress} />
+                <LibraryProgress progress={library.progress} />
               </div>
-              {libraryActive ? (
-                <button
-                  className="library-scan-button"
-                  disabled={stoppingScan}
-                  type="button"
-                  title="停止当前扫描"
-                  onClick={onStopScan}
-                >
-                  <Square size={15} />
-                  <span>{stoppingScan ? '停止中' : '停止'}</span>
-                </button>
-              ) : (
-                <div className="library-action-group">
-                  <button disabled={scanRunning || stoppingScan} type="button" title="文件数扫描" onClick={() => onLibraryScan(library.id, 'count')}>
-                    文件数
-                  </button>
-                  <button disabled={scanRunning || stoppingScan} type="button" title="媒体信息扫描" onClick={() => onLibraryScan(library.id, 'metadata')}>
-                    媒体信息
-                  </button>
-                  <button disabled={scanRunning || stoppingScan} type="button" title="缩略图重建" onClick={() => onLibraryScan(library.id, 'thumbnails')}>
-                    缩略图
-                  </button>
-                </div>
-              )}
-              <button type="button" title="编辑" onClick={() => onSetEditingLibrary(library)}>
+              <button className="library-manage-button" type="button" title="编辑" onClick={() => onSetEditingLibrary(library)}>
                 <Pencil size={15} />
               </button>
-              <button type="button" title="删除" onClick={() => onRemoveLibrary(library.id)}>
+              <button className="library-manage-button" type="button" title="删除" onClick={() => onRemoveLibrary(library.id)}>
                 <Trash2 size={15} />
               </button>
             </div>
-            );
-          })}
+          ))}
           {libraries.length === 0 && <div className="muted-line">未添加图库</div>}
         </div>
         <div className="selected-folder-actions">
@@ -123,34 +82,14 @@ export function ScanManager({
   );
 }
 
-const emptyCounts: WorkStatusCounts = {
-  error: 0,
-  notRequired: 0,
-  pending: 0,
-  processing: 0,
-  ready: 0,
-  total: 0,
-};
-
-const emptyLibraryProgress: ScanLibraryProgress = {
-  active: false,
-  assetTotal: 0,
-  discoveredAt: null,
-  discoveredFiles: 0,
-  scannedFiles: 0,
-  thumb: emptyCounts,
-  transcode: emptyCounts,
-  videoProxy: emptyCounts,
-  unscannedFiles: 0,
-};
-
-function LibraryProgress({ progress }: { progress: ScanLibraryProgress }) {
+function LibraryProgress({ progress }: {
+  progress: ScanLibraryProgress;
+}) {
   const discovered = Math.max(progress.discoveredFiles, progress.scannedFiles + progress.unscannedFiles, progress.scannedFiles);
   const scanned = Math.min(progress.scannedFiles, discovered);
   const mediaReady = progress.thumb.ready;
   const proxiedVideos = progress.videoProxy?.ready ?? 0;
-  const thumbTotal = Math.max(progress.thumb.total, progress.scannedFiles, mediaReady);
-  const scanPercent = discovered > 0 ? Math.min(100, Math.round((scanned / discovered) * 100)) : 0;
+  const thumbTotal = Math.max(0, progress.thumb.total - progress.thumb.notRequired);
   const thumbPercent = thumbTotal > 0 ? Math.min(100, Math.round((mediaReady / thumbTotal) * 100)) : 0;
   return (
     <div className="library-progress">
@@ -175,26 +114,14 @@ function LibraryProgress({ progress }: { progress: ScanLibraryProgress }) {
       <div className="library-progress-bars">
         <div className="progress-row">
           <div className="progress-row-title">
-            <span>文件数</span>
-            <strong>{discovered}{progress.discoveredAt ? ` · ${timeLabel(progress.discoveredAt)}` : ''}</strong>
-          </div>
-          <div className="progress-bar" aria-label={`文件数 ${discovered}`}>
-            <div className="progress-fill" style={{ width: discovered > 0 ? '100%' : '0%' }} />
-          </div>
-        </div>
-        <div className="progress-row">
-          <div className="progress-row-title">
-            <span>媒体信息</span>
-            <strong>{scanned}/{discovered}</strong>
-          </div>
-          <div className="progress-bar" aria-label={`媒体信息 ${scanned}/${discovered}`}>
-            <div className="progress-fill" style={{ width: `${scanPercent}%` }} />
+            <span>上次清点</span>
+            <strong>{discovered.toLocaleString()}{progress.discoveredAt ? ` · ${timeLabel(progress.discoveredAt)}` : ' · 尚未执行'}</strong>
           </div>
         </div>
         <div className="progress-row">
           <div className="progress-row-title">
             <span>缩略图</span>
-            <strong>{mediaReady}/{thumbTotal}</strong>
+            <strong>{Math.min(mediaReady, thumbTotal).toLocaleString()}/{thumbTotal.toLocaleString()}</strong>
           </div>
           <div className="progress-bar" aria-label={`缩略图 ${mediaReady}/${thumbTotal}`}>
             <div className="progress-fill" style={{ width: `${thumbPercent}%` }} />
@@ -203,18 +130,6 @@ function LibraryProgress({ progress }: { progress: ScanLibraryProgress }) {
       </div>
     </div>
   );
-}
-
-function optimisticLibraryProgress(progress: ScanLibraryProgress): ScanLibraryProgress {
-  const discoveredFiles = Math.max(progress.discoveredFiles, progress.assetTotal);
-  const scannedFiles = Math.min(Math.max(progress.scannedFiles, progress.assetTotal), discoveredFiles);
-  return {
-    ...progress,
-    active: true,
-    discoveredFiles,
-    scannedFiles,
-    unscannedFiles: discoveredFiles - scannedFiles,
-  };
 }
 
 function timeLabel(value: number) {

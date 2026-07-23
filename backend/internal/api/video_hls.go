@@ -1,0 +1,1058 @@
+package api
+
+import (
+	"bufio"
+	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"lpicto/backend/internal/config"
+	"lpicto/backend/internal/jobs"
+	"lpicto/backend/internal/model"
+	videoproc "lpicto/backend/internal/video"
+)
+
+type videoSegmentRuntime struct {
+	AssetID      int64
+	CacheKey     string
+	SessionID    string
+	SegmentIndex int
+	StartSeconds float64
+	Duration     float64
+	DestPath     string
+	TempPath     string
+	Queued       bool
+	Transcoding  bool
+	StartedAt    time.Time
+	UpdatedAt    time.Time
+	Progress     float64
+	SecondsDone  float64
+	Bytes        int64
+	Error        string
+	Err          error
+	Priority     int
+	QueueOrder   uint64
+	Claiming     bool
+	DeleteOnDone bool
+	Cancel       context.CancelCauseFunc
+	Done         chan struct{}
+}
+
+type videoSegmentPlan struct {
+	CacheKey       string
+	SegmentIndex   int
+	StartSeconds   float64
+	Duration       float64
+	TotalDuration  float64
+	SegmentSeconds int
+	SegmentCount   int
+}
+
+const videoPrioritySegmentCount = 5
+
+const (
+	videoSegmentPriorityStale    = 10
+	videoSegmentPriorityBalanced = 50
+	videoSegmentPriorityCritical = 80
+	videoSegmentPriorityPlayback = 100
+)
+
+var (
+	errVideoSegmentPreempted   = errors.New("video segment preempted by playback")
+	errVideoSegmentSuperseded  = errors.New("video segment superseded by a newer viewer session")
+	errVideoSegmentSessionStop = errors.New("video segment session stopped")
+)
+
+func (s *Server) videoHLSPlaylist(w http.ResponseWriter, r *http.Request) {
+	asset, ok := s.assetByParam(w, r)
+	if !ok {
+		return
+	}
+	if asset.MediaType != model.MediaTypeVideo {
+		writeError(w, http.StatusBadRequest, "not_video", "资源不是视频")
+		return
+	}
+	if asset.BrowserPlayable {
+		writeError(w, http.StatusConflict, "video_segments_not_required", "视频可直接播放，不需要转码分片")
+		return
+	}
+	if !s.cfg.VideoProxyEnabled {
+		writeError(w, http.StatusNotFound, "video_segments_disabled", "视频分片未启用")
+		return
+	}
+	if missing, err := s.assetSourceMissing(asset); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("check video segment source failed", "assetID", asset.ID, "relPath", asset.RelPath, "error", err)
+		}
+	} else if missing {
+		writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
+		return
+	}
+	duration := assetDuration(asset)
+	if duration <= 0 {
+		writeError(w, http.StatusConflict, "video_duration_missing", "缺少视频时长，暂时不能分片播放")
+		return
+	}
+	session := videoProxySessionFromRequest(r)
+	segmentSeconds := s.videoSegmentSeconds()
+	segmentCount := videoSegmentCount(duration, segmentSeconds)
+	targetDuration := int(math.Ceil(float64(segmentSeconds)))
+	query := videoSegmentQuery(asset, session)
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintln(w, "#EXTM3U")
+	_, _ = fmt.Fprintln(w, "#EXT-X-VERSION:3")
+	_, _ = fmt.Fprintf(w, "#EXT-X-TARGETDURATION:%d\n", targetDuration)
+	_, _ = fmt.Fprintln(w, "#EXT-X-MEDIA-SEQUENCE:0")
+	_, _ = fmt.Fprintln(w, "#EXT-X-PLAYLIST-TYPE:VOD")
+	for index := 0; index < segmentCount; index++ {
+		if index > 0 {
+			_, _ = fmt.Fprintln(w, "#EXT-X-DISCONTINUITY")
+		}
+		segmentDuration := videoSegmentDuration(duration, segmentSeconds, index)
+		_, _ = fmt.Fprintf(w, "#EXTINF:%.3f,\n", segmentDuration)
+		_, _ = fmt.Fprintf(w, "segments/%d.ts?%s\n", index, query)
+	}
+	_, _ = fmt.Fprintln(w, "#EXT-X-ENDLIST")
+}
+
+func (s *Server) videoHLSSegment(w http.ResponseWriter, r *http.Request) {
+	asset, ok := s.assetByParam(w, r)
+	if !ok {
+		return
+	}
+	if asset.MediaType != model.MediaTypeVideo {
+		writeError(w, http.StatusBadRequest, "not_video", "资源不是视频")
+		return
+	}
+	if asset.BrowserPlayable {
+		writeError(w, http.StatusConflict, "video_segments_not_required", "视频可直接播放，不需要转码分片")
+		return
+	}
+	if !s.cfg.VideoProxyEnabled {
+		writeError(w, http.StatusNotFound, "video_segments_disabled", "视频分片未启用")
+		return
+	}
+	index, err := parseVideoSegmentIndex(chi.URLParam(r, "segment"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_segment", "视频分片无效")
+		return
+	}
+	if missing, err := s.assetSourceMissing(asset); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("check video segment source failed", "assetID", asset.ID, "relPath", asset.RelPath, "error", err)
+		}
+	} else if missing {
+		writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
+		return
+	}
+	plan, err := s.videoSegmentPlan(asset, index)
+	if err != nil {
+		status := http.StatusInternalServerError
+		code := "video_segment_failed"
+		message := "视频分片失败"
+		if errors.Is(err, errVideoSegmentDurationMissing) {
+			status = http.StatusConflict
+			code = "video_duration_missing"
+			message = "缺少视频时长，暂时不能分片播放"
+		} else if errors.Is(err, errVideoSegmentOutOfRange) {
+			status = http.StatusRequestedRangeNotSatisfiable
+			code = "segment_out_of_range"
+			message = "视频分片不存在"
+		}
+		writeError(w, status, code, message)
+		return
+	}
+	session := videoProxySessionFromRequest(r)
+	cacheSettings := s.videoProxyCacheSettings(r.Context())
+	priority := parseVideoSegmentPriority(r.URL.Query().Get("priority"), videoSegmentPriorityBalanced)
+	var state *videoSegmentRuntime
+	for {
+		var cached bool
+		state, cached, err = s.ensureVideoSegmentRuntime(asset, plan, session.SessionID, cacheSettings, priority)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "video_segment_failed", "启动视频分片失败")
+			return
+		}
+		if cached {
+			break
+		}
+		s.markPlaybackPriority(r.Context())
+		err = s.waitVideoSegment(r.Context(), state)
+		if errors.Is(err, errVideoSegmentPreempted) {
+			continue
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "video_segment_failed", "视频分片失败")
+			return
+		}
+		break
+	}
+	s.serveCachedVideoSegment(w, r, state)
+}
+
+func (s *Server) videoHLSPrewarm(w http.ResponseWriter, r *http.Request) {
+	asset, ok := s.assetByParam(w, r)
+	if !ok {
+		return
+	}
+	if asset.MediaType != model.MediaTypeVideo {
+		writeError(w, http.StatusBadRequest, "not_video", "资源不是视频")
+		return
+	}
+	if asset.BrowserPlayable {
+		writeJSON(w, http.StatusOK, map[string]any{"cachedSegments": 0, "required": false})
+		return
+	}
+	if !s.cfg.VideoProxyEnabled {
+		writeError(w, http.StatusNotFound, "video_segments_disabled", "视频分片未启用")
+		return
+	}
+	start, _ := strconv.Atoi(r.URL.Query().Get("from"))
+	if start < 0 {
+		start = 0
+	}
+	count, _ := strconv.Atoi(r.URL.Query().Get("count"))
+	if count < 1 || count > videoPrioritySegmentCount {
+		count = videoPrioritySegmentCount
+	}
+	session := videoProxySessionFromRequest(r)
+	cacheSettings := s.videoProxyCacheSettings(r.Context())
+	priority := parseVideoSegmentPriority(r.URL.Query().Get("priority"), videoSegmentPriorityCritical)
+	completed := 0
+	for index := start; index < start+count; index++ {
+		plan, err := s.videoSegmentPlan(asset, index)
+		if errors.Is(err, errVideoSegmentOutOfRange) {
+			break
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "video_segment_failed", "视频分片失败")
+			return
+		}
+		state, cached, err := s.ensureVideoSegmentRuntime(asset, plan, session.SessionID, cacheSettings, priority)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "video_segment_failed", "启动视频分片失败")
+			return
+		}
+		if !cached {
+			s.markPlaybackPriority(r.Context())
+			if err := s.waitVideoSegment(r.Context(), state); errors.Is(err, errVideoSegmentPreempted) {
+				index--
+				continue
+			} else if err != nil {
+				writeError(w, http.StatusInternalServerError, "video_segment_failed", "视频分片失败")
+				return
+			}
+		}
+		completed++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cachedSegments": completed, "required": true})
+}
+
+func (s *Server) videoHLSSessionStop(w http.ResponseWriter, r *http.Request) {
+	asset, ok := s.assetByParam(w, r)
+	if !ok {
+		return
+	}
+	session := videoProxySessionFromRequest(r)
+	cancelled := s.stopVideoSegmentSession(asset.ID, session.SessionID)
+	writeJSON(w, http.StatusOK, map[string]any{"cancelled": cancelled})
+}
+
+func (s *Server) videoHLSStatus(w http.ResponseWriter, r *http.Request) {
+	asset, ok := s.assetByParam(w, r)
+	if !ok {
+		return
+	}
+	session := videoProxySessionFromRequest(r)
+	writeJSON(w, http.StatusOK, s.videoSegmentStatus(asset, session.SessionID))
+}
+
+func (s *Server) videoSegmentPlan(asset model.Asset, index int) (videoSegmentPlan, error) {
+	duration := assetDuration(asset)
+	if duration <= 0 {
+		return videoSegmentPlan{}, errVideoSegmentDurationMissing
+	}
+	segmentSeconds := s.videoSegmentSeconds()
+	count := videoSegmentCount(duration, segmentSeconds)
+	if index < 0 || index >= count {
+		return videoSegmentPlan{}, errVideoSegmentOutOfRange
+	}
+	start := float64(index * segmentSeconds)
+	segmentDuration := videoSegmentDuration(duration, segmentSeconds, index)
+	return videoSegmentPlan{
+		CacheKey:       videoSegmentCacheKey(asset.CacheKey, segmentSeconds, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, index),
+		SegmentIndex:   index,
+		StartSeconds:   start,
+		Duration:       segmentDuration,
+		TotalDuration:  duration,
+		SegmentSeconds: segmentSeconds,
+		SegmentCount:   count,
+	}, nil
+}
+
+func (s *Server) ensureVideoSegmentRuntime(asset model.Asset, plan videoSegmentPlan, sessionID string, cacheSettings videoProxyCacheSettings, priority int) (*videoSegmentRuntime, bool, error) {
+	dest, err := s.store.CachePath("video-proxies", plan.CacheKey, "ts")
+	if err != nil {
+		return nil, false, err
+	}
+	tmp := dest + ".tmp.ts"
+	now := time.Now()
+	sessionID = sanitizeVideoProxyID(sessionID, "legacy")
+	s.videoProxyMu.Lock()
+	if s.videoSegmentStates == nil {
+		s.videoSegmentStates = map[string]*videoSegmentRuntime{}
+	}
+	state := s.videoSegmentStates[plan.CacheKey]
+	if state == nil {
+		state = &videoSegmentRuntime{
+			AssetID:      asset.ID,
+			CacheKey:     plan.CacheKey,
+			SessionID:    sessionID,
+			SegmentIndex: plan.SegmentIndex,
+			StartSeconds: plan.StartSeconds,
+			Duration:     plan.Duration,
+			DestPath:     dest,
+			TempPath:     tmp,
+			UpdatedAt:    now,
+			Done:         make(chan struct{}),
+		}
+		s.videoSegmentStates[plan.CacheKey] = state
+	}
+	state.AssetID = asset.ID
+	state.CacheKey = plan.CacheKey
+	state.SessionID = sessionID
+	state.SegmentIndex = plan.SegmentIndex
+	state.StartSeconds = plan.StartSeconds
+	state.Duration = plan.Duration
+	state.DestPath = dest
+	state.TempPath = tmp
+	state.UpdatedAt = now
+	if info, err := os.Stat(dest); err == nil && !info.IsDir() {
+		state.Queued = false
+		state.Transcoding = false
+		state.Progress = 1
+		state.SecondsDone = plan.Duration
+		state.Bytes = info.Size()
+		state.Error = ""
+		state.Err = nil
+		s.videoProxyMu.Unlock()
+		_ = touchFile(dest, now)
+		return state, true, nil
+	}
+	s.preemptVideoSegmentsLocked(plan.CacheKey, sessionID, priority)
+	if state.Queued || state.Transcoding {
+		if priority > state.Priority {
+			state.Priority = priority
+			state.SessionID = sessionID
+		}
+		s.videoProxyMu.Unlock()
+		return state, false, nil
+	}
+	state = &videoSegmentRuntime{
+		AssetID:      asset.ID,
+		CacheKey:     plan.CacheKey,
+		SessionID:    sessionID,
+		SegmentIndex: plan.SegmentIndex,
+		StartSeconds: plan.StartSeconds,
+		Duration:     plan.Duration,
+		DestPath:     dest,
+		TempPath:     tmp,
+		Queued:       true,
+		StartedAt:    now,
+		UpdatedAt:    now,
+		Priority:     priority,
+	}
+	s.videoSegmentSequence++
+	state.QueueOrder = s.videoSegmentSequence
+	state.Done = make(chan struct{})
+	s.videoSegmentStates[plan.CacheKey] = state
+	timeoutSeconds := math.Max(300, plan.Duration*60)
+	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+	transcodeCtx, transcodeCancel := context.WithCancelCause(timeoutCtx)
+	state.Cancel = transcodeCancel
+	s.videoProxyMu.Unlock()
+	go func() {
+		defer timeoutCancel()
+		s.runVideoSegmentTranscode(transcodeCtx, asset, plan, dest, tmp)
+	}()
+	return state, false, nil
+}
+
+func (s *Server) preemptVideoSegmentsLocked(cacheKey string, sessionID string, priority int) {
+	for key, running := range s.videoSegmentStates {
+		if key == cacheKey || running == nil || (!running.Queued && !running.Transcoding) || running.Cancel == nil {
+			continue
+		}
+		if running.Priority < priority && (running.Claiming || running.Transcoding) {
+			running.Cancel(errVideoSegmentPreempted)
+		} else if priority == videoSegmentPriorityPlayback && running.Priority == priority && running.SessionID != sessionID {
+			running.Cancel(errVideoSegmentSuperseded)
+		}
+	}
+}
+
+func (s *Server) stopVideoSegmentSession(assetID int64, sessionID string) int {
+	sessionID = sanitizeVideoProxyID(sessionID, "legacy")
+	cancelled := 0
+	s.videoProxyMu.Lock()
+	for key, state := range s.videoSegmentStates {
+		if state == nil || state.AssetID != assetID || state.SessionID != sessionID {
+			continue
+		}
+		if state.Queued || state.Claiming || state.Transcoding {
+			state.DeleteOnDone = true
+			if state.Cancel != nil {
+				state.Cancel(errVideoSegmentSessionStop)
+			}
+			cancelled++
+			continue
+		}
+		delete(s.videoSegmentStates, key)
+	}
+	s.videoProxyMu.Unlock()
+	return cancelled
+}
+
+func (s *Server) removeVideoSegmentCaches(assetCacheKey string) error {
+	prefix := assetCacheKey + "-hls-"
+	var done []<-chan struct{}
+	s.videoProxyMu.Lock()
+	for key, state := range s.videoSegmentStates {
+		if state == nil || !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if state.Cancel != nil && (state.Queued || state.Transcoding) {
+			state.Cancel(errVideoSegmentSuperseded)
+		}
+		if state.Done != nil && (state.Queued || state.Transcoding) {
+			done = append(done, state.Done)
+		}
+	}
+	s.videoProxyMu.Unlock()
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for _, finished := range done {
+		select {
+		case <-finished:
+		case <-deadline.C:
+			return errors.New("timed out stopping video segment transcode")
+		}
+	}
+
+	s.videoProxyMu.Lock()
+	for key := range s.videoSegmentStates {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.videoSegmentStates, key)
+		}
+	}
+	s.videoProxyMu.Unlock()
+	return s.store.RemoveCachePrefix(prefix, "video-proxies", "ts")
+}
+
+func (s *Server) runVideoSegmentTranscode(ctx context.Context, asset model.Asset, plan videoSegmentPlan, dest string, tmp string) {
+	_ = os.Remove(tmp)
+	source, err := s.store.PhotoPath(asset.RelPath)
+	if err != nil {
+		s.finishVideoSegmentTranscode(plan.CacheKey, dest, tmp, err)
+		return
+	}
+	releaseSlot, err := s.acquireScheduledVideoSegmentSlot(ctx, plan.CacheKey)
+	if err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
+		s.finishVideoSegmentTranscode(plan.CacheKey, dest, tmp, err)
+		return
+	}
+	defer releaseSlot()
+	stopPriority := s.holdPlaybackPriority(ctx)
+	defer stopPriority()
+	s.markVideoSegmentTranscodeStarted(plan.CacheKey)
+	canIgnoreEditList := plan.StartSeconds > 0 && videoSegmentSupportsEditListFallback(source)
+	ignoreEditList := canIgnoreEditList && s.videoSegmentIgnoreEditListEnabled(asset.CacheKey)
+	args := videoproc.StreamSegmentArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
+	if ignoreEditList {
+		args = videoproc.StreamSegmentIgnoreEditListArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
+	}
+	err = s.writeVideoSegment(ctx, plan, tmp, args)
+	if err == nil {
+		err = validateVideoSegmentFile(ctx, tmp, plan.Duration)
+	}
+	if err != nil && canIgnoreEditList && !ignoreEditList && ctx.Err() == nil {
+		if s.logger != nil {
+			s.logger.Warn("video segment fast seek produced invalid output; retrying without edit list", "assetID", asset.ID, "segmentIndex", plan.SegmentIndex, "error", err)
+		}
+		s.enableVideoSegmentIgnoreEditList(asset.CacheKey)
+		_ = os.Remove(tmp)
+		s.updateVideoSegmentProgress(plan.CacheKey, 0, plan.Duration)
+		args = videoproc.StreamSegmentIgnoreEditListArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
+		err = s.writeVideoSegment(ctx, plan, tmp, args)
+		if err == nil {
+			err = validateVideoSegmentFile(ctx, tmp, plan.Duration)
+		}
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		err = cause
+	}
+	s.finishVideoSegmentTranscode(plan.CacheKey, dest, tmp, err)
+}
+
+func (s *Server) acquireScheduledVideoSegmentSlot(ctx context.Context, cacheKey string) (func(), error) {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		claim := false
+		s.videoProxyMu.Lock()
+		state := s.videoSegmentStates[cacheKey]
+		if state == nil {
+			s.videoProxyMu.Unlock()
+			return nil, errors.New("video segment state missing")
+		}
+		if !state.Claiming && state.Queued && s.videoSegmentQueueHeadLocked() == state {
+			state.Claiming = true
+			claim = true
+		}
+		s.videoProxyMu.Unlock()
+		if claim {
+			release, err := s.acquireVideoProxySlot(ctx)
+			if err != nil {
+				s.videoProxyMu.Lock()
+				if current := s.videoSegmentStates[cacheKey]; current == state {
+					current.Claiming = false
+				}
+				s.videoProxyMu.Unlock()
+				return nil, err
+			}
+			if err := context.Cause(ctx); err != nil {
+				s.videoProxyMu.Lock()
+				if current := s.videoSegmentStates[cacheKey]; current == state {
+					current.Claiming = false
+				}
+				s.videoProxyMu.Unlock()
+				release()
+				return nil, err
+			}
+			return release, nil
+		}
+		select {
+		case <-ctx.Done():
+			if cause := context.Cause(ctx); cause != nil {
+				return nil, cause
+			}
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) videoSegmentQueueHeadLocked() *videoSegmentRuntime {
+	var selected *videoSegmentRuntime
+	for _, state := range s.videoSegmentStates {
+		if state == nil || !state.Queued || state.Cancel == nil {
+			continue
+		}
+		if selected == nil || state.Priority > selected.Priority ||
+			(state.Priority == selected.Priority && state.QueueOrder < selected.QueueOrder) {
+			selected = state
+		}
+	}
+	return selected
+}
+
+func (s *Server) markPlaybackPriority(ctx context.Context) {
+	if s == nil || s.jobs == nil {
+		return
+	}
+	if err := s.jobs.MarkPlaybackPriority(ctx, 3*time.Second); err != nil && s.logger != nil {
+		s.logger.Warn("mark playback priority failed", "error", err)
+	}
+}
+
+func (s *Server) holdPlaybackPriority(ctx context.Context) func() {
+	if s == nil || s.jobs == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	s.markPlaybackPriority(ctx)
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				s.markPlaybackPriority(ctx)
+			}
+		}
+	}()
+	return func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+		jobs.MarkForegroundActive(750 * time.Millisecond)
+	}
+}
+
+func (s *Server) writeVideoSegment(ctx context.Context, plan videoSegmentPlan, tmp string, args []string) error {
+	_ = os.Remove(tmp)
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	output, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = output.Close()
+		return err
+	}
+	errText := make(chan string, 1)
+	go func() {
+		errText <- s.readVideoSegmentProgress(plan.CacheKey, plan.Duration, stderr)
+	}()
+	_, copyErr := io.Copy(output, stdout)
+	closeErr := output.Close()
+	waitErr := cmd.Wait()
+	progressText := <-errText
+	if copyErr != nil {
+		err = copyErr
+	} else if closeErr != nil {
+		err = closeErr
+	} else if waitErr != nil {
+		if strings.TrimSpace(progressText) != "" {
+			err = fmt.Errorf("%w: %s", waitErr, strings.TrimSpace(progressText))
+		} else {
+			err = waitErr
+		}
+	}
+	return err
+}
+
+func validateVideoSegmentFile(ctx context.Context, path string, expectedDuration float64) error {
+	cmd := exec.CommandContext(ctx, "ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-count_packets",
+		"-show_entries", "stream=nb_read_packets",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1",
+		path,
+	)
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("probe video segment: %w", err)
+	}
+	duration, packets := parseVideoSegmentProbe(string(output))
+	if !videoSegmentOutputValid(duration, packets, expectedDuration) {
+		return fmt.Errorf("invalid video segment: duration=%.3f expected=%.3f packets=%d", duration, expectedDuration, packets)
+	}
+	return nil
+}
+
+func parseVideoSegmentProbe(output string) (float64, int64) {
+	var duration float64
+	var packets int64
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "duration":
+			duration, _ = strconv.ParseFloat(value, 64)
+		case "nb_read_packets":
+			packets, _ = strconv.ParseInt(value, 10, 64)
+		}
+	}
+	return duration, packets
+}
+
+func videoSegmentOutputValid(duration float64, packets int64, expectedDuration float64) bool {
+	if packets <= 0 || duration <= 0 || expectedDuration <= 0 {
+		return false
+	}
+	return duration >= expectedDuration*0.8
+}
+
+func videoSegmentSupportsEditListFallback(source string) bool {
+	switch strings.ToLower(filepath.Ext(source)) {
+	case ".mp4", ".m4v", ".mov":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) videoSegmentIgnoreEditListEnabled(assetCacheKey string) bool {
+	s.videoProxyMu.Lock()
+	defer s.videoProxyMu.Unlock()
+	return s.videoSegmentIgnoreEditList[assetCacheKey]
+}
+
+func (s *Server) enableVideoSegmentIgnoreEditList(assetCacheKey string) {
+	s.videoProxyMu.Lock()
+	defer s.videoProxyMu.Unlock()
+	if s.videoSegmentIgnoreEditList == nil {
+		s.videoSegmentIgnoreEditList = map[string]bool{}
+	}
+	s.videoSegmentIgnoreEditList[assetCacheKey] = true
+}
+
+func (s *Server) markVideoSegmentTranscodeStarted(cacheKey string) {
+	now := time.Now()
+	s.videoProxyMu.Lock()
+	defer s.videoProxyMu.Unlock()
+	state := s.videoSegmentStates[cacheKey]
+	if state == nil {
+		return
+	}
+	state.Queued = false
+	state.Claiming = false
+	state.Transcoding = true
+	state.StartedAt = now
+	state.UpdatedAt = now
+}
+
+func (s *Server) readVideoSegmentProgress(cacheKey string, duration float64, stderr io.Reader) string {
+	var errorLines []string
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "out_time_ms=") {
+			ms, _ := strconv.ParseFloat(strings.TrimPrefix(line, "out_time_ms="), 64)
+			s.updateVideoSegmentProgress(cacheKey, ms/1000000, duration)
+			continue
+		}
+		if strings.HasPrefix(line, "out_time_us=") {
+			us, _ := strconv.ParseFloat(strings.TrimPrefix(line, "out_time_us="), 64)
+			s.updateVideoSegmentProgress(cacheKey, us/1000000, duration)
+			continue
+		}
+		if strings.HasPrefix(line, "progress=") || strings.Contains(line, "=") {
+			continue
+		}
+		errorLines = append(errorLines, line)
+		if len(errorLines) > 6 {
+			errorLines = errorLines[1:]
+		}
+	}
+	return strings.Join(errorLines, "\n")
+}
+
+func (s *Server) updateVideoSegmentProgress(cacheKey string, seconds float64, duration float64) {
+	now := time.Now()
+	s.videoProxyMu.Lock()
+	defer s.videoProxyMu.Unlock()
+	state := s.videoSegmentStates[cacheKey]
+	if state == nil {
+		return
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	state.SecondsDone = minFloat(seconds, duration)
+	state.Duration = duration
+	if duration > 0 {
+		state.Progress = minFloat(1, maxFloat(0, seconds/duration))
+	}
+	state.UpdatedAt = now
+}
+
+func (s *Server) finishVideoSegmentTranscode(cacheKey string, dest string, tmp string, err error) {
+	now := time.Now()
+	if err != nil {
+		_ = os.Remove(tmp)
+	} else if renameErr := os.Rename(tmp, dest); renameErr != nil {
+		err = renameErr
+		_ = os.Remove(tmp)
+	} else {
+		_ = touchFile(dest, now)
+	}
+	s.videoProxyMu.Lock()
+	state := s.videoSegmentStates[cacheKey]
+	if state != nil {
+		state.Queued = false
+		state.Claiming = false
+		state.Transcoding = false
+		state.Cancel = nil
+		state.UpdatedAt = now
+		state.Err = err
+		if err != nil {
+			state.Error = videoProxyPublicError(err)
+		} else {
+			state.Progress = 1
+			state.SecondsDone = state.Duration
+			state.Error = ""
+			if info, statErr := os.Stat(dest); statErr == nil {
+				state.Bytes = info.Size()
+			}
+		}
+		close(state.Done)
+		if state.DeleteOnDone {
+			delete(s.videoSegmentStates, cacheKey)
+		}
+	}
+	s.videoProxyMu.Unlock()
+	if err != nil && !errors.Is(err, errVideoSegmentPreempted) && !errors.Is(err, errVideoSegmentSuperseded) && !errors.Is(err, errVideoSegmentSessionStop) && s.logger != nil {
+		s.logger.Warn("video segment transcode failed", "cacheKey", cacheKey, "error", err)
+	}
+}
+
+func parseVideoSegmentPriority(value string, fallback int) int {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "playback":
+		return videoSegmentPriorityPlayback
+	case "critical":
+		return videoSegmentPriorityCritical
+	case "balanced", "neighbor", "tail":
+		return videoSegmentPriorityBalanced
+	case "stale":
+		return videoSegmentPriorityStale
+	default:
+		return fallback
+	}
+}
+
+func (s *Server) waitVideoSegment(ctx context.Context, state *videoSegmentRuntime) error {
+	if state == nil || state.Done == nil {
+		return errors.New("video segment state missing")
+	}
+	select {
+	case <-state.Done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.videoProxyMu.Lock()
+	defer s.videoProxyMu.Unlock()
+	if state.Err != nil {
+		return state.Err
+	}
+	if state.Error != "" {
+		return errors.New(state.Error)
+	}
+	return nil
+}
+
+func (s *Server) serveCachedVideoSegment(w http.ResponseWriter, r *http.Request, state *videoSegmentRuntime) {
+	file, err := os.Open(state.DestPath)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "cache_not_ready", "缓存尚未生成")
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		writeError(w, http.StatusNotFound, "cache_not_ready", "缓存尚未生成")
+		return
+	}
+	w.Header().Set("Content-Type", "video/mp2t")
+	w.Header().Set("Cache-Control", "public, max-age=1200")
+	w.Header().Set("ETag", `"`+state.CacheKey+`"`)
+	w.Header().Set("X-Accel-Buffering", "no")
+	http.ServeContent(w, r, filepath.Base(state.DestPath), info.ModTime(), file)
+}
+
+func (s *Server) videoSegmentStatus(asset model.Asset, sessionID string) VideoSegmentStatusDTO {
+	now := time.Now()
+	sessionID = sanitizeVideoProxyID(sessionID, "legacy")
+	cacheSummary := s.videoSegmentCacheSummary(asset)
+	dto := VideoSegmentStatusDTO{
+		AssetID:             asset.ID,
+		SessionID:           sessionID,
+		SegmentIndex:        -1,
+		State:               "idle",
+		Status:              "idle",
+		Duration:            float64(s.videoSegmentSeconds()),
+		UpdatedAt:           now.Unix(),
+		ServerTime:          now.Unix(),
+		CachedBytes:         cacheSummary.CachedBytes,
+		CachedSegments:      cacheSummary.CachedSegments,
+		SegmentCount:        cacheSummary.SegmentCount,
+		EstimatedTotalBytes: cacheSummary.EstimatedTotalBytes,
+		SourceBytes:         asset.Size,
+	}
+	s.videoProxyMu.Lock()
+	defer s.videoProxyMu.Unlock()
+	var selected *videoSegmentRuntime
+	for _, state := range s.videoSegmentStates {
+		if state == nil || state.AssetID != asset.ID || state.SessionID != sessionID {
+			continue
+		}
+		if selected == nil || state.Priority > selected.Priority ||
+			(state.Priority == selected.Priority && state.Transcoding && !selected.Transcoding) ||
+			(state.Priority == selected.Priority && state.Transcoding == selected.Transcoding && state.UpdatedAt.After(selected.UpdatedAt)) {
+			selected = state
+		}
+	}
+	if selected == nil {
+		dto.Message = "等待分片"
+		return dto
+	}
+	dto.SegmentIndex = selected.SegmentIndex
+	dto.Progress = selected.Progress
+	dto.SecondsDone = selected.SecondsDone
+	dto.Duration = selected.Duration
+	dto.Bytes = selected.Bytes
+	dto.Error = selected.Error
+	dto.UpdatedAt = selected.UpdatedAt.Unix()
+	dto.Queued = selected.Queued
+	dto.Transcoding = selected.Transcoding
+	if selected.Queued {
+		dto.State = "queued"
+		dto.Status = "queued"
+		dto.Message = "等待分片转码槽位"
+	} else if selected.Transcoding {
+		dto.State = "transcoding"
+		dto.Status = "transcoding"
+		dto.Message = fmt.Sprintf("分片转码 %d%%", int(math.Round(minFloat(1, maxFloat(0, selected.Progress))*100)))
+	} else if selected.Error != "" {
+		dto.State = "error"
+		dto.Status = "error"
+		dto.Message = "分片转码失败"
+	} else if selected.Progress >= 1 {
+		dto.State = "cached"
+		dto.Status = "cached"
+		dto.Cached = true
+		dto.Message = "分片已缓存"
+	} else {
+		dto.State = "idle"
+		dto.Status = "idle"
+		dto.Message = "等待分片"
+	}
+	return dto
+}
+
+type videoSegmentCacheSummary struct {
+	CachedBytes         int64
+	CachedSegments      int
+	SegmentCount        int
+	EstimatedTotalBytes int64
+}
+
+func (s *Server) videoSegmentCacheSummary(asset model.Asset) videoSegmentCacheSummary {
+	segmentCount := videoSegmentCount(assetDuration(asset), s.videoSegmentSeconds())
+	summary := videoSegmentCacheSummary{SegmentCount: segmentCount}
+	if segmentCount == 0 || strings.TrimSpace(asset.CacheKey) == "" {
+		return summary
+	}
+	firstKey := videoSegmentCacheKey(asset.CacheKey, s.videoSegmentSeconds(), s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, 0)
+	firstPath, err := s.store.CacheFilePath("video-proxies", firstKey, "ts")
+	if err != nil {
+		return summary
+	}
+	entries, err := os.ReadDir(filepath.Dir(firstPath))
+	if err != nil {
+		return summary
+	}
+	entrySizes := make(map[string]int64, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".ts") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		entrySizes[entry.Name()] = info.Size()
+	}
+	for index := 0; index < segmentCount; index++ {
+		key := videoSegmentCacheKey(asset.CacheKey, s.videoSegmentSeconds(), s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, index)
+		if size, ok := entrySizes[key+".ts"]; ok {
+			summary.CachedSegments++
+			summary.CachedBytes += size
+		}
+	}
+	if summary.CachedSegments > 0 {
+		summary.EstimatedTotalBytes = int64(math.Round(float64(summary.CachedBytes) / float64(summary.CachedSegments) * float64(segmentCount)))
+	}
+	return summary
+}
+
+func videoSegmentQuery(asset model.Asset, session VideoProxyHeartbeatRequest) string {
+	query := url.Values{}
+	query.Set("v", asset.CacheKey)
+	query.Set("priority", "playback")
+	if session.ClientID != "" {
+		query.Set("clientId", session.ClientID)
+	}
+	if session.SessionID != "" {
+		query.Set("sessionId", session.SessionID)
+	}
+	return query.Encode()
+}
+
+func (s *Server) videoSegmentSeconds() int {
+	if s == nil || s.cfg.VideoSegmentSeconds < 1 {
+		return config.DefaultVideoSegmentSeconds
+	}
+	return s.cfg.VideoSegmentSeconds
+}
+
+func videoSegmentCount(duration float64, segmentSeconds int) int {
+	if duration <= 0 || segmentSeconds < 1 {
+		return 0
+	}
+	return int(math.Ceil(duration / float64(segmentSeconds)))
+}
+
+func videoSegmentDuration(totalDuration float64, segmentSeconds int, index int) float64 {
+	start := float64(index * segmentSeconds)
+	if totalDuration <= start {
+		return 0
+	}
+	return minFloat(float64(segmentSeconds), totalDuration-start)
+}
+
+func videoSegmentCacheKey(assetCacheKey string, segmentSeconds int, maxHeight int, crf int, hwAccel string, index int) string {
+	profile := fmt.Sprintf("hls-v3:%s:%d:%d:%d:%s:%d", assetCacheKey, segmentSeconds, maxHeight, crf, strings.ToLower(strings.TrimSpace(hwAccel)), index)
+	sum := sha1.Sum([]byte(profile))
+	return fmt.Sprintf("%s-hls-%s", assetCacheKey, hex.EncodeToString(sum[:])[:16])
+}
+
+func parseVideoSegmentIndex(raw string) (int, error) {
+	raw = strings.TrimSpace(strings.TrimSuffix(raw, ".ts"))
+	if raw == "" {
+		return 0, errors.New("empty segment")
+	}
+	index, err := strconv.Atoi(raw)
+	if err != nil || index < 0 {
+		return 0, errors.New("invalid segment")
+	}
+	return index, nil
+}
+
+var (
+	errVideoSegmentDurationMissing = errors.New("video duration missing")
+	errVideoSegmentOutOfRange      = errors.New("video segment out of range")
+)

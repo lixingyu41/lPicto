@@ -104,12 +104,81 @@ func StreamProxyArgs(source string, maxHeight int, crf int, hwAccel string, hwDe
 	}
 }
 
+func StreamSegmentArgs(source string, maxHeight int, crf int, hwAccel string, hwDevice string, startSeconds float64, durationSeconds float64) []string {
+	return streamSegmentArgs(source, maxHeight, crf, hwAccel, hwDevice, startSeconds, durationSeconds, false)
+}
+
+func StreamSegmentIgnoreEditListArgs(source string, maxHeight int, crf int, hwAccel string, hwDevice string, startSeconds float64, durationSeconds float64) []string {
+	return streamSegmentArgs(source, maxHeight, crf, hwAccel, hwDevice, startSeconds, durationSeconds, true)
+}
+
+func streamSegmentArgs(source string, maxHeight int, crf int, hwAccel string, hwDevice string, startSeconds float64, durationSeconds float64, ignoreEditList bool) []string {
+	inputArgs := streamSegmentInputArgs(source, startSeconds, ignoreEditList)
+	durationArgs := streamDurationArgs(durationSeconds)
+	switch strings.ToLower(strings.TrimSpace(hwAccel)) {
+	case "cuda":
+		args := []string{"-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:2"}
+		args = append(args, inputArgs...)
+		args = append(args, durationArgs...)
+		return append(args,
+			"-map", "0:v:0", "-map", "0:a?",
+			"-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", strconv.Itoa(crf), "-b:v", "0",
+			"-g", "48", "-force_key_frames", "expr:gte(t,n_forced*2)",
+			"-vf", cpuProxyFilter(maxHeight), "-pix_fmt", "yuv420p",
+			"-c:a", "aac", "-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0",
+			"-f", "mpegts", "-max_muxing_queue_size", "1024", "pipe:1",
+		)
+	case "vaapi":
+		args := []string{"-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:2", "-vaapi_device", vaapiDevice(hwDevice)}
+		args = append(args, inputArgs...)
+		args = append(args, durationArgs...)
+		return append(args,
+			"-map", "0:v:0", "-map", "0:a?",
+			"-vf", vaapiProxyFilter(maxHeight),
+			"-c:v", "h264_vaapi", "-qp", strconv.Itoa(crf),
+			"-g", "48", "-force_key_frames", "expr:gte(t,n_forced*2)",
+			"-c:a", "aac", "-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0",
+			"-f", "mpegts", "-max_muxing_queue_size", "1024", "pipe:1",
+		)
+	default:
+		args := append([]string{"-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:2"}, hwAccelArgs(hwAccel, hwDevice)...)
+		args = append(args, inputArgs...)
+		args = append(args, durationArgs...)
+		return append(args,
+			"-map", "0:v:0", "-map", "0:a?",
+			"-c:v", "libx264", "-preset", "veryfast", "-crf", strconv.Itoa(crf),
+			"-g", "48", "-keyint_min", "24", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)",
+			"-vf", cpuProxyFilter(maxHeight), "-pix_fmt", "yuv420p",
+			"-c:a", "aac", "-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0",
+			"-f", "mpegts", "-max_muxing_queue_size", "1024", "pipe:1",
+		)
+	}
+}
+
+func streamSegmentInputArgs(source string, startSeconds float64, ignoreEditList bool) []string {
+	args := make([]string, 0, 8)
+	if ignoreEditList {
+		args = append(args, "-ignore_editlist", "1", "-seek_streams_individually", "0")
+	}
+	if startSeconds > 0 {
+		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
+	}
+	return append(args, "-i", source)
+}
+
 func streamInputArgs(source string, startSeconds float64) []string {
 	args := make([]string, 0, 4)
 	if startSeconds > 0 {
 		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
 	}
 	return append(args, "-i", source)
+}
+
+func streamDurationArgs(durationSeconds float64) []string {
+	if durationSeconds <= 0 {
+		return nil
+	}
+	return []string{"-t", strconv.FormatFloat(durationSeconds, 'f', 3, 64)}
 }
 
 func hwAccelArgs(hwAccel string, hwDevice string) []string {

@@ -1,14 +1,33 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Maximize2, Minimize2, RotateCw } from 'lucide-react';
+import { Maximize2, Minimize2, RotateCw, Settings, Trash2 } from 'lucide-react';
 import type { Asset } from '../types/api';
-import { assetOriginalUrl, assetThumbUrl } from '../api/client';
-import { loadViewerPrefs, saveViewerPrefs, viewerPrefsChanged, zoomPixelAreaRange, zoomScaleRange, type ViewerPrefs } from '../utils/viewerPrefs';
+import {
+  loadViewerPrefs,
+  playbackModeOptions,
+  saveViewerPrefs,
+  viewerPrefsChanged,
+  zoomPixelAreaRange,
+  zoomScaleRange,
+  type ViewerPlaybackMode,
+  type ViewerPrefs,
+} from '../utils/viewerPrefs';
 import { rotatedContainStyle } from '../utils/rotation';
 import { viewerImageUrl } from '../utils/imagePreload';
+import type { ViewerMediaLayerMode } from './mediaLayer';
 
 interface Props {
   asset: Asset;
+  deleting: boolean;
   fullscreen: boolean;
+  layerMode: ViewerMediaLayerMode;
+  preloadEnabled: boolean;
+  playbackMode: ViewerPlaybackMode;
+  slideshowSeconds: number;
+  onDelete: () => void;
+  onMediaError: (assetId: number, cacheKey: string, message: string) => void;
+  onMediaReady: (assetId: number, cacheKey: string) => void;
+  onPlaybackEnded: () => void;
+  onPlaybackModeChange: (value: ViewerPlaybackMode) => void;
   onRotate: () => void;
   onToggleFullscreen: () => void;
 }
@@ -21,14 +40,12 @@ interface ZoomState {
   backgroundY: number;
 }
 
-export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFullscreen }: Props) {
+export default function ImageViewer({ asset, deleting, fullscreen, layerMode, preloadEnabled, playbackMode, slideshowSeconds, onDelete, onMediaError, onMediaReady, onPlaybackEnded, onPlaybackModeChange, onRotate, onToggleFullscreen }: Props) {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
-  const animatedPressTimer = useRef(0);
-  const animatedPressActive = useRef(false);
+  const settingsRef = useRef<HTMLDivElement | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [prefs, setPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
-  const animated = isAnimatedImage(asset);
-  const [animatedPlaying, setAnimatedPlaying] = useState(() => !animated || loadViewerPrefs().videoAutoplay);
   const [zoom, setZoom] = useState<ZoomState>({
     active: false,
     backgroundHeight: 0,
@@ -37,13 +54,10 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
     backgroundY: 0,
   });
   const [stageSize, setStageSize] = useState({ height: 0, width: 0 });
-  const [mainImageReady, setMainImageReady] = useState(false);
-  const originalSrc = viewerImageUrl(asset);
-  const thumbSrc = asset.thumbStatus === 'ready' ? assetThumbUrl(asset) : '';
-  const pausedSrc = thumbSrc || originalSrc;
-  const src = animated && !animatedPlaying ? pausedSrc : originalSrc;
-  const placeholderSrc = thumbSrc && thumbSrc !== src ? thumbSrc : '';
-  const zoomSrc = animated && asset.browserPlayable ? assetOriginalUrl(asset) : src;
+  const [readyImageKey, setReadyImageKey] = useState('');
+  const src = viewerImageUrl(asset);
+  const imageKey = `${asset.id}:${asset.cacheKey}:${src}`;
+  const mainImageReady = readyImageKey === imageKey;
   const imageStyle = useMemo(
     () => rotatedContainStyle(asset, stageSize),
     [asset, stageSize.height, stageSize.width],
@@ -63,20 +77,37 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
   }, []);
 
   useEffect(() => {
-    if (!animated) {
-      setAnimatedPlaying(true);
-      return;
+    if (!settingsOpen) return undefined;
+    function close(event: PointerEvent) {
+      if (event.target instanceof Node && settingsRef.current?.contains(event.target)) return;
+      setSettingsOpen(false);
     }
-    setAnimatedPlaying(prefs.videoAutoplay);
-  }, [animated, asset.id, prefs.videoAutoplay]);
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') setSettingsOpen(false);
+    }
+    document.addEventListener('pointerdown', close, true);
+    document.addEventListener('keydown', closeOnEscape, true);
+    return () => {
+      document.removeEventListener('pointerdown', close, true);
+      document.removeEventListener('keydown', closeOnEscape, true);
+    };
+  }, [settingsOpen]);
 
   useEffect(() => {
-    return () => {
-      if (animatedPressTimer.current) {
-        window.clearTimeout(animatedPressTimer.current);
-      }
-    };
-  }, []);
+    if (layerMode !== 'active' || playbackMode !== 'continuous' || !mainImageReady || zoom.active) return undefined;
+    const timer = window.setTimeout(onPlaybackEnded, Math.max(1, slideshowSeconds) * 1000);
+    return () => window.clearTimeout(timer);
+  }, [asset.id, layerMode, mainImageReady, onPlaybackEnded, playbackMode, slideshowSeconds, zoom.active]);
+
+  useEffect(() => {
+    setSettingsOpen(false);
+  }, [asset.id]);
+
+  useEffect(() => {
+    if (layerMode === 'active') return;
+    setSettingsOpen(false);
+    setZoom((current) => current.active ? { ...current, active: false } : current);
+  }, [layerMode]);
 
   useEffect(() => {
     if (!zoom.active) return;
@@ -88,7 +119,6 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
   }, [zoom.active]);
 
   useEffect(() => {
-    setMainImageReady(false);
     setZoom({
       active: false,
       backgroundHeight: 0,
@@ -110,12 +140,6 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
     observer.observe(stage);
     return () => observer.disconnect();
   }, []);
-
-  function clearAnimatedPressTimer() {
-    if (!animatedPressTimer.current) return;
-    window.clearTimeout(animatedPressTimer.current);
-    animatedPressTimer.current = 0;
-  }
 
   function updateZoom(clientX: number, clientY: number, nextPrefs = prefs) {
     const image = imageRef.current;
@@ -185,26 +209,12 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
       className={zoom.active ? 'image-stage zooming' : 'image-stage'}
       onMouseDown={(event) => {
         if (event.button !== 0) return;
+        if (!mainImageReady) return;
         event.preventDefault();
-        if (animated) {
-          clearAnimatedPressTimer();
-          animatedPressActive.current = true;
-          animatedPressTimer.current = window.setTimeout(() => {
-            animatedPressTimer.current = 0;
-            updateZoom(event.clientX, event.clientY);
-            setZoom((current) => ({ ...current, active: true }));
-          }, 160);
-          return;
-        }
         updateZoom(event.clientX, event.clientY);
         setZoom((current) => ({ ...current, active: true }));
       }}
       onMouseMove={(event) => {
-        if (animated && animatedPressActive.current && !zoom.active && event.buttons !== 1) {
-          clearAnimatedPressTimer();
-          animatedPressActive.current = false;
-          return;
-        }
         if (!zoom.active) return;
         if (event.buttons !== 1) {
           setZoom((current) => ({ ...current, active: false }));
@@ -213,47 +223,38 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
         updateZoom(event.clientX, event.clientY);
       }}
       onMouseUp={() => {
-        if (animated) {
-          const wasWaitingForLongPress = animatedPressTimer.current !== 0;
-          clearAnimatedPressTimer();
-          animatedPressActive.current = false;
-          if (wasWaitingForLongPress) {
-            setAnimatedPlaying((value) => !value);
-          }
-        }
         setZoom((current) => ({ ...current, active: false }));
       }}
     >
-      {placeholderSrc && !mainImageReady && (
-        <img
-          className="viewer-image viewer-image-placeholder"
-          src={placeholderSrc}
-          alt=""
-          decoding="async"
-          draggable={false}
-          aria-hidden="true"
-          style={imageStyle}
-          onDragStart={(event) => event.preventDefault()}
-        />
-      )}
-      <img
+      {preloadEnabled && <img
+        key={src}
         ref={imageRef}
-        className={placeholderSrc && !mainImageReady ? 'viewer-image viewer-image-loading' : 'viewer-image'}
+        className={mainImageReady ? 'viewer-image' : 'viewer-image viewer-image-loading'}
         src={src}
         alt={asset.filename}
-        decoding="async"
-        fetchPriority="high"
+        decoding={layerMode === 'active' ? 'sync' : 'async'}
+        fetchPriority={layerMode === 'active' ? 'high' : 'low'}
         loading="eager"
         draggable={false}
         style={imageStyle}
-        onLoad={() => setMainImageReady(true)}
+        onLoad={(event) => {
+          const image = event.currentTarget;
+          void Promise.resolve(typeof image.decode === 'function' ? image.decode() : undefined)
+            .catch(() => undefined)
+            .then(() => {
+              if (imageRef.current !== image || image.getAttribute('src') !== src || !image.complete || image.naturalWidth <= 0) return;
+              setReadyImageKey(imageKey);
+              onMediaReady(asset.id, asset.cacheKey);
+            });
+        }}
+        onError={() => onMediaError(asset.id, asset.cacheKey, '图片加载失败')}
         onDragStart={(event) => event.preventDefault()}
-      />
+      />}
       {zoom.active && (
         <div
           className="image-zoom-layer"
           style={{
-            backgroundImage: `url("${zoomSrc}")`,
+            backgroundImage: `url("${src}")`,
             backgroundPosition: `${zoom.backgroundX}px ${zoom.backgroundY}px`,
             backgroundSize: `${zoom.backgroundWidth}px ${zoom.backgroundHeight}px`,
           }}
@@ -261,9 +262,50 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
       )}
       <div className="image-control-zone" onClick={(event) => event.stopPropagation()} onMouseDown={(event) => event.stopPropagation()}>
         <div className="image-controls">
-          <button type="button" title={`旋转 ${asset.rotation || 0}°`} onClick={onRotate}>
-            <RotateCw size={18} />
-          </button>
+          <div className="video-settings-wrap image-settings-wrap" data-viewer-wheel-control ref={settingsRef}>
+            <button
+              className={settingsOpen ? 'active' : undefined}
+              type="button"
+              title="图片设置"
+              aria-label="图片设置"
+              aria-expanded={settingsOpen}
+              onClick={() => setSettingsOpen((value) => !value)}
+            >
+              <Settings size={18} />
+            </button>
+            {settingsOpen && (
+              <div className="video-settings-popover image-settings-popover" role="dialog" aria-label="图片设置">
+                <label className="video-settings-row">
+                  <span>播放模式</span>
+                  <select
+                    aria-label="播放模式"
+                    value={playbackMode}
+                    onChange={(event) => onPlaybackModeChange(event.currentTarget.value as ViewerPlaybackMode)}
+                  >
+                    {playbackModeOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <button className="video-settings-action" type="button" onClick={onRotate}>
+                  <span>图片旋转</span>
+                  <span><output>{asset.rotation || 0}°</output><RotateCw size={16} /></span>
+                </button>
+                <button
+                  className="video-settings-action danger"
+                  type="button"
+                  disabled={deleting}
+                  onClick={() => {
+                    setSettingsOpen(false);
+                    onDelete();
+                  }}
+                >
+                  <span>删除媒体</span>
+                  <Trash2 size={16} />
+                </button>
+              </div>
+            )}
+          </div>
           <button
             type="button"
             title={fullscreen ? '退出全屏' : '全屏'}
@@ -279,12 +321,6 @@ export default function ImageViewer({ asset, fullscreen, onRotate, onToggleFulls
       </div>
     </div>
   );
-}
-
-function isAnimatedImage(asset: Asset) {
-  const mime = asset.mimeType?.toLowerCase() ?? '';
-  const name = asset.filename.toLowerCase();
-  return mime === 'image/gif' || name.endsWith('.gif') || mime === 'image/webp' || name.endsWith('.webp');
 }
 
 function clampNumber(value: number, min: number, max: number) {

@@ -4,9 +4,18 @@ import type {
   AlbumSourceInput,
   AlbumsResponse,
   Asset,
+  BatchOperationResult,
+  Collection,
+  CollectionRule,
+  DuplicateGroup,
   AssetDeletePlan,
   AssetDeleteResult,
   AlbumAssetFilter,
+  AssetTag,
+	AssetAIResult,
+	AITagSummary,
+	AIStatus,
+	AISettings,
   AssetRating,
   AssetServerGroup,
   AssetKind,
@@ -23,7 +32,8 @@ import type {
   ProcessingProgress,
   ScanCommandResponse,
   ScanRun,
-  SearchAssetsParams,
+  ScanLibrary,
+  LibraryFilterParams,
   ScanFolder,
   ScanLibrariesResponse,
   SettingsActivity,
@@ -31,9 +41,14 @@ import type {
   ScanStatus,
   SortKey,
   SourceFoldersResponse,
+  SystemTask,
+  TagSummary,
   VideoProxyHeartbeat,
   VideoProxyRuntime,
+  VideoProxySettings,
+  VideoSegmentStatus,
 } from '../types/api';
+import { loadMediaViewPreferences } from '../utils/mediaViewPrefs';
 
 interface APIErrorBody {
   error?: {
@@ -137,8 +152,13 @@ function qs(params: Record<string, string | number | undefined | null>): string 
   return text ? `?${text}` : '';
 }
 
+function includeAISummary() {
+  return loadMediaViewPreferences().mode === 'list' ? 1 : undefined;
+}
+
 export const api = {
   health: () => request<{ status: string }>('/api/health'),
+  storageStatus: () => request<import('../types/api').StorageStatus>('/api/storage/status'),
   publicConfig: () => request<PublicConfig>('/api/config/public'),
   triggerScan: () => request<ScanCommandResponse>('/api/scan', { method: 'POST' }),
   countScan: () => request<ScanCommandResponse>('/api/scan/count', { method: 'POST' }),
@@ -146,10 +166,27 @@ export const api = {
   pauseScan: () => request<ScanCommandResponse>('/api/scan/pause', { method: 'POST' }),
   rebuildScan: () => request<ScanCommandResponse>('/api/scan/rebuild?force=1', { method: 'POST' }),
   rebuildThumbnails: () => request<ScanCommandResponse>('/api/scan/thumbnails/rebuild?force=1', { method: 'POST' }),
+  continueThumbnails: () => request<ScanCommandResponse>('/api/scan/thumbnails/continue', { method: 'POST' }),
   scanStatus: () => request<ScanStatus>('/api/scan/status'),
   scanRuns: (page = 1, pageSize = 20) => request<Page<ScanRun>>(`/api/scan/runs${qs({ page, pageSize })}`),
   settingsProgress: () => request<ProcessingProgress>('/api/settings/progress'),
   settingsActivity: () => request<SettingsActivity>('/api/settings/activity'),
+  systemTasks: () => request<{ items: SystemTask[] }>('/api/settings/tasks'),
+  runSystemTask: (id: string, action: string, libraryId: string | null) =>
+    request<{ accepted: boolean; count?: number; state?: string }>(`/api/settings/tasks/${encodeURIComponent(id)}/run`, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, libraryId }),
+    }),
+  stopSystemTask: (id: string) =>
+    request<{ accepted: boolean; state?: string }>(`/api/settings/tasks/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
+  videoProxySettings: () => request<VideoProxySettings>('/api/settings/video-proxy'),
+  updateVideoProxySettings: (settings: VideoProxySettings) =>
+    request<VideoProxySettings>('/api/settings/video-proxy', {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings),
+    }),
   scanLibraries: () => request<ScanLibrariesResponse>('/api/settings/libraries'),
   createScanLibrary: (name: string, relPaths: string[]) =>
     request<ScanLibrariesResponse & { started: boolean }>('/api/settings/libraries', {
@@ -167,6 +204,14 @@ export const api = {
     request<ScanLibrariesResponse & { started: boolean; cleanupQueued?: boolean }>(`/api/settings/libraries/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+  updateScanLibraryAIFocus: (id: string, focus: string) =>
+    request<ScanLibrary>(`/api/settings/libraries/${encodeURIComponent(id)}/ai-focus`, {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ focus }),
+    }),
+  reindexScanLibraryAI: (id: string) =>
+    request<{ accepted: boolean; count: number; libraryId: string }>(`/api/settings/libraries/${encodeURIComponent(id)}/ai/reindex`, { method: 'POST' }),
   scanLibrary: (id: string) =>
     request<ScanCommandResponse>(`/api/settings/libraries/${encodeURIComponent(id)}/scan`, { method: 'POST' }),
   countScanLibrary: (id: string) =>
@@ -175,6 +220,10 @@ export const api = {
     request<ScanCommandResponse>(`/api/settings/libraries/${encodeURIComponent(id)}/scan/metadata`, { method: 'POST' }),
   rebuildLibraryThumbnails: (id: string) =>
     request<ScanCommandResponse>(`/api/settings/libraries/${encodeURIComponent(id)}/thumbnails/rebuild?force=1`, {
+      method: 'POST',
+    }),
+  continueLibraryThumbnails: (id: string) =>
+    request<ScanCommandResponse>(`/api/settings/libraries/${encodeURIComponent(id)}/thumbnails/continue`, {
       method: 'POST',
     }),
   scanFolders: () => request<ScanFoldersResponse>('/api/settings/scan-folders'),
@@ -221,59 +270,150 @@ export const api = {
     rating?: AssetRating,
     orientation?: OrientationFilter,
     type?: AssetKind,
-  ) => request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q, group, rating, orientation, type })}`),
-  albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind) =>
-    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, sort, q, group, rating, orientation, type })}`),
+    combinedTags?: string,
+  ) => request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q, group, rating, orientation, type, combinedTags, includeAiSummary: includeAISummary() })}`),
+  albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags?: string) =>
+    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, sort, q, group, rating, orientation, type, combinedTags })}`),
   albumSourceFolders: (parentRelPath: string) =>
     request<SourceFoldersResponse>(`/api/albums/source-folders${qs({ parentRelPath })}`),
-  libraryAssets: (
-    page: number,
-    pageSize: number,
-    type: AssetKind,
-    sort: SortKey,
-    q: string,
-    group?: AssetServerGroup,
-    rating?: AssetRating,
-    albumId?: number,
-    albumFilter?: AlbumAssetFilter,
-    albumIds?: number[],
-    orientation?: OrientationFilter,
-  ) =>
-    request<Page<Asset>>(
-      `/api/library/assets${qs({ page, pageSize, type, sort, q, group, rating, albumId, albumFilter, albumIds: albumIds?.join(','), orientation })}`,
-    ),
-  libraryAnchors: (
-    pageSize: number,
-    type: AssetKind,
-    sort: SortKey,
-    q: string,
-    group?: AssetServerGroup,
-    rating?: AssetRating,
-    albumId?: number,
-    albumFilter?: AlbumAssetFilter,
-    albumIds?: number[],
-    orientation?: OrientationFilter,
-  ) =>
-    request<LibraryAnchorsResponse>(
-      `/api/library/anchors${qs({ pageSize, type, sort, q, group, rating, albumId, albumFilter, albumIds: albumIds?.join(','), orientation })}`,
-    ),
-  searchAssets: (page: number, pageSize: number, params: SearchAssetsParams) =>
-    request<Page<Asset>>(`/api/search/assets${qs({ page, pageSize, ...params })}`),
-  searchAnchors: (pageSize: number, params: SearchAssetsParams) =>
-    request<LibraryAnchorsResponse>(`/api/search/anchors${qs({ pageSize, ...params })}`),
-  searchNFOOptions: (field: NFOFilterField, q: string, signal?: AbortSignal) =>
-    request<{ items: string[] }>(`/api/search/nfo-options${qs({ field, q, limit: 40 })}`, { signal }),
+  libraryAssets: (page: number, pageSize: number, params: LibraryFilterParams) =>
+    request<Page<Asset>>(`/api/library/assets${qs({ page, pageSize, ...params, includeAiSummary: includeAISummary() })}`),
+  libraryAnchors: (pageSize: number, params: LibraryFilterParams) =>
+    request<LibraryAnchorsResponse>(`/api/library/anchors${qs({ pageSize, ...params })}`),
+  libraryNFOOptions: (field: NFOFilterField, q: string, signal?: AbortSignal) =>
+    request<{ items: string[] }>(`/api/library/nfo-options${qs({ field, q, limit: 40 })}`, { signal }),
   folders: (parentId: number) => request<{ items: Folder[] }>(`/api/folders${qs({ parentId })}`),
   folderTree: () => request<{ items: Folder[] }>('/api/folders/tree'),
   folderByPath: (relPath: string) => request<Folder>(`/api/folders/by-path${qs({ relPath })}`),
   folder: (id: number) => request<Folder>(`/api/folders/${id}`),
-  folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter) =>
-    request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation })}`),
-  folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter) =>
-    request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation })}`),
+  folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, combinedTags?: string) =>
+    request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation, combinedTags, includeAiSummary: includeAISummary() })}`),
+  folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, combinedTags?: string) =>
+    request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation, combinedTags })}`),
+  tags: () => request<{ items: TagSummary[] }>('/api/tags'),
+  createTag: (name: string) =>
+    request<TagSummary>('/api/tags', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }),
+  updateTag: (id: number, name: string) =>
+    request<TagSummary>(`/api/tags/${id}`, {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }),
+  deleteTag: (id: number) => request<{ deleted: boolean }>(`/api/tags/${id}`, { method: 'DELETE' }),
+  mergeTags: (sourceTagIds: number[], targetTagId: number, targetName?: string) =>
+    request<TagSummary>('/api/tags/merge', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceTagIds, targetTagId, targetName }),
+    }),
+  collections: () => request<{ items: Collection[] }>('/api/collections'),
+  createCollection: (name: string, rule: CollectionRule) =>
+    request<Collection>('/api/collections', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, rule }),
+    }),
+  updateCollection: (id: string, patch: { name?: string; rule?: CollectionRule }) =>
+    request<Collection>(`/api/collections/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    }),
+  deleteCollection: (id: string) => request<{ deleted: boolean }>(`/api/collections/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  collectionAssets: (
+    id: string,
+    page: number,
+    pageSize: number,
+    sort: SortKey,
+    q: string,
+    group?: AssetServerGroup,
+    rating?: AssetRating,
+    orientation?: OrientationFilter,
+    type?: AssetKind,
+    combinedTags: string[] = [],
+  ) => request<Page<Asset>>(`/api/collections/${collectionPathID(id)}/assets${qs({ page, pageSize, sort, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, includeAiSummary: includeAISummary() })}`),
+  collectionAnchors: (id: string, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags: string[] = []) =>
+    request<LibraryAnchorsResponse>(`/api/collections/${collectionPathID(id)}/anchors${qs({ pageSize, sort, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined })}`),
+  duplicates: () => request<{ items: DuplicateGroup[] }>('/api/duplicates'),
+  duplicateSelection: () => request<{ assetIds: number[]; keepPolicy: 'oldest_imported' }>('/api/duplicates/selection'),
+  addAlbumAssets: (id: number, assetIds: number[]) =>
+    request<BatchOperationResult>(`/api/albums/${id}/assets`, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetIds }),
+    }),
+  removeAlbumAssets: (id: number, assetIds: number[]) =>
+    request<BatchOperationResult>(`/api/albums/${id}/assets`, {
+      method: 'DELETE',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetIds }),
+    }),
+  batchAddTags: (assetIds: number[], tags: string[]) =>
+    request<BatchOperationResult>('/api/assets/batch/tags', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetIds, tags }),
+    }),
+  batchSetRating: (assetIds: number[], rating: AssetRating) =>
+    request<BatchOperationResult>('/api/assets/batch/rating', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetIds, rating }),
+    }),
+  batchAddToAlbum: (assetIds: number[], albumId: number) =>
+    request<BatchOperationResult>('/api/assets/batch/album', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetIds, albumId }),
+    }),
+  batchRotate: (assetIds: number[], rotation: number) =>
+    request<BatchOperationResult>('/api/assets/batch/rotation', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetIds, rotation }),
+    }),
+  batchHide: (assetIds: number[], hidden = true) =>
+    request<BatchOperationResult>(hidden ? '/api/assets/batch/hide' : '/api/assets/batch/unhide', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetIds }),
+    }),
+  batchDelete: (assetIds: number[], purgeUnavailable = false, refreshCollectionCounts = false) =>
+    request<BatchOperationResult>('/api/assets/batch/delete', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetIds, purgeUnavailable, refreshCollectionCounts }),
+    }),
   asset: (id: number) => request<Asset>(`/api/assets/${id}`),
+  assetAI: (id: number) => request<AssetAIResult>(`/api/assets/${id}/ai`),
+  reanalyzeAssetAI: (id: number) => request<{ accepted: boolean; assetId: number }>(`/api/assets/${id}/ai/reanalyze`, { method: 'POST' }),
+  aiStatus: () => request<AIStatus>('/api/ai/status'),
+  aiSettings: () => request<AISettings>('/api/ai/settings'),
+  updateAISettings: (autoAnalyze: boolean) => request<AISettings>('/api/ai/settings', {
+    method: 'PUT',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ autoAnalyze }),
+  }),
+  runAIManually: () => request<{ accepted: boolean; count: number; settings: AISettings }>('/api/ai/run', { method: 'POST' }),
+  stopAIManually: () => request<AISettings>('/api/ai/stop', { method: 'POST' }),
+  reindexAI: () => request<{ accepted: boolean; count: number }>('/api/ai/reindex', { method: 'POST' }),
+  retryFailedAI: () => request<{ accepted: boolean; count: number }>('/api/ai/retry-failed', { method: 'POST' }),
+  aiTags: (q = '') => request<{ items: AITagSummary[] }>(`/api/ai/tags${qs({ q })}`),
   assetDeletePlan: (id: number) => request<AssetDeletePlan>(`/api/assets/${id}/delete-plan`),
   deleteAsset: (id: number, token: string) => requestDeleteAsset(`/api/assets/${id}/delete`, token),
+  assetTags: (id: number) => request<{ items: AssetTag[] }>(`/api/assets/${id}/tags`),
+  addAssetTag: (id: number, tag: string) =>
+    request<{ items: AssetTag[] }>(`/api/assets/${id}/tags`, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tag }),
+    }),
+  removeAssetTag: (id: number, tag: string) =>
+    request<{ items: AssetTag[] }>(`/api/assets/${id}/tags${qs({ tag })}`, { method: 'DELETE' }),
   assetPreferences: (id: number) => request<AssetPreference>(`/api/assets/${id}/preferences`),
   assetSidecars: (id: number) => request<AssetSidecars>(`/api/assets/${id}/sidecars`),
   updateAssetPreferences: (id: number, rotation: number) =>
@@ -296,6 +436,18 @@ export const api = {
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: heartbeat ? JSON.stringify(heartbeat) : undefined,
     }),
+  videoSegmentStatus: (id: number, session?: VideoProxySessionContext) =>
+    request<VideoSegmentStatus>(`/api/assets/${id}/hls/status${videoSessionQuery(session)}`),
+  prewarmVideoSegments: (id: number, from: number, count: number, priority: 'critical' | 'balanced', session?: VideoProxySessionContext, signal?: AbortSignal) =>
+    request<{ cachedSegments: number; required: boolean }>(`/api/assets/${id}/hls/prewarm${qs({
+      from: Math.max(0, Math.floor(from)),
+      count: Math.max(1, Math.floor(count)),
+      priority,
+      clientId: session?.clientId,
+      sessionId: session?.sessionId,
+    })}`, { method: 'POST', signal }),
+  stopVideoSegmentSession: (id: number, session?: VideoProxySessionContext) =>
+    request<{ cancelled: number }>(`/api/assets/${id}/hls/session/stop${videoSessionQuery(session)}`, { method: 'POST' }),
   neighbors: (id: number, params: Record<string, string | number | undefined | null>, signal?: AbortSignal) =>
     request<Neighbors>(`/api/assets/${id}/neighbors${qs(params)}`, { signal }),
   assetPosition: (id: number, params: Record<string, string | number | undefined | null>) =>
@@ -338,12 +490,47 @@ export function assetVideoProxyUrl(asset: Asset, startSeconds = 0, session?: Vid
   return `/api/assets/${asset.id}/video-proxy?${query.toString()}`;
 }
 
+export function assetVideoHlsPlaylistUrl(asset: Asset, session?: VideoProxySessionContext): string {
+  const query = new URLSearchParams({ v: asset.cacheKey });
+  if (session?.clientId) {
+    query.set('clientId', session.clientId);
+  }
+  if (session?.sessionId) {
+    query.set('sessionId', session.sessionId);
+  }
+  return `/api/assets/${asset.id}/hls/playlist.m3u8?${query.toString()}`;
+}
+
+export function assetVideoHlsSegmentUrl(asset: Asset, segmentIndex: number, session?: VideoProxySessionContext): string {
+  const query = new URLSearchParams({ v: asset.cacheKey, priority: 'neighbor' });
+  if (session?.clientId) {
+    query.set('clientId', session.clientId);
+  }
+  if (session?.sessionId) {
+    query.set('sessionId', session.sessionId);
+  }
+  return `/api/assets/${asset.id}/hls/segments/${Math.max(0, Math.floor(segmentIndex))}.ts?${query.toString()}`;
+}
+
 function videoProxyQuery(startSeconds: number, session?: VideoProxySessionContext) {
   return qs({
     start: Number.isFinite(startSeconds) && startSeconds > 0 ? Math.max(0, startSeconds).toFixed(2) : undefined,
     clientId: session?.clientId,
     sessionId: session?.sessionId,
   });
+}
+
+function videoSessionQuery(session?: VideoProxySessionContext) {
+  return qs({
+    clientId: session?.clientId,
+    sessionId: session?.sessionId,
+  });
+}
+
+function collectionPathID(id: string) {
+  const encoded = encodeURIComponent(id);
+  if (id.startsWith('ai-tag:')) return encoded.replace(/^ai-tag%3A/i, 'ai-tag:');
+  return id.startsWith('tag:') ? encoded.replace(/^tag%3A/i, 'tag:') : encoded;
 }
 
 export function assetSubtitleUrl(asset: Asset, subtitleId: string): string {

@@ -36,7 +36,7 @@ func TestOpenMarksInterruptedScanRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.StartScanRun(ctx); err != nil {
+	if _, err := database.StartScanRun(ctx, "metadata"); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.Close(); err != nil {

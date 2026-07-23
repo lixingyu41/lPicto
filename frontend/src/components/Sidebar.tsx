@@ -1,8 +1,9 @@
 import { type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, useCallback, useEffect } from 'react';
-import { FolderTree, Images, Library, Search, Settings, Star } from 'lucide-react';
+import { FolderTree, Images, Layers, Library, Settings } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { useSidebarPanelValue, type SidebarPanelTarget } from './SidebarContext';
 import { isPrimarySidebarPanelTarget, primaryTargetForPath, type PrimarySidebarPanelTarget } from '../utils/sidebarPrefs';
+import { loadSettingsSection, settingsSectionPath } from '../utils/settingsRoute';
 
 interface Props {
   collapsed: boolean;
@@ -21,10 +22,9 @@ const navItems: Array<{
   to: string;
 }> = [
   { Icon: Library, label: '图库', target: 'library', to: '/library' },
-  { Icon: Star, label: '星级', target: 'ratings', to: '/ratings' },
-  { Icon: Search, label: '搜索', target: 'search', to: '/search' },
   { Icon: Images, label: '相册', target: 'albums', to: '/albums' },
   { Icon: FolderTree, label: '文件夹', target: 'folders', to: '/folders' },
+  { Icon: Layers, label: '智能', target: 'collections', to: '/collections' },
   { Icon: Settings, label: '设置', target: 'settings', to: '/settings' },
 ];
 
@@ -48,7 +48,7 @@ export default function Sidebar({
     }
   }, [expanded, onToggleExpanded, panels]);
 
-  const viewerPanel = panels.viewer ? <div className="sidebar-panel sidebar-panel-viewer">{panels.viewer}</div> : null;
+  const viewerPanel = panels.viewer ?? null;
   const activeRouteSecondaryTarget = routeTarget && expanded === routeTarget ? routeTarget : null;
   const activeSecondaryTarget = activeRouteSecondaryTarget;
   const secondaryPanel = activeRouteSecondaryTarget ? panels[activeRouteSecondaryTarget] : null;
@@ -107,7 +107,7 @@ export default function Sidebar({
         </div>
         <div className="nav-main">
           {navItems.map(({ Icon, label, target, to }) => (
-            <SidebarItem active={routeTarget === target} icon={<Icon size={18} />} key={target} label={label} to={to} onActivate={() => toggleSecondaryForNav(target)} />
+            <SidebarItem active={routeTarget === target} icon={<Icon size={18} />} key={target} label={label} to={target === 'settings' ? settingsSectionPath(loadSettingsSection()) : to} onActivate={() => toggleSecondaryForNav(target)} />
           ))}
         </div>
         <div className="nav-bottom">
@@ -129,7 +129,7 @@ export default function Sidebar({
               >
                 <span className="sidebar-secondary-title">{routeSecondaryLabel}</span>
               </div>
-              {secondaryPanel && <div className={`sidebar-panel sidebar-panel-${activeRouteSecondaryTarget}`}>{secondaryPanel}</div>}
+              {secondaryPanel}
             </div>
           )}
           {viewerPanel && <div className="sidebar-secondary-viewer">{viewerPanel}</div>}
@@ -163,22 +163,20 @@ function SidebarItem({
   to: string;
 }) {
   return (
-    <div className="nav-item">
-      <NavLink
-        to={to}
-        className={active ? 'nav-link active' : 'nav-link'}
-        title={label}
-        onClick={(event) => {
-          if (active) {
-            event.preventDefault();
-          }
-          onActivate(event);
-        }}
-      >
-        {icon}
-        <span>{label}</span>
-      </NavLink>
-    </div>
+    <NavLink
+      to={to}
+      className={active ? 'nav-link active' : 'nav-link'}
+      title={label}
+      onClick={(event) => {
+        if (active) {
+          event.preventDefault();
+        }
+        onActivate(event);
+      }}
+    >
+      {icon}
+      <span>{label}</span>
+    </NavLink>
   );
 }
 

@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { Check, FolderPlus, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { Check, FolderInput, FolderPlus, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import AlbumEditor from '../components/AlbumEditor';
 import AssetGrid from '../components/AssetGrid';
-import AssetGroupingControls, { normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
+import { CompactAssetGroupingControls, normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
-import { SidebarAlbumList, SidebarButtonGroup, SidebarMediaTypeList, SidebarRatingFilter, sidebarOrientationOptions } from '../components/SidebarControls';
-import SortControls, { isSortKey } from '../components/SortControls';
+import { SidebarAlbumList, SidebarFilterIconRow, SidebarMediaTypeList, SidebarOrientationFilter, SidebarRatingFilter } from '../components/SidebarControls';
+import { CompactSortControls, isSortKey } from '../components/SortControls';
 import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { api } from '../api/client';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
@@ -32,23 +32,29 @@ import {
   appendViewerReturnParams,
   decodeReturnState,
   loadPageState,
+  requestViewerOverlayClose,
   resetGridState,
   savePageState,
   saveViewerReturnPath,
   type GridReturnState,
+  viewerOverlayCloseCompleted,
 } from '../utils/pageState';
 import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import { assetMatchesAlbum } from '../utils/assetFilters';
 import { mergeSortedAssets, removeAssetById } from '../utils/assetSort';
 import { assetRatingParam, currentURLHasParam, currentURLLocation, currentURLPath, orientationParam, positiveIntParam, replaceURLState } from '../utils/urlState';
+import { waterfallPageSize } from '../utils/waterfallPaging';
+import { parseTagFilters, serializeTagFilters } from '../utils/tagFilters';
 
-const pageSize = 100;
+const pageSize = waterfallPageSize;
 const albumsStateKey = 'albums';
-const albumsURLKeys = ['albumId', 'album', 'type', 'rating', 'orientation', 'sort', 'group', 'q'];
+const albumsURLKeys = ['albumId', 'album', 'type', 'rating', 'orientation', 'sort', 'group', 'q', 'combinedTags'];
+const pendingAlbumEditorKey = 'lpicto:pending-album-editor';
 const assetKinds: AssetKind[] = ['all', 'image', 'video'];
 
+type PendingAlbumEditor = { mode: 'add' } | { mode: 'edit'; albumId: number };
+
 interface AlbumsPageState extends GridReturnState {
-  albumListCollapsed: boolean;
   collapsedGroupKeys: string[];
   groupMode: AssetGroupMode;
   orientation: OrientationFilter;
@@ -56,12 +62,12 @@ interface AlbumsPageState extends GridReturnState {
   rating: AssetRating;
   selectedId: number | null;
   sort: SortKey;
+  tagFilters: string[];
   type: AssetKind;
 }
 
 const defaultAlbumsState: AlbumsPageState = {
   ...resetGridState(),
-  albumListCollapsed: false,
   collapsedGroupKeys: [],
   groupMode: 'none',
   orientation: 'all',
@@ -69,6 +75,7 @@ const defaultAlbumsState: AlbumsPageState = {
   rating: 0,
   selectedId: null,
   sort: 'timeline_desc',
+  tagFilters: [],
   type: 'all',
 };
 
@@ -91,11 +98,13 @@ export default function AlbumsPage() {
   const [query, setQuery] = useState(initialStateRef.current.query);
   const [rating, setRating] = useState<AssetRating>(initialStateRef.current.rating ?? 0);
   const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
+  const [tagFilters, setTagFilters] = useState(initialStateRef.current.tagFilters ?? []);
   const [addOpen, setAddOpen] = useState(false);
   const [editingAlbum, setEditingAlbum] = useState<Album | null>(null);
   const [groupDraftOpen, setGroupDraftOpen] = useState(false);
   const [groupName, setGroupName] = useState('');
-  const [albumListCollapsed, setAlbumListCollapsed] = useState(initialStateRef.current.albumListCollapsed);
+  const [moveGroupOpen, setMoveGroupOpen] = useState(false);
+  const [moveGroupId, setMoveGroupId] = useState('');
   const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Set<string>>(() => new Set(initialStateRef.current.collapsedGroupKeys));
   const [error, setError] = useState<string | null>(null);
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
@@ -135,9 +144,9 @@ export default function AlbumsPage() {
       if (!selectedAlbum) {
         return Promise.resolve({ items: [], page, pageSize, hasMore: false });
       }
-      return api.albumAssets(selectedAlbum.id, page, pageSize, sort, query, serverGroup, rating, orientation, type);
+      return api.albumAssets(selectedAlbum.id, page, pageSize, sort, query, serverGroup, rating, orientation, type, serializeTagFilters(tagFilters));
     },
-    [orientation, query, rating, selectedAlbum, serverGroup, sort, type],
+    [orientation, query, rating, selectedAlbum, serverGroup, sort, tagFilters, type],
   );
 
   const { items, hasMore, hasPrevious, loading, error: loadError, loadMore, loadPrevious, reset, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
@@ -204,7 +213,7 @@ export default function AlbumsPage() {
     let live = true;
     async function loadAnchors(albumId: number) {
       try {
-        const result = await api.albumAnchors(albumId, pageSize, sort, query, serverGroup, rating, orientation, type);
+        const result = await api.albumAnchors(albumId, pageSize, sort, query, serverGroup, rating, orientation, type, serializeTagFilters(tagFilters));
         if (live) {
           setAnchors(result.items);
           setTotalCount(result.total);
@@ -225,12 +234,11 @@ export default function AlbumsPage() {
     return () => {
       live = false;
     };
-  }, [orientation, query, rating, selectedAlbum?.id, serverGroup, sort, type]);
+  }, [orientation, query, rating, selectedAlbum?.id, serverGroup, sort, tagFilters, type]);
 
   const currentPageState = useCallback(
     (): AlbumsPageState => ({
       ...getGridState(),
-      albumListCollapsed,
       collapsedGroupKeys: Array.from(collapsedGroupKeys),
       groupMode,
       orientation,
@@ -239,9 +247,10 @@ export default function AlbumsPage() {
       selectedId: selectedAlbum?.id ?? selectedId,
       sidebarExpanded: sidebarState.sidebarExpanded,
       sort,
+      tagFilters,
       type,
     }),
-    [albumListCollapsed, collapsedGroupKeys, getGridState, groupMode, orientation, query, rating, selectedAlbum?.id, selectedId, sidebarState.sidebarExpanded, sort, type],
+    [collapsedGroupKeys, getGridState, groupMode, orientation, query, rating, selectedAlbum?.id, selectedId, sidebarState.sidebarExpanded, sort, tagFilters, type],
   );
 
   const saveCurrentState = useCallback(() => {
@@ -262,11 +271,12 @@ export default function AlbumsPage() {
         q: query,
         rating,
         sort,
+        combinedTags: serializeTagFilters(tagFilters),
         type,
       },
       albumsURLKeys,
     );
-  }, [groupMode, location, navigate, orientation, query, rating, searchParams, selectedAlbum, sort, type]);
+  }, [groupMode, location, navigate, orientation, query, rating, searchParams, selectedAlbum, sort, tagFilters, type]);
   const handlePersistentGridScrollState = useCallback(
     (state: { ratio: number; scrollTop: number }) => {
       handleGridScrollState(state);
@@ -299,6 +309,55 @@ export default function AlbumsPage() {
       return next;
     });
   }, []);
+
+  const queueAlbumEditorAfterViewerClose = useCallback((pending: PendingAlbumEditor) => {
+    const saved = savePendingAlbumEditor(pending);
+    if (requestViewerOverlayClose()) return saved;
+    clearPendingAlbumEditor();
+    return false;
+  }, []);
+
+  const handleAddAlbum = useCallback(() => {
+    if (queueAlbumEditorAfterViewerClose({ mode: 'add' })) return;
+    setEditingAlbum(null);
+    setAddOpen(true);
+  }, [queueAlbumEditorAfterViewerClose]);
+
+  const handleEditAlbum = useCallback(
+    (album: Album) => {
+      if (queueAlbumEditorAfterViewerClose({ mode: 'edit', albumId: album.id })) return;
+      setAddOpen(false);
+      setEditingAlbum(album);
+    },
+    [queueAlbumEditorAfterViewerClose],
+  );
+
+  const applyPendingAlbumEditor = useCallback(() => {
+    const pending = readPendingAlbumEditor();
+    if (!pending) return;
+    if (pending.mode === 'add') {
+      clearPendingAlbumEditor();
+      setEditingAlbum(null);
+      setAddOpen(true);
+      return;
+    }
+    if (albums.length === 0) return;
+    clearPendingAlbumEditor();
+    const album = albums.find((item) => item.id === pending.albumId);
+    if (album) {
+      setAddOpen(false);
+      setEditingAlbum(album);
+    }
+  }, [albums]);
+
+  useEffect(() => {
+    applyPendingAlbumEditor();
+  }, [applyPendingAlbumEditor]);
+
+  useEffect(() => {
+    window.addEventListener(viewerOverlayCloseCompleted, applyPendingAlbumEditor);
+    return () => window.removeEventListener(viewerOverlayCloseCompleted, applyPendingAlbumEditor);
+  }, [applyPendingAlbumEditor]);
 
   useEffect(() => {
     const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);
@@ -378,17 +437,104 @@ export default function AlbumsPage() {
     }
   }
 
+  async function moveSelectedAlbumToGroup() {
+    if (!selectedAlbum) return;
+    const groupId = moveGroupId === '' ? null : Number(moveGroupId);
+    if (groupId !== null && (!Number.isInteger(groupId) || !groups.some((group) => group.id === groupId))) {
+      setError('相册组无效');
+      return;
+    }
+    try {
+      await api.updateAlbum(
+        selectedAlbum.id,
+        selectedAlbum.name,
+        selectedAlbum.sources.map((source) => ({
+          relPath: source.relPath,
+          recursive: source.recursive,
+          mediaTypeFilter: source.mediaTypeFilter,
+          orientationFilter: source.orientationFilter,
+        })),
+        groupId,
+      );
+      setMoveGroupOpen(false);
+      await loadAlbums();
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '移动相册失败');
+    }
+  }
+
   useSidebarPanel(
     'albums',
     <div className="sidebar-control-stack">
-      <div className="album-toolbar">
-        <button className="sidebar-command" type="button" onClick={() => setAddOpen(true)}>
-          <Plus size={16} />
-          添加相册
+      {selectedAlbum && (
+        <SidebarFilterIconRow>
+          <SidebarMediaTypeList value={type} onChange={setType} />
+          <SidebarOrientationFilter value={orientation} onChange={setOrientation} />
+          <SidebarRatingFilter value={rating} onChange={handleRatingChange} />
+          <CompactAssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
+          <CompactSortControls sort={sort} onChange={setSort} />
+        </SidebarFilterIconRow>
+      )}
+      <SidebarAlbumList
+        albums={albums}
+        collapsedGroupKeys={Array.from(collapsedGroupKeys)}
+        forceGroupHeaders
+        groups={groups}
+        selectedIds={selectedAlbum ? [selectedAlbum.id] : []}
+        showEmptyGroups
+        showLabel={false}
+        onSelectAlbum={(album) => setSelectedId(album.id)}
+        onToggleGroup={handleToggleAlbumGroup}
+      />
+      <div className="album-toolbar sidebar-filter-icon-row">
+        <button className="sidebar-compact-trigger" type="button" title="新建相册" onClick={handleAddAlbum}>
+          <Plus size={18} />
         </button>
-        <button className="sidebar-command" type="button" onClick={() => setGroupDraftOpen((value) => !value)}>
-          <FolderPlus size={16} />
-          新建组
+        <button className="sidebar-compact-trigger" type="button" title="新建组" onClick={() => {
+          setMoveGroupOpen(false);
+          setGroupDraftOpen((value) => !value);
+        }}>
+          <FolderPlus size={18} />
+        </button>
+        <button className="sidebar-compact-trigger" type="button" title="编辑相册" disabled={!selectedAlbum} onClick={() => selectedAlbum && handleEditAlbum(selectedAlbum)}>
+          <Pencil size={18} />
+        </button>
+        <button
+          className="sidebar-compact-trigger"
+          type="button"
+          title="刷新相册"
+          disabled={!selectedAlbum}
+          onClick={() => {
+            if (selectedAlbum) void refreshAlbum(selectedAlbum.id);
+          }}
+        >
+          <RefreshCw size={18} />
+        </button>
+        <button
+          className="sidebar-compact-trigger"
+          type="button"
+          title="删除相册"
+          disabled={!selectedAlbum}
+          onClick={() => {
+            if (selectedAlbum) void deleteAlbum(selectedAlbum.id);
+          }}
+        >
+          <Trash2 size={18} />
+        </button>
+        <button
+          className="sidebar-compact-trigger"
+          type="button"
+          title="放到组"
+          disabled={!selectedAlbum}
+          onClick={() => {
+            if (!selectedAlbum) return;
+            setGroupDraftOpen(false);
+            setMoveGroupId(selectedAlbum.groupId === null ? '' : String(selectedAlbum.groupId));
+            setMoveGroupOpen((value) => !value);
+          }}
+        >
+          <FolderInput size={18} />
         </button>
       </div>
       {groupDraftOpen && (
@@ -399,62 +545,40 @@ export default function AlbumsPage() {
           </button>
         </div>
       )}
-      <SidebarAlbumList
-        albums={albums}
-        collapsed={albumListCollapsed}
-        collapsedGroupKeys={Array.from(collapsedGroupKeys)}
-        collapsible
-        forceGroupHeaders
-        groups={groups}
-        selectedIds={selectedAlbum ? [selectedAlbum.id] : []}
-        onSelectAlbum={(album) => setSelectedId(album.id)}
-        onToggleCollapsed={() => setAlbumListCollapsed((value) => !value)}
-        onToggleGroup={handleToggleAlbumGroup}
-      />
+      {moveGroupOpen && selectedAlbum && (
+        <div className="album-group-create">
+          <select aria-label="选择相册组" value={moveGroupId} onChange={(event) => setMoveGroupId(event.target.value)}>
+            <option value="">未分组</option>
+            {groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
+          </select>
+          <button type="button" title="确认放到组" onClick={() => void moveSelectedAlbumToGroup()}>
+            <Check size={15} />
+          </button>
+        </div>
+      )}
       {selectedAlbum && (
-        <>
-          <div className="sidebar-icon-actions">
-            <button type="button" title="编辑相册" onClick={() => setEditingAlbum(selectedAlbum)}>
-              <Pencil size={15} />
-            </button>
-            <button type="button" title="刷新相册" onClick={() => void refreshAlbum(selectedAlbum.id)}>
-              <RefreshCw size={15} />
-            </button>
-            <button type="button" title="删除相册" onClick={() => void deleteAlbum(selectedAlbum.id)}>
-              <Trash2 size={15} />
-            </button>
-            <span>{albumFilterLabel(selectedAlbum)}</span>
-          </div>
-          <SidebarMediaTypeList value={type} onChange={setType} />
-          <SidebarRatingFilter value={rating} onChange={handleRatingChange} />
-          <SidebarButtonGroup columns={3} label="方向" value={orientation} options={sidebarOrientationOptions} onChange={setOrientation} />
-          <SortControls sort={sort} onChange={setSort} />
-          <AssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
-          <label className="sidebar-field">
-            <span>搜索</span>
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="文件名" />
-          </label>
-          <div className="library-paths">
-            {selectedAlbum.sources.map((source) => (
-              <span key={source.id}>{displayRelPath(source.relPath)} · {sourceFilterLabel(source)}</span>
-            ))}
-          </div>
-        </>
+        <label className="sidebar-field">
+          <span>搜索</span>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="文件名" />
+        </label>
       )}
     </div>,
     [
       albums,
-      albumListCollapsed,
       collapsedGroupKeys,
       groups,
       groupDraftOpen,
       groupName,
       groupMode,
+      handleAddAlbum,
+      handleEditAlbum,
       handleRatingChange,
       handleToggleAlbumGroup,
       orientation,
       query,
       rating,
+      moveGroupId,
+      moveGroupOpen,
       selectedAlbum?.id,
       selectedAlbum?.updatedAt,
       sort,
@@ -486,7 +610,7 @@ export default function AlbumsPage() {
             onLoadPrevious={loadPreviousPage}
             onOpenAsset={handleOpenAsset}
             onOpenViewer={handleOpenViewer}
-            onAssetMissing={(asset) => mutateItems((current) => removeAssetById(current, asset.id))}
+            onBatchRemoveAssets={(ids) => mutateItems((current) => current.filter((asset) => !ids.includes(asset.id)))}
             onPressPreviewChange={setPressPreviewAsset}
             onScrollRatioChange={setScrollRatio}
             onScrollStateChange={handlePersistentGridScrollState}
@@ -495,12 +619,15 @@ export default function AlbumsPage() {
             focusAssetId={focusAssetId}
             groupMode={groupMode}
             sort={sort}
+            onSortChange={setSort}
+            selectedTags={tagFilters}
+            onTagFilterChange={setTagFilters}
             scrollSignal={scrollResetSignal}
             scrollTarget={scrollTarget}
             scrollTopTarget={scrollTopTarget}
             buildViewerUrl={(asset) =>
               appendViewerReturnParams(
-                `/viewer/${asset.id}?context=album&albumId=${selectedAlbum.id}&type=${type}&sort=${sort}&q=${encodeURIComponent(query)}${ratingViewerParam(
+                `/viewer/${asset.id}?context=album&albumId=${selectedAlbum.id}&type=${type}&sort=${sort}&q=${encodeURIComponent(query)}${serializeTagFilters(tagFilters) ? `&combinedTags=${encodeURIComponent(serializeTagFilters(tagFilters)!)}` : ''}${ratingViewerParam(
                   rating,
                 )}${orientationViewerParam(orientation)}${serverGroup ? `&group=${serverGroup}` : ''}`,
                 currentPageReturnPath(),
@@ -540,6 +667,43 @@ export default function AlbumsPage() {
   );
 }
 
+function savePendingAlbumEditor(pending: PendingAlbumEditor) {
+  if (typeof window === 'undefined') return false;
+  try {
+    window.sessionStorage.setItem(pendingAlbumEditorKey, JSON.stringify(pending));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readPendingAlbumEditor(): PendingAlbumEditor | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.sessionStorage.getItem(pendingAlbumEditorKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PendingAlbumEditor> | null;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (parsed.mode === 'add') return { mode: 'add' };
+    const albumId = Number((parsed as { albumId?: unknown }).albumId);
+    if (parsed.mode === 'edit' && Number.isFinite(albumId) && albumId > 0) {
+      return { mode: 'edit', albumId };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPendingAlbumEditor() {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.removeItem(pendingAlbumEditorKey);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
 function albumsStateFromSearchParams(params: URLSearchParams, fallback: AlbumsPageState): AlbumsPageState {
   const selectedId = positiveIntParam(params.get('albumId')) ?? positiveIntParam(params.get('album'));
   const sort = params.get('sort');
@@ -554,6 +718,7 @@ function albumsStateFromSearchParams(params: URLSearchParams, fallback: AlbumsPa
     rating: params.has('rating') ? assetRatingParam(params.get('rating')) ?? base.rating : base.rating,
     selectedId: selectedId ?? base.selectedId,
     sort: isSortKey(sort) ? sort : base.sort,
+    tagFilters: params.has('combinedTags') ? parseTagFilters(params.get('combinedTags')) : base.tagFilters ?? [],
     type: assetKinds.includes(type as AssetKind) ? (type as AssetKind) : base.type,
   };
 }
@@ -564,25 +729,4 @@ function ratingViewerParam(rating: AssetRating) {
 
 function orientationViewerParam(orientation: OrientationFilter) {
   return orientation === 'all' ? '' : `&orientation=${orientation}`;
-}
-
-function sourceFilterLabel(source: { mediaTypeFilter: string; orientationFilter: string; recursive: boolean }) {
-  const type = source.mediaTypeFilter === 'image' ? '照片' : source.mediaTypeFilter === 'video' ? '视频' : '全部';
-  const orientation =
-    source.orientationFilter === 'portrait' ? '竖屏' : source.orientationFilter === 'landscape' ? '横屏' : '全部方向';
-  return `${type} · ${orientation} · ${source.recursive ? '含子文件夹' : '仅本层'}`;
-}
-
-function displayRelPath(relPath: string) {
-  return relPath ? `/${relPath}` : '全部存储';
-}
-
-function albumFilterLabel(album: Album) {
-  if (album.sources.some((source) => source.mediaTypeFilter !== 'all' || source.orientationFilter !== 'all' || !source.recursive)) {
-    return `${album.sources.length} 条筛选`;
-  }
-  const type = album.mediaTypeFilter === 'image' ? '照片' : album.mediaTypeFilter === 'video' ? '视频' : '全部';
-  const orientation =
-    album.orientationFilter === 'portrait' ? '竖屏' : album.orientationFilter === 'landscape' ? '横屏' : '全部方向';
-  return `${type} · ${orientation}`;
 }

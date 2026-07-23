@@ -59,3 +59,28 @@ func TestStreamProxyArgsUseVAAPIEncoder(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamSegmentArgsUseBoundedMpegTS(t *testing.T) {
+	got := StreamSegmentArgs("in.mkv", 1080, 23, "none", "", 80, 10)
+	for _, want := range []string{"-ss", "80.000", "-t", "10.000", "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("segment args = %#v, missing %q", got, want)
+		}
+	}
+	if slices.Contains(got, "-movflags") {
+		t.Fatalf("segment args = %#v, should not use fragmented mp4 output", got)
+	}
+}
+
+func TestStreamSegmentIgnoreEditListArgsKeepFastSeek(t *testing.T) {
+	got := StreamSegmentIgnoreEditListArgs("in.mp4", 1080, 23, "none", "", 80, 10)
+	wantOrder := []string{"-ignore_editlist", "1", "-seek_streams_individually", "0", "-ss", "80.000", "-i", "in.mp4"}
+	position := -1
+	for _, want := range wantOrder {
+		found := slices.Index(got[position+1:], want)
+		if found < 0 {
+			t.Fatalf("segment args = %#v, missing ordered argument %q", got, want)
+		}
+		position += found + 1
+	}
+}

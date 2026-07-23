@@ -1,0 +1,17 @@
+CREATE TABLE IF NOT EXISTS tag (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS asset_tag (
+  asset_id BIGINT NOT NULL REFERENCES media_asset(id) ON DELETE CASCADE,
+  tag_id BIGINT NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(asset_id, tag_id)
+);
+
+ALTER TABLE asset_tag
+ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+CREATE INDEX IF NOT EXISTS idx_asset_tag_tag_asset
+ON asset_tag (tag_id, asset_id);

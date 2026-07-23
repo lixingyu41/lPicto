@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	aiworker "lpicto/backend/internal/ai"
 	"lpicto/backend/internal/api"
 	"lpicto/backend/internal/config"
 	"lpicto/backend/internal/db"
@@ -42,6 +43,7 @@ func main() {
 		logger.Error("storage init failed", "error", err)
 		os.Exit(1)
 	}
+	sources := storage.NewSourceHealth(store, 15*time.Second, cfg.RedisURL)
 
 	database, err := db.Open(rootCtx, cfg.DatabaseURL, cfg.MigrationsDir)
 	if err != nil {
@@ -58,7 +60,7 @@ func main() {
 	}
 	thumbProcessor := thumb.Processor{
 		DB: database, Store: store, ThumbLongEdge: cfg.ThumbLongEdge, PreviewLongEdge: cfg.PreviewLongEdge,
-		PreviewQuality: cfg.PreviewQuality, Events: eventBus, Logger: logger,
+		PreviewQuality: cfg.PreviewQuality, Events: eventBus, Logger: logger, Sources: sources,
 	}
 	queue, err := jobs.NewRedis(rootCtx, logger, cfg.RedisURL, thumbProcessor.Handle, jobs.ResourcePolicy{
 		MaxActive:          cfg.BackgroundMaxActive,
@@ -73,9 +75,10 @@ func main() {
 
 	scan := &scanner.Scanner{
 		DB: database, Store: store, Extractor: media.NewExtractor(), Jobs: queue,
-		Events: eventBus, StatusReporter: statusStore, VideoProxyEnabled: cfg.VideoProxyEnabled, ScanWorkers: cfg.ScanWorkers, Logger: logger,
+		Events: eventBus, StatusReporter: statusStore, VideoProxyEnabled: cfg.VideoProxyEnabled, ScanWorkers: cfg.ScanWorkers, Logger: logger, Sources: sources,
 	}
 	queue.SetScanHandler(scanTaskHandler(scan))
+	queue.SetAIHandler((&aiworker.Processor{DB: database, BaseURL: cfg.AIURL, Logger: logger, Sources: sources}).Handle)
 
 	role := ""
 	if len(os.Args) > 1 {
@@ -90,10 +93,10 @@ func main() {
 	}
 	switch role {
 	case "worker":
-		runWorker(rootCtx, cfg, database, queue, scan, logger)
+		runWorker(rootCtx, cfg, database, queue, scan, sources, logger)
 		<-rootCtx.Done()
 	case "all":
-		runWorker(rootCtx, cfg, database, queue, scan, logger)
+		runWorker(rootCtx, cfg, database, queue, scan, sources, logger)
 		handler := api.NewServer(cfg, database, store, scan, queue, eventBus, logger)
 		if err := api.Start(rootCtx, cfg.HTTPAddr, handler, logger); err != nil {
 			logger.Error("server stopped with error", "error", err)
@@ -109,13 +112,16 @@ func main() {
 	}
 }
 
-func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *jobs.Manager, scan *scanner.Scanner, logger *slog.Logger) {
+func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *jobs.Manager, scan *scanner.Scanner, sources *storage.SourceHealth, logger *slog.Logger) {
 	scan.Start(ctx)
 	if cfg.EnableFSWatch {
 		scan.StartWatcher(ctx, 3*time.Second)
 	}
 	scan.StartPeriodicCount(ctx, cfg.FileCountScanInterval)
 	queue.ResetRuntimeState(ctx)
+	if err := database.ResetAIProcessing(ctx); err != nil {
+		logger.Warn("reset interrupted AI work failed", "error", err)
+	}
 	if err := database.ResetBackgroundVideoProxyWork(ctx); err != nil {
 		logger.Warn("reset background video proxy work failed", "error", err)
 	}
@@ -123,7 +129,91 @@ func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *j
 	queue.Start(ctx, jobs.WorkerConfig{
 		Image:       cfg.ThumbWorkers,
 		VideoPoster: cfg.VideoPosterWorkers,
+		AI:          1,
 	})
+	go enqueueAIBackfill(ctx, database, queue, sources, logger)
+	go monitorSourceRecovery(ctx, scan, sources, logger)
+	aiworker.StartHealthMonitor(ctx, database, cfg.AIURL, logger)
+}
+
+func monitorSourceRecovery(ctx context.Context, scan *scanner.Scanner, sources *storage.SourceHealth, logger *slog.Logger) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	wasUnavailable := sourceUnavailable(sources)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			unavailable := sourceUnavailable(sources)
+			if wasUnavailable && !unavailable {
+				result := scan.RequestMetadataScan("storage_recovered")
+				if result.Accepted && logger != nil {
+					logger.Info("storage recovered; scheduled one metadata scan")
+				}
+			}
+			wasUnavailable = unavailable
+		}
+	}
+}
+
+func sourceUnavailable(sources *storage.SourceHealth) bool {
+	if sources == nil {
+		return false
+	}
+	for _, status := range sources.Statuses() {
+		if !status.Available {
+			return true
+		}
+	}
+	return false
+}
+
+func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager, sources *storage.SourceHealth, logger *slog.Logger) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		settings, settingsErr := database.GetAISettings(ctx)
+		if settingsErr != nil {
+			logger.Warn("load AI settings failed", "error", settingsErr)
+		} else if settings.AutoAnalyze || settings.ManualRun {
+			items, err := database.AIBackfillBatch(ctx, 1000)
+			if err != nil {
+				logger.Warn("load AI backfill failed", "error", err)
+			} else {
+				if len(items) > 0 {
+					_ = database.EnsureSystemTaskRunning(ctx, "ai_analysis")
+				}
+				for _, item := range items {
+					if sources != nil {
+						if available, _ := sources.AvailableForRel(item.RelPath); !available {
+							continue
+						}
+					}
+					if err := database.EnsureAIQueued(ctx, item.AssetID, item.CacheKey, false); err == nil {
+						queue.Enqueue(jobs.Task{Type: "ai_analyze", AssetID: item.AssetID, Priority: 100})
+					}
+				}
+				if settings.ManualRun && len(items) == 0 {
+					if _, err := database.SetAIManualRun(ctx, false); err != nil {
+						logger.Warn("finish manual AI run failed", "error", err)
+					}
+				}
+				stats := queue.Stats()
+				if len(items) == 0 && stats.AIQueued+stats.ActiveAI == 0 {
+					state, stateErr := database.SystemTaskState(ctx, "ai_analysis")
+					if stateErr == nil && state != nil && state.Status == "running" {
+						_ = database.FinishSystemTask(ctx, "ai_analysis", "success", "AI 分析已完成")
+					}
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func scanTaskHandler(scan *scanner.Scanner) jobs.Handler {
@@ -147,6 +237,12 @@ func scanTaskHandler(scan *scanner.Scanner) jobs.Handler {
 				scan.RequestThumbnailRebuildRoots(defaultReason(task.Reason, "thumb_rebuild"), task.Roots)
 			} else {
 				scan.RequestThumbnailRebuild(defaultReason(task.Reason, "thumb_rebuild"))
+			}
+		case "thumb_continue":
+			if len(task.Roots) > 0 {
+				scan.RequestThumbnailContinueRoots(defaultReason(task.Reason, "thumb_continue"), task.Roots)
+			} else {
+				scan.RequestThumbnailContinue(defaultReason(task.Reason, "thumb_continue"))
 			}
 		case "scan_stop":
 			scan.RequestStop()

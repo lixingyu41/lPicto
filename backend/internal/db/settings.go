@@ -15,13 +15,14 @@ type ScanLibrary struct {
 	ID              string   `json:"id"`
 	Name            string   `json:"name"`
 	Roots           []string `json:"roots"`
+	AIFocus         string   `json:"aiFocus"`
 	DiscoveredFiles int      `json:"discoveredFiles"`
 	DiscoveredAt    *int64   `json:"discoveredAt"`
 }
 
 func (d *DB) GetScanLibraries(ctx context.Context) ([]ScanLibrary, bool, error) {
 	rows, err := d.conn.QueryContext(ctx, `
-SELECT l.public_id, l.name, COALESCE(l.discovered_files, 0), l.discovered_at, r.rel_path
+SELECT l.public_id, l.name, COALESCE(l.discovered_files, 0), l.discovered_at, l.ai_focus, r.rel_path
 FROM scan_library l
 LEFT JOIN scan_library_root r ON r.scan_library_id = l.id
 ORDER BY l.id ASC, r.position ASC, r.rel_path ASC`)
@@ -36,15 +37,16 @@ ORDER BY l.id ASC, r.position ASC, r.rel_path ASC`)
 		var name string
 		var discoveredFiles int
 		var discoveredAt sql.NullInt64
+		var aiFocus string
 		var root sql.NullString
-		if err := rows.Scan(&id, &name, &discoveredFiles, &discoveredAt, &root); err != nil {
+		if err := rows.Scan(&id, &name, &discoveredFiles, &discoveredAt, &aiFocus, &root); err != nil {
 			return nil, false, err
 		}
 		pos, ok := index[id]
 		if !ok {
 			pos = len(libraries)
 			index[id] = pos
-			library := ScanLibrary{ID: id, Name: name, DiscoveredFiles: discoveredFiles}
+			library := ScanLibrary{ID: id, Name: name, AIFocus: aiFocus, DiscoveredFiles: discoveredFiles}
 			if discoveredAt.Valid {
 				library.DiscoveredAt = &discoveredAt.Int64
 			}
@@ -83,9 +85,9 @@ func (d *DB) SetScanLibraries(ctx context.Context, libraries []ScanLibrary) erro
 	for _, library := range normalized {
 		var libraryID int64
 		if err := tx.QueryRowContext(ctx, `
-INSERT INTO scan_library (public_id, name, discovered_files, discovered_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, now(), now())
-RETURNING id`, library.ID, library.Name, library.DiscoveredFiles, nullInt64(library.DiscoveredAt)).Scan(&libraryID); err != nil {
+INSERT INTO scan_library (public_id, name, ai_focus, discovered_files, discovered_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, now(), now())
+RETURNING id`, library.ID, library.Name, strings.TrimSpace(library.AIFocus), library.DiscoveredFiles, nullInt64(library.DiscoveredAt)).Scan(&libraryID); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -207,6 +209,41 @@ UPDATE scan_library
 SET discovered_files = ?, discovered_at = ?, updated_at = now()
 WHERE public_id = ?`, discoveredFiles, discoveredAt, strings.TrimSpace(id))
 	return err
+}
+
+func (d *DB) UpdateScanLibraryAIFocus(ctx context.Context, id, focus string) (ScanLibrary, error) {
+	result, err := d.conn.ExecContext(ctx, `
+UPDATE scan_library SET ai_focus=?,updated_at=now() WHERE public_id=?`, strings.TrimSpace(focus), strings.TrimSpace(id))
+	if err != nil {
+		return ScanLibrary{}, err
+	}
+	if count, _ := result.RowsAffected(); count == 0 {
+		return ScanLibrary{}, sql.ErrNoRows
+	}
+	return d.FindScanLibrary(ctx, id)
+}
+
+func (d *DB) AIFocusForPath(ctx context.Context, relPath string) (string, error) {
+	libraries, _, err := d.GetScanLibraries(ctx)
+	if err != nil {
+		return "", err
+	}
+	relPath = strings.Trim(strings.ReplaceAll(relPath, `\`, "/"), "/")
+	bestRootLength := -1
+	focus := ""
+	for _, library := range libraries {
+		for _, root := range library.Roots {
+			root = strings.Trim(strings.ReplaceAll(root, `\`, "/"), "/")
+			if root != "" && relPath != root && !strings.HasPrefix(relPath, root+"/") {
+				continue
+			}
+			if len(root) > bestRootLength {
+				bestRootLength = len(root)
+				focus = strings.TrimSpace(library.AIFocus)
+			}
+		}
+	}
+	return focus, nil
 }
 
 func (d *DB) GetScanFolders(ctx context.Context) ([]string, bool, error) {

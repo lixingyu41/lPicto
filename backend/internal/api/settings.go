@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/scanner"
 	"lpicto/backend/internal/storage"
 	"lpicto/backend/internal/util"
@@ -39,6 +40,10 @@ type scanFolderRequest struct {
 type scanLibraryRequest struct {
 	Name     string   `json:"name"`
 	RelPaths []string `json:"relPaths"`
+}
+
+type scanLibraryAIFocusRequest struct {
+	Focus string `json:"focus"`
 }
 
 func (s *Server) settingsProgress(w http.ResponseWriter, r *http.Request) {
@@ -279,6 +284,49 @@ func (s *Server) removeScanLibrary(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) updateScanLibraryAIFocus(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	var payload scanLibraryAIFocusRequest
+	if id == "" || json.NewDecoder(r.Body).Decode(&payload) != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "请求内容无效")
+		return
+	}
+	focus := strings.TrimSpace(payload.Focus)
+	if len([]rune(focus)) > 500 {
+		writeError(w, http.StatusBadRequest, "ai_focus_too_long", "重点识别内容不能超过 500 个字符")
+		return
+	}
+	library, err := s.db.UpdateScanLibraryAIFocus(r.Context(), id, focus)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "scan_library_not_found", "图库不存在")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "ai_focus_update_failed", "保存重点识别失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.scanLibraryDTO(library, s.libraryProgressStats(r.Context(), library), scanner.Status{}))
+}
+
+func (s *Server) reindexScanLibraryAI(w http.ResponseWriter, r *http.Request) {
+	library, ok := s.scanLibraryForAction(w, r)
+	if !ok {
+		return
+	}
+	items, err := s.db.ReindexAIForLibrary(r.Context(), library)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "library_ai_reindex_failed", "重新分析图库失败")
+		return
+	}
+	if len(items) > 0 {
+		_ = s.db.EnsureSystemTaskRunning(r.Context(), "ai_analysis")
+		for _, item := range items {
+			s.jobs.Enqueue(jobs.Task{Type: "ai_analyze", AssetID: item.AssetID, Priority: 1})
+		}
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": len(items), "libraryId": library.ID})
+}
+
 func (s *Server) startClearAllAssetsCleanup() bool {
 	s.cleanupMu.Lock()
 	if s.cleanupStatus.Running {
@@ -319,6 +367,9 @@ func (s *Server) removeDeletedAssetCaches(items []db.DeletedAsset) {
 			continue
 		}
 		seen[item.CacheKey] = struct{}{}
+		if err := s.removeVideoSegmentCaches(item.CacheKey); err != nil {
+			s.logger.Warn("remove video segment cache after asset deletion failed", "relPath", item.RelPath, "cacheKey", item.CacheKey, "error", err)
+		}
 		if err := s.store.RemoveCache(item.CacheKey); err != nil {
 			s.logger.Warn("remove cache after asset deletion failed", "relPath", item.RelPath, "cacheKey", item.CacheKey, "error", err)
 		}
@@ -360,6 +411,15 @@ func (s *Server) thumbnailRebuildLibrary(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	result := s.scanner.RequestThumbnailRebuildRoots("thumb_rebuild:"+library.Name, library.Roots)
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
+}
+
+func (s *Server) thumbnailContinueLibrary(w http.ResponseWriter, r *http.Request) {
+	library, ok := s.scanLibraryForAction(w, r)
+	if !ok {
+		return
+	}
+	result := s.scanner.RequestThumbnailContinueRoots("thumb_continue:"+library.Name, library.Roots)
 	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 }
 
@@ -640,6 +700,7 @@ func (s *Server) scanLibraryDTO(library db.ScanLibrary, stats scanLibraryProgres
 	return ScanLibraryDTO{
 		ID:       library.ID,
 		Name:     library.Name,
+		AIFocus:  library.AIFocus,
 		Folders:  folders,
 		Exists:   exists,
 		Progress: scanLibraryProgressDTO(library, stats, status),

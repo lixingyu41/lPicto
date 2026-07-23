@@ -4,20 +4,6 @@ x-paths:
   cache: &cache-source ${LPICTO_CACHE:-./data/cache}
 
 services:
-  nginx:
-    image: nginx:1.27-alpine
-    ports:
-      - "${LPICTO_BIND:-127.0.0.1}:${LPICTO_PORT:-18080}:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - type: bind
-        source: *cache-source
-        target: /cache
-        read_only: true
-    depends_on:
-      - api
-    restart: unless-stopped
-
   api:
     build:
       context: .
@@ -28,6 +14,11 @@ services:
         APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian-security}
     environment:
       - TZ=${TZ:-Asia/Shanghai}
+      - AI_URL=http://ai:8090
+      - FFMPEG_HWACCEL=none
+    command: ["all"]
+    ports:
+      - "${LPICTO_BIND:-127.0.0.1}:${LPICTO_PORT:-18080}:8080"
     group_add:
       - "${LPICTO_MEDIA_GID:-950}"
     volumes:
@@ -47,39 +38,54 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
     restart: unless-stopped
+    networks:
+      - default
+      - ai-internal
 
-  worker:
+  ai:
     build:
       context: .
+      dockerfile: ai/Dockerfile
       args:
-        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
-        NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org/}
         APT_MIRROR: ${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian}
         APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian-security}
-    environment:
-      - TZ=${TZ:-Asia/Shanghai}
-    command: ["worker"]
+        LLAMA_CPP_COMMIT: 1d1d9a9ed7a4f09c4225ea4cc8fd3bd1cf2c940f
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    cpus: 8
+    pids_limit: 512
     group_add:
       - "${LPICTO_MEDIA_GID:-950}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=768m,mode=1777
     volumes:
       - type: bind
         source: *media-source
         target: /Media
         read_only: true
-        bind:
-          propagation: rslave
-      - type: bind
-        source: *data-source
-        target: /data
       - type: bind
         source: *cache-source
         target: /cache
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+        read_only: true
+      - type: bind
+        source: ${LPICTO_DATA:-./data/app}/ai-models
+        target: /models
+        read_only: true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8090/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 180s
+    networks:
+      - ai-internal
     restart: unless-stopped
 
   postgres:
@@ -115,3 +121,7 @@ services:
       timeout: 3s
       retries: 20
     restart: unless-stopped
+
+networks:
+  ai-internal:
+    internal: true

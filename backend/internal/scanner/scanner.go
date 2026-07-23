@@ -30,6 +30,7 @@ type Scanner struct {
 	VideoProxyEnabled bool
 	ScanWorkers       int
 	Logger            *slog.Logger
+	Sources           *storage.SourceHealth
 
 	startOnce sync.Once
 	commands  chan scanCommand
@@ -116,21 +117,24 @@ type scanWrite struct {
 	nfoChanged      bool
 	nfoSize         *int64
 	nfoMtime        *int64
+	hasSubtitle     bool
+	hasDanmaku      bool
 	errorText       *string
 }
 
 type scanState struct {
-	scanner  *Scanner
-	ctx      context.Context
-	files    chan scanFile
-	writes   chan scanWrite
-	seen     map[string]struct{}
-	counts   *counters
-	roots    []string
-	task     scanTask
-	mu       sync.Mutex
-	wg       sync.WaitGroup
-	writerWG sync.WaitGroup
+	scanner       *Scanner
+	ctx           context.Context
+	files         chan scanFile
+	writes        chan scanWrite
+	seen          map[string]struct{}
+	counts        *counters
+	roots         []string
+	task          scanTask
+	forceMetadata bool
+	mu            sync.Mutex
+	wg            sync.WaitGroup
+	writerWG      sync.WaitGroup
 }
 
 type scanRequest struct {
@@ -144,9 +148,10 @@ type scanRequest struct {
 type scanTask string
 
 const (
-	scanTaskMetadata     scanTask = "metadata"
-	scanTaskCount        scanTask = "count"
-	scanTaskThumbRebuild scanTask = "thumb_rebuild"
+	scanTaskMetadata      scanTask = "metadata"
+	scanTaskCount         scanTask = "count"
+	scanTaskThumbContinue scanTask = "thumb_continue"
+	scanTaskThumbRebuild  scanTask = "thumb_rebuild"
 )
 
 type scanCommandKind string
@@ -219,6 +224,14 @@ func (s *Scanner) RequestThumbnailRebuild(reason string) CommandResult {
 
 func (s *Scanner) RequestThumbnailRebuildRoots(reason string, roots []string) CommandResult {
 	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: true, task: scanTaskThumbRebuild})
+}
+
+func (s *Scanner) RequestThumbnailContinue(reason string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, task: scanTaskThumbContinue})
+}
+
+func (s *Scanner) RequestThumbnailContinueRoots(reason string, roots []string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: true, task: scanTaskThumbContinue})
 }
 
 func (s *Scanner) requestStart(req scanRequest) CommandResult {
@@ -383,6 +396,9 @@ func (s *Scanner) startRun(parent context.Context, req scanRequest) (context.Can
 	done := make(chan struct{}, 1)
 	go func() {
 		s.run(runCtx, req)
+		if _, err := s.DB.RefreshSystemCollectionCounts(context.Background()); err != nil && s.Logger != nil {
+			s.Logger.Warn("refresh system collection count cache failed", "error", err)
+		}
 		done <- struct{}{}
 	}()
 	return cancel, done
@@ -527,7 +543,7 @@ func nextStatusRevision() int64 {
 
 func (s *Scanner) run(ctx context.Context, req scanRequest) {
 	logger := s.Logger.With("reason", req.reason)
-	runID, err := s.DB.StartScanRun(ctx)
+	runID, err := s.DB.StartScanRun(ctx, string(req.task))
 	if err != nil {
 		logger.Error("start scan run failed", "error", err)
 		return
@@ -558,12 +574,24 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 		}
 		return
 	}
+	if unavailable := s.unavailableScanRoots(scanRoots); len(unavailable) > 0 {
+		message := "存储不可达，扫描已暂停"
+		s.updateProgressPhase("storage_unavailable")
+		if err := s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "skipped", LastError: &message}); err != nil {
+			logger.Warn("finish unavailable storage scan failed", "error", err)
+		}
+		logger.Warn("scan skipped because storage is unavailable", "roots", unavailable)
+		return
+	}
 	switch req.task {
 	case scanTaskCount:
 		s.runCount(ctx, runID, scanRoots, req.reason, logger)
 		return
 	case scanTaskThumbRebuild:
 		s.runThumbnailRebuild(ctx, runID, scanRoots, logger)
+		return
+	case scanTaskThumbContinue:
+		s.runThumbnailContinue(ctx, runID, scanRoots, logger)
 		return
 	}
 	activeBefore, err := s.DB.ActiveRelPathsForRoots(ctx, scanRoots)
@@ -577,6 +605,7 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 	s.updateProgressPhase("discovering")
 	seen := make(map[string]struct{}, len(activeBefore))
 	state := s.newScanState(ctx, seen, &counts, scanRoots, req.task)
+	state.forceMetadata = req.task == scanTaskMetadata && len(req.paths) > 0
 	state.start(s.scanWorkerCount())
 	failedRoots := map[string]struct{}{}
 	if len(req.paths) > 0 {
@@ -599,6 +628,7 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 				break
 			}
 			if walkErr != nil {
+				s.Sources.MarkUnavailableForRel(root, walkErr)
 				failedRoots[root] = struct{}{}
 				state.recordError("扫描目录失败", walkErr)
 				logger.Warn("walk failed", "root", root, "error", walkErr)
@@ -615,7 +645,7 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 		return
 	}
 	if len(req.paths) == 0 {
-		deletedAt := util.UnixNow()
+		missingPaths := make([]string, 0)
 		for rel := range activeBefore {
 			if ctx.Err() != nil {
 				s.finishPaused(runID, counts)
@@ -631,21 +661,17 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 			if assetUnderFailedRoot(rel, failedRoots) {
 				continue
 			}
-			deleted, err := s.DB.MarkDeletedWithCache(ctx, rel, deletedAt)
+			missingPaths = append(missingPaths, rel)
+		}
+		if len(missingPaths) > 0 {
+			missing, err := s.DB.MarkMissingRelPaths(ctx, missingPaths)
 			if err != nil {
-				counts.recordError("标记删除失败", err)
-				logger.Warn("mark deleted failed", "relPath", rel, "error", err)
-				continue
+				counts.recordError("标记缺失媒体失败", err)
+				logger.Warn("mark missing media failed", "count", len(missingPaths), "error", err)
+			} else {
+				counts.assetsDeleted += missing
+				s.updateProgressCounts(counts, "")
 			}
-			if deleted == nil {
-				continue
-			}
-			if err := s.removeCacheKey(deleted.CacheKey); err != nil {
-				counts.recordError("删除缓存失败", err)
-				logger.Warn("remove cache failed", "relPath", rel, "cacheKey", deleted.CacheKey, "error", err)
-			}
-			counts.assetsDeleted++
-			s.updateProgressCounts(counts, rel)
 		}
 	}
 	if err := s.DB.RefreshFolders(ctx); err != nil {
@@ -669,6 +695,31 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 		logger.Error("finish scan run failed", "error", err)
 	}
 	logger.Info("scan finished", "seen", counts.totalSeen, "added", counts.assetsAdded, "updated", counts.assetsUpdated, "deleted", counts.assetsDeleted, "errors", counts.errors)
+}
+
+func (s *Scanner) unavailableScanRoots(scanRoots []string) []string {
+	if s.Sources == nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	for _, rel := range scanRoots {
+		if rel == "" && s.Store.HasVirtualRoot() {
+			for _, rootRel := range s.Store.RootRelPaths() {
+				if available, _ := s.Sources.AvailableForRel(rootRel); !available {
+					seen[rootRel] = struct{}{}
+				}
+			}
+			continue
+		}
+		if available, _ := s.Sources.AvailableForRel(rel); !available {
+			seen[rel] = struct{}{}
+		}
+	}
+	roots := make([]string, 0, len(seen))
+	for rel := range seen {
+		roots = append(roots, rel)
+	}
+	return roots
 }
 
 func (s *Scanner) runCount(ctx context.Context, runID int64, scanRoots []string, reason string, logger *slog.Logger) {
@@ -755,6 +806,27 @@ func (s *Scanner) runThumbnailRebuild(ctx context.Context, runID int64, scanRoot
 	s.updateProgressPhase("finished")
 	_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "finished", TotalSeen: reset})
 	logger.Info("thumbnail rebuild queued", "reset", reset, "queued", len(items))
+}
+
+func (s *Scanner) runThumbnailContinue(ctx context.Context, runID int64, scanRoots []string, logger *slog.Logger) {
+	s.updateProgressPhase("thumb_continue")
+	items, err := s.DB.ThumbnailWorkForRoots(ctx, scanRoots)
+	if err != nil {
+		message := "读取未完成缩略图任务失败"
+		_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "error", Errors: 1, LastError: &message})
+		logger.Error("load unfinished thumbnail work failed", "error", err)
+		return
+	}
+	if s.Jobs != nil {
+		for _, item := range items {
+			s.Jobs.Enqueue(jobs.Task{Type: item.Type, AssetID: item.AssetID})
+		}
+	}
+	s.updateProgressTotalFiles(len(items))
+	s.updateProgressCounts(counters{totalSeen: len(items)}, "")
+	s.updateProgressPhase("finished")
+	_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "finished", TotalSeen: len(items)})
+	logger.Info("unfinished thumbnails queued", "queued", len(items))
 }
 
 func (s *Scanner) finishPaused(runID int64, counts counters) {
@@ -1294,7 +1366,16 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 	}
 	if signature != nil {
 		nfoChanged = !sameNFOSignature(signature, nfoSignature)
-		if signature.Size == info.Size() && signature.Mtime == info.ModTime().Unix() && !nfoChanged {
+		if signature.Size == info.Size() && signature.Mtime == info.ModTime().Unix() && !nfoChanged && !st.forceMetadata {
+			hasSubtitle, hasDanmaku := sidecarFlagsForAsset(absPath, detection.MediaType)
+			if signature.HasSubtitle != hasSubtitle || signature.HasDanmaku != hasDanmaku {
+				if err := s.DB.SetAssetSidecarFlags(ctx, signature.ID, hasSubtitle, hasDanmaku); err != nil {
+					st.recordError("写入附加文件状态失败", err)
+					s.Logger.Warn("update sidecar flags failed", "relPath", rel, "error", err)
+				} else {
+					st.addUpdated()
+				}
+			}
 			st.markSeen(rel)
 			if asset, err := s.DB.GetAsset(ctx, signature.ID); err == nil {
 				s.enqueuePendingWork(asset)
@@ -1322,6 +1403,7 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 	if meta.RawJSON != "" {
 		metadataJSON = &meta.RawJSON
 	}
+	hasSubtitle, hasDanmaku := sidecarFlagsForAsset(absPath, detection.MediaType)
 	var errorText *string
 	if meta.Err != nil {
 		if ctx.Err() != nil {
@@ -1351,6 +1433,8 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 		proxyStatus:     proxyStatus,
 		metadataJSON:    metadataJSON,
 		nfoChanged:      nfoChanged,
+		hasSubtitle:     hasSubtitle,
+		hasDanmaku:      hasDanmaku,
 		errorText:       errorText,
 	}:
 	case <-ctx.Done():
@@ -1400,6 +1484,13 @@ func (st *scanState) writeAsset(write scanWrite) {
 		Width:             write.meta.Width,
 		Height:            write.meta.Height,
 		Duration:          write.meta.Duration,
+		FPS:               write.meta.FPS,
+		VideoCodec:        write.meta.VideoCodec,
+		AudioCodec:        write.meta.AudioCodec,
+		Container:         write.meta.Container,
+		VideoBitrate:      write.meta.VideoBitrate,
+		AudioBitrate:      write.meta.AudioBitrate,
+		OverallBitrate:    write.meta.OverallBitrate,
 		TakenAt:           write.meta.TakenAt,
 		ImportedAt:        importedAt,
 		TimelineAt:        timelineAt,
@@ -1415,6 +1506,8 @@ func (st *scanState) writeAsset(write scanWrite) {
 		NFOSize:           nfoSize,
 		NFOMtime:          nfoMtime,
 		NFOScanned:        nfoScanned,
+		HasSubtitle:       write.hasSubtitle,
+		HasDanmaku:        write.hasDanmaku,
 		Error:             write.errorText,
 	}
 	result, err := s.DB.UpsertAssetDetailed(ctx, params)
@@ -1423,6 +1516,14 @@ func (st *scanState) writeAsset(write scanWrite) {
 		st.updateProgress(rel)
 		s.Logger.Warn("upsert asset failed", "relPath", rel, "error", err)
 		return
+	}
+	metadataStatus := model.StatusReady
+	if write.errorText != nil {
+		metadataStatus = model.StatusError
+	}
+	if err := s.DB.SetMetadataJobStatus(ctx, result.ID, metadataStatus, write.errorText); err != nil {
+		st.recordError("写入媒体信息任务状态失败", err)
+		s.Logger.Warn("update metadata job failed", "relPath", rel, "error", err)
 	}
 	if result.OldCacheKey != "" {
 		if err := s.removeCacheKey(result.OldCacheKey); err != nil {
@@ -1518,6 +1619,50 @@ func sameNFOSignature(signature *db.AssetSignature, current *media.NFOFileSignat
 		return false
 	}
 	return *signature.NFOSize == current.Size && *signature.NFOMtime == current.Mtime
+}
+
+func sidecarFlagsForAsset(absPath string, mediaType string) (bool, bool) {
+	if mediaType != model.MediaTypeVideo {
+		return false, false
+	}
+	entries, err := os.ReadDir(filepath.Dir(absPath))
+	if err != nil {
+		return false, false
+	}
+	base := strings.TrimSuffix(filepath.Base(absPath), filepath.Ext(absPath))
+	hasSubtitle := false
+	hasDanmaku := false
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		stem := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		switch ext {
+		case ".xml":
+			if sidecarStemMatches(base, stem) {
+				hasDanmaku = true
+			}
+		case ".ass", ".srt", ".ssa", ".vtt":
+			if sidecarStemMatches(base, stem) {
+				hasSubtitle = true
+			}
+		}
+		if hasSubtitle && hasDanmaku {
+			break
+		}
+	}
+	return hasSubtitle, hasDanmaku
+}
+
+func sidecarStemMatches(assetBase string, sidecarStem string) bool {
+	base := strings.ToLower(strings.TrimSpace(assetBase))
+	stem := strings.ToLower(strings.TrimSpace(sidecarStem))
+	return stem == base ||
+		strings.HasPrefix(stem, base+".") ||
+		strings.HasPrefix(stem, base+" ") ||
+		strings.HasPrefix(stem, base+"-") ||
+		strings.HasPrefix(stem, base+"_")
 }
 
 func (s *Scanner) updateProgressRoot(rootRel string) {
@@ -1640,8 +1785,13 @@ func (s *Scanner) enqueueWork(assetID int64, mediaType string, previewStatus str
 	if s.Jobs == nil {
 		return
 	}
-	if mediaType == model.MediaTypeImage || mediaType == model.MediaTypeVideo {
+	if enabled, err := s.DB.AIExecutionEnabled(context.Background()); err == nil && enabled {
+		s.Jobs.Enqueue(jobs.Task{Type: "ai_analyze", AssetID: assetID, Priority: 10})
+	}
+	if mediaType == model.MediaTypeImage {
 		s.Jobs.Enqueue(jobs.Task{Type: "thumb", AssetID: assetID})
+	} else if mediaType == model.MediaTypeVideo {
+		s.Jobs.Enqueue(jobs.Task{Type: "video_poster", AssetID: assetID})
 	}
 	if !rebuild && mediaType == model.MediaTypeImage && previewStatus == model.StatusPending {
 		s.Jobs.Enqueue(jobs.Task{Type: "preview", AssetID: assetID})
@@ -1653,7 +1803,14 @@ func (s *Scanner) enqueuePendingWork(asset model.Asset) {
 		return
 	}
 	if recoverableWorkStatus(asset.ThumbStatus) {
-		s.Jobs.Enqueue(jobs.Task{Type: "thumb", AssetID: asset.ID})
+		if asset.MediaType == model.MediaTypeVideo {
+			s.Jobs.Enqueue(jobs.Task{Type: "video_poster", AssetID: asset.ID})
+		} else {
+			s.Jobs.Enqueue(jobs.Task{Type: "thumb", AssetID: asset.ID})
+		}
+	}
+	if asset.MediaType == model.MediaTypeVideo && recoverableWorkStatus(asset.VideoPosterStatus) {
+		s.Jobs.Enqueue(jobs.Task{Type: "video_poster", AssetID: asset.ID})
 	}
 	if asset.MediaType == model.MediaTypeImage && recoverableWorkStatus(asset.PreviewStatus) {
 		s.Jobs.Enqueue(jobs.Task{Type: "preview", AssetID: asset.ID})

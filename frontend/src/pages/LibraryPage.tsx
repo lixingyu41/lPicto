@@ -1,21 +1,34 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { ChevronDown, ChevronRight, RotateCcw, Save } from 'lucide-react';
+import { api } from '../api/client';
 import AssetGrid from '../components/AssetGrid';
-import AssetGroupingControls, { normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
+import { CompactAssetGroupingControls, normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
+import NFOSearchFilters from '../components/NFOSearchFilters';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
-import { SidebarButtonGroup, SidebarMediaTypeList, SidebarRatingFilter, sidebarOrientationOptions } from '../components/SidebarControls';
-import SortControls, { isSortKey } from '../components/SortControls';
-import { api } from '../api/client';
+import { SidebarAlbumList, SidebarFilterIconRow, SidebarMediaTypeList, SidebarOrientationFilter, SidebarRatingFilter } from '../components/SidebarControls';
+import { CompactSortControls, isSortKey } from '../components/SortControls';
+import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
-import type { Asset, AssetDeletedEvent, AssetKind, AssetRating, LibraryAnchor, OrientationFilter, SortKey } from '../types/api';
-import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
-import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
+import type {
+  Album,
+  AlbumGroup,
+  Asset,
+  AssetDeletedEvent,
+  AssetKind,
+  AssetRating,
+  LibraryAnchor,
+  NFOFilterField,
+  OrientationFilter,
+  LibraryFilterParams,
+  SortKey,
+} from '../types/api';
 import {
   appendViewerReturnParams,
   decodeReturnState,
@@ -25,72 +38,255 @@ import {
   saveViewerReturnPath,
   type GridReturnState,
 } from '../utils/pageState';
-import { assetMatchesLibrary } from '../utils/assetFilters';
-import { mergeSortedAssets, removeAssetById } from '../utils/assetSort';
-import { assetRatingParam, currentURLHasParam, currentURLLocation, currentURLPath, orientationParam, replaceURLState } from '../utils/urlState';
+import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
+import { removeAssetById } from '../utils/assetSort';
+import { assetRatingParam, currentURLHasParam, currentURLLocation, currentURLPath, replaceURLState } from '../utils/urlState';
+import { waterfallPageSize } from '../utils/waterfallPaging';
+import { parseTagFilters, serializeTagFilters } from '../utils/tagFilters';
 
-const pageSize = 100;
+const pageSize = waterfallPageSize;
 const libraryStateKey = 'library';
-const libraryURLKeys = ['type', 'rating', 'orientation', 'sort', 'group', 'q'];
-type LibraryControlState = Pick<LibraryPageState, 'groupMode' | 'orientation' | 'query' | 'rating' | 'sort' | 'type'>;
+const libraryURLKeys = [
+  'q',
+	'visible',
+	'aiDescription',
+	'aiTag',
+  'combinedTags',
+  'nfo',
+  'nfoActor',
+  'nfoId',
+  'nfoTag',
+  'nfoTitle',
+  'nfoYear',
+  'type',
+  'sort',
+  'rating',
+  'orientation',
+  'albumFilter',
+  'albumIds',
+  'albumId',
+  'album',
+  'group',
+  'widthMin',
+  'widthMax',
+  'heightMin',
+  'heightMax',
+  'durationMin',
+  'durationMax',
+  'sizeMin',
+  'sizeMax',
+  'from',
+  'to',
+];
+
+type SearchAlbumFilterMode = 'all' | 'none' | 'albums';
 
 interface LibraryPageState extends GridReturnState {
-  groupMode: AssetGroupMode;
+	aiDescriptionQuery: string;
+  albumFilterMode: SearchAlbumFilterMode;
+  albumFilterCardCollapsed: boolean;
+  albumIds: number[];
+  collapsedGroupKeys: string[];
+  dateFrom: string;
+  dateTo: string;
+  durationMaxMinutes: string;
+  durationMinMinutes: string;
+  durationRange?: string;
+  nfoActorQuery: string;
+  nfoIDQuery: string;
+  nfoQuery: string;
+  nfoTagQuery: string;
+  nfoTitleQuery: string;
+  nfoYearQuery: string;
   orientation: OrientationFilter;
+  groupMode: AssetGroupMode;
   query: string;
   rating: AssetRating;
+  resolutionRange?: string;
+  resolutionXRange: string;
+  resolutionYRange: string;
+  sizeMaxMB: string;
+  sizeMinMB: string;
   sort: SortKey;
+  searchCardCollapsed: boolean;
+  tagFilters: string[];
   type: AssetKind;
 }
 
 const defaultLibraryState: LibraryPageState = {
   ...resetGridState(),
-  groupMode: 'none',
+	aiDescriptionQuery: '',
+  albumFilterMode: 'all',
+  albumFilterCardCollapsed: false,
+  albumIds: [],
+  collapsedGroupKeys: [],
+  dateFrom: '',
+  dateTo: '',
+  durationMaxMinutes: '',
+  durationMinMinutes: '',
+  durationRange: '',
+  nfoActorQuery: '',
+  nfoIDQuery: '',
+  nfoQuery: '',
+  nfoTagQuery: '',
+  nfoTitleQuery: '',
+  nfoYearQuery: '',
   orientation: 'all',
+  groupMode: 'none',
   query: '',
   rating: 0,
+  resolutionRange: '',
+  resolutionXRange: '',
+  resolutionYRange: '',
+  sizeMaxMB: '',
+  sizeMinMB: '',
   sort: 'timeline_desc',
+  searchCardCollapsed: false,
+  tagFilters: [],
   type: 'all',
 };
 
-const assetKinds: AssetKind[] = ['all', 'image', 'video'];
 export default function LibraryPage() {
   const [searchParams] = useSearchParams();
   const location = useLocation();
   const navigate = useNavigate();
   const persistedState = loadPageState<LibraryPageState>(libraryStateKey, defaultLibraryState);
-  const decodedInitialState = decodeReturnState<LibraryPageState>(
-    searchParams.get('restore'),
-    persistedState,
-  );
   const initialStateRef = useRef(
-    searchParams.has('restore') ? decodedInitialState : libraryStateFromSearchParams(searchParams, persistedState),
+    initialLibraryState(searchParams, persistedState),
   );
-  const pendingControlStateRef = useRef<Partial<LibraryControlState> | null>(null);
+  const initialResolution = initialResolutionRanges(initialStateRef.current);
+  const initialDuration = initialDurationMinuteRanges(initialStateRef.current);
+  const [query, setQuery] = useState(initialStateRef.current.query);
+	const [aiDescriptionQuery, setAIDescriptionQuery] = useState(initialStateRef.current.aiDescriptionQuery ?? '');
+  const [nfoQuery, setNFOQuery] = useState(initialStateRef.current.nfoQuery);
+  const [nfoActorQuery, setNFOActorQuery] = useState(initialStateRef.current.nfoActorQuery ?? '');
+  const [nfoIDQuery, setNFOIDQuery] = useState(initialStateRef.current.nfoIDQuery ?? '');
+  const [nfoTagQuery, setNFOTagQuery] = useState(initialStateRef.current.nfoTagQuery ?? '');
+  const [nfoTitleQuery, setNFOTitleQuery] = useState(initialStateRef.current.nfoTitleQuery ?? '');
+  const [nfoYearQuery, setNFOYearQuery] = useState(initialStateRef.current.nfoYearQuery ?? '');
   const [type, setType] = useState<AssetKind>(initialStateRef.current.type);
   const [rating, setRating] = useState<AssetRating>(initialStateRef.current.rating ?? 0);
-  const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
   const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
-  const [query, setQuery] = useState(initialStateRef.current.query);
+  const [resolutionXRange, setResolutionXRange] = useState(initialResolution.x);
+  const [resolutionYRange, setResolutionYRange] = useState(initialResolution.y);
+  const [dateFrom, setDateFrom] = useState(initialStateRef.current.dateFrom);
+  const [dateTo, setDateTo] = useState(initialStateRef.current.dateTo);
+  const [durationMinMinutes, setDurationMinMinutes] = useState(initialDuration.min);
+  const [durationMaxMinutes, setDurationMaxMinutes] = useState(initialDuration.max);
+  const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
+  const [albumFilterMode, setAlbumFilterMode] = useState<SearchAlbumFilterMode>(initialStateRef.current.albumFilterMode);
+  const [albumFilterCardCollapsed, setAlbumFilterCardCollapsed] = useState(initialStateRef.current.albumFilterCardCollapsed ?? false);
+  const [albumIds, setAlbumIds] = useState<number[]>(initialStateRef.current.albumIds);
+  const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Set<string>>(() => new Set(initialStateRef.current.collapsedGroupKeys));
+  const [albums, setAlbums] = useState<Album[]>([]);
+  const [groups, setGroups] = useState<AlbumGroup[]>([]);
+  const [groupMode, setGroupMode] = useState<AssetGroupMode>(initialStateRef.current.groupMode);
+  const [sizeMinMB, setSizeMinMB] = useState(initialStateRef.current.sizeMinMB);
+  const [sizeMaxMB, setSizeMaxMB] = useState(initialStateRef.current.sizeMaxMB);
+  const [searchCardCollapsed, setSearchCardCollapsed] = useState(initialStateRef.current.searchCardCollapsed ?? false);
+  const [tagFilters, setTagFilters] = useState(initialStateRef.current.tagFilters ?? []);
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
-  const [groupMode, setGroupMode] = useState<AssetGroupMode>(initialStateRef.current.groupMode);
-  const serverGroup = serverGroupForMode(groupMode);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
+  const [smartCollectionName, setSmartCollectionName] = useState('');
+  const [savingSmartCollection, setSavingSmartCollection] = useState(false);
+  const [smartCollectionError, setSmartCollectionError] = useState<string | null>(null);
   const sidebarState = useSidebarReturnState();
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
-  const loadAssets = useCallback(
-    (page: number) => api.libraryAssets(page, pageSize, type, sort, query, serverGroup, rating, undefined, undefined, undefined, orientation),
-    [orientation, query, rating, serverGroup, sort, type],
+  const serverGroup = serverGroupForMode(groupMode);
+  const activeAlbumIds = useMemo(() => (albumFilterMode === 'albums' ? albumIds : []), [albumFilterMode, albumIds]);
+  const albumIdsParam = activeAlbumIds.length > 0 ? activeAlbumIds.join(',') : undefined;
+	const includeUnavailable = searchParams.get('visible') === 'all';
+
+  const searchRequest = useMemo<LibraryFilterParams>(
+    () => ({
+      albumFilter: albumFilterMode === 'none' ? 'none' : undefined,
+      albumIds: albumIdsParam,
+      q: query.trim() || undefined,
+		visible: includeUnavailable ? 'all' : undefined,
+		aiDescription: aiDescriptionQuery.trim() || undefined,
+		aiTag: searchParams.get('aiTag')?.trim() || undefined,
+      combinedTags: serializeTagFilters(tagFilters),
+      nfo: nfoQuery.trim() || undefined,
+      nfoActor: nfoActorQuery.trim() || undefined,
+      nfoId: nfoIDQuery.trim() || undefined,
+      nfoTag: nfoTagQuery.trim() || undefined,
+      nfoTitle: nfoTitleQuery.trim() || undefined,
+      nfoYear: nfoYearQuery.trim() || undefined,
+      rating,
+      type,
+      sort,
+      ...parseResolutionRanges(resolutionXRange, resolutionYRange, orientation),
+      from: datetimeLocalToUnix(dateFrom),
+      to: datetimeLocalToUnix(dateTo),
+      ...parseDurationMinuteRange(durationMinMinutes, durationMaxMinutes),
+      orientation,
+      group: serverGroup,
+      sizeMin: mbToBytes(sizeMinMB),
+      sizeMax: mbToBytes(sizeMaxMB),
+    }),
+    [
+      dateFrom,
+		includeUnavailable,
+		aiDescriptionQuery,
+      dateTo,
+      albumFilterMode,
+      albumIdsParam,
+      durationMaxMinutes,
+      durationMinMinutes,
+      nfoActorQuery,
+      nfoIDQuery,
+      nfoQuery,
+      nfoTagQuery,
+      nfoTitleQuery,
+      nfoYearQuery,
+      orientation,
+      query,
+      rating,
+      resolutionXRange,
+      resolutionYRange,
+      serverGroup,
+      sizeMaxMB,
+      sizeMinMB,
+      sort,
+      tagFilters,
+      type,
+    ],
   );
-  const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
-    type,
-    rating,
-    orientation,
-    sort,
-    query,
-    serverGroup,
-  ]);
+
+  useEffect(() => {
+    let live = true;
+    async function loadAlbums() {
+      try {
+        const result = await api.albums();
+        if (!live) return;
+        setAlbums(result.items);
+        setGroups(result.groups ?? []);
+      } catch {
+        if (!live) return;
+        setAlbums([]);
+        setGroups([]);
+      }
+    }
+    void loadAlbums();
+    return () => {
+      live = false;
+    };
+  }, []);
+  const nfoOptionQueries = useMemo<Record<NFOFilterField, string>>(
+    () => ({
+      actor: nfoActorQuery,
+      id: nfoIDQuery,
+      tag: nfoTagQuery,
+      title: nfoTitleQuery,
+      year: nfoYearQuery,
+    }),
+    [nfoActorQuery, nfoIDQuery, nfoTagQuery, nfoTitleQuery, nfoYearQuery],
+  );
+  const searchKey = useMemo(() => JSON.stringify(searchRequest), [searchRequest]);
+  const anchorSearchRequest = useMemo<LibraryFilterParams>(() => ({ ...searchRequest }), [searchRequest]);
+  const loadAssets = useCallback((page: number) => api.libraryAssets(page, pageSize, searchRequest), [searchRequest]);
+  const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [searchKey]);
   const {
     focusAssetId,
     getGridState,
@@ -113,151 +309,20 @@ export default function LibraryPage() {
     loadMore,
     loadPrevious,
     pageSize,
-    resetKey: JSON.stringify([type, rating, orientation, sort, query, groupMode]),
+    resetKey: searchKey,
     searchParams,
   });
-
-  const mergeReadyAssets = useCallback(
-    (incoming: Asset[]) => {
-      const filtered = incoming.filter((asset) => assetMatchesLibrary(asset, type, query, rating, orientation));
-      if (filtered.length === 0) return;
-      mutateItems((current) => mergeSortedAssets(current, filtered, sort, { hasMore, loadedStartIndex, groupMode }));
-    },
-    [groupMode, hasMore, loadedStartIndex, mutateItems, orientation, query, rating, sort, type],
-  );
-
-  const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
   const handleAssetDeleted = useCallback((event: AssetDeletedEvent) => mutateItems((current) => removeAssetById(current, event.id)), [mutateItems]);
-  const eventsConnected = useAssetReadyEvents(handleAssetReady, [handleAssetReady, handleAssetDeleted], handleAssetDeleted);
-
-  useEffect(() => {
-    if (eventsConnected) return undefined;
-    const timer = window.setInterval(() => {
-      void api
-        .libraryAssets(1, pageSize, type, sort, query, serverGroup, rating, undefined, undefined, undefined, orientation)
-        .then((result) => mergeReadyAssets(result.items))
-        .catch(() => undefined);
-    }, 30000);
-    return () => window.clearInterval(timer);
-  }, [eventsConnected, mergeReadyAssets, orientation, query, rating, serverGroup, sort, type]);
-
-  const currentPageState = useCallback(
-    (): LibraryPageState => ({
-      ...getGridState(),
-      groupMode,
-      orientation,
-      query,
-      rating,
-      sidebarExpanded: sidebarState.sidebarExpanded,
-      sort,
-      type,
-    }),
-    [getGridState, groupMode, orientation, query, rating, sidebarState.sidebarExpanded, sort, type],
-  );
-
-  const saveCurrentState = useCallback(() => {
-    savePageState<LibraryPageState>(libraryStateKey, { ...currentPageState(), ...(pendingControlStateRef.current ?? {}) });
-  }, [currentPageState]);
-  const saveControlState = useCallback(
-    (patch: Partial<LibraryControlState>) => {
-      const controls: LibraryControlState = {
-        groupMode,
-        orientation,
-        query,
-        rating,
-        sort,
-        type,
-        ...(pendingControlStateRef.current ?? {}),
-        ...patch,
-      };
-      pendingControlStateRef.current = controls;
-      const current = currentPageState();
-      const reset = resetGridState();
-      savePageState<LibraryPageState>(libraryStateKey, {
-        ...current,
-        ...reset,
-        groupMode: controls.groupMode,
-        orientation: controls.orientation,
-        query: controls.query,
-        rating: controls.rating,
-        sidebarExpanded: current.sidebarExpanded,
-        sort: controls.sort,
-        type: controls.type,
-      });
-    },
-    [currentPageState, groupMode, orientation, query, rating, sort, type],
-  );
-  const handleTypeChange = useCallback(
-    (nextType: AssetKind) => {
-      setType(nextType);
-      saveControlState({ type: nextType });
-    },
-    [saveControlState],
-  );
-  const handleSortChange = useCallback(
-    (nextSort: SortKey) => {
-      const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, nextSort);
-      setSort(nextSort);
-      if (nextGroupMode !== groupMode) {
-        setGroupMode(nextGroupMode);
-      }
-      saveControlState({ groupMode: nextGroupMode, sort: nextSort });
-    },
-    [groupMode, saveControlState],
-  );
-  const handleRatingChange = useCallback(
-    (nextRating: AssetRating) => {
-      setRating(nextRating);
-      saveControlState({ rating: nextRating });
-    },
-    [saveControlState],
-  );
-  const handleOrientationChange = useCallback(
-    (nextOrientation: OrientationFilter) => {
-      setOrientation(nextOrientation);
-      saveControlState({ orientation: nextOrientation });
-    },
-    [saveControlState],
-  );
-  const handleQueryChange = useCallback(
-    (nextQuery: string) => {
-      setQuery(nextQuery);
-      saveControlState({ query: nextQuery });
-    },
-    [saveControlState],
-  );
-  const handleGroupModeChange = useCallback(
-    (nextGroupMode: AssetGroupMode) => {
-      setGroupMode(nextGroupMode);
-      saveControlState({ groupMode: nextGroupMode });
-    },
-    [saveControlState],
-  );
-  const scheduleCurrentStateSave = usePersistentPageState(saveCurrentState);
-
-  useEffect(() => {
-    if (currentURLHasParam(location, 'restore')) return;
-    replaceURLState(
-      navigate,
-      location,
-      { group: groupMode, orientation: orientation === 'all' ? undefined : orientation, q: query, rating, sort, type },
-      libraryURLKeys,
-    );
-  }, [groupMode, location, navigate, orientation, query, rating, searchParams, sort, type]);
-
-  const handlePersistentGridScrollState = useCallback(
-    (state: { ratio: number; scrollTop: number }) => {
-      handleGridScrollState(state);
-      scheduleCurrentStateSave();
-    },
-    [handleGridScrollState, scheduleCurrentStateSave],
-  );
+  const handleAssetReady = useCallback(() => {
+    void jumpToPage(Math.floor(loadedStartIndex / pageSize) + 1);
+  }, [jumpToPage, loadedStartIndex]);
+  useAssetReadyEvents(handleAssetReady, [handleAssetReady, handleAssetDeleted], handleAssetDeleted);
 
   useEffect(() => {
     let live = true;
     async function loadAnchors() {
       try {
-        const result = await api.libraryAnchors(pageSize, type, sort, query, serverGroup, rating, undefined, undefined, undefined, orientation);
+        const result = await api.libraryAnchors(pageSize, anchorSearchRequest);
         if (live) {
           setAnchors(result.items);
           setTotalCount(result.total);
@@ -273,14 +338,158 @@ export default function LibraryPage() {
     return () => {
       live = false;
     };
-  }, [orientation, query, rating, serverGroup, sort, type]);
+  }, [anchorSearchRequest]);
+
+  const currentPageState = useCallback(
+    (): LibraryPageState => ({
+      ...getGridState(),
+      albumFilterMode,
+		aiDescriptionQuery,
+      albumFilterCardCollapsed,
+      albumIds,
+      collapsedGroupKeys: Array.from(collapsedGroupKeys),
+      dateFrom,
+      dateTo,
+      durationMaxMinutes,
+      durationMinMinutes,
+      nfoActorQuery,
+      nfoIDQuery,
+      nfoQuery,
+      nfoTagQuery,
+      nfoTitleQuery,
+      nfoYearQuery,
+      orientation,
+      groupMode,
+      query,
+      rating,
+      resolutionXRange,
+      resolutionYRange,
+      sidebarExpanded: sidebarState.sidebarExpanded,
+      sizeMaxMB,
+      sizeMinMB,
+      sort,
+      searchCardCollapsed,
+      tagFilters,
+      type,
+    }),
+    [
+      albumFilterMode,
+      albumFilterCardCollapsed,
+      albumIds,
+      collapsedGroupKeys,
+      dateFrom,
+      dateTo,
+      durationMaxMinutes,
+      durationMinMinutes,
+      getGridState,
+      groupMode,
+      nfoActorQuery,
+      nfoIDQuery,
+      nfoQuery,
+      nfoTagQuery,
+      nfoTitleQuery,
+      nfoYearQuery,
+      orientation,
+      query,
+      rating,
+      resolutionXRange,
+      resolutionYRange,
+      sidebarState.sidebarExpanded,
+      sizeMaxMB,
+      sizeMinMB,
+      sort,
+      searchCardCollapsed,
+      tagFilters,
+      type,
+    ],
+  );
+
+  const saveCurrentState = useCallback(() => {
+    savePageState<LibraryPageState>(libraryStateKey, currentPageState());
+  }, [currentPageState]);
+  const toggleAlbumFilterCard = useCallback(() => {
+    setAlbumFilterCardCollapsed((current) => {
+      const next = !current;
+      savePageState<LibraryPageState>(libraryStateKey, { ...currentPageState(), albumFilterCardCollapsed: next });
+      return next;
+    });
+  }, [currentPageState]);
+  const toggleSearchCard = useCallback(() => {
+    setSearchCardCollapsed((current) => {
+      const next = !current;
+      savePageState<LibraryPageState>(libraryStateKey, { ...currentPageState(), searchCardCollapsed: next });
+      return next;
+    });
+  }, [currentPageState]);
+  const scheduleCurrentStateSave = usePersistentPageState(saveCurrentState);
 
   useEffect(() => {
-    const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);
-    if (nextGroupMode !== groupMode) {
-      setGroupMode(nextGroupMode);
-    }
-  }, [groupMode, sort]);
+    if (currentURLHasParam(location, 'restore')) return;
+    replaceURLState(
+      navigate,
+      location,
+      {
+        durationMax: searchRequest.durationMax,
+        durationMin: searchRequest.durationMin,
+        from: searchRequest.from,
+        group: groupMode,
+        albumFilter: searchRequest.albumFilter,
+        albumIds: searchRequest.albumIds,
+        heightMax: searchRequest.heightMax,
+        heightMin: searchRequest.heightMin,
+        nfo: nfoQuery.trim(),
+		aiDescription: aiDescriptionQuery.trim(),
+		aiTag: searchRequest.aiTag,
+        combinedTags: searchRequest.combinedTags,
+        nfoActor: nfoActorQuery.trim(),
+        nfoId: nfoIDQuery.trim(),
+        nfoTag: nfoTagQuery.trim(),
+        nfoTitle: nfoTitleQuery.trim(),
+        nfoYear: nfoYearQuery.trim(),
+        orientation,
+        q: query.trim(),
+		visible: searchRequest.visible,
+        rating,
+        sizeMax: searchRequest.sizeMax,
+        sizeMin: searchRequest.sizeMin,
+        sort,
+        to: searchRequest.to,
+        type,
+        widthMax: searchRequest.widthMax,
+        widthMin: searchRequest.widthMin,
+      },
+      libraryURLKeys,
+    );
+  }, [
+    groupMode,
+		aiDescriptionQuery,
+    albumFilterMode,
+    albumIdsParam,
+    location,
+    navigate,
+    nfoActorQuery,
+    nfoIDQuery,
+    nfoQuery,
+    nfoTagQuery,
+    nfoTitleQuery,
+    nfoYearQuery,
+    orientation,
+    query,
+    rating,
+    searchParams,
+    searchRequest,
+    sort,
+    tagFilters,
+    type,
+  ]);
+
+  const handlePersistentGridScrollState = useCallback(
+    (state: { ratio: number; scrollTop: number }) => {
+      handleGridScrollState(state);
+      scheduleCurrentStateSave();
+    },
+    [handleGridScrollState, scheduleCurrentStateSave],
+  );
 
   const handleOpenAsset = useCallback(() => {
     saveCurrentState();
@@ -294,31 +503,277 @@ export default function LibraryPage() {
     [location, navigate],
   );
 
+  const saveSmartCollection = useCallback(async () => {
+    const name = smartCollectionName.trim();
+    if (!name || savingSmartCollection) return;
+    setSavingSmartCollection(true);
+    setSmartCollectionError(null);
+    try {
+      await api.createCollection(name, searchRequest);
+      setSmartCollectionName('');
+    } catch (err) {
+      setSmartCollectionError(err instanceof Error ? err.message : '保存智能集合失败');
+    } finally {
+      setSavingSmartCollection(false);
+    }
+  }, [savingSmartCollection, searchRequest, smartCollectionName]);
+
+  useEffect(() => {
+    const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);
+    if (nextGroupMode !== groupMode) {
+      setGroupMode(nextGroupMode);
+    }
+  }, [groupMode, sort]);
+
+  const resetFilters = useCallback(() => {
+    setQuery('');
+		setAIDescriptionQuery('');
+    setNFOQuery('');
+    setNFOActorQuery('');
+    setNFOIDQuery('');
+    setNFOTagQuery('');
+    setNFOTitleQuery('');
+    setNFOYearQuery('');
+    setType('all');
+    setRating(0);
+    setAlbumFilterMode('all');
+    setAlbumIds([]);
+    setCollapsedGroupKeys(new Set());
+    setSort('timeline_desc');
+    setTagFilters([]);
+    setResolutionXRange('');
+    setResolutionYRange('');
+    setDateFrom('');
+    setDateTo('');
+    setDurationMinMinutes('');
+    setDurationMaxMinutes('');
+    setOrientation('all');
+    setGroupMode('none');
+    setSizeMinMB('');
+    setSizeMaxMB('');
+  }, []);
+
+  const handleRatingChange = useCallback((nextRating: AssetRating) => {
+    setRating(nextRating);
+  }, []);
+
+  const handleSelectAllAlbums = useCallback(() => {
+    setAlbumFilterMode('all');
+    setAlbumIds([]);
+  }, []);
+
+  const handleSelectUnassignedAlbums = useCallback(() => {
+    setAlbumFilterMode('none');
+    setAlbumIds([]);
+  }, []);
+
+  const handleToggleAlbum = useCallback(
+    (album: Album) => {
+      const nextAlbumIds = albumIds.includes(album.id) ? albumIds.filter((id) => id !== album.id) : [...albumIds, album.id];
+      setAlbumIds(nextAlbumIds);
+      setAlbumFilterMode(nextAlbumIds.length > 0 ? 'albums' : 'all');
+    },
+    [albumIds],
+  );
+
+  const handleToggleAlbumGroup = useCallback((key: string) => {
+    setCollapsedGroupKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  }, []);
+
+  const setNFOFieldQuery = useCallback((field: NFOFilterField, value: string) => {
+    switch (field) {
+      case 'actor':
+        setNFOActorQuery(value);
+        return;
+      case 'id':
+        setNFOIDQuery(value);
+        return;
+      case 'tag':
+        setNFOTagQuery(value);
+        return;
+      case 'title':
+        setNFOTitleQuery(value);
+        return;
+      case 'year':
+        setNFOYearQuery(value);
+        return;
+    }
+  }, []);
+
   useSidebarPanel(
     'library',
-    <div className="sidebar-control-stack">
-      <SidebarMediaTypeList value={type} onChange={handleTypeChange} />
-      <SidebarRatingFilter value={rating} onChange={handleRatingChange} />
-      <SidebarButtonGroup columns={3} label="方向" value={orientation} options={sidebarOrientationOptions} onChange={handleOrientationChange} />
-      <SortControls sort={sort} onChange={handleSortChange} />
-      <label className="sidebar-field">
-        <span>搜索</span>
-        <input value={query} onChange={(event) => handleQueryChange(event.target.value)} placeholder="文件名" />
-      </label>
-      <AssetGroupingControls groupMode={groupMode} sort={sort} onChange={handleGroupModeChange} />
+    <div className="sidebar-control-stack sidebar-library-panel">
+      <SidebarFilterIconRow>
+        <SidebarMediaTypeList value={type} onChange={setType} />
+        <SidebarOrientationFilter value={orientation} onChange={setOrientation} />
+        <SidebarRatingFilter value={rating} onChange={handleRatingChange} />
+        <CompactAssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
+        <CompactSortControls sort={sort} onChange={setSort} />
+      </SidebarFilterIconRow>
+      <section className="sidebar-filter-card sidebar-album-filter-card" aria-labelledby="library-album-filter-title">
+        <button
+          aria-expanded={!albumFilterCardCollapsed}
+          className="sidebar-filter-card-toggle"
+          type="button"
+          onClick={toggleAlbumFilterCard}
+        >
+          {albumFilterCardCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+          <span className="sidebar-control-title" id="library-album-filter-title">相册筛选</span>
+        </button>
+        {!albumFilterCardCollapsed && (
+          <SidebarAlbumList
+            albums={albums}
+            collapsedGroupKeys={Array.from(collapsedGroupKeys)}
+            forceGroupHeaders
+            groups={groups}
+            selectedIds={albumFilterMode === 'albums' ? albumIds : []}
+            showAll
+            showLabel={false}
+            showUnassigned
+            allActive={albumFilterMode === 'all'}
+            unassignedActive={albumFilterMode === 'none'}
+            onSelectAll={handleSelectAllAlbums}
+            onSelectUnassigned={handleSelectUnassignedAlbums}
+            onSelectAlbum={handleToggleAlbum}
+            onToggleGroup={handleToggleAlbumGroup}
+          />
+        )}
+      </section>
+      <section className="sidebar-filter-card sidebar-search-card" aria-labelledby="library-search-title">
+            <button
+              aria-expanded={!searchCardCollapsed}
+              className="sidebar-filter-card-toggle"
+              type="button"
+              onClick={toggleSearchCard}
+            >
+              {searchCardCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+              <span className="sidebar-control-title" id="library-search-title">搜索</span>
+            </button>
+            {!searchCardCollapsed && (
+              <>
+            <div className="sidebar-reset-row">
+              <button className="sidebar-command" type="button" title="重置" aria-label="重置" onClick={resetFilters}>
+                <RotateCcw size={15} />
+                <span>重置</span>
+              </button>
+            </div>
+            <label className="sidebar-field">
+              <span>文件名</span>
+              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="文件名" />
+            </label>
+			<label className="sidebar-field">
+			  <span>AI 描述</span>
+			  <input value={aiDescriptionQuery} onChange={(event) => setAIDescriptionQuery(event.target.value)} placeholder="包含或模糊匹配" />
+			</label>
+            <NFOSearchFilters
+              nfoQuery={nfoQuery}
+              nfoOptionQueries={nfoOptionQueries}
+              onNFOQueryChange={setNFOQuery}
+              onNFOFieldQueryChange={setNFOFieldQuery}
+            />
+            <label className="sidebar-field">
+              <span>分辨率</span>
+              <div className="sidebar-field-grid">
+                <input value={resolutionXRange} onChange={(event) => setResolutionXRange(event.target.value)} placeholder="X 100-4000" />
+                <input value={resolutionYRange} onChange={(event) => setResolutionYRange(event.target.value)} placeholder="Y 100-3000" />
+              </div>
+            </label>
+            <div className="sidebar-field-grid">
+              <label className="sidebar-field">
+                <span>起始时间</span>
+                <input type="datetime-local" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} />
+              </label>
+              <label className="sidebar-field">
+                <span>结束时间</span>
+                <input type="datetime-local" value={dateTo} onChange={(event) => setDateTo(event.target.value)} />
+              </label>
+            </div>
+            <div className="sidebar-field-grid">
+              <label className="sidebar-field">
+                <span>最短分钟</span>
+                <input inputMode="decimal" value={durationMinMinutes} onChange={(event) => setDurationMinMinutes(event.target.value)} />
+              </label>
+              <label className="sidebar-field">
+                <span>最长分钟</span>
+                <input inputMode="decimal" value={durationMaxMinutes} onChange={(event) => setDurationMaxMinutes(event.target.value)} />
+              </label>
+            </div>
+            <div className="sidebar-field-grid">
+              <label className="sidebar-field">
+                <span>最小 MB</span>
+                <input inputMode="decimal" value={sizeMinMB} onChange={(event) => setSizeMinMB(event.target.value)} />
+              </label>
+              <label className="sidebar-field">
+                <span>最大 MB</span>
+                <input inputMode="decimal" value={sizeMaxMB} onChange={(event) => setSizeMaxMB(event.target.value)} />
+              </label>
+            </div>
+            <div className="sidebar-group-section">
+              <div className="sidebar-control-subtitle">智能相册</div>
+              <label className="sidebar-field">
+                <span>保存当前搜索</span>
+                <input value={smartCollectionName} onChange={(event) => setSmartCollectionName(event.target.value)} placeholder="智能相册名称" />
+              </label>
+              <button className="sidebar-command" disabled={!smartCollectionName.trim() || savingSmartCollection} type="button" onClick={() => void saveSmartCollection()}>
+                <Save size={15} />
+                <span>{savingSmartCollection ? '保存中' : '保存'}</span>
+              </button>
+              {smartCollectionError && <div className="error-line">{smartCollectionError}</div>}
+            </div>
+              </>
+            )}
+      </section>
     </div>,
     [
+      dateFrom,
+		aiDescriptionQuery,
+      dateTo,
+      albumFilterMode,
+      albumFilterCardCollapsed,
+      albumIds,
+      albums,
+      collapsedGroupKeys,
+      durationMaxMinutes,
+      durationMinMinutes,
       groupMode,
-      handleGroupModeChange,
-      handleOrientationChange,
-      handleQueryChange,
       handleRatingChange,
-      handleSortChange,
-      handleTypeChange,
+      handleSelectAllAlbums,
+      handleSelectUnassignedAlbums,
+      handleToggleAlbum,
+      handleToggleAlbumGroup,
+      groups,
+      nfoOptionQueries,
+      saveSmartCollection,
+      searchCardCollapsed,
+      savingSmartCollection,
+      smartCollectionError,
+      smartCollectionName,
+      nfoActorQuery,
+      nfoIDQuery,
+      nfoQuery,
+      nfoTagQuery,
+      nfoTitleQuery,
+      nfoYearQuery,
       orientation,
       query,
       rating,
+      resetFilters,
+      resolutionXRange,
+      resolutionYRange,
+      setNFOFieldQuery,
+      sizeMaxMB,
+      sizeMinMB,
       sort,
+      toggleAlbumFilterCard,
+      toggleSearchCard,
       type,
     ],
   );
@@ -345,7 +800,8 @@ export default function LibraryPage() {
             onLoadPrevious={loadPreviousPage}
             onOpenAsset={handleOpenAsset}
             onOpenViewer={handleOpenViewer}
-            onAssetMissing={(asset) => mutateItems((current) => removeAssetById(current, asset.id))}
+            onBatchRemoveAssets={(ids) => mutateItems((current) => current.filter((asset) => !ids.includes(asset.id)))}
+            onPressPreviewChange={setPressPreviewAsset}
             onScrollRatioChange={setScrollRatio}
             onScrollStateChange={handlePersistentGridScrollState}
             totalCount={totalCount}
@@ -353,19 +809,13 @@ export default function LibraryPage() {
             focusAssetId={focusAssetId}
             groupMode={groupMode}
             sort={sort}
+            onSortChange={setSort}
+            selectedTags={tagFilters}
+            onTagFilterChange={setTagFilters}
             scrollSignal={scrollResetSignal}
             scrollTarget={scrollTarget}
             scrollTopTarget={scrollTopTarget}
-            onPressPreviewChange={setPressPreviewAsset}
-            buildViewerUrl={(asset) =>
-              appendViewerReturnParams(
-                `/viewer/${asset.id}?context=library&type=${type}&sort=${sort}&q=${encodeURIComponent(query)}${ratingViewerParam(rating)}${orientationViewerParam(
-                  orientation,
-                )}${serverGroup ? `&group=${serverGroup}` : ''}`,
-                currentPageReturnPath(),
-                currentPageState(),
-              )
-            }
+            buildViewerUrl={(asset) => buildViewerUrl(asset, searchRequest, currentPageState(), currentPageReturnPath())}
           />
           {groupMode !== 'folder' && (
             <LibraryIndexRail
@@ -384,27 +834,247 @@ export default function LibraryPage() {
   );
 }
 
-function libraryStateFromSearchParams(params: URLSearchParams, fallback: LibraryPageState): LibraryPageState {
-  const type = params.get('type');
-  const sort = params.get('sort');
-  const q = params.get('q');
-  const hasLibraryParams = libraryURLKeys.some((key) => params.has(key));
-  const base = hasLibraryParams ? { ...fallback, ...resetGridState() } : fallback;
+function initialLibraryState(searchParams: URLSearchParams, persistedState: LibraryPageState): LibraryPageState {
+  if (searchParams.has('restore')) {
+    return decodeReturnState<LibraryPageState>(searchParams.get('restore'), persistedState);
+  }
+  if (!hasSearchStateParams(searchParams)) {
+    return persistedState;
+  }
   return {
-    ...base,
-    groupMode: parseAssetGroupMode(params.get('group'), base.groupMode),
-    orientation: params.has('orientation') ? orientationParam(params.get('orientation')) : base.orientation,
-    query: q ?? (hasLibraryParams ? '' : base.query),
-    rating: params.has('rating') ? assetRatingParam(params.get('rating')) ?? base.rating : base.rating,
-    sort: isSortKey(sort) ? sort : base.sort,
-    type: assetKinds.includes(type as AssetKind) ? (type as AssetKind) : base.type,
+    ...defaultLibraryState,
+    albumFilterCardCollapsed: persistedState.albumFilterCardCollapsed ?? false,
+    searchCardCollapsed: persistedState.searchCardCollapsed ?? false,
+    ...albumFilterStateFromSearchParams(searchParams),
+    query: searchParams.get('q') ?? '',
+		aiDescriptionQuery: searchParams.get('aiDescription') ?? '',
+    nfoQuery: searchParams.get('nfo') ?? '',
+    nfoActorQuery: searchParams.get('nfoActor') ?? '',
+    nfoIDQuery: searchParams.get('nfoId') ?? '',
+    nfoTagQuery: searchParams.get('nfoTag') ?? '',
+    nfoTitleQuery: searchParams.get('nfoTitle') ?? '',
+    nfoYearQuery: searchParams.get('nfoYear') ?? '',
+    type: parseAssetKindParam(searchParams.get('type')),
+    sort: parseSortParam(searchParams.get('sort')),
+    orientation: parseOrientationParam(searchParams.get('orientation')),
+    rating: assetRatingParam(searchParams.get('rating')) ?? defaultLibraryState.rating,
+    groupMode: parseAssetGroupMode(searchParams.get('group'), 'none'),
+    resolutionXRange: rangeInputFromParams(searchParams.get('widthMin'), searchParams.get('widthMax')),
+    resolutionYRange: rangeInputFromParams(searchParams.get('heightMin'), searchParams.get('heightMax')),
+    durationMinMinutes: secondsParamToMinutes(searchParams.get('durationMin')),
+    durationMaxMinutes: secondsParamToMinutes(searchParams.get('durationMax')),
+    sizeMinMB: bytesParamToMB(searchParams.get('sizeMin')),
+    sizeMaxMB: bytesParamToMB(searchParams.get('sizeMax')),
+    dateFrom: unixParamToDatetimeLocal(searchParams.get('from')),
+    dateTo: unixParamToDatetimeLocal(searchParams.get('to')),
+    tagFilters: parseTagFilters(searchParams.get('combinedTags')),
   };
 }
 
-function ratingViewerParam(rating: AssetRating) {
-  return `&rating=${rating}`;
+function hasSearchStateParams(searchParams: URLSearchParams) {
+  return [
+    'q',
+		'visible',
+		'aiDescription',
+		'aiTag',
+    'combinedTags',
+    'nfo',
+    'nfoActor',
+    'nfoId',
+    'nfoTag',
+    'nfoTitle',
+    'nfoYear',
+    'type',
+    'sort',
+    'rating',
+    'orientation',
+    'albumFilter',
+    'albumIds',
+    'albumId',
+    'album',
+    'group',
+    'widthMin',
+    'widthMax',
+    'heightMin',
+    'heightMax',
+    'durationMin',
+    'durationMax',
+    'sizeMin',
+    'sizeMax',
+    'from',
+    'to',
+  ].some((key) => searchParams.has(key));
 }
 
-function orientationViewerParam(orientation: OrientationFilter) {
-  return orientation === 'all' ? '' : `&orientation=${orientation}`;
+function albumFilterStateFromSearchParams(params: URLSearchParams): Pick<LibraryPageState, 'albumFilterMode' | 'albumIds'> {
+  const mode = (params.get('albumFilter') ?? params.get('album') ?? '').trim().toLowerCase();
+  if (mode === 'none' || mode === 'unassigned') {
+    return { albumFilterMode: 'none', albumIds: [] };
+  }
+  const albumIds = parseAlbumIds(params.get('albumIds'));
+  if (albumIds.length > 0) {
+    return { albumFilterMode: 'albums', albumIds };
+  }
+  const singleAlbumId = positiveIntParam(params.get('albumId')) ?? positiveIntParam(params.get('album'));
+  if (singleAlbumId !== null) {
+    return { albumFilterMode: 'albums', albumIds: [singleAlbumId] };
+  }
+  return { albumFilterMode: 'all', albumIds: [] };
+}
+
+function parseAlbumIds(value: string | null) {
+  if (!value) return [];
+  const seen = new Set<number>();
+  const result: number[] = [];
+  value.split(',').forEach((part) => {
+    const parsed = positiveIntParam(part);
+    if (parsed === null || seen.has(parsed)) return;
+    seen.add(parsed);
+    result.push(parsed);
+  });
+  return result;
+}
+
+function positiveIntParam(value: string | null) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseAssetKindParam(value: string | null): AssetKind {
+  return value === 'image' || value === 'video' ? value : 'all';
+}
+
+function parseOrientationParam(value: string | null): OrientationFilter {
+  return value === 'landscape' || value === 'portrait' ? value : 'all';
+}
+
+function parseSortParam(value: string | null): SortKey {
+  return isSortKey(value) ? value : 'timeline_desc';
+}
+
+function rangeInputFromParams(minValue: string | null, maxValue: string | null) {
+  const min = positiveNumber(minValue ?? '');
+  const max = positiveNumber(maxValue ?? '');
+  if (min === undefined && max === undefined) return '';
+  if (min !== undefined && max !== undefined && min === max) return String(min);
+  return `${min ?? ''}-${max ?? ''}`;
+}
+
+function secondsParamToMinutes(value: string | null) {
+  const seconds = positiveNumber(value ?? '');
+  if (seconds === undefined) return '';
+  return formatMinuteValue(seconds / 60);
+}
+
+function bytesParamToMB(value: string | null) {
+  const bytes = positiveNumber(value ?? '');
+  if (bytes === undefined) return '';
+  return formatMinuteValue(bytes / (1024 * 1024));
+}
+
+function unixParamToDatetimeLocal(value: string | null) {
+  const seconds = positiveNumber(value ?? '');
+  if (seconds === undefined) return '';
+  const date = new Date(seconds * 1000);
+  if (!Number.isFinite(date.getTime())) return '';
+  const pad = (part: number) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function buildViewerUrl(asset: Asset, params: LibraryFilterParams, state: LibraryPageState, returnPath: string) {
+  const query = new URLSearchParams(searchQueryEntries(params));
+  query.set('context', 'library');
+  return appendViewerReturnParams(`/viewer/${asset.id}?${query.toString()}`, returnPath, state);
+}
+
+function searchQueryEntries(params: LibraryFilterParams) {
+  const entries: Array<[string, string]> = [];
+  Object.entries(params).forEach(([key, value]) => {
+    if (value === undefined || value === '' || (value === 'all' && key !== 'visible')) return;
+    entries.push([key, String(value)]);
+  });
+  return entries;
+}
+
+function parseResolutionRanges(
+  xValue: string,
+  yValue: string,
+  orientation: OrientationFilter,
+): Pick<LibraryFilterParams, 'widthMin' | 'widthMax' | 'heightMin' | 'heightMax' | 'dimensionMode'> {
+  const width = parseNumberRange(xValue);
+  const height = parseNumberRange(yValue);
+  const hasResolutionFilter = width.min !== undefined || width.max !== undefined || height.min !== undefined || height.max !== undefined;
+  return {
+    widthMin: width.min,
+    widthMax: width.max,
+    heightMin: height.min,
+    heightMax: height.max,
+    dimensionMode: hasResolutionFilter && orientation === 'all' ? 'both' : undefined,
+  };
+}
+
+function parseDurationMinuteRange(minValue: string, maxValue: string): Pick<LibraryFilterParams, 'durationMin' | 'durationMax'> {
+  const min = positiveNumber(minValue);
+  const max = positiveNumber(maxValue);
+  return {
+    durationMin: min === undefined ? undefined : min * 60,
+    durationMax: max === undefined ? undefined : max * 60,
+  };
+}
+
+function parseNumberRange(value: string): { min?: number; max?: number } {
+  const clean = value.trim();
+  if (clean === '') return {};
+  const parts = clean.split('-', 2);
+  if (parts.length === 1) {
+    const exact = positiveNumber(parts[0]);
+    return exact === undefined ? {} : { min: exact, max: exact };
+  }
+  return { min: positiveNumber(parts[0]), max: positiveNumber(parts[1]) };
+}
+
+function positiveNumber(value: string): number | undefined {
+  const clean = value.trim();
+  if (clean === '') return undefined;
+  const parsed = Number(clean);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return parsed;
+}
+
+function datetimeLocalToUnix(value: string): number | undefined {
+  if (!value) return undefined;
+  const parsed = new Date(value).getTime();
+  if (!Number.isFinite(parsed)) return undefined;
+  return Math.floor(parsed / 1000);
+}
+
+function mbToBytes(value: string): number | undefined {
+  const parsed = positiveNumber(value);
+  if (parsed === undefined) return undefined;
+  return Math.round(parsed * 1024 * 1024);
+}
+
+function initialResolutionRanges(state: LibraryPageState): { x: string; y: string } {
+  if (state.resolutionXRange || state.resolutionYRange) {
+    return { x: state.resolutionXRange ?? '', y: state.resolutionYRange ?? '' };
+  }
+  const legacy = state.resolutionRange?.toLowerCase().replace(/\s+/g, '') ?? '';
+  const [x, y] = legacy.split(/[x×]/);
+  return { x: x ?? '', y: y ?? '' };
+}
+
+function initialDurationMinuteRanges(state: LibraryPageState): { min: string; max: string } {
+  if (state.durationMinMinutes || state.durationMaxMinutes) {
+    return { min: state.durationMinMinutes ?? '', max: state.durationMaxMinutes ?? '' };
+  }
+  const range = parseNumberRange(state.durationRange ?? '');
+  return {
+    min: range.min === undefined ? '' : formatMinuteValue(range.min / 60),
+    max: range.max === undefined ? '' : formatMinuteValue(range.max / 60),
+  };
+}
+
+function formatMinuteValue(value: number): string {
+  if (!Number.isFinite(value)) return '';
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(3)));
 }

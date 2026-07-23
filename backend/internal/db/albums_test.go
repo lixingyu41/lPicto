@@ -213,6 +213,50 @@ func TestUpdateAlbumAndGroups(t *testing.T) {
 	}
 }
 
+func TestListAlbumsUsesCachedStatsUntilRefresh(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	if _, _, _, err := database.UpsertAsset(ctx, testAlbumAsset("a/one.jpg", "a", model.MediaTypeImage, 100, 100)); err != nil {
+		t.Fatal(err)
+	}
+	album, err := database.CreateAlbum(ctx, AlbumCreate{
+		Name:           "缓存统计",
+		FolderRelPaths: []string{""},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if album.AssetCount != 1 || album.StatsUpdatedAt == 0 {
+		t.Fatalf("created album stats = count %d updated %d, want cached count 1", album.AssetCount, album.StatsUpdatedAt)
+	}
+
+	if _, _, _, err := database.UpsertAsset(ctx, testAlbumAsset("b/two.jpg", "b", model.MediaTypeImage, 100, 100)); err != nil {
+		t.Fatal(err)
+	}
+	albums, err := database.ListAlbums(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := albumByID(albums, album.ID).AssetCount; got != 1 {
+		t.Fatalf("cached album count after asset insert = %d, want 1 before refresh", got)
+	}
+	if err := database.RefreshAlbumStats(ctx); err != nil {
+		t.Fatal(err)
+	}
+	albums, err = database.ListAlbums(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := albumByID(albums, album.ID).AssetCount; got != 2 {
+		t.Fatalf("cached album count after refresh = %d, want 2", got)
+	}
+}
+
 func TestLibraryAlbumIDFilters(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
@@ -298,6 +342,65 @@ func TestLibraryAlbumIDFilters(t *testing.T) {
 	if got := albumRelPaths(page.Items); len(got) != 1 || got[0] != "a/one.jpg" {
 		t.Fatalf("single album compatibility = %#v, want a/one.jpg", got)
 	}
+}
+
+func TestLibraryImageSizeNeighbors(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	large := testAlbumAsset("large.jpg", "", model.MediaTypeImage, 100, 100)
+	large.Size = 300
+	medium := testAlbumAsset("medium.jpg", "", model.MediaTypeImage, 100, 100)
+	medium.Size = 200
+	small := testAlbumAsset("small.jpg", "", model.MediaTypeImage, 100, 100)
+	small.Size = 100
+	video := testAlbumAsset("video.mp4", "", model.MediaTypeVideo, 100, 100)
+	video.Size = 250
+	if _, _, _, err := database.UpsertAsset(ctx, large); err != nil {
+		t.Fatal(err)
+	}
+	mediumID, _, _, err := database.UpsertAsset(ctx, medium)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := database.UpsertAsset(ctx, small); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := database.UpsertAsset(ctx, video); err != nil {
+		t.Fatal(err)
+	}
+
+	rating := 0
+	neighbors, err := database.Neighbors(ctx, NeighborOptions{
+		Context: "library",
+		AssetID: mediumID,
+		Type:    model.MediaTypeImage,
+		Sort:    "size_desc",
+		Rating:  &rating,
+		Limit:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(neighbors.Previous) != 1 || neighbors.Previous[0].RelPath != "large.jpg" {
+		t.Fatalf("previous = %#v, want large.jpg", albumRelPaths(neighbors.Previous))
+	}
+	if len(neighbors.Next) != 1 || neighbors.Next[0].RelPath != "small.jpg" {
+		t.Fatalf("next = %#v, want small.jpg", albumRelPaths(neighbors.Next))
+	}
+}
+
+func albumByID(albums []model.Album, id int64) model.Album {
+	for _, album := range albums {
+		if album.ID == id {
+			return album
+		}
+	}
+	return model.Album{}
 }
 
 func TestPendingWorkDoesNotRecoverProcessingVideoProxy(t *testing.T) {

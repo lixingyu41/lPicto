@@ -104,6 +104,19 @@ func (e assetDeletePlanError) Error() string {
 	return e.message
 }
 
+func assetDeleteUnavailable(err error) bool {
+	var planErr assetDeletePlanError
+	if !errors.As(err, &planErr) {
+		return false
+	}
+	switch planErr.code {
+	case "asset_root_invalid", "asset_root_unavailable", "asset_not_found":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) buildAssetDeletePlan(asset model.Asset) (assetDeletePlanInternal, error) {
 	root, _, err := s.store.RootForRel(asset.RelPath)
 	if err != nil {
@@ -237,7 +250,7 @@ func sameStemDeleteMatch(base string, mediaType string, filename string) (bool, 
 
 func subtitleExtension(ext string) bool {
 	switch ext {
-	case ".ass", ".srt", ".ssa", ".vtt":
+	case ".ass", ".srt", ".ssa", ".vtt", ".xml":
 		return true
 	default:
 		return false
@@ -455,7 +468,13 @@ func (s *Server) executeAssetDeletePlan(ctx context.Context, plan assetDeletePla
 	if len(deletedAssets) > 0 {
 		s.removeDeletedAssetCaches(deletedAssets)
 		s.invalidateProcessingProgress()
-		s.publishAssetDeletedEvents(deletedAssets)
+		purged, err := s.db.PurgeAssetIDs(ctx, result.DeletedAssetIDs)
+		if err != nil {
+			result.Deleted = false
+			result.Failures = append(result.Failures, AssetDeleteFailureDTO{RelPath: plan.asset.RelPath, Message: "数据库永久删除失败"})
+		} else {
+			s.publishAssetDeletedEvents(purged)
+		}
 	}
 	if len(deletedAssets) > 0 || plan.mode == assetDeleteModeFolder && len(result.Failures) == 0 {
 		s.refreshFoldersAfterExplicitDelete(plan.asset)

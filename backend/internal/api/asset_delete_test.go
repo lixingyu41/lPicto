@@ -16,6 +16,7 @@ func TestBuildAssetDeletePlanDeletesSameStemFiles(t *testing.T) {
 	writeTestFile(t, root, "a.mp4")
 	writeTestFile(t, root, "a.nfo")
 	writeTestFile(t, root, "a.zh.srt")
+	writeTestFile(t, root, "a.xml")
 	writeTestFile(t, root, "a.jpg")
 	writeTestFile(t, root, "b.mp4")
 
@@ -26,7 +27,7 @@ func TestBuildAssetDeletePlanDeletesSameStemFiles(t *testing.T) {
 	if plan.mode != assetDeleteModeFiles {
 		t.Fatalf("mode = %q, want files", plan.mode)
 	}
-	want := []string{"a.jpg", "a.mp4", "a.nfo", "a.zh.srt"}
+	want := []string{"a.jpg", "a.mp4", "a.nfo", "a.xml", "a.zh.srt"}
 	if got := deleteRelPaths(plan.files); !reflect.DeepEqual(got, want) {
 		t.Fatalf("files = %#v, want %#v", got, want)
 	}

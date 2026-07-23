@@ -84,7 +84,7 @@ func TestFolderAssetsRecursiveOptionAndLiveCounts(t *testing.T) {
 	}
 }
 
-func TestRefreshFoldersHidesPendingAssetsUntilThumbReady(t *testing.T) {
+func TestRefreshFoldersCountsPendingAssetsWithoutUsingThemAsCovers(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
 	if err != nil {
@@ -107,15 +107,15 @@ func TestRefreshFoldersHidesPendingAssetsUntilThumbReady(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if folderRelInTree(tree, "pending/deep") {
-		t.Fatalf("FolderTree = %#v, want pending/deep hidden before thumb ready", tree)
+	if !folderRelInTree(tree, "pending/deep") {
+		t.Fatalf("FolderTree = %#v, want pending/deep visible before thumb ready", tree)
 	}
 	folder, err := database.GetFolderByRel(ctx, "pending/deep")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if folder.AssetCount != 0 || folder.RecursiveAssetCount != 0 {
-		t.Fatalf("pending/deep counts = direct %d recursive %d, want 0 and 0", folder.AssetCount, folder.RecursiveAssetCount)
+	if folder.AssetCount != 1 || folder.RecursiveAssetCount != 1 {
+		t.Fatalf("pending/deep counts = direct %d recursive %d, want 1 and 1", folder.AssetCount, folder.RecursiveAssetCount)
 	}
 	if folder.CoverAssetID != nil {
 		t.Fatalf("pending/deep cover = %v, want nil before thumb ready", *folder.CoverAssetID)

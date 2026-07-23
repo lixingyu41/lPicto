@@ -1,6 +1,13 @@
-import type { CSSProperties } from 'react';
-import { ChevronRight, Image as ImageIcon, Images, Star, Video } from 'lucide-react';
+import { Fragment, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { ChevronRight, EyeOff, Image as ImageIcon, Images, ListChecks, MonitorSmartphone, RectangleHorizontal, RectangleVertical, RotateCw, Sparkles, Square, Star, StarOff, Tags, Trash2, Video } from 'lucide-react';
 import type { Album, AlbumGroup, AssetKind, AssetRating, OrientationFilter } from '../types/api';
+import { CompactSidebarMenu, CompactSidebarMenuGroup } from './CompactSidebarMenu';
+import {
+  assetGridBatchStateEvent,
+  assetGridBatchStateRequestEvent,
+  dispatchAssetGridBatchCommand,
+  type AssetGridBatchState,
+} from '../utils/batchSelection';
 
 export interface SidebarSelectOption {
   disabled?: boolean;
@@ -58,15 +65,144 @@ export function SidebarSelect({
 }
 
 export function SidebarMediaTypeList({ onChange, value }: { onChange: (value: AssetKind) => void; value: AssetKind }) {
+  return <SidebarIconMenu label="类型" value={value} options={assetKindOptions} onChange={onChange} />;
+}
+
+export function SidebarOrientationFilter({ onChange, value }: { onChange: (value: OrientationFilter) => void; value: OrientationFilter }) {
+  return <SidebarIconMenu label="方向" value={value} options={orientationFilterOptions} onChange={onChange} />;
+}
+
+export function SidebarRatingFilter({ onChange, value }: { onChange: (value: AssetRating) => void; value: AssetRating }) {
+  return <SidebarIconMenu label="星级" value={value} options={ratingFilterOptions} onChange={onChange} />;
+}
+
+export function SidebarFilterIconRow({ children }: { children: ReactNode }) {
   return (
-    <div className="sidebar-list">
-      {assetKinds.map((kind) => (
-        <button className={value === kind ? 'sidebar-list-row active' : 'sidebar-list-row'} key={kind} type="button" onClick={() => onChange(kind)}>
-          {kind === 'all' ? <Images size={14} /> : kind === 'image' ? <ImageIcon size={14} /> : <Video size={14} />}
-          <span>{assetKindLabel(kind)}</span>
-        </button>
-      ))}
-    </div>
+    <CompactSidebarMenuGroup>
+      <div className="sidebar-filter-icon-row">
+        {children}
+        <SidebarBatchSelectionMenu />
+      </div>
+    </CompactSidebarMenuGroup>
+  );
+}
+
+const emptyBatchState: AssetGridBatchState = {
+  available: false,
+  busy: false,
+  canAutoSelect: false,
+  message: '',
+  progress: null,
+  selectedCount: 0,
+  selectionMode: false,
+};
+
+function SidebarBatchSelectionMenu() {
+  const [state, setState] = useState<AssetGridBatchState>(emptyBatchState);
+  useEffect(() => {
+    const handleState = (event: Event) => setState((event as CustomEvent<AssetGridBatchState>).detail);
+    window.addEventListener(assetGridBatchStateEvent, handleState);
+    window.dispatchEvent(new Event(assetGridBatchStateRequestEvent));
+    return () => window.removeEventListener(assetGridBatchStateEvent, handleState);
+  }, []);
+  const unavailable = !state.available || state.busy;
+  const selectionDisabled = unavailable || state.selectedCount === 0;
+  const options = [
+    {
+      active: state.selectionMode,
+      disabled: !state.available || state.busy,
+      icon: <Square size={18} fill={state.selectionMode ? 'currentColor' : 'none'} />,
+      key: 'toggle-selection',
+      label: state.selectionMode ? '退出选择' : '进入选择',
+      onSelect: () => dispatchAssetGridBatchCommand('toggle-selection'),
+    },
+    ...(state.canAutoSelect ? [{
+      disabled: unavailable,
+      icon: <Sparkles size={18} />,
+      key: 'auto-select',
+      label: '自动选择重复项',
+      onSelect: () => dispatchAssetGridBatchCommand('auto-select'),
+    }] : []),
+    {
+      disabled: unavailable,
+      icon: <ListChecks size={18} />,
+      key: 'select-all',
+      label: '全选已加载',
+      onSelect: () => dispatchAssetGridBatchCommand('select-all'),
+    },
+    {
+      disabled: unavailable || state.selectedCount === 0,
+      icon: <Square size={18} />,
+      key: 'clear',
+      label: `清空选择 (${state.selectedCount})`,
+      onSelect: () => dispatchAssetGridBatchCommand('clear'),
+    },
+    { disabled: selectionDisabled, icon: <Tags size={18} />, key: 'add-tag', label: '批量加标签', onSelect: () => dispatchAssetGridBatchCommand('add-tag') },
+    { disabled: selectionDisabled, icon: <Star size={18} />, key: 'set-rating', label: '批量评分', onSelect: () => dispatchAssetGridBatchCommand('set-rating') },
+    { disabled: selectionDisabled, icon: <Images size={18} />, key: 'add-album', label: '批量加入相册', onSelect: () => dispatchAssetGridBatchCommand('add-album') },
+    { disabled: selectionDisabled, icon: <RotateCw size={18} />, key: 'rotate', label: '批量旋转', onSelect: () => dispatchAssetGridBatchCommand('rotate') },
+    { disabled: selectionDisabled, icon: <EyeOff size={18} />, key: 'hide', label: '批量隐藏', onSelect: () => dispatchAssetGridBatchCommand('hide') },
+    { disabled: selectionDisabled, icon: <Trash2 size={18} />, key: 'delete', label: '批量删除', onSelect: () => dispatchAssetGridBatchCommand('delete') },
+  ];
+  return (
+    <CompactSidebarMenu
+      ariaLabel={`多选，已选择 ${state.selectedCount} 个`}
+      persistent
+      title={`多选 · ${state.selectedCount} 个`}
+      trigger={<ListChecks size={18} />}
+      options={options}
+      footer={(state.message || state.progress) && (
+        <div className="sidebar-batch-status">
+          {state.message && <span>{state.message}</span>}
+          {state.progress && (
+            <span className="batch-progress" role="progressbar" aria-valuemin={0} aria-valuemax={state.progress.total} aria-valuenow={state.progress.current}>
+              <i style={{ width: `${state.progress.total > 0 ? (state.progress.current / state.progress.total) * 100 : 0}%` }} />
+              <small>{state.progress.current}/{state.progress.total}</small>
+            </span>
+          )}
+        </div>
+      )}
+    />
+  );
+}
+
+interface SidebarIconMenuOption<T extends string | number> {
+  badge?: string;
+  label: string;
+  renderIcon: (active: boolean) => ReactNode;
+  value: T;
+}
+
+function SidebarIconMenu<T extends string | number>({
+  label,
+  onChange,
+  options,
+  value,
+}: {
+  label: string;
+  onChange: (value: T) => void;
+  options: Array<SidebarIconMenuOption<T>>;
+  value: T;
+}) {
+  const active = options.find((option) => option.value === value) ?? options[0];
+  return (
+    <CompactSidebarMenu
+      ariaLabel={`${label}: ${active.label}`}
+      title={`${label}: ${active.label}`}
+      trigger={
+        <>
+          {active.renderIcon(true)}
+          {active.badge && <small>{active.badge}</small>}
+        </>
+      }
+      options={options.map((option) => ({
+        active: value === option.value,
+        icon: option.renderIcon(value === option.value),
+        key: String(option.value),
+        label: option.label,
+        onSelect: () => onChange(option.value),
+      }))}
+    />
   );
 }
 
@@ -111,30 +247,6 @@ export function SidebarButtonGroup<T extends string>({
   );
 }
 
-export function SidebarRatingFilter({ onChange, value }: { onChange: (value: AssetRating) => void; value: AssetRating }) {
-  return (
-    <div className="sidebar-field sidebar-rating-filter">
-      <span>星级</span>
-      <div className="rating-stars sidebar-rating-stars" role="radiogroup" aria-label="星级">
-        {ratingValues.map((rating) => (
-          <button
-            aria-checked={value === rating}
-            aria-label={rating === 0 ? '未评级' : `${rating} 星`}
-            className={rating === 0 ? ratingZeroClass(value) : ratingStarClass(value, rating)}
-            key={rating}
-            role="radio"
-            title={rating === 0 ? '未评级' : `${rating} 星`}
-            type="button"
-            onClick={() => onChange(rating)}
-          >
-            {rating === 0 ? <span className="rating-zero-label">0</span> : <Star size={15} fill={rating <= value && value > 0 ? 'currentColor' : 'none'} />}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 export function SidebarAlbumList({
   allActive = false,
   albums,
@@ -152,6 +264,8 @@ export function SidebarAlbumList({
   onToggleGroup,
   selectedIds,
   showAll = false,
+  showEmptyGroups = false,
+  showLabel = true,
   showUnassigned = false,
   unassignedActive = false,
 }: {
@@ -171,12 +285,14 @@ export function SidebarAlbumList({
   onToggleGroup?: (key: string) => void;
   selectedIds: number[];
   showAll?: boolean;
+  showEmptyGroups?: boolean;
+  showLabel?: boolean;
   showUnassigned?: boolean;
   unassignedActive?: boolean;
 }) {
   const selected = new Set(selectedIds);
   const collapsedGroups = new Set(collapsedGroupKeys);
-  const buckets = buildSidebarAlbumBuckets(albums, groups).filter((bucket) => bucket.albums.length > 0);
+  const buckets = buildSidebarAlbumBuckets(albums, groups).filter((bucket) => showEmptyGroups || bucket.albums.length > 0);
   return (
     <div className="sidebar-group-section sidebar-album-list">
       {collapsible ? (
@@ -187,9 +303,9 @@ export function SidebarAlbumList({
           <span>{label}</span>
           <small>{albums.length}</small>
         </button>
-      ) : (
+      ) : showLabel ? (
         <div className="sidebar-control-subtitle">{label}</div>
-      )}
+      ) : null}
       {!collapsed && showAll && (
         <button className={allActive ? 'album-row active' : 'album-row'} type="button" onClick={onSelectAll}>
           <i className="sidebar-list-marker" aria-hidden="true" />
@@ -209,7 +325,7 @@ export function SidebarAlbumList({
           const groupCollapsed = collapsedGroups.has(bucket.key);
           const showGroupHeader = forceGroupHeaders || buckets.length > 1;
           return (
-            <div className="album-group-block" key={bucket.key}>
+            <Fragment key={bucket.key}>
               {showGroupHeader &&
                 (onToggleGroup ? (
                   <button aria-expanded={!groupCollapsed} className="album-group-row" type="button" onClick={() => onToggleGroup(bucket.key)}>
@@ -236,7 +352,7 @@ export function SidebarAlbumList({
                     <small>{album.assetCount}</small>
                   </button>
                 ))}
-            </div>
+            </Fragment>
           );
         })}
       {!collapsed && albums.length === 0 && <div className="muted-line">{emptyLabel}</div>}
@@ -244,13 +360,32 @@ export function SidebarAlbumList({
   );
 }
 
-const assetKinds: AssetKind[] = ['all', 'video', 'image'];
 const ratingValues: AssetRating[] = [0, 1, 2, 3, 4, 5];
 export const sidebarOrientationOptions: Array<SidebarButtonGroupOption<OrientationFilter>> = [
   { value: 'all', label: '任意' },
   { value: 'landscape', label: '横屏' },
   { value: 'portrait', label: '竖屏' },
 ];
+
+const assetKindOptions: Array<SidebarIconMenuOption<AssetKind>> = [
+  { value: 'all', label: '全部', renderIcon: () => <Images size={18} /> },
+  { value: 'video', label: '视频', renderIcon: () => <Video size={18} /> },
+  { value: 'image', label: '图片', renderIcon: () => <ImageIcon size={18} /> },
+];
+
+const orientationFilterOptions: Array<SidebarIconMenuOption<OrientationFilter>> = [
+  { value: 'all', label: '任意方向', renderIcon: () => <MonitorSmartphone size={18} /> },
+  { value: 'landscape', label: '横屏', renderIcon: () => <RectangleHorizontal size={18} /> },
+  { value: 'portrait', label: '竖屏', renderIcon: () => <RectangleVertical size={18} /> },
+];
+
+const ratingFilterOptions: Array<SidebarIconMenuOption<AssetRating>> = ratingValues.map((rating) => ({
+  badge: String(rating),
+  label: rating === 0 ? '未评级' : `${rating} 星`,
+  renderIcon: (active) =>
+    rating === 0 ? <StarOff size={18} /> : <Star size={18} fill={active ? 'currentColor' : 'none'} />,
+  value: rating,
+}));
 
 interface SidebarAlbumBucket {
   key: string;
@@ -284,14 +419,6 @@ function buildSidebarAlbumBuckets(albums: Album[], groups: AlbumGroup[]): Sideba
 
 function albumGroupKey(groupId: number | null) {
   return groupId === null ? 'ungrouped' : `group-${groupId}`;
-}
-
-function ratingZeroClass(value: AssetRating) {
-  return value === 0 ? 'rating-star-button active zero' : 'rating-star-button zero';
-}
-
-function ratingStarClass(value: AssetRating, rating: AssetRating) {
-  return rating <= value && value > 0 ? 'rating-star-button active' : 'rating-star-button';
 }
 
 export function assetKindLabel(value: AssetKind) {

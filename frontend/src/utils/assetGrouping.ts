@@ -18,14 +18,14 @@ export function assetGroupLabel(asset: Asset, mode: AssetGroupMode, sort: SortKe
     case 'size':
       return sizeGroupLabel(asset.size);
     case 'letter':
-      return firstLetterGroup(asset.filename);
+      return firstLetterGroup(asset.filenameSortKey || asset.filename);
     default:
       return '';
   }
 }
 
 export function serverGroupForMode(mode: AssetGroupMode): AssetServerGroup | undefined {
-  return mode === 'folder' ? 'folder' : undefined;
+  return mode === 'none' ? undefined : mode;
 }
 
 export function parseAssetGroupMode(value: string | null, fallback: AssetGroupMode = 'none'): AssetGroupMode {
@@ -51,7 +51,7 @@ export function firstLetterGroup(filename: string): string {
   const trimmed = filename.trim();
   if (!trimmed) return '#';
   const letter = trimmed[0]?.toUpperCase() ?? '#';
-  return /[A-Z0-9]/.test(letter) ? letter : letter;
+  return /[A-Z0-9]/.test(letter) || /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/.test(letter) ? letter : '#';
 }
 
 function formatDateGroup(unix: number, unit: 'day' | 'month' | 'year'): string {

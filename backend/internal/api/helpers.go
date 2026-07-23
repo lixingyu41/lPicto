@@ -118,18 +118,30 @@ func ClampPage(page int, pageSize int, defaultPageSize int, maxPageSize int) (in
 }
 
 func safeSort(value string) string {
-	switch value {
-	case "timeline_asc", "timeline_desc", "filename", "filename_asc", "filename_desc", "size", "size_asc", "size_desc", "imported_asc", "imported_desc":
+	if value == "filename" || value == "size" {
 		return value
-	default:
+	}
+	parts := strings.Split(value, "_")
+	if len(parts) < 2 {
 		return "timeline_desc"
 	}
+	direction := parts[len(parts)-1]
+	field := strings.Join(parts[:len(parts)-1], "_")
+	if direction != "asc" && direction != "desc" {
+		return "timeline_desc"
+	}
+	switch field {
+	case "timeline", "imported", "filename", "path", "media_type", "resolution", "duration", "modified", "size", "rating",
+		"container", "video_codec", "audio_codec", "fps", "bitrate", "subtitle", "danmaku", "ai_description", "ai_tag":
+		return value
+	}
+	return "timeline_desc"
 }
 
 func safeGroup(value string) string {
 	switch value {
-	case "folder":
-		return "folder"
+	case "day", "month", "year", "size", "letter", "folder":
+		return value
 	default:
 		return ""
 	}

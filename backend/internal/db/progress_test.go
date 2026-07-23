@@ -203,6 +203,13 @@ WHERE a.rel_path LIKE 'family/%' AND mj.job_type = 'thumb' AND mj.status = 'pend
 	if pendingJobs != 2 {
 		t.Fatalf("pending thumb jobs = %d, want 2", pendingJobs)
 	}
+	unfinished, err := database.ThumbnailWorkForRoots(ctx, []string{"family", "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unfinished) != 2 {
+		t.Fatalf("unfinished thumbnail work = %d, want only the 2 reset family assets", len(unfinished))
+	}
 }
 
 func insertProgressAsset(t *testing.T, database *DB, asset AssetUpsert) {

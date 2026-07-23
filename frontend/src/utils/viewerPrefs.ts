@@ -1,5 +1,12 @@
 export interface ViewerPrefs {
+  danmakuDensity: number;
+  danmakuFontScale: number;
+  danmakuOpacity: number;
+  danmakuSpeed: number;
   playbackRate: number;
+  playbackMode: ViewerPlaybackMode;
+  videoProcessingMode: VideoProcessingMode;
+  imageSlideshowSeconds: number;
   subtitlesEnabled: boolean;
   videoAutoplay: boolean;
   zoomMode: ViewerZoomMode;
@@ -8,12 +15,31 @@ export interface ViewerPrefs {
 }
 
 export type ViewerZoomMode = 'scale' | 'pixels';
+export type ViewerPlaybackMode = 'continuous' | 'single' | 'pause';
+export type VideoProcessingMode = 'browser' | 'server';
 
 export const playbackRates = [0.5, 1, 1.5, 2, 3] as const;
+export const playbackModeOptions: ReadonlyArray<{ label: string; value: ViewerPlaybackMode }> = [
+  { value: 'continuous', label: '连续播放' },
+  { value: 'single', label: '单个循环' },
+  { value: 'pause', label: '播完暂停' },
+];
+export const danmakuDensityRange = { min: 0.25, max: 1.5, fallback: 1 } as const;
+export const danmakuFontScaleRange = { min: 0.75, max: 1.5, fallback: 1 } as const;
+export const danmakuOpacityRange = { min: 0.15, max: 1, fallback: 0.95 } as const;
+export const danmakuSpeedRange = { min: 0.5, max: 2, fallback: 1 } as const;
 export const zoomScaleRange = { min: 1.5, max: 8, fallback: 2.6 } as const;
 export const zoomPixelAreaRange = { min: 50, max: 2000, fallback: 300 } as const;
+export const imageSlideshowSecondsRange = { min: 1, max: 60, fallback: 3 } as const;
 
+const danmakuDensityKey = 'lpicto.danmakuDensity';
+const danmakuFontScaleKey = 'lpicto.danmakuFontScale';
+const danmakuOpacityKey = 'lpicto.danmakuOpacity';
+const danmakuSpeedKey = 'lpicto.danmakuSpeed';
 const playbackRateKey = 'lpicto.playbackRate';
+const playbackModeKey = 'lpicto.playbackMode';
+const videoProcessingModeKey = 'lpicto.videoProcessingMode';
+const imageSlideshowSecondsKey = 'lpicto.imageSlideshowSeconds';
 const subtitlesEnabledKey = 'lpicto.subtitlesEnabled';
 const zoomModeKey = 'lpicto.zoomMode';
 const zoomScaleKey = 'lpicto.zoomScale';
@@ -23,7 +49,14 @@ export const viewerPrefsChanged = 'lpicto-prefs-changed';
 
 export function loadViewerPrefs(): ViewerPrefs {
   return {
+    danmakuDensity: loadNumber(danmakuDensityKey, danmakuDensityRange.min, danmakuDensityRange.max, danmakuDensityRange.fallback),
+    danmakuFontScale: loadNumber(danmakuFontScaleKey, danmakuFontScaleRange.min, danmakuFontScaleRange.max, danmakuFontScaleRange.fallback),
+    danmakuOpacity: loadNumber(danmakuOpacityKey, danmakuOpacityRange.min, danmakuOpacityRange.max, danmakuOpacityRange.fallback),
+    danmakuSpeed: loadNumber(danmakuSpeedKey, danmakuSpeedRange.min, danmakuSpeedRange.max, danmakuSpeedRange.fallback),
     playbackRate: loadPlaybackRate(),
+    playbackMode: loadPlaybackMode(),
+    videoProcessingMode: loadVideoProcessingMode(),
+    imageSlideshowSeconds: loadNumber(imageSlideshowSecondsKey, imageSlideshowSecondsRange.min, imageSlideshowSecondsRange.max, imageSlideshowSecondsRange.fallback),
     subtitlesEnabled: loadBoolean(subtitlesEnabledKey, true),
     videoAutoplay: localStorage.getItem(videoAutoplayKey) === 'true',
     zoomMode: loadZoomMode(),
@@ -33,7 +66,17 @@ export function loadViewerPrefs(): ViewerPrefs {
 }
 
 export function saveViewerPrefs(prefs: ViewerPrefs) {
+  localStorage.setItem(danmakuDensityKey, String(clampNumber(prefs.danmakuDensity, danmakuDensityRange.min, danmakuDensityRange.max, danmakuDensityRange.fallback)));
+  localStorage.setItem(
+    danmakuFontScaleKey,
+    String(clampNumber(prefs.danmakuFontScale, danmakuFontScaleRange.min, danmakuFontScaleRange.max, danmakuFontScaleRange.fallback)),
+  );
+  localStorage.setItem(danmakuOpacityKey, String(clampNumber(prefs.danmakuOpacity, danmakuOpacityRange.min, danmakuOpacityRange.max, danmakuOpacityRange.fallback)));
+  localStorage.setItem(danmakuSpeedKey, String(clampNumber(prefs.danmakuSpeed, danmakuSpeedRange.min, danmakuSpeedRange.max, danmakuSpeedRange.fallback)));
   localStorage.setItem(playbackRateKey, String(normalizePlaybackRate(prefs.playbackRate)));
+  localStorage.setItem(playbackModeKey, prefs.playbackMode);
+  localStorage.setItem(videoProcessingModeKey, prefs.videoProcessingMode);
+  localStorage.setItem(imageSlideshowSecondsKey, String(clampNumber(prefs.imageSlideshowSeconds, imageSlideshowSecondsRange.min, imageSlideshowSecondsRange.max, imageSlideshowSecondsRange.fallback)));
   localStorage.setItem(subtitlesEnabledKey, String(prefs.subtitlesEnabled));
   localStorage.setItem(videoAutoplayKey, String(prefs.videoAutoplay));
   localStorage.setItem(zoomModeKey, prefs.zoomMode);
@@ -61,6 +104,15 @@ function loadZoomMode(): ViewerZoomMode {
 
 function loadPlaybackRate() {
   return normalizePlaybackRate(loadNumber(playbackRateKey, 0.5, 3, 1));
+}
+
+function loadPlaybackMode(): ViewerPlaybackMode {
+  const value = localStorage.getItem(playbackModeKey);
+  return value === 'continuous' || value === 'single' ? value : 'pause';
+}
+
+function loadVideoProcessingMode(): VideoProcessingMode {
+  return localStorage.getItem(videoProcessingModeKey) === 'browser' ? 'browser' : 'server';
 }
 
 function loadBoolean(key: string, fallback: boolean) {

@@ -13,6 +13,14 @@ import (
 	"lpicto/backend/internal/storage"
 )
 
+const (
+	DefaultVideoProxyCacheTTL   = 72 * time.Hour
+	MinVideoProxyCacheTTL       = time.Minute
+	MaxVideoProxyCacheTTL       = 30 * 24 * time.Hour
+	DefaultVideoSegmentSeconds  = 10
+	DefaultVideoPreloadSegments = 5
+)
+
 type Config struct {
 	PhotoRoot                    string               `json:"photoRoot"`
 	PhotoRoots                   []storage.RootConfig `json:"photoRoots"`
@@ -20,6 +28,7 @@ type Config struct {
 	CacheRoot                    string               `json:"cacheRoot"`
 	DatabaseURL                  string               `json:"-"`
 	RedisURL                     string               `json:"-"`
+	AIURL                        string               `json:"-"`
 	HTTPAddr                     string               `json:"httpAddr"`
 	ScanInterval                 time.Duration        `json:"-"`
 	ScanIntervalMinutes          int                  `json:"scanIntervalMinutes"`
@@ -43,6 +52,11 @@ type Config struct {
 	LiveVideoProxyMaxActive      int                  `json:"liveVideoProxyMaxActive"`
 	VideoProxyMaxHeight          int                  `json:"videoProxyMaxHeight"`
 	VideoProxyCRF                int                  `json:"videoProxyCrf"`
+	VideoProxyCacheTTL           time.Duration        `json:"-"`
+	VideoProxyCacheTTLSeconds    int64                `json:"videoProxyCacheTtlSeconds"`
+	VideoProxyCacheMaxBytes      int64                `json:"videoProxyCacheMaxBytes"`
+	VideoSegmentSeconds          int                  `json:"videoSegmentSeconds"`
+	VideoPreloadSegments         int                  `json:"videoPreloadSegments"`
 	FFmpegHWAccel                string               `json:"ffmpegHwAccel"`
 	FFmpegHWDevice               string               `json:"ffmpegHwDevice"`
 	FFmpegHWFallback             bool                 `json:"ffmpegHwFallback"`
@@ -69,6 +83,8 @@ func Load() (Config, error) {
 	videoPosterWorkers := intEnv("VIDEO_POSTER_WORKERS", videoPosterDefault)
 	backgroundMaxActive := intEnv("BACKGROUND_MAX_ACTIVE", boundedInt(cpus, 2, 8))
 	backgroundStartGapMS := intEnv("BACKGROUND_START_SPACING_MS", 50)
+	videoProxyCacheTTL := NormalizeVideoProxyCacheTTL(durationSecondsEnv("VIDEO_PROXY_CACHE_TTL_SECONDS", DefaultVideoProxyCacheTTL))
+	videoProxyCacheMaxBytes := NormalizeVideoProxyCacheMaxBytes(int64Env("VIDEO_PROXY_CACHE_MAX_BYTES", 0))
 	cfg := Config{
 		PhotoRoot:                    photoRoot,
 		PhotoRoots:                   photoRoots,
@@ -76,6 +92,7 @@ func Load() (Config, error) {
 		CacheRoot:                    stringEnv("CACHE_ROOT", "/cache"),
 		DatabaseURL:                  stringEnv("DATABASE_URL", "postgres://media:media@postgres:5432/media?sslmode=disable"),
 		RedisURL:                     stringEnv("REDIS_URL", "redis://redis:6379/0"),
+		AIURL:                        stringEnv("AI_URL", "http://ai:8090"),
 		HTTPAddr:                     stringEnv("HTTP_ADDR", ":8080"),
 		ScanIntervalMinutes:          scanMinutes,
 		ScanInterval:                 time.Duration(scanMinutes) * time.Minute,
@@ -96,9 +113,14 @@ func Load() (Config, error) {
 		PreviewLongEdge:              intEnv("PREVIEW_LONG_EDGE", 2560),
 		PreviewQuality:               intEnv("PREVIEW_QUALITY", 82),
 		VideoProxyEnabled:            boolEnv("VIDEO_PROXY_ENABLED", true),
-		LiveVideoProxyMaxActive:      intEnv("LIVE_VIDEO_PROXY_MAX_ACTIVE", 10),
+		LiveVideoProxyMaxActive:      intEnv("LIVE_VIDEO_PROXY_MAX_ACTIVE", 1),
 		VideoProxyMaxHeight:          intEnv("VIDEO_PROXY_MAX_HEIGHT", 0),
 		VideoProxyCRF:                intEnv("VIDEO_PROXY_CRF", 23),
+		VideoProxyCacheTTL:           videoProxyCacheTTL,
+		VideoProxyCacheTTLSeconds:    int64(videoProxyCacheTTL.Seconds()),
+		VideoProxyCacheMaxBytes:      videoProxyCacheMaxBytes,
+		VideoSegmentSeconds:          intEnv("VIDEO_SEGMENT_SECONDS", intEnv("LPICTO_VIDEO_SEGMENT_SECONDS", DefaultVideoSegmentSeconds)),
+		VideoPreloadSegments:         intEnv("VIDEO_PRELOAD_SEGMENTS", intEnv("LPICTO_VIDEO_PRELOAD_SEGMENTS", DefaultVideoPreloadSegments)),
 		FFmpegHWAccel:                hwAccelEnv("FFMPEG_HWACCEL", "none"),
 		FFmpegHWDevice:               stringEnv("FFMPEG_HWACCEL_DEVICE", ""),
 		FFmpegHWFallback:             boolEnv("FFMPEG_HWACCEL_FALLBACK", true),
@@ -122,6 +144,12 @@ func Load() (Config, error) {
 	}
 	if cfg.LiveVideoProxyMaxActive < 1 {
 		cfg.LiveVideoProxyMaxActive = 1
+	}
+	if cfg.VideoSegmentSeconds < 1 {
+		cfg.VideoSegmentSeconds = DefaultVideoSegmentSeconds
+	}
+	if cfg.VideoPreloadSegments < 1 {
+		cfg.VideoPreloadSegments = DefaultVideoPreloadSegments
 	}
 	if cfg.BackgroundMaxActive < 1 {
 		cfg.BackgroundMaxActive = 1
@@ -149,6 +177,7 @@ func (c Config) Log(logger *slog.Logger) {
 		"dataRoot", c.DataRoot,
 		"cacheRoot", c.CacheRoot,
 		"httpAddr", c.HTTPAddr,
+		"aiURL", c.AIURL,
 		"scanIntervalMinutes", c.ScanIntervalMinutes,
 		"fileCountScanIntervalMinutes", c.FileCountScanIntervalMinutes,
 		"scanWorkers", c.ScanWorkers,
@@ -168,6 +197,10 @@ func (c Config) Log(logger *slog.Logger) {
 		"liveVideoProxyMaxActive", c.LiveVideoProxyMaxActive,
 		"videoProxyMaxHeight", c.VideoProxyMaxHeight,
 		"videoProxyCrf", c.VideoProxyCRF,
+		"videoProxyCacheTtlSeconds", c.VideoProxyCacheTTLSeconds,
+		"videoProxyCacheMaxBytes", c.VideoProxyCacheMaxBytes,
+		"videoSegmentSeconds", c.VideoSegmentSeconds,
+		"videoPreloadSegments", c.VideoPreloadSegments,
 		"ffmpegHwAccel", c.FFmpegHWAccel,
 		"ffmpegHwDevice", c.FFmpegHWDevice,
 		"ffmpegHwFallback", c.FFmpegHWFallback,
@@ -226,6 +259,23 @@ func intEnv(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func int64Env(key string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func durationSecondsEnv(key string, fallback time.Duration) time.Duration {
+	seconds := int64Env(key, int64(fallback.Seconds()))
+	return time.Duration(seconds) * time.Second
 }
 
 func floatEnv(key string, fallback float64) float64 {
@@ -310,6 +360,23 @@ func boundedInt(value int, min int, max int) int {
 	}
 	if value > max {
 		return max
+	}
+	return value
+}
+
+func NormalizeVideoProxyCacheTTL(value time.Duration) time.Duration {
+	if value < MinVideoProxyCacheTTL {
+		return MinVideoProxyCacheTTL
+	}
+	if value > MaxVideoProxyCacheTTL {
+		return MaxVideoProxyCacheTTL
+	}
+	return value
+}
+
+func NormalizeVideoProxyCacheMaxBytes(value int64) int64 {
+	if value < 0 {
+		return 0
 	}
 	return value
 }

@@ -117,6 +117,12 @@ func (c RemoteController) RequestMetadataScanRoots(reason string, roots []string
 	return CommandResult{Accepted: true, Started: false, State: "queued"}
 }
 
+func (c RemoteController) RequestMetadataScanPaths(reason string, roots []string, paths []string) CommandResult {
+	c.setQueuedScanStatus(reason, scanTaskMetadata, roots)
+	c.Jobs.Enqueue(jobs.Task{Type: "scan_metadata_paths", Reason: reason, Roots: append([]string(nil), roots...), Paths: append([]string(nil), paths...), Priority: 10})
+	return CommandResult{Accepted: true, Started: false, State: "queued"}
+}
+
 func (c RemoteController) RequestThumbnailRebuild(reason string) CommandResult {
 	c.setQueuedScanStatus(reason, scanTaskThumbRebuild, nil)
 	c.Jobs.Enqueue(jobs.Task{Type: "thumb_rebuild", Reason: reason, Priority: 10})
@@ -126,6 +132,18 @@ func (c RemoteController) RequestThumbnailRebuild(reason string) CommandResult {
 func (c RemoteController) RequestThumbnailRebuildRoots(reason string, roots []string) CommandResult {
 	c.setQueuedScanStatus(reason, scanTaskThumbRebuild, roots)
 	c.Jobs.Enqueue(jobs.Task{Type: "thumb_rebuild", Reason: reason, Roots: append([]string(nil), roots...), Priority: 10})
+	return CommandResult{Accepted: true, Started: false, State: "queued"}
+}
+
+func (c RemoteController) RequestThumbnailContinue(reason string) CommandResult {
+	c.setQueuedScanStatus(reason, scanTaskThumbContinue, nil)
+	c.Jobs.Enqueue(jobs.Task{Type: "thumb_continue", Reason: reason, Priority: 10})
+	return CommandResult{Accepted: true, Started: false, State: "queued"}
+}
+
+func (c RemoteController) RequestThumbnailContinueRoots(reason string, roots []string) CommandResult {
+	c.setQueuedScanStatus(reason, scanTaskThumbContinue, roots)
+	c.Jobs.Enqueue(jobs.Task{Type: "thumb_continue", Reason: reason, Roots: append([]string(nil), roots...), Priority: 10})
 	return CommandResult{Accepted: true, Started: false, State: "queued"}
 }
 

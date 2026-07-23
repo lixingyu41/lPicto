@@ -2,24 +2,35 @@ export type MediaType = 'image' | 'video';
 export type AssetKind = 'all' | MediaType;
 export type OrientationFilter = 'all' | 'landscape' | 'portrait';
 export type NFOFilterField = 'actor' | 'id' | 'tag' | 'title' | 'year';
-export type AssetServerGroup = 'folder';
+export type AssetServerGroup = 'day' | 'month' | 'year' | 'size' | 'letter' | 'folder';
 export type AssetRating = 0 | 1 | 2 | 3 | 4 | 5;
 export type AlbumAssetFilter = 'none';
-export type SortKey =
-  | 'timeline_desc'
-  | 'timeline_asc'
-  | 'imported_desc'
-  | 'imported_asc'
+export type SortField =
+  | 'timeline'
+  | 'imported'
   | 'filename'
-  | 'filename_asc'
-  | 'filename_desc'
+  | 'path'
+  | 'media_type'
+  | 'resolution'
+  | 'duration'
+  | 'modified'
   | 'size'
-  | 'size_desc'
-  | 'size_asc';
+  | 'rating'
+  | 'container'
+  | 'video_codec'
+  | 'audio_codec'
+  | 'fps'
+  | 'bitrate'
+  | 'subtitle'
+  | 'danmaku'
+  | 'ai_description'
+  | 'ai_tag';
+export type SortKey = 'filename' | 'size' | `${SortField}_${'asc' | 'desc'}`;
 
 export interface Asset {
   id: number;
   filename: string;
+  filenameSortKey: string;
   relPath: string;
   parentRelPath: string;
   mediaType: MediaType;
@@ -40,6 +51,21 @@ export interface Asset {
   videoProxyStatus: string;
   rotation: number;
   rating: AssetRating;
+  hidden: boolean;
+  sha256: string | null;
+  hasSubtitle: boolean;
+  hasDanmaku: boolean;
+  fps: number | null;
+  videoCodec: string | null;
+  audioCodec: string | null;
+  container: string | null;
+  videoBitrate: number | null;
+  audioBitrate: number | null;
+  overallBitrate: number | null;
+  aiDescription?: string | null;
+  aiTags?: AssetAITag[];
+  manualTags?: AssetTag[];
+  palette?: AIColor[];
 }
 
 export interface VideoProxyRuntime {
@@ -72,6 +98,30 @@ export interface VideoProxyRuntime {
   serverTime: number;
 }
 
+export interface VideoSegmentStatus {
+  assetId: number;
+  sessionId: string;
+  segmentIndex: number;
+  state: string;
+  status: string;
+  cached: boolean;
+  transcoding: boolean;
+  queued: boolean;
+  progress: number;
+  secondsDone: number;
+  duration: number;
+  bytes: number;
+  cachedBytes: number;
+  cachedSegments: number;
+  segmentCount: number;
+  estimatedTotalBytes: number;
+  sourceBytes: number;
+  error: string;
+  message: string;
+  updatedAt: number;
+  serverTime: number;
+}
+
 export interface VideoProxyHeartbeat {
   clientId: string;
   sessionId: string;
@@ -80,6 +130,106 @@ export interface VideoProxyHeartbeat {
   playbackRate: number;
   wantsStream: boolean;
   hidden: boolean;
+}
+
+export interface VideoProxySettings {
+  cacheTtlSeconds: number;
+  maxCacheBytes: number;
+}
+
+export interface AssetTag {
+  assetId: number;
+  tag: string;
+  createdAt: number;
+}
+
+export interface AssetAITag { tag: string; confidence: number; }
+export interface AIColor { hex: string; weight: number; }
+export interface AssetAIResult {
+  assetId: number;
+  inputCacheKey: string;
+  status: 'pending' | 'processing' | 'ready' | 'failed';
+  description: string;
+  tags: AssetAITag[];
+  palette: AIColor[];
+  attempts: number;
+  error?: string;
+  sampledFrames: Array<{ ratio: number }>;
+  updatedAt?: string;
+}
+export interface AITagSummary { tag: string; count: number; aiCount: number; manualCount: number; manualAdded: boolean; manualTagId?: number; }
+export interface AIStatus {
+  total: number; pending: number; processing: number; ready: number; failed: number; stale: number;
+  queued: number; active: number; perMinute: number; etaSeconds: number | null;
+}
+export interface AISettings { autoAnalyze: boolean; manualRun: boolean; }
+export interface SourceHealth { rootId: string; available: boolean; message?: string; checkedAt: number; }
+export interface StorageStatus { available: boolean; message: string; roots: SourceHealth[]; }
+
+export interface SystemTask {
+  id: string;
+  name: string;
+  description: string;
+  schedule: string;
+  status: 'never' | 'pending' | 'running' | 'success' | 'warning' | 'failed' | 'stopped' | 'interrupted' | 'skipped';
+  succeeded: boolean | null;
+  lastStartedAt: number | null;
+  lastFinishedAt: number | null;
+  nextRunAt: number | null;
+  durationSeconds: number | null;
+  message: string;
+  lastError: string;
+  processed: number;
+  failedCount: number;
+  canRetry: boolean;
+  supportsScope: boolean;
+  progress: null | { total: number; completed: number; queued: number; pending: number; processing: number; failed: number };
+  actions: Array<{ id: string; label: string; kind: 'primary' | 'secondary' | 'danger'; enabled: boolean; requiresConfirmation: boolean }>;
+  failures: Array<{ assetId?: number; path: string; reason: string }>;
+}
+
+export interface TagSummary {
+  id: number;
+  name: string;
+  assetCount: number;
+  createdAt: number;
+}
+
+export type SystemCollectionKind = 'unclassified' | 'unrated' | 'untagged' | 'with_danmaku' | 'with_subtitles' | 'needs_transcode' | 'duplicates' | 'missing' | 'hidden' | 'ai_pending' | 'ai_ready' | 'ai_failed';
+
+export interface CollectionRule extends LibraryFilterParams {
+  name?: string;
+}
+
+export interface Collection {
+  id: string;
+  name: string;
+  kind: 'system' | 'smart';
+  systemKind?: SystemCollectionKind;
+  description?: string;
+  assetCount?: number;
+  rule?: CollectionRule;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export interface BatchOperationFailure {
+  relPath?: string;
+  assetId?: number;
+  message: string;
+}
+
+export interface BatchOperationResult {
+  updatedAssetIds: number[];
+  deletedAssetIds?: number[];
+  failures?: BatchOperationFailure[];
+}
+
+export interface DuplicateGroup {
+  key: string;
+  sha256: string;
+  size: number;
+  items: Asset[];
 }
 
 export interface AssetDeletedEvent {
@@ -122,12 +272,19 @@ export interface AssetDeleteResult {
   stale?: boolean;
 }
 
-export interface SearchAssetsParams {
+export interface LibraryFilterParams {
   q?: string;
+  visible?: 'all';
+  combinedQuery?: string;
   nfo?: string;
   nfoActor?: string;
   nfoId?: string;
   nfoTag?: string;
+  manualTag?: string;
+  combinedTag?: string;
+  combinedTags?: string;
+  aiDescription?: string;
+  aiTag?: string;
   nfoTitle?: string;
   nfoYear?: string;
   type?: AssetKind;
@@ -237,6 +394,8 @@ export interface QueueStats {
   videoQueued: number;
   videoCap: number;
   activeThumb: number;
+  activePreview: number;
+  activeVideoPoster: number;
   activeTranscode: number;
 }
 
@@ -289,6 +448,7 @@ export interface ScanFolder {
 export interface ScanLibrary {
   id: string;
   name: string;
+  aiFocus: string;
   folders: ScanFolder[];
   exists: boolean;
   progress: ScanLibraryProgress;
@@ -448,4 +608,6 @@ export interface PublicConfig {
   videoProxyEnabled: boolean;
   liveVideoProxyMaxActive: number;
   videoProxyMaxHeight: number;
+  videoSegmentSeconds: number;
+  videoPreloadSegments: number;
 }

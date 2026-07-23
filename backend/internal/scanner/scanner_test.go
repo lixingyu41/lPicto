@@ -38,7 +38,7 @@ func TestLibraryScansDoNotDeleteOtherRoots(t *testing.T) {
 	assertActiveRelPaths(t, ctx, database, []string{"Y/one.jpg", "Z/two.jpg"})
 }
 
-func TestLibraryScanDeletesOnlyInsideScope(t *testing.T) {
+func TestLibraryScanMarksMissingOnlyInsideScope(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	scan, database := newTestScanner(t, ctx)
@@ -60,6 +60,19 @@ func TestLibraryScanDeletesOnlyInsideScope(t *testing.T) {
 	}
 	waitScannerIdle(t, ctx, scan)
 	assertActiveRelPaths(t, ctx, database, []string{"Y/keep.jpg", "Z/keep.jpg"})
+	var missing bool
+	if err := database.Conn().QueryRowContext(ctx, `SELECT missing FROM file_instance WHERE rel_path = $1`, "Y/remove.jpg").Scan(&missing); err != nil {
+		t.Fatal(err)
+	}
+	if !missing {
+		t.Fatal("removed source should be marked missing")
+	}
+	if err := database.Conn().QueryRowContext(ctx, `SELECT missing FROM file_instance WHERE rel_path = $1`, "Z/keep.jpg").Scan(&missing); err != nil {
+		t.Fatal(err)
+	}
+	if missing {
+		t.Fatal("asset outside scan scope should remain available")
+	}
 }
 
 func TestStopThenStartRunsLatestRequest(t *testing.T) {
@@ -83,6 +96,37 @@ func TestStopThenStartRunsLatestRequest(t *testing.T) {
 	}
 	waitScannerIdle(t, ctx, scan)
 	assertActiveRelPaths(t, ctx, database, []string{"Z/latest.jpg"})
+}
+
+func TestMetadataPathScanProcessesUnchangedPendingAsset(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	scan, database := newTestScanner(t, ctx)
+
+	writeTestFile(t, scan.Store, "Y/pending.jpg")
+	if result := scan.RequestScanRoots("initial", []string{"Y"}); !result.Accepted {
+		t.Fatalf("initial scan result = %#v", result)
+	}
+	waitScannerIdle(t, ctx, scan)
+
+	if _, err := database.ResetMetadataForRoots(ctx, []string{"Y"}); err != nil {
+		t.Fatal(err)
+	}
+	if result := scan.RequestMetadataScanPaths("continue", []string{"Y"}, []string{"Y/pending.jpg"}); !result.Accepted {
+		t.Fatalf("metadata path scan result = %#v", result)
+	}
+	waitScannerIdle(t, ctx, scan)
+
+	counts, err := database.MetadataProgress(ctx, []string{"Y"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Pending != 0 || counts.Processing != 0 {
+		t.Fatalf("metadata progress remained pending after explicit path scan: %#v", counts)
+	}
+	if counts.Ready+counts.Error != 1 {
+		t.Fatalf("metadata path scan did not reach a terminal state: %#v", counts)
+	}
 }
 
 func newTestScanner(t *testing.T, ctx context.Context) (*Scanner, *db.DB) {

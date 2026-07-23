@@ -1,14 +1,14 @@
 import type { SidebarPanelTarget } from '../components/SidebarContext';
 
-export type PrimarySidebarPanelTarget = 'library' | 'ratings' | 'search' | 'albums' | 'folders' | 'settings';
+export type PrimarySidebarPanelTarget = 'library' | 'albums' | 'folders' | 'collections' | 'settings';
 
 const sidebarSecondaryKey = 'lpicto.sidebarSecondaryExpanded';
 const sidebarWidthsKey = 'lpicto.sidebarWidths';
 const sidebarCollapsedKey = 'lpicto.sidebarCollapsed';
 export const sidebarPrimaryWidth = 122;
-const sidebarWidthDefaults = { primary: sidebarPrimaryWidth, secondary: 260 };
+const sidebarWidthDefaults = { primary: sidebarPrimaryWidth, secondary: 268 };
 const sidebarWidthLimits = {
-  secondary: { max: 640, min: 180 },
+  secondary: { max: 640, min: 268 },
 };
 
 export interface SidebarWidths {
@@ -17,15 +17,14 @@ export interface SidebarWidths {
 }
 
 export function isPrimarySidebarPanelTarget(target: SidebarPanelTarget | null | undefined): target is PrimarySidebarPanelTarget {
-  return target === 'library' || target === 'ratings' || target === 'search' || target === 'albums' || target === 'folders' || target === 'settings';
+  return target === 'library' || target === 'albums' || target === 'folders' || target === 'collections' || target === 'settings';
 }
 
 export function primaryTargetForPath(pathname: string): PrimarySidebarPanelTarget | null {
   if (pathname === '/library' || pathname.startsWith('/library/')) return 'library';
-  if (pathname === '/ratings' || pathname.startsWith('/ratings/')) return 'ratings';
-  if (pathname === '/search' || pathname.startsWith('/search/')) return 'search';
   if (pathname === '/albums' || pathname.startsWith('/albums/')) return 'albums';
   if (pathname === '/folders' || pathname.startsWith('/folders/')) return 'folders';
+  if (pathname === '/collections' || pathname.startsWith('/collections/') || pathname === '/tags' || pathname.startsWith('/tags/')) return 'collections';
   if (pathname === '/settings' || pathname.startsWith('/settings/')) return 'settings';
   return null;
 }
@@ -39,10 +38,9 @@ export function loadSidebarSecondaryExpanded() {
     if (!parsed || typeof parsed !== 'object') return false;
     return (
       parsed.library === true ||
-      parsed.ratings === true ||
-      parsed.search === true ||
       parsed.albums === true ||
       parsed.folders === true ||
+      parsed.collections === true ||
       parsed.settings === true
     );
   } catch {

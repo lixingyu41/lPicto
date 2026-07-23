@@ -1,112 +1,104 @@
 <#
 .SYNOPSIS
-    lPicto 一键部署：打包 -> 上传 -> 远端 Docker 重建并启动
-    Docker 在远端编译（Dockerfile 多阶段构建：前端 npm build + go build），本地无需 Node/Go。
-    右键 -> "使用 PowerShell 运行"，或从终端执行 .\deploy.ps1
+    lPicto 一键部署到 Ubuntu。
+
+.DESCRIPTION
+    自动打包当前工作区、上传到 Ubuntu、编译并切换 Docker Compose 服务，
+    最后检查健康状态和 CPU 转码。远端 .env、数据库、缓存和媒体配置均会保留。
 #>
 
 param(
-    [string]$HostIP   = "192.168.2.97",
-    [string]$User     = "lxy",
-    [string]$Password = "lxylxylxy"
+    [string]$HostIP = "192.168.2.97",
+    [string]$User = "lxy",
+    [string]$Password = "lxylxylxy",
+    [int]$Port = 18080
 )
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-# ── helpers ─────────────────────────────────────────────────────
-function Write-Step { Write-Host "`n── $args" -ForegroundColor Cyan }
-function Write-OK   { Write-Host "   ✔ $args" -ForegroundColor Green }
-function Write-Err  { Write-Host "   ✘ $args" -ForegroundColor Red; exit 1 }
+function Write-Step { Write-Host "`n-- $args" -ForegroundColor Cyan }
+function Write-OK { Write-Host "   完成：$args" -ForegroundColor Green }
+function Stop-Deploy([string]$Message) { throw $Message }
 
-$sshOpts = '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=no', '-o', 'ConnectTimeout=10'
-$remote  = "${User}@${HostIP}"
-$remoteTgz = '/home/lxy/lpicto-deploy.tgz'
-$remoteSh  = '/home/lxy/lpicto-deploy-run.sh'
-$appPort   = 18080
-
-# ── preflight ───────────────────────────────────────────────────
-Write-Step "检查前置条件"
-if (-not (Get-Command ssh  -ErrorAction SilentlyContinue)) { Write-Err "未找到 ssh  — 请安装 OpenSSH Client" }
-if (-not (Get-Command scp  -ErrorAction SilentlyContinue)) { Write-Err "未找到 scp  — 请安装 OpenSSH Client" }
-
-# 确保 sshpass 可用（没有它无法自动输入密码）
-$sshpassCmd = Get-Command sshpass -ErrorAction SilentlyContinue
-if (-not $sshpassCmd) {
-    Write-Host "   未找到 sshpass，尝试自动安装..." -ForegroundColor DarkGray
-    # 尝试 winget 的几个已知包名
-    $ids = @('sshpass', 'GnuWin32.SshPass')
-    foreach ($id in $ids) {
-        winget install --silent --accept-source-agreements --accept-package-agreements $id 2>$null
-        Start-Sleep -Seconds 2
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                     [System.Environment]::GetEnvironmentVariable("Path","User")
-        if (Get-Command sshpass -ErrorAction SilentlyContinue) { break }
-    }
-    $sshpassCmd = Get-Command sshpass -ErrorAction SilentlyContinue
-}
-if (-not $sshpassCmd) {
-    Write-Err @"
-sshpass 自动安装失败。请手动执行以下任一操作后重新运行本脚本：
-
-  方式1 (winget):    winget install sshpass
-  方式2 (下载):      从 https://github.com/kevinburke/sshpass/releases 下载 sshpass.exe 放到 PATH 中
-"@
-}
-Write-OK "ssh / scp / sshpass 可用"
-
-# ── 1. 打包 ─────────────────────────────────────────────────────
-Write-Step "1/4  打包项目（排除 .git data cache node_modules dist .env db 等）"
-
+$sshOptions = @('-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10')
+$remote = "${User}@${HostIP}"
+$remoteHome = "/home/${User}"
+$remoteArchive = "${remoteHome}/lpicto-deploy.tgz"
+$remoteScript = "${remoteHome}/lpicto-deploy-run.sh"
 $archive = Join-Path $PSScriptRoot 'lpicto-deploy.tgz'
-Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
-
-$excludes = @(
-    './.git'
-    './data'
-    './cache'
-    './frontend/node_modules'
-    './frontend/dist'
-    './frontend/tsconfig.tsbuildinfo'
-    './.env'
-    '*.db'
-    '*.db-shm'
-    '*.db-wal'
-    './.codex'
-    './.agents'
-    './.gitignore'
-    './.gitattributes'
-    './.dockerignore'
-    './lpicto-deploy.tgz'
-    './deploy.ps1'
-    './remote-deploy.sh'
+$localRunner = Join-Path ([System.IO.Path]::GetTempPath()) 'lpicto-deploy-run.sh'
+$localAIModels = Join-Path $env:LOCALAPPDATA 'lPicto\ai-models'
+$aiModelFiles = @(
+    @{ Rel = 'Qwen3VL-2B-Instruct-Q4_K_M.gguf'; Size = 1107409952L; SHA = '089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae'; URL = 'https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/52d6c8ffea26cc873ac5ad116f8631268d7eb503/Qwen3VL-2B-Instruct-Q4_K_M.gguf' },
+    @{ Rel = 'mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf'; Size = 445053216L; SHA = 'f9a68fabba69c3b81e153367b2c7521030b0fa8bb0de400c9599c8e6725f9c82'; URL = 'https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/52d6c8ffea26cc873ac5ad116f8631268d7eb503/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf' },
+    @{ Rel = 'chinese-clip/onnx/model.onnx'; Size = 753665706L; SHA = 'd4e282affd5f09e196856cc63fbd0e77c576f598fdf6f6bb78ee61f1ef7cd770'; URL = 'https://huggingface.co/Xenova/chinese-clip-vit-base-patch16/resolve/f26904860903e70e050b8f48255e5f48401816e9/onnx/model.onnx' }
 )
 
-$tarArgs = @('-czf', $archive) + ($excludes | ForEach-Object { '--exclude'; $_ }) + @('.')
-& tar @tarArgs 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Err "tar 打包失败" }
+function Test-LockedFile($Path, $Size, $SHA) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    if ((Get-Item -LiteralPath $Path).Length -ne $Size) { return $false }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() -eq $SHA
+}
 
-$size = [math]::Round((Get-Item $archive).Length / 1KB)
-Write-OK "归档完成  ${size} KB"
-
-# ── 2. 上传 ─────────────────────────────────────────────────────
-Write-Step "2/4  上传归档到 ${HostIP}"
-
-$env:SSHPASS = $Password
-& sshpass -e scp @sshOpts $archive "${remote}:${remoteTgz}"
-if ($LASTEXITCODE -ne 0) { Write-Err "scp 上传失败" }
-Write-OK "归档已上传"
-
-# ── 3. 构建远端脚本并上传 ──────────────────────────────────────
-Write-Step "3/4  推送远端部署脚本"
-
-$remoteBash = @'
+function Prepare-LocalAIModels {
+    foreach ($model in $aiModelFiles) {
+        $target = Join-Path $localAIModels $model.Rel
+        if (Test-LockedFile $target $model.Size $model.SHA) { continue }
+        New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+        $part = "$target.part"
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        Write-Host "   下载 $($model.Rel) ($($model.Size) 字节)"
+        Invoke-WebRequest -Uri $model.URL -OutFile $part -MaximumRedirection 8
+        if (-not (Test-LockedFile $part $model.Size $model.SHA)) { Stop-Deploy "模型校验失败：$($model.Rel)" }
+        Move-Item -LiteralPath $part -Destination $target -Force
+    }
+    $clipBase = 'https://huggingface.co/Xenova/chinese-clip-vit-base-patch16/resolve/f26904860903e70e050b8f48255e5f48401816e9'
+    foreach ($rel in @('config.json', 'preprocessor_config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'vocab.txt')) {
+        $target = Join-Path $localAIModels "chinese-clip/$rel"
+        if (Test-Path -LiteralPath $target -PathType Leaf) { continue }
+        New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+        Invoke-WebRequest -Uri "$clipBase/$rel" -OutFile $target -MaximumRedirection 8
+    }
+}
+$remoteRunner = @'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 read -r SUDO_PASS
 
-sudo_cmd() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"; }
+PROJECT=$HOME/lpicto
+MODEL_UPLOAD=$HOME/lpicto-ai-models-upload
+ARCHIVE=$HOME/lpicto-deploy.tgz
+TS=$(date +%Y%m%d%H%M%S)
+STAGING=$HOME/lpicto.next.$TS
+BACKUP=$HOME/lpicto.backup.$TS
+BUILD_LOG=$HOME/lpicto-deploy-build.log
+COMPOSE_FILES=(-f docker-compose.yml)
+export COMPOSE_PROJECT_NAME=lpicto
+export COMPOSE_PROGRESS=plain
+export DOCKER_BUILDKIT=1
+
+docker_cmd() { docker "$@"; }
+if ! docker info >/dev/null 2>&1; then
+  if ! printf '%s\n' "$SUDO_PASS" | sudo -S -p '' docker info >/dev/null 2>&1; then
+    echo '错误：当前用户和 sudo 均无法访问 Docker'
+    exit 11
+  fi
+  docker_cmd() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' docker "$@"; }
+fi
+
+sudo_cmd() {
+  if [ "$(id -u)" = 0 ]; then
+    "$@"
+  else
+    printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"
+  fi
+}
+
+compose() {
+  docker_cmd compose "${COMPOSE_FILES[@]}" "$@"
+}
 
 upsert_env() {
   local key="$1" value="$2" file="$3"
@@ -117,42 +109,21 @@ upsert_env() {
   fi
 }
 
-PROJECT=/home/lxy/lpicto
-ARCHIVE=/home/lxy/lpicto-deploy.tgz
-TS=$(date +%Y%m%d%H%M%S)
-STAGING=/home/lxy/lpicto.next.$TS
-BACKUP=/home/lxy/lpicto.backup.$TS
-BUILD_LOG=/home/lxy/lpicto-deploy-build.log
-export COMPOSE_PROGRESS=plain
-export DOCKER_BUILDKIT=1
+cleanup_staging() {
+  if [ -d "$STAGING" ]; then
+    rm -rf "$STAGING"
+  fi
+}
+trap cleanup_staging EXIT
 
-echo "deploy_ts=$TS"
-
-test -f "$ARCHIVE" || { echo 'missing_archive'; exit 10; }
-test -e /dev/dri/renderD128 || { echo 'missing_gpu_device=/dev/dri/renderD128'; exit 12; }
-
-RENDER_GID=$(getent group render | cut -d: -f3 || true)
-VIDEO_GID=$(getent group video | cut -d: -f3 || true)
-: "${RENDER_GID:=109}"
-: "${VIDEO_GID:=44}"
-echo "gpu=/dev/dri/renderD128 render_gid=$RENDER_GID video_gid=$VIDEO_GID"
-
-sudo_cmd docker info --format 'docker_server={{.ServerVersion}}'
+echo "部署时间：$TS"
+test -f "$ARCHIVE" || { echo "错误：找不到上传归档 $ARCHIVE"; exit 10; }
+docker_cmd info --format 'Docker 服务端版本：{{.ServerVersion}}'
+echo '媒体转码：CPU（libx264）'
 
 rm -rf "$STAGING"
 mkdir -p "$STAGING"
 tar -xzf "$ARCHIVE" -C "$STAGING"
-
-if [ -d "$PROJECT" ] && [ -f "$PROJECT/docker-compose.yml" ]; then
-  echo 'stopping_existing_stack=1'
-  cd "$PROJECT"
-  if [ -f docker-compose.gpu.yml ]; then
-    sudo_cmd docker compose -f docker-compose.yml -f docker-compose.gpu.yml down --remove-orphans >/tmp/lpicto-compose-down.$TS.log 2>&1 \
-      || sudo_cmd docker compose down --remove-orphans >/tmp/lpicto-compose-down-fallback.$TS.log 2>&1 || true
-  else
-    sudo_cmd docker compose down --remove-orphans >/tmp/lpicto-compose-down.$TS.log 2>&1 || true
-  fi
-fi
 
 if [ -f "$PROJECT/.env" ]; then
   cp "$PROJECT/.env" "$STAGING/.env"
@@ -170,12 +141,50 @@ APT_SECURITY_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian-security
 ENVEOF
 fi
 
-upsert_env LPICTO_VIDEO_GID "$VIDEO_GID" "$STAGING/.env"
-upsert_env LPICTO_RENDER_GID "$RENDER_GID" "$STAGING/.env"
-upsert_env LIBVA_DRIVER_NAME iHD "$STAGING/.env"
+upsert_env LPICTO_BIND 0.0.0.0 "$STAGING/.env"
+upsert_env LPICTO_PORT 18080 "$STAGING/.env"
+upsert_env LPICTO_MEDIA /mnt "$STAGING/.env"
+upsert_env LPICTO_DATA ./data/app "$STAGING/.env"
+upsert_env LPICTO_CACHE ./data/cache "$STAGING/.env"
+upsert_env FFMPEG_HWACCEL none "$STAGING/.env"
+upsert_env LIVE_VIDEO_PROXY_MAX_ACTIVE 1 "$STAGING/.env"
+upsert_env VIDEO_PRELOAD_SEGMENTS 5 "$STAGING/.env"
+mkdir -p "$STAGING/data/app" "$STAGING/data/cache"
+
+echo '校验本机上传的锁定版本 AI 模型（旧服务保持运行）'
+test -d "$MODEL_UPLOAD" || { echo "错误：找不到模型上传目录 $MODEL_UPLOAD"; exit 13; }
+cd "$MODEL_UPLOAD"
+echo '089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae  Qwen3VL-2B-Instruct-Q4_K_M.gguf' | sha256sum -c -
+echo 'f9a68fabba69c3b81e153367b2c7521030b0fa8bb0de400c9599c8e6725f9c82  mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf' | sha256sum -c -
+echo 'd4e282affd5f09e196856cc63fbd0e77c576f598fdf6f6bb78ee61f1ef7cd770  chinese-clip/onnx/model.onnx' | sha256sum -c -
+if [ -d "$PROJECT/data/app" ]; then MODEL_DEST="$PROJECT/data/app/ai-models"; else MODEL_DEST="$STAGING/data/app/ai-models"; fi
+mkdir -p "$MODEL_DEST"
+cp -a "$MODEL_UPLOAD/." "$MODEL_DEST/"
+chmod -R a+rX "$MODEL_DEST"
+
+echo '检查 Docker Compose 配置'
+cd "$STAGING"
+compose config >/tmp/lpicto-compose-config.$TS.yml
+
+echo "开始编译镜像，完整日志：$BUILD_LOG"
+if ! DOCKER_BUILDKIT=0 compose build ai >"$BUILD_LOG" 2>&1; then
+  echo '错误：AI 镜像编译失败，显示最后 160 行日志'
+  tail -n 160 "$BUILD_LOG"
+  exit 20
+fi
+if ! DOCKER_BUILDKIT=1 compose build api >>"$BUILD_LOG" 2>&1; then
+  echo '错误：镜像编译失败，显示最后 160 行日志'
+  tail -n 160 "$BUILD_LOG"
+  exit 20
+fi
+
+echo '编译完成，开始切换版本'
+if [ -d "$PROJECT" ] && [ -f "$PROJECT/docker-compose.yml" ]; then
+  cd "$PROJECT"
+  compose down --remove-orphans >/tmp/lpicto-compose-down.$TS.log 2>&1 || true
+fi
 
 if [ -d "$PROJECT/data" ]; then
-  echo 'preserve_data=move_existing_project_data'
   rm -rf "$STAGING/data"
   mv "$PROJECT/data" "$STAGING/data"
 fi
@@ -183,29 +192,27 @@ mkdir -p "$STAGING/data/app" "$STAGING/data/cache"
 
 if [ -d "$PROJECT" ]; then
   mv "$PROJECT" "$BACKUP"
-  echo "backup=$BACKUP"
+  echo "旧版本备份：$BACKUP"
 fi
 mv "$STAGING" "$PROJECT"
+trap - EXIT
+echo '修复共享缓存目录权限'
+sudo_cmd chown -R 10001:999 "$PROJECT/data/cache"
+sudo_cmd chmod -R u+rwX,g+rwX,o-rwx "$PROJECT/data/cache"
+rm -f "$ARCHIVE"
+rm -rf "$MODEL_UPLOAD"
 
 cd "$PROJECT"
-
-echo 'compose_config_check=1'
-sudo_cmd docker compose -f docker-compose.yml -f docker-compose.gpu.yml config >/tmp/lpicto-compose-config.$TS.yml
-
-echo 'compose_up_build=1'
-echo "Build output -> $BUILD_LOG"
-if ! sudo_cmd docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build >"$BUILD_LOG" 2>&1; then
-  echo 'compose_up_failed=1'
-  tail -n 160 "$BUILD_LOG"
-  exit 20
+echo '启动新版本服务'
+if ! compose up -d --no-build >"$BUILD_LOG.start" 2>&1; then
+  echo '错误：新版本服务启动失败'
+  cat "$BUILD_LOG.start"
+  exit 21
 fi
 
-echo 'compose_ps=1'
-sudo_cmd docker compose -f docker-compose.yml -f docker-compose.gpu.yml ps
-
-echo 'health_wait=1'
+echo '等待服务健康检查'
 health_ok=0
-for i in $(seq 1 90); do
+for _ in $(seq 1 90); do
   if curl -fsS http://127.0.0.1:18080/api/health; then
     echo
     health_ok=1
@@ -213,48 +220,134 @@ for i in $(seq 1 90); do
   fi
   sleep 2
 done
-
 if [ "$health_ok" != 1 ]; then
-  echo 'health_failed=1'
-  sudo_cmd docker compose -f docker-compose.yml -f docker-compose.gpu.yml logs --tail=120 api worker nginx
-  exit 21
+  echo '错误：健康检查超时，显示服务日志'
+  compose logs --tail=120 api ai postgres redis
+  exit 22
 fi
 
-echo 'gpu_check=1'
-sudo_cmd docker compose -f docker-compose.yml -f docker-compose.gpu.yml exec -T api sh -lc \
-  'ls -l /dev/dri/renderD128 && ffmpeg -hide_banner -encoders | grep -E "h264_vaapi" | head -n 3'
+echo '当前容器状态'
+compose ps
+echo '检查所有容器依赖与挂载权限'
+for service in api; do
+  container="lpicto-${service}-1"
+  service_health=''
+  for _ in $(seq 1 30); do
+    service_health="$(docker_cmd inspect -f '{{.State.Health.Status}}' "$container" 2>/dev/null || true)"
+    [ "$service_health" = healthy ] && break
+    [ "$service_health" = unhealthy ] && break
+    sleep 1
+  done
+  if [ "$service_health" != healthy ]; then
+    echo "错误：${service} 容器健康状态为 ${service_health:-unknown}"
+    compose logs --tail=80 "$service"
+    exit 24
+  fi
+done
+compose exec -T api sh -lc 'test -r /Media && touch /cache/.api-write-check && rm /cache/.api-write-check'
+compose exec -T ai sh -lc 'test -r /Media && test -r /cache && test -r /models/Qwen3VL-2B-Instruct-Q4_K_M.gguf'
+compose exec -T postgres pg_isready -U media -d media
+test "$(compose exec -T redis redis-cli ping | tr -d '\r')" = PONG
+curl -fsS http://127.0.0.1:18080/api/settings/progress >/dev/null
+curl -fsS http://127.0.0.1:18080/api/settings/libraries >/dev/null
+echo '检查 AI 服务与模型'
+ai_health_ok=0
+for _ in $(seq 1 180); do
+  if compose exec -T ai curl -fsS http://127.0.0.1:8090/health; then ai_health_ok=1; break; fi
+  sleep 2
+done
+if [ "$ai_health_ok" != 1 ]; then
+  echo '错误：AI 健康检查超时'
+  compose logs --tail=160 ai
+  exit 23
+fi
+echo
+curl -fsS http://127.0.0.1:18080/api/ai/status
+echo
+echo '检查 CPU 视频编码'
+compose exec -T api sh -lc \
+  'test "$FFMPEG_HWACCEL" = none && ffmpeg -hide_banner -encoders | grep -E "libx264" | head -n 3'
 
-echo 'api_worker_hwaccel=1'
-sudo_cmd docker compose -f docker-compose.yml -f docker-compose.gpu.yml logs --tail=80 api worker \
-  | grep -E 'ffmpeg hardware acceleration selected|ffmpeg hardware acceleration unavailable' || true
+find "$HOME" -maxdepth 1 -type d -name 'lpicto.backup.*' -printf '%T@ %p\n' \
+  | sort -nr \
+  | tail -n +4 \
+  | cut -d' ' -f2- \
+  | xargs -r rm -rf
 
-echo 'deploy_done=1'
+echo '远端部署完成'
 '@
 
-$localSh = Join-Path $env:TEMP 'lpicto-deploy-run.sh'
-$remoteBash -replace "`r", "" | Set-Content -Path $localSh -NoNewline
-
-& sshpass -e scp @sshOpts $localSh "${remote}:${remoteSh}"
-if ($LASTEXITCODE -ne 0) { Write-Err "远端脚本上传失败" }
-Remove-Item $localSh -Force
-Write-OK "远端脚本已推送"
-
-# ── 4. 执行远端部署 ────────────────────────────────────────────
-Write-Step "4/4  远端 Docker 重建并启动（编译 + 启动，需要几分钟）"
-
-$Password | & sshpass -e ssh @sshOpts $remote "bash ${remoteSh}"
-if ($LASTEXITCODE -ne 0) { Write-Err "远端部署失败"; exit $LASTEXITCODE }
-
-# ── 5. 本地验证 ─────────────────────────────────────────────────
-Write-Step "本地验证 http://${HostIP}:${appPort}/api/health"
 try {
-    $health = Invoke-RestMethod -Uri "http://${HostIP}:${appPort}/api/health" -TimeoutSec 5
-    Write-OK "健康检查通过: $($health | ConvertTo-Json -Compress)"
-} catch {
-    Write-Host "   (本地无法直连 ${HostIP}:${appPort}，远端健康检查已在上一步完成)" -ForegroundColor DarkGray
+    Write-Step "检查本地部署工具"
+    foreach ($command in @('ssh', 'scp', 'sshpass', 'tar')) {
+        if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
+            Stop-Deploy "缺少命令：$command"
+        }
+    }
+    Write-OK "ssh、scp、sshpass 和 tar 均可用"
+
+    Write-Step "检查远端 SSH 连接"
+    $env:SSHPASS = $Password
+    & sshpass -e ssh @sshOptions $remote "printf '远端连接成功\n'"
+    if ($LASTEXITCODE -ne 0) {
+        Stop-Deploy "无法连接到 ${remote}"
+    }
+
+    Write-Step "准备锁定版本 AI 模型"
+    Prepare-LocalAIModels
+    Write-OK "模型文件已通过 SHA-256 校验"
+
+    Write-Step "打包当前工作区"
+    Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+    $excludes = @(
+        './.git',
+        './data',
+        './cache',
+        './frontend/node_modules',
+        './frontend/dist',
+        './frontend/tsconfig.tsbuildinfo',
+        './.env',
+        '*.db',
+        '*.db-shm',
+        '*.db-wal',
+        './.codex',
+        './.agents',
+        './deploy.ps1',
+        './lpicto-deploy.tgz'
+    )
+    $tarArguments = @('-czf', $archive) + ($excludes | ForEach-Object { '--exclude'; $_ }) + @('.')
+    & tar @tarArguments
+    if ($LASTEXITCODE -ne 0) { Stop-Deploy "创建部署归档失败" }
+    Write-OK "归档创建完成，大小 $([math]::Round((Get-Item $archive).Length / 1KB)) KB"
+
+    Write-Step "上传源码和远端执行器"
+    & sshpass -e scp @sshOptions $archive "${remote}:${remoteArchive}"
+    if ($LASTEXITCODE -ne 0) { Stop-Deploy "上传源码归档失败" }
+    & sshpass -e ssh @sshOptions $remote "rm -rf ${remoteHome}/lpicto-ai-models-upload"
+    & sshpass -e scp @sshOptions -r $localAIModels "${remote}:${remoteHome}/lpicto-ai-models-upload"
+    if ($LASTEXITCODE -ne 0) { Stop-Deploy "上传 AI 模型失败" }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($localRunner, ($remoteRunner -replace "`r", ""), $utf8NoBom)
+    & sshpass -e scp @sshOptions $localRunner "${remote}:${remoteScript}"
+    if ($LASTEXITCODE -ne 0) { Stop-Deploy "上传远端部署执行器失败" }
+    Write-OK "文件上传完成"
+
+    Write-Step "远端编译并重启服务"
+    $Password | & sshpass -e ssh @sshOptions $remote "bash ${remoteScript}"
+    if ($LASTEXITCODE -ne 0) { Stop-Deploy "远端部署失败" }
+
+    Write-Step "检查外部访问地址"
+    $health = Invoke-RestMethod -Uri "http://${HostIP}:${Port}/api/health" -TimeoutSec 10
+    if ($health.status -ne 'ok') { Stop-Deploy "健康接口返回异常" }
+    Write-OK "健康检查通过"
+    Write-Host "`n部署完成：http://${HostIP}:${Port}" -ForegroundColor Green
 }
-
-Write-Host "`n部署完成。入口: http://${HostIP}:${appPort}" -ForegroundColor Green
-
-# 清理
-Remove-Item $archive -Force -ErrorAction SilentlyContinue
+catch {
+    Write-Host "`n部署失败：$($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+finally {
+    Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $localRunner -Force -ErrorAction SilentlyContinue
+    Remove-Item Env:SSHPASS -ErrorAction SilentlyContinue
+}

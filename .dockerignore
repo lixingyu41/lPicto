@@ -1,6 +1,11 @@
 .git
+.agents
+.codex
+.env
 data
 cache
+deploy.ps1
+lpicto-deploy.tgz
 backend/server
 backend/server.exe
 frontend/dist

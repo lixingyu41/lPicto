@@ -63,6 +63,10 @@ func Open(ctx context.Context, databaseURL string, migrationsDir string) (*DB, e
 		_ = raw.Close()
 		return nil, err
 	}
+	if err := database.BackfillFilenameSortKeys(ctx); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
 	if err := database.MarkInterruptedScanRuns(ctx); err != nil {
 		_ = raw.Close()
 		return nil, err
@@ -350,6 +354,13 @@ func nullInt(value *int) sql.NullInt64 {
 		return sql.NullInt64{}
 	}
 	return sql.NullInt64{Int64: int64(*value), Valid: true}
+}
+
+func nullFloat64(value *float64) sql.NullFloat64 {
+	if value == nil {
+		return sql.NullFloat64{}
+	}
+	return sql.NullFloat64{Float64: *value, Valid: true}
 }
 
 func nullFloat(value *float64) sql.NullFloat64 {

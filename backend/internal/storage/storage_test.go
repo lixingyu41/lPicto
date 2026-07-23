@@ -1,11 +1,18 @@
 package storage
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 )
+
+func TestOperationNotPermittedMarksSourceUnavailable(t *testing.T) {
+	if !IsSourceUnavailable(errors.New("[Errno 1] Operation not permitted: /Media/nas/VID/a.mp4")) {
+		t.Fatal("operation-not-permitted storage error was not recognized")
+	}
+}
 
 func TestNormalizeRelPathSafety(t *testing.T) {
 	got, err := NormalizeRelPath(`2024\IMG_001.jpg`)
@@ -149,6 +156,46 @@ func TestRemoveCacheDeletesVariants(t *testing.T) {
 		if _, err := os.Stat(path + ".tmp." + item.ext); !os.IsNotExist(err) {
 			t.Fatalf("tmp cache path still exists: %s", path)
 		}
+	}
+}
+
+func TestRemoveCachePrefixDeletesOnlyMatchingVariants(t *testing.T) {
+	store, err := New(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := "abcdef1234567890-hls-"
+	matching := []string{prefix + "one", prefix + "two"}
+	other := "abcdef9999999999-hls-other"
+	for _, key := range append(append([]string{}, matching...), other) {
+		path, err := store.CachePath("video-proxies", key, "ts")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("segment"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if key == matching[0] {
+			if err := os.WriteFile(path+".tmp.ts", []byte("temp"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := store.RemoveCachePrefix(prefix, "video-proxies", "ts"); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range matching {
+		path, _ := store.CacheFilePath("video-proxies", key, "ts")
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("matching cache still exists: %s", path)
+		}
+		if _, err := os.Stat(path + ".tmp.ts"); !os.IsNotExist(err) {
+			t.Fatalf("matching temp cache still exists: %s", path)
+		}
+	}
+	otherPath, _ := store.CacheFilePath("video-proxies", other, "ts")
+	if _, err := os.Stat(otherPath); err != nil {
+		t.Fatalf("unrelated cache was removed: %v", err)
 	}
 }
 

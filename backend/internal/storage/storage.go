@@ -376,6 +376,44 @@ func (s Store) RemoveCacheVariant(cacheKey string, kind string, ext string) erro
 	return firstErr
 }
 
+func (s Store) RemoveCachePrefix(cacheKeyPrefix string, kind string, ext string) error {
+	if cacheKeyPrefix == "" || strings.ContainsAny(cacheKeyPrefix, `/\`) || strings.Contains(cacheKeyPrefix, "..") {
+		return errors.New("invalid cache key prefix")
+	}
+	switch kind {
+	case "thumbs", "previews", "video-posters", "video-proxies":
+	default:
+		return errors.New("invalid cache kind")
+	}
+	ext = strings.TrimPrefix(ext, ".")
+	if ext == "" || strings.ContainsAny(ext, `/\`) || strings.Contains(ext, "..") {
+		return errors.New("invalid cache extension")
+	}
+	shard := cacheKeyPrefix
+	if len(shard) > 2 {
+		shard = shard[:2]
+	}
+	shardDir := filepath.Join(s.CacheRoot, kind, shard)
+	entries, err := os.ReadDir(shardDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), cacheKeyPrefix) || !strings.HasSuffix(entry.Name(), "."+ext) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(shardDir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	_ = os.Remove(shardDir)
+	return firstErr
+}
+
 func (s Store) cacheVariantPaths(kind string, cacheKey string, ext string) []string {
 	path := s.cacheFilePath(kind, cacheKey, ext)
 	return []string{path, path + ".tmp." + strings.TrimPrefix(ext, ".")}

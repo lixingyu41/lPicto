@@ -18,10 +18,13 @@ type ScanFinish struct {
 	Status        string
 }
 
-func (d *DB) StartScanRun(ctx context.Context) (int64, error) {
+func (d *DB) StartScanRun(ctx context.Context, taskType string) (int64, error) {
 	now := util.UnixNow()
 	var id int64
-	err := d.conn.QueryRowContext(ctx, `INSERT INTO scan_runs (status, started_at) VALUES ('running', ?) RETURNING id`, now).Scan(&id)
+	if taskType == "" {
+		taskType = "metadata"
+	}
+	err := d.conn.QueryRowContext(ctx, `INSERT INTO scan_runs (task_type, status, started_at) VALUES (?, 'running', ?) RETURNING id`, taskType, now).Scan(&id)
 	return id, err
 }
 
@@ -40,7 +43,7 @@ func (d *DB) MarkInterruptedScanRuns(ctx context.Context) error {
 UPDATE scan_runs
 SET status = 'interrupted',
     finished_at = ?,
-    last_error = '扫描已中断'
+    last_error = '服务重启，扫描未完成'
 WHERE status = 'running'`,
 		util.UnixNow())
 	return err
@@ -77,15 +80,27 @@ func (d *DB) LastScanRun(ctx context.Context) (*model.ScanRun, error) {
 	return &run, nil
 }
 
+func (d *DB) LastScanRunForTask(ctx context.Context, taskType string) (*model.ScanRun, error) {
+	row := d.conn.QueryRowContext(ctx, scanRunSelectSQL()+` WHERE task_type=? ORDER BY started_at DESC,id DESC LIMIT 1`, taskType)
+	run, err := scanRun(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &run, nil
+}
+
 func scanRunSelectSQL() string {
-	return `SELECT id, status, started_at, finished_at, total_seen, assets_added, assets_updated, assets_deleted, errors, last_error FROM scan_runs`
+	return `SELECT id, task_type, status, started_at, finished_at, total_seen, assets_added, assets_updated, assets_deleted, errors, last_error FROM scan_runs`
 }
 
 func scanRun(row interface{ Scan(dest ...any) error }) (model.ScanRun, error) {
 	var run model.ScanRun
 	var finished sql.NullInt64
 	var lastError sql.NullString
-	err := row.Scan(&run.ID, &run.Status, &run.StartedAt, &finished, &run.TotalSeen, &run.AssetsAdded, &run.AssetsUpdated, &run.AssetsDeleted, &run.Errors, &lastError)
+	err := row.Scan(&run.ID, &run.TaskType, &run.Status, &run.StartedAt, &finished, &run.TotalSeen, &run.AssetsAdded, &run.AssetsUpdated, &run.AssetsDeleted, &run.Errors, &lastError)
 	if err != nil {
 		return model.ScanRun{}, err
 	}

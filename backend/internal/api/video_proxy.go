@@ -12,16 +12,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"lpicto/backend/internal/config"
+	"lpicto/backend/internal/db"
 	"lpicto/backend/internal/model"
 	videoproc "lpicto/backend/internal/video"
 )
 
 const (
-	videoProxyCacheTTL     = 72 * time.Hour
 	videoProxyKeepaliveTTL = 45 * time.Second
 	videoProxySweepEvery   = 1 * time.Minute
 	videoProxyReadDelay    = 250 * time.Millisecond
@@ -30,6 +32,11 @@ const (
 )
 
 var errVideoProxyIdle = errors.New("video proxy idle")
+
+type videoProxyCacheSettings struct {
+	TTL      time.Duration
+	MaxBytes int64
+}
 
 type videoProxyRuntime struct {
 	AssetID      int64
@@ -66,6 +73,45 @@ type videoProxySession struct {
 	LeaseUntil   time.Time
 }
 
+func (s *Server) videoProxyCacheSettings(ctx context.Context) videoProxyCacheSettings {
+	settings := videoProxyCacheSettingsFromConfig(s.cfg)
+	if s == nil || s.db == nil {
+		return settings
+	}
+	dbSettings, err := s.db.GetVideoProxyCacheSettings(ctx, db.VideoProxyCacheSettings{
+		TTLSeconds: int64(settings.TTL.Seconds()),
+		MaxBytes:   settings.MaxBytes,
+	})
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("read video proxy cache settings failed", "error", err)
+		}
+		return settings
+	}
+	return normalizeVideoProxyCacheSettings(dbSettings)
+}
+
+func videoProxyCacheSettingsFromConfig(cfg config.Config) videoProxyCacheSettings {
+	ttl := cfg.VideoProxyCacheTTL
+	if ttl == 0 && cfg.VideoProxyCacheTTLSeconds > 0 {
+		ttl = time.Duration(cfg.VideoProxyCacheTTLSeconds) * time.Second
+	}
+	if ttl == 0 {
+		ttl = config.DefaultVideoProxyCacheTTL
+	}
+	return videoProxyCacheSettings{
+		TTL:      config.NormalizeVideoProxyCacheTTL(ttl),
+		MaxBytes: config.NormalizeVideoProxyCacheMaxBytes(cfg.VideoProxyCacheMaxBytes),
+	}
+}
+
+func normalizeVideoProxyCacheSettings(settings db.VideoProxyCacheSettings) videoProxyCacheSettings {
+	return videoProxyCacheSettings{
+		TTL:      config.NormalizeVideoProxyCacheTTL(time.Duration(settings.TTLSeconds) * time.Second),
+		MaxBytes: config.NormalizeVideoProxyCacheMaxBytes(settings.MaxBytes),
+	}
+}
+
 func (s *Server) videoProxy(w http.ResponseWriter, r *http.Request) {
 	asset, ok := s.assetByParam(w, r)
 	if !ok {
@@ -93,9 +139,10 @@ func (s *Server) videoProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
 		return
 	}
+	cacheSettings := s.videoProxyCacheSettings(r.Context())
 	startSeconds := videoProxyStartSeconds(r, asset)
 	session := videoProxySessionFromRequest(r)
-	state, cached, err := s.ensureVideoProxyRuntime(asset, startSeconds)
+	state, cached, err := s.ensureVideoProxyRuntime(asset, startSeconds, cacheSettings)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "video_proxy_failed", "启动视频转码失败")
 		return
@@ -113,7 +160,7 @@ func (s *Server) videoProxyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session := videoProxySessionFromRequest(r)
-	dto, err := s.videoProxyRuntimeDTO(asset, videoProxyStartSeconds(r, asset), session.SessionID)
+	dto, err := s.videoProxyRuntimeDTO(r.Context(), asset, videoProxyStartSeconds(r, asset), session.SessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "video_proxy_status_failed", "读取转码状态失败")
 		return
@@ -128,17 +175,18 @@ func (s *Server) videoProxyKeepalive(w http.ResponseWriter, r *http.Request) {
 	}
 	startSeconds := videoProxyStartSeconds(r, asset)
 	heartbeat := videoProxyHeartbeatFromRequest(r)
-	dto, err := s.touchVideoProxyRuntime(asset, true, startSeconds, heartbeat)
+	cacheSettings := s.videoProxyCacheSettings(r.Context())
+	dto, err := s.touchVideoProxyRuntime(asset, true, startSeconds, heartbeat, cacheSettings)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "video_proxy_keepalive_failed", "刷新转码缓存失败")
 		return
 	}
 	if videoProxyHeartbeatWantsRuntime(heartbeat) {
-		if _, _, err := s.ensureVideoProxyRuntime(asset, startSeconds); err != nil {
+		if _, _, err := s.ensureVideoProxyRuntime(asset, startSeconds, cacheSettings); err != nil {
 			writeError(w, http.StatusInternalServerError, "video_proxy_failed", "启动视频转码失败")
 			return
 		}
-		dto, err = s.videoProxyRuntimeDTO(asset, startSeconds, heartbeat.SessionID)
+		dto, err = s.videoProxyRuntimeDTO(r.Context(), asset, startSeconds, heartbeat.SessionID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "video_proxy_status_failed", "读取转码状态失败")
 			return
@@ -147,7 +195,7 @@ func (s *Server) videoProxyKeepalive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dto)
 }
 
-func (s *Server) ensureVideoProxyRuntime(asset model.Asset, startSeconds float64) (*videoProxyRuntime, bool, error) {
+func (s *Server) ensureVideoProxyRuntime(asset model.Asset, startSeconds float64, cacheSettings videoProxyCacheSettings) (*videoProxyRuntime, bool, error) {
 	runtimeKey := videoProxyRuntimeKey(asset.CacheKey, startSeconds)
 	dest, err := s.store.CachePath("video-proxies", runtimeKey, "mp4")
 	if err != nil {
@@ -166,7 +214,7 @@ func (s *Server) ensureVideoProxyRuntime(asset model.Asset, startSeconds float64
 			TempPath:     tmp,
 			Duration:     assetDuration(asset),
 			UpdatedAt:    now,
-			ExpiresAt:    now.Add(videoProxyCacheTTL),
+			ExpiresAt:    now.Add(cacheSettings.TTL),
 			Sessions:     map[string]*videoProxySession{},
 			Done:         make(chan struct{}),
 		}
@@ -182,7 +230,7 @@ func (s *Server) ensureVideoProxyRuntime(asset model.Asset, startSeconds float64
 	state.TempPath = tmp
 	state.Duration = assetDuration(asset)
 	state.UpdatedAt = now
-	state.ExpiresAt = now.Add(videoProxyCacheTTL)
+	state.ExpiresAt = now.Add(cacheSettings.TTL)
 	if fileInfo, err := os.Stat(dest); err == nil && !fileInfo.IsDir() {
 		state.Transcoding = false
 		state.Progress = 1
@@ -223,8 +271,9 @@ func (s *Server) serveCachedVideoProxy(w http.ResponseWriter, r *http.Request, a
 		writeError(w, http.StatusNotFound, "cache_not_ready", "缓存尚未生成")
 		return
 	}
-	s.markVideoProxyStream(state.CacheKey, sessionID, true)
-	defer s.markVideoProxyStream(state.CacheKey, sessionID, false)
+	cacheSettings := s.videoProxyCacheSettings(r.Context())
+	s.markVideoProxyStream(state.CacheKey, sessionID, true, cacheSettings)
+	defer s.markVideoProxyStream(state.CacheKey, sessionID, false, cacheSettings)
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "public, max-age=1200")
 	w.Header().Set("ETag", `"`+state.CacheKey+`"`)
@@ -234,8 +283,9 @@ func (s *Server) serveCachedVideoProxy(w http.ResponseWriter, r *http.Request, a
 }
 
 func (s *Server) serveLiveVideoProxy(w http.ResponseWriter, r *http.Request, asset model.Asset, state *videoProxyRuntime, sessionID string) {
-	s.markVideoProxyStream(state.CacheKey, sessionID, true)
-	defer s.markVideoProxyStream(state.CacheKey, sessionID, false)
+	cacheSettings := s.videoProxyCacheSettings(r.Context())
+	s.markVideoProxyStream(state.CacheKey, sessionID, true, cacheSettings)
+	defer s.markVideoProxyStream(state.CacheKey, sessionID, false, cacheSettings)
 	reader, err := openGrowingFile(r.Context(), state)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "video_proxy_failed", "视频转码失败")
@@ -632,13 +682,14 @@ func (s *Server) finishVideoProxyTranscode(asset model.Asset, runtimeKey string,
 	if dbErr := s.db.SetAssetWorkStatus(context.Background(), asset.ID, "video_proxy_status", status, message); dbErr != nil && s.logger != nil {
 		s.logger.Warn("set video proxy final status failed", "assetID", asset.ID, "status", status, "error", dbErr)
 	}
+	cacheSettings := s.videoProxyCacheSettings(context.Background())
 	s.videoProxyMu.Lock()
 	state := s.videoProxyStates[runtimeKey]
 	if state != nil {
 		state.Queued = false
 		state.Transcoding = false
 		state.UpdatedAt = now
-		state.ExpiresAt = now.Add(videoProxyCacheTTL)
+		state.ExpiresAt = now.Add(cacheSettings.TTL)
 		if idleStop {
 			state.Progress = 0
 			state.SecondsDone = 0
@@ -663,7 +714,7 @@ func (s *Server) finishVideoProxyTranscode(asset model.Asset, runtimeKey string,
 	}
 }
 
-func (s *Server) markVideoProxyStream(cacheKey string, sessionID string, active bool) {
+func (s *Server) markVideoProxyStream(cacheKey string, sessionID string, active bool, cacheSettings videoProxyCacheSettings) {
 	now := time.Now()
 	s.videoProxyMu.Lock()
 	defer s.videoProxyMu.Unlock()
@@ -683,7 +734,7 @@ func (s *Server) markVideoProxyStream(cacheKey string, sessionID string, active 
 		state.ActiveStream--
 	}
 	state.UpdatedAt = now
-	state.ExpiresAt = now.Add(videoProxyCacheTTL)
+	state.ExpiresAt = now.Add(cacheSettings.TTL)
 }
 
 func (s *Server) videoProxyStillRunning(cacheKey string) bool {
@@ -702,11 +753,12 @@ func (s *Server) markVideoProxyError(cacheKey string, err error) {
 	}
 }
 
-func (s *Server) videoProxyRuntimeDTO(asset model.Asset, startSeconds float64, sessionID string) (VideoProxyRuntimeDTO, error) {
-	return s.touchVideoProxyRuntime(asset, false, startSeconds, VideoProxyHeartbeatRequest{SessionID: sessionID})
+func (s *Server) videoProxyRuntimeDTO(ctx context.Context, asset model.Asset, startSeconds float64, sessionID string) (VideoProxyRuntimeDTO, error) {
+	cacheSettings := s.videoProxyCacheSettings(ctx)
+	return s.touchVideoProxyRuntime(asset, false, startSeconds, VideoProxyHeartbeatRequest{SessionID: sessionID}, cacheSettings)
 }
 
-func (s *Server) touchVideoProxyRuntime(asset model.Asset, keepalive bool, startSeconds float64, heartbeat VideoProxyHeartbeatRequest) (VideoProxyRuntimeDTO, error) {
+func (s *Server) touchVideoProxyRuntime(asset model.Asset, keepalive bool, startSeconds float64, heartbeat VideoProxyHeartbeatRequest, cacheSettings videoProxyCacheSettings) (VideoProxyRuntimeDTO, error) {
 	now := time.Now()
 	required := asset.MediaType == model.MediaTypeVideo && !asset.BrowserPlayable && s.cfg.VideoProxyEnabled
 	dest := ""
@@ -732,7 +784,7 @@ func (s *Server) touchVideoProxyRuntime(asset model.Asset, keepalive bool, start
 			TempPath:     tmp,
 			Duration:     assetDuration(asset),
 			UpdatedAt:    now,
-			ExpiresAt:    now.Add(videoProxyCacheTTL),
+			ExpiresAt:    now.Add(cacheSettings.TTL),
 			Sessions:     map[string]*videoProxySession{},
 			Done:         make(chan struct{}),
 		}
@@ -748,7 +800,7 @@ func (s *Server) touchVideoProxyRuntime(asset model.Asset, keepalive bool, start
 		state.Duration = assetDuration(asset)
 		state.UpdatedAt = now
 		if keepalive {
-			s.applyVideoProxyHeartbeatLocked(state, heartbeat, now)
+			s.applyVideoProxyHeartbeatLocked(state, heartbeat, now, cacheSettings)
 		}
 		state.LeaseUntil = videoProxyMaxSessionLease(state, now)
 	}
@@ -756,10 +808,10 @@ func (s *Server) touchVideoProxyRuntime(asset model.Asset, keepalive bool, start
 	if keepalive && dest != "" {
 		_ = touchFile(dest, now)
 	}
-	return s.snapshotVideoProxyRuntime(asset, required, runtimeKey, startSeconds, dest, heartbeat.SessionID), nil
+	return s.snapshotVideoProxyRuntime(asset, required, runtimeKey, startSeconds, dest, heartbeat.SessionID, cacheSettings), nil
 }
 
-func (s *Server) snapshotVideoProxyRuntime(asset model.Asset, required bool, runtimeKey string, startSeconds float64, dest string, sessionID string) VideoProxyRuntimeDTO {
+func (s *Server) snapshotVideoProxyRuntime(asset model.Asset, required bool, runtimeKey string, startSeconds float64, dest string, sessionID string, cacheSettings videoProxyCacheSettings) VideoProxyRuntimeDTO {
 	now := time.Now()
 	dto := VideoProxyRuntimeDTO{
 		AssetID:      asset.ID,
@@ -767,7 +819,7 @@ func (s *Server) snapshotVideoProxyRuntime(asset model.Asset, required bool, run
 		Status:       "not_required",
 		Duration:     assetDuration(asset),
 		UpdatedAt:    now.Unix(),
-		CacheTTL:     int64(videoProxyCacheTTL.Seconds()),
+		CacheTTL:     int64(cacheSettings.TTL.Seconds()),
 		KeepaliveTTL: int64(videoProxyKeepaliveTTL.Seconds()),
 		RuntimeKey:   runtimeKey,
 		StartSeconds: startSeconds,
@@ -785,7 +837,7 @@ func (s *Server) snapshotVideoProxyRuntime(asset model.Asset, required bool, run
 		dto.Progress = 1
 		dto.SecondsDone = dto.Duration
 		dto.Bytes = info.Size()
-		dto.ExpiresAt = info.ModTime().Add(videoProxyCacheTTL).Unix()
+		dto.ExpiresAt = info.ModTime().Add(cacheSettings.TTL).Unix()
 	}
 	s.videoProxyMu.Lock()
 	defer s.videoProxyMu.Unlock()
@@ -815,7 +867,7 @@ func (s *Server) snapshotVideoProxyRuntime(asset model.Asset, required bool, run
 		dto.ClientID = currentSession.ClientID
 		dto.SessionState = currentSession.State
 	}
-	if state.ExpiresAt.After(now) {
+	if !dto.Cached && state.ExpiresAt.After(now) {
 		dto.ExpiresAt = state.ExpiresAt.Unix()
 	}
 	if state.Queued {
@@ -833,7 +885,7 @@ func (s *Server) snapshotVideoProxyRuntime(asset model.Asset, required bool, run
 	return dto
 }
 
-func (s *Server) applyVideoProxyHeartbeatLocked(state *videoProxyRuntime, heartbeat VideoProxyHeartbeatRequest, now time.Time) {
+func (s *Server) applyVideoProxyHeartbeatLocked(state *videoProxyRuntime, heartbeat VideoProxyHeartbeatRequest, now time.Time, cacheSettings videoProxyCacheSettings) {
 	if state.Sessions == nil {
 		state.Sessions = map[string]*videoProxySession{}
 	}
@@ -852,7 +904,7 @@ func (s *Server) applyVideoProxyHeartbeatLocked(state *videoProxyRuntime, heartb
 	session.UpdatedAt = now
 	if videoProxyHeartbeatWantsRuntime(heartbeat) {
 		session.LeaseUntil = now.Add(videoProxyKeepaliveTTL)
-		state.ExpiresAt = now.Add(videoProxyCacheTTL)
+		state.ExpiresAt = now.Add(cacheSettings.TTL)
 	}
 	state.LeaseUntil = videoProxyMaxSessionLease(state, now)
 	state.UpdatedAt = now
@@ -968,50 +1020,187 @@ func (s *Server) startVideoProxySweeper() {
 	}()
 }
 
+type videoProxyRuntimeSnapshot struct {
+	AssetID  int64
+	TempPath string
+	Active   bool
+}
+
+type videoProxyCacheEntry struct {
+	Path     string
+	CacheKey string
+	TempPath string
+	Size     int64
+	ModTime  time.Time
+	Active   bool
+	AssetID  int64
+}
+
 func (s *Server) sweepVideoProxyCache() {
 	now := time.Now()
+	cacheSettings := s.videoProxyCacheSettings(context.Background())
+	snapshots, expiredStates := s.videoProxyRuntimeSnapshots(now, cacheSettings)
+	for _, state := range expiredStates {
+		_ = os.Remove(state.TempPath)
+		if state.DestPath != "" {
+			_ = os.Remove(state.DestPath)
+		}
+		if s.db != nil {
+			_ = s.db.SetAssetWorkStatus(context.Background(), state.AssetID, "video_proxy_status", model.StatusNotRequired, nil)
+		}
+	}
+	entries, staleTemps := s.videoProxyCacheEntries(snapshots)
+	for _, path := range staleTemps {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() && !info.ModTime().Add(cacheSettings.TTL).After(now) {
+			_ = os.Remove(path)
+		}
+	}
+	for _, entry := range videoProxyCacheDeletePlan(entries, now, cacheSettings) {
+		s.removeVideoProxyCacheEntry(entry, now)
+	}
+}
+
+func (s *Server) videoProxyRuntimeSnapshots(now time.Time, cacheSettings videoProxyCacheSettings) (map[string]videoProxyRuntimeSnapshot, []*videoProxyRuntime) {
+	snapshots := map[string]videoProxyRuntimeSnapshot{}
 	var expired []*videoProxyRuntime
 	s.videoProxyMu.Lock()
 	for key, state := range s.videoProxyStates {
 		state.LeaseUntil = videoProxyMaxSessionLease(state, now)
-		if state.Queued || state.Transcoding || state.ActiveStream > 0 || state.LeaseUntil.After(now) || state.ExpiresAt.After(now) {
-			continue
+		state.ExpiresAt = state.UpdatedAt.Add(cacheSettings.TTL)
+		active := state.Queued || state.Transcoding || state.ActiveStream > 0 || state.LeaseUntil.After(now)
+		snapshots[key] = videoProxyRuntimeSnapshot{AssetID: state.AssetID, TempPath: state.TempPath, Active: active}
+		if !active && !state.ExpiresAt.After(now) {
+			expired = append(expired, state)
+			delete(s.videoProxyStates, key)
 		}
-		expired = append(expired, state)
-		delete(s.videoProxyStates, key)
+	}
+	for key, state := range s.videoSegmentStates {
+		active := state.Queued || state.Transcoding
+		snapshots[key] = videoProxyRuntimeSnapshot{TempPath: state.TempPath, Active: active}
+		if !active && !state.UpdatedAt.Add(cacheSettings.TTL).After(now) {
+			delete(s.videoSegmentStates, key)
+		}
 	}
 	s.videoProxyMu.Unlock()
-	for _, state := range expired {
-		_ = os.Remove(state.DestPath)
-		_ = os.Remove(state.TempPath)
-		_ = s.db.SetAssetWorkStatus(context.Background(), state.AssetID, "video_proxy_status", model.StatusNotRequired, nil)
-	}
-	s.sweepUntrackedVideoProxyFiles(now)
+	return snapshots, expired
 }
 
-func (s *Server) sweepUntrackedVideoProxyFiles(now time.Time) {
+func (s *Server) videoProxyCacheEntries(snapshots map[string]videoProxyRuntimeSnapshot) ([]videoProxyCacheEntry, []string) {
 	root := filepath.Join(s.store.CacheRoot, "video-proxies")
+	var entries []videoProxyCacheEntry
+	var staleTemps []string
 	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".mp4") {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		if strings.HasSuffix(name, ".tmp.mp4") || strings.HasSuffix(name, ".tmp.ts") {
+			staleTemps = append(staleTemps, path)
+			return nil
+		}
+		if !strings.HasSuffix(name, ".mp4") && !strings.HasSuffix(name, ".ts") {
 			return nil
 		}
 		info, err := entry.Info()
-		if err != nil || now.Sub(info.ModTime()) < videoProxyCacheTTL {
+		if err != nil || !info.Mode().IsRegular() {
 			return nil
 		}
-		cacheKey := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
-		s.videoProxyMu.Lock()
-		state := s.videoProxyStates[cacheKey]
-		if state != nil {
-			state.LeaseUntil = videoProxyMaxSessionLease(state, now)
-		}
-		active := state != nil && (state.Transcoding || state.ActiveStream > 0 || state.LeaseUntil.After(now))
-		s.videoProxyMu.Unlock()
-		if !active {
-			_ = os.Remove(path)
-		}
+		cacheKey := strings.TrimSuffix(name, filepath.Ext(name))
+		snapshot := snapshots[cacheKey]
+		entries = append(entries, videoProxyCacheEntry{
+			Path:     path,
+			CacheKey: cacheKey,
+			TempPath: snapshot.TempPath,
+			Size:     info.Size(),
+			ModTime:  info.ModTime(),
+			Active:   snapshot.Active,
+			AssetID:  snapshot.AssetID,
+		})
 		return nil
 	})
+	return entries, staleTemps
+}
+
+func videoProxyCacheDeletePlan(entries []videoProxyCacheEntry, now time.Time, cacheSettings videoProxyCacheSettings) []videoProxyCacheEntry {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].ModTime.Equal(entries[j].ModTime) {
+			return entries[i].Path < entries[j].Path
+		}
+		return entries[i].ModTime.Before(entries[j].ModTime)
+	})
+	var total int64
+	deleteByPath := map[string]videoProxyCacheEntry{}
+	for _, entry := range entries {
+		total += entry.Size
+	}
+	for _, entry := range entries {
+		if entry.Active || entry.ModTime.Add(cacheSettings.TTL).After(now) {
+			continue
+		}
+		deleteByPath[entry.Path] = entry
+		total -= entry.Size
+	}
+	if cacheSettings.MaxBytes > 0 && total > cacheSettings.MaxBytes {
+		for _, entry := range entries {
+			if total <= cacheSettings.MaxBytes {
+				break
+			}
+			if entry.Active {
+				continue
+			}
+			if _, ok := deleteByPath[entry.Path]; ok {
+				continue
+			}
+			deleteByPath[entry.Path] = entry
+			total -= entry.Size
+		}
+	}
+	deletes := make([]videoProxyCacheEntry, 0, len(deleteByPath))
+	for _, entry := range entries {
+		if deleted, ok := deleteByPath[entry.Path]; ok {
+			deletes = append(deletes, deleted)
+		}
+	}
+	return deletes
+}
+
+func (s *Server) removeVideoProxyCacheEntry(entry videoProxyCacheEntry, now time.Time) {
+	var assetID int64
+	tempPath := entry.TempPath
+	active := entry.Active
+	s.videoProxyMu.Lock()
+	if state := s.videoProxyStates[entry.CacheKey]; state != nil {
+		state.LeaseUntil = videoProxyMaxSessionLease(state, now)
+		active = state.Queued || state.Transcoding || state.ActiveStream > 0 || state.LeaseUntil.After(now)
+		assetID = state.AssetID
+		if tempPath == "" {
+			tempPath = state.TempPath
+		}
+		if !active {
+			delete(s.videoProxyStates, entry.CacheKey)
+		}
+	} else if segment := s.videoSegmentStates[entry.CacheKey]; segment != nil {
+		active = segment.Queued || segment.Transcoding
+		if tempPath == "" {
+			tempPath = segment.TempPath
+		}
+		if !active {
+			delete(s.videoSegmentStates, entry.CacheKey)
+		}
+	} else {
+		assetID = entry.AssetID
+	}
+	s.videoProxyMu.Unlock()
+	if active {
+		return
+	}
+	_ = os.Remove(entry.Path)
+	if tempPath != "" {
+		_ = os.Remove(tempPath)
+	}
+	if assetID != 0 && s.db != nil {
+		_ = s.db.SetAssetWorkStatus(context.Background(), assetID, "video_proxy_status", model.StatusNotRequired, nil)
+	}
 }
 
 func touchFile(path string, now time.Time) error {

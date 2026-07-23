@@ -21,6 +21,13 @@ type Metadata struct {
 	VideoCreatedAt  *int64
 	TimelineAt      int64
 	BrowserPlayable bool
+	FPS             *float64
+	VideoCodec      *string
+	AudioCodec      *string
+	Container       *string
+	VideoBitrate    *int64
+	AudioBitrate    *int64
+	OverallBitrate  *int64
 	RawJSON         string
 	Err             error
 }
@@ -108,6 +115,12 @@ func (e Extractor) extractVideo(ctx context.Context, path string, detection Dete
 			}
 			if videoCodec == "" {
 				videoCodec = strings.ToLower(stream.CodecName)
+				meta.VideoCodec = stringPtrValue(codecDisplayName(stream.CodecName, stream.Profile))
+				meta.VideoBitrate = positiveInt64Value(stream.BitRate)
+				meta.FPS = frameRateValue(stream.AvgFrameRate)
+				if meta.FPS == nil {
+					meta.FPS = frameRateValue(stream.RFrameRate)
+				}
 			}
 			if created := tagUnixTime(stream.Tags); created != nil && meta.VideoCreatedAt == nil {
 				meta.VideoCreatedAt = created
@@ -115,9 +128,13 @@ func (e Extractor) extractVideo(ctx context.Context, path string, detection Dete
 		case "audio":
 			if audioCodec == "" {
 				audioCodec = strings.ToLower(stream.CodecName)
+				meta.AudioCodec = stringPtrValue(codecDisplayName(stream.CodecName, stream.Profile))
+				meta.AudioBitrate = positiveInt64Value(stream.BitRate)
 			}
 		}
 	}
+	meta.Container = stringPtrValue(probe.Format.FormatName)
+	meta.OverallBitrate = positiveInt64Value(probe.Format.BitRate)
 	if probe.Format.Duration != "" {
 		if duration, err := strconv.ParseFloat(probe.Format.Duration, 64); err == nil {
 			meta.Duration = &duration
@@ -169,16 +186,72 @@ func (e Extractor) run(ctx context.Context, name string, args ...string) ([]byte
 
 type ffprobeResult struct {
 	Streams []struct {
-		CodecType string            `json:"codec_type"`
-		CodecName string            `json:"codec_name"`
-		Width     int               `json:"width"`
-		Height    int               `json:"height"`
-		Tags      map[string]string `json:"tags"`
+		CodecType    string            `json:"codec_type"`
+		CodecName    string            `json:"codec_name"`
+		Profile      string            `json:"profile"`
+		BitRate      string            `json:"bit_rate"`
+		AvgFrameRate string            `json:"avg_frame_rate"`
+		RFrameRate   string            `json:"r_frame_rate"`
+		Width        int               `json:"width"`
+		Height       int               `json:"height"`
+		Tags         map[string]string `json:"tags"`
 	} `json:"streams"`
 	Format struct {
-		Duration string            `json:"duration"`
-		Tags     map[string]string `json:"tags"`
+		Duration   string            `json:"duration"`
+		FormatName string            `json:"format_name"`
+		BitRate    string            `json:"bit_rate"`
+		Tags       map[string]string `json:"tags"`
 	} `json:"format"`
+}
+
+func codecDisplayName(codec, profile string) string {
+	codec = strings.TrimSpace(codec)
+	profile = strings.TrimSpace(profile)
+	if codec == "" {
+		return ""
+	}
+	if profile == "" || strings.EqualFold(codec, profile) {
+		return codec
+	}
+	return codec + " " + profile
+}
+
+func stringPtrValue(value string) *string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func positiveInt64Value(value string) *int64 {
+	parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || parsed <= 0 {
+		return nil
+	}
+	return &parsed
+}
+
+func frameRateValue(value string) *float64 {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "0/0" {
+		return nil
+	}
+	if !strings.Contains(value, "/") {
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err == nil && parsed > 0 {
+			return &parsed
+		}
+		return nil
+	}
+	parts := strings.SplitN(value, "/", 2)
+	numerator, firstErr := strconv.ParseFloat(parts[0], 64)
+	denominator, secondErr := strconv.ParseFloat(parts[1], 64)
+	if firstErr != nil || secondErr != nil || numerator <= 0 || denominator <= 0 {
+		return nil
+	}
+	result := numerator / denominator
+	return &result
 }
 
 func stringValue(value any) (string, bool) {

@@ -13,6 +13,7 @@ export function usePagedLoader<T>(
   const [error, setError] = useState<string | null>(null);
   const loadingRef = useRef(false);
   const requestId = useRef(0);
+  const responsePageSize = useRef(0);
   const loadPageRef = useRef(loadPage);
 
   useEffect(() => {
@@ -26,6 +27,7 @@ export function usePagedLoader<T>(
     try {
       const result = await loadPageRef.current(pageToLoad);
       if (requestId.current !== currentRequest) return;
+      assertPageContract(result, pageToLoad, responsePageSize);
       setItems((prev) => (replace ? result.items : [...prev, ...result.items]));
       setHasMore(result.hasMore);
       setPage(pageToLoad + 1);
@@ -60,6 +62,7 @@ export function usePagedLoader<T>(
     try {
       const result = await loadPageRef.current(pageToLoad);
       if (requestId.current !== currentRequest) return null;
+      assertPageContract(result, pageToLoad, responsePageSize);
       beforePrepend?.(result);
       setItems((prev) => [...result.items, ...prev]);
       setStartPage(pageToLoad);
@@ -80,6 +83,7 @@ export function usePagedLoader<T>(
     async (pageToLoad: number) => {
       const currentRequest = requestId.current + 1;
       requestId.current = currentRequest;
+      responsePageSize.current = 0;
       loadingRef.current = false;
       setItems([]);
       setPage(pageToLoad);
@@ -94,6 +98,7 @@ export function usePagedLoader<T>(
   const reset = useCallback(() => {
     const currentRequest = requestId.current + 1;
     requestId.current = currentRequest;
+    responsePageSize.current = 0;
     loadingRef.current = false;
     setItems([]);
     setPage(1);
@@ -115,4 +120,17 @@ export function usePagedLoader<T>(
   }, []);
 
   return { items, hasMore, hasPrevious: startPage > 1, loading, error, loadMore, loadPrevious, reset, jumpToPage, mutateItems };
+}
+
+function assertPageContract<T>(result: Page<T>, requestedPage: number, pageSizeRef: { current: number }) {
+  if (result.page !== requestedPage) {
+    throw new Error(`分页响应错位：请求第 ${requestedPage} 页，收到第 ${result.page} 页`);
+  }
+  if (result.pageSize < 1) {
+    throw new Error('分页响应缺少有效的 pageSize');
+  }
+  if (pageSizeRef.current > 0 && result.pageSize !== pageSizeRef.current) {
+    throw new Error(`分页大小发生变化：${pageSizeRef.current} → ${result.pageSize}`);
+  }
+  pageSizeRef.current = result.pageSize;
 }

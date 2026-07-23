@@ -12,6 +12,8 @@ export interface GridReturnState {
 const pageStatePrefix = 'lpicto:page-state:';
 const viewerReturnKey = 'lpicto:viewer-return-path';
 export const viewerOverlayAssetFocusChanged = 'lpicto:viewer-overlay-asset-focus';
+export const viewerOverlayCloseRequested = 'lpicto:viewer-overlay-close-requested';
+export const viewerOverlayCloseCompleted = 'lpicto:viewer-overlay-close-completed';
 export const assetRatingChanged = 'lpicto:asset-rating-changed';
 
 function loadStoredValue(key: string) {
@@ -92,6 +94,18 @@ export function appendViewerReturnParams(url: string, returnPath: string, state:
 export function emitViewerOverlayAssetFocus(assetId: number) {
   if (typeof window === 'undefined' || !Number.isFinite(assetId) || assetId <= 0) return;
   window.dispatchEvent(new CustomEvent(viewerOverlayAssetFocusChanged, { detail: { assetId } }));
+}
+
+export function requestViewerOverlayClose() {
+  if (typeof window === 'undefined') return false;
+  const detail = { handled: false };
+  window.dispatchEvent(new CustomEvent(viewerOverlayCloseRequested, { detail }));
+  return detail.handled;
+}
+
+export function emitViewerOverlayCloseCompleted() {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new Event(viewerOverlayCloseCompleted));
 }
 
 export function emitAssetRatingChanged(assetId: number, rating: number) {

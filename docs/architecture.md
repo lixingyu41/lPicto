@@ -1,6 +1,6 @@
 # 架构说明
 
-当前架构是多容器：Nginx 是入口，Go API 服务 `/api` 和前端静态文件，Go worker 执行扫描与媒体派生任务，React 前端通过 `/api` 获取数据，PostgreSQL 是唯一主库，Redis 是任务队列和扫描热状态，缓存落在 `/cache`。
+当前部署固定为 4 个容器：`api` 同时提供 React 静态文件、`/api`、媒体流和后台任务执行器，`ai` 负责本地识别，PostgreSQL 是唯一主库，Redis 保存任务队列与扫描热状态。媒体、应用数据和派生缓存分别挂载到 `/Media`、`/data`、`/cache`，容器升级不搬动宿主机数据。
 
 ```text
 /Media
@@ -9,22 +9,22 @@
   -> Redis job queue
   -> libvips / ffmpeg / ffprobe / exiftool
   -> /cache
-  -> API DTO / media endpoints
-  -> React library / search / folders / viewer
+  -> API DTO / media endpoints / background workers
+  -> React library / albums / collections / folders / viewer
 ```
 
 ## 数据流
 
 1. scan：默认扫描 `/Media`，识别支持的图片/视频，按 `rel_path + size + mtime` 判断新增或修改，删除文件标记 `deleted_at`。
 2. db：写入 `media_asset`、`file_instance`、`media_variant`、`folder`、`scan_runs`，folder 统计在扫描后刷新。
-3. jobs：新增或修改的资源进入 Redis Sorted Set 队列，worker 按配置并发消费。
+3. jobs：新增或修改的资源进入 Redis 队列，由 `api` 进程内的后台执行器按资源策略并发消费；播放优先级与任务执行处于同一进程，能够立即协调 CPU。
 4. cache：图片输出 WebP thumb/preview，视频输出 JPG poster 和必要的 MP4 proxy；视频处理按内置配置选择硬件或 CPU 解码。
 5. API：分页返回 DTO；媒体文件通过 asset id 访问，不接受路径参数。
 6. frontend：图库、相册、搜索、文件夹共享 Asset DTO 和 Viewer context。
 
-## Library / Albums / Search / Folders
+## Library / Albums / Collections / Folders
 
-Library 对全部未删除资源分页筛选；Albums 保存来源规则、媒体类型和横竖屏筛选；Search 追加尺寸、时长、大小、NFO 文本等筛选；Folders 保留 NAS 原始层级。四者只改变查询上下文，最终进入同一个 Viewer。
+Library 对全部未删除资源分页筛选并承载组合搜索；Albums 保存来源规则；Collections 保存智能规则；Folders 保留 NAS 原始层级。各入口只改变查询上下文，最终进入同一个 Viewer。
 
 ## Viewer context / neighbors
 
@@ -38,6 +38,6 @@ Viewer URL 保存 `context`、筛选、排序、albumId 或 folderId。`/api/ass
 
 MP4/M4V H.264 + AAC/MP3/无音频和 WebM VP8/VP9/AV1 + Opus/Vorbis/无音频标记为浏览器可播放；其他视频进入 proxy 队列，FFmpeg 输出 H.264/AAC MP4，最大高度和硬件解码策略由应用内置配置控制。
 
-## 未来 AI 扩展
+## 本地 AI
 
-asset 是核心实体。未来扩展 AI 时新增独立表：`asset_tags` 存标签，`asset_faces` 存人脸框和聚类，`asset_embeddings` 存向量引用；V1 不包含 AI 字段和 AI API。
+AI 使用独立容器提供 Chinese-CLIP 标签和 Qwen3-VL 中文描述，`api` 内的后台执行器通过内部网络串行提交任务。结果保存在 `asset_ai_result` 与 `asset_ai_tag`，手工标签保持独立；媒体版本变化后自动重新排队，播放需要 CPU 时可中断 AI 任务。

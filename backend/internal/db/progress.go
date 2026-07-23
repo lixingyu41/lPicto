@@ -32,6 +32,10 @@ func (d *DB) ProcessingProgress(ctx context.Context) (ProcessingProgress, error)
 	return d.processingProgress(ctx, "deleted_at IS NULL", nil)
 }
 
+func (d *DB) ThumbnailProgress(ctx context.Context) (WorkStatusCounts, error) {
+	return d.statusCounts(ctx, "thumb_status", "", "deleted_at IS NULL", nil)
+}
+
 func (d *DB) ProcessingProgressForRoots(ctx context.Context, roots []string) (ProcessingProgress, error) {
 	where, args, err := assetRootsWhere(roots)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"lpicto/backend/internal/db"
 	"lpicto/backend/internal/storage"
@@ -199,6 +200,7 @@ func (s *Server) refreshAlbum(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) albumAssets(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	id, ok := s.idParam(w, r)
 	if !ok {
 		return
@@ -211,9 +213,10 @@ func (s *Server) albumAssets(w http.ResponseWriter, r *http.Request) {
 	opts := db.AssetListOptions{
 		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-		Orientation: searchOrientation(r),
+		Orientation: searchOrientation(r), CombinedTags: combinedTagsQuery(r),
 	}
 	assets, err := s.db.ListAlbumAssets(r.Context(), id, opts)
+	s.recordFilterTiming(w, r, started)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "album_not_found", "相册不存在")
 		return
@@ -222,12 +225,16 @@ func (s *Server) albumAssets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "album_assets_failed", "读取相册资源失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{
-		Items: assetDTOs(assets.Items), Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore,
-	})
+	items, err := s.listAssetDTOs(r, assets.Items)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "album_assets_failed", "读取 AI 摘要失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{Items: items, Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore})
 }
 
 func (s *Server) albumAnchors(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	id, ok := s.idParam(w, r)
 	if !ok {
 		return
@@ -246,7 +253,9 @@ func (s *Server) albumAnchors(w http.ResponseWriter, r *http.Request) {
 		VisibleOnly: visibleOnly(r),
 		Rating:      ratingQueryPtr(r, "rating"),
 		Orientation: searchOrientation(r),
+		CombinedTags: combinedTagsQuery(r),
 	})
+	s.recordFilterTiming(w, r, started)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "album_not_found", "相册不存在")
 		return

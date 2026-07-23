@@ -1,14 +1,14 @@
 import { type Ref, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { ChevronsUp, ChevronRight, Folder as FolderIcon } from 'lucide-react';
 import AssetGrid from '../components/AssetGrid';
-import AssetGroupingControls, { normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
+import { CompactAssetGroupingControls, normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
 import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
-import { SidebarButtonGroup, SidebarRatingFilter, SidebarSelect, sidebarOrientationOptions } from '../components/SidebarControls';
-import SortControls, { isSortKey } from '../components/SortControls';
+import { SidebarFilterIconRow, SidebarOrientationFilter, SidebarRatingFilter, SidebarSelect } from '../components/SidebarControls';
+import { CompactSortControls, isSortKey } from '../components/SortControls';
 import { api } from '../api/client';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
@@ -38,10 +38,12 @@ import {
   orientationParam,
   replaceURLState,
 } from '../utils/urlState';
+import { waterfallPageSize } from '../utils/waterfallPaging';
+import { parseTagFilters, serializeTagFilters } from '../utils/tagFilters';
 
-const pageSize = 100;
+const pageSize = waterfallPageSize;
 const foldersStateKey = 'folders';
-const foldersURLKeys = ['folderId', 'folder', 'rating', 'orientation', 'sort', 'group', 'q', 'recursive'];
+const foldersURLKeys = ['folderId', 'folder', 'rating', 'orientation', 'sort', 'group', 'q', 'recursive', 'combinedTags'];
 
 interface FoldersPageState extends GridReturnState {
   collapsedFolderKeys: string[];
@@ -52,6 +54,7 @@ interface FoldersPageState extends GridReturnState {
   query: string;
   rating: AssetRating;
   sort: SortKey;
+  tagFilters: string[];
 }
 
 const defaultFoldersState: FoldersPageState = {
@@ -64,19 +67,23 @@ const defaultFoldersState: FoldersPageState = {
   query: '',
   rating: 0,
   sort: 'timeline_desc',
+  tagFilters: [],
 };
 
 let folderTreeCache: Folder[] | null = null;
 
 export default function FoldersPage() {
-  const [searchParams] = useSearchParams();
   const location = useLocation();
   const navigate = useNavigate();
+  const liveSearchText = typeof window === 'undefined' ? location.search : window.location.search;
+  const liveSearchParams = useMemo(() => new URLSearchParams(liveSearchText), [liveSearchText]);
   const persistedState = loadPageState<FoldersPageState>(foldersStateKey, defaultFoldersState);
-  const decodedInitialState = decodeReturnState<FoldersPageState>(searchParams.get('restore'), persistedState);
-  const initialStateRef = useRef(searchParams.has('restore') ? decodedInitialState : foldersStateFromSearchParams(searchParams, persistedState));
-  const requestedFolderRelPath = searchParams.has('folder') ? searchParams.get('folder') ?? '' : null;
+  const decodedInitialState = decodeReturnState<FoldersPageState>(liveSearchParams.get('restore'), persistedState);
+  const initialStateRef = useRef(liveSearchParams.has('restore') ? decodedInitialState : foldersStateFromSearchParams(liveSearchParams, persistedState));
+  const requestedFolderRelPath = liveSearchParams.has('folder') ? liveSearchParams.get('folder') ?? '' : null;
   const [tree, setTree] = useState<Folder[]>(() => folderTreeCache ?? []);
+  const [treeLoading, setTreeLoading] = useState(folderTreeCache === null);
+  const [treeError, setTreeError] = useState('');
   const [currentId, setCurrentId] = useState(initialStateRef.current.currentId);
   const [current, setCurrent] = useState<Folder | null>(null);
   const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
@@ -85,13 +92,23 @@ export default function FoldersPage() {
   const [includeSubfolders, setIncludeSubfolders] = useState(initialStateRef.current.includeSubfolders);
   const [rating, setRating] = useState<AssetRating>(initialStateRef.current.rating ?? 0);
   const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
-  const [collapsedFolderKeys, setCollapsedFolderKeys] = useState<Set<string>>(() => new Set(initialStateRef.current.collapsedFolderKeys));
+  const [tagFilters, setTagFilters] = useState(initialStateRef.current.tagFilters ?? []);
+  const [collapsedFolderKeys, setCollapsedFolderKeys] = useState<Set<string>>(() => {
+    if (initialStateRef.current.collapsedFolderKeys.length > 0 || !folderTreeCache) {
+      return new Set(initialStateRef.current.collapsedFolderKeys);
+    }
+    const selected = requestedFolderRelPath !== null
+      ? folderTreeCache.find((folder) => folder.relPath === requestedFolderRelPath)
+      : folderTreeCache.find((folder) => folderID(folder) === initialStateRef.current.currentId);
+    return initialCollapsedFolderKeys(folderTreeCache, selected);
+  });
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const sidebarState = useSidebarReturnState();
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const folderTreeRef = useRef<HTMLDivElement | null>(null);
+  const initializeFolderTreeRef = useRef(folderTreeCache === null);
   const serverGroup = serverGroupForMode(groupMode);
   const currentLookupId = requestedFolderRelPath === null ? currentId : null;
   const resolvingRequestedFolder = requestedFolderRelPath !== null && current?.relPath !== requestedFolderRelPath;
@@ -99,16 +116,26 @@ export default function FoldersPage() {
   useEffect(() => {
     let live = true;
     async function loadTree() {
+      if (folderTreeCache === null) setTreeLoading(true);
+      setTreeError('');
       try {
         const treeResult = await api.folderTree();
         if (!live) return;
+        if (initializeFolderTreeRef.current) {
+          const selected = requestedFolderRelPath !== null
+            ? treeResult.items.find((folder) => folder.relPath === requestedFolderRelPath)
+            : treeResult.items.find((folder) => folderID(folder) === initialStateRef.current.currentId);
+          setCollapsedFolderKeys(initialCollapsedFolderKeys(treeResult.items, selected));
+          initializeFolderTreeRef.current = false;
+        }
         folderTreeCache = treeResult.items;
         setTree(treeResult.items);
-      } catch {
+      } catch (err) {
         if (live) {
-          folderTreeCache = null;
-          setTree([]);
+          setTreeError(err instanceof Error ? err.message : '读取文件夹失败');
         }
+      } finally {
+        if (live) setTreeLoading(false);
       }
     }
     void loadTree();
@@ -158,9 +185,9 @@ export default function FoldersPage() {
       if (resolvingRequestedFolder) {
         return Promise.resolve({ items: [], page, pageSize, hasMore: false });
       }
-      return api.folderAssets(currentId, page, pageSize, sort, query, includeSubfolders, serverGroup, rating, orientation);
+      return api.folderAssets(currentId, page, pageSize, sort, query, includeSubfolders, serverGroup, rating, orientation, serializeTagFilters(tagFilters));
     },
-    [currentId, includeSubfolders, orientation, query, rating, resolvingRequestedFolder, serverGroup, sort],
+    [currentId, includeSubfolders, orientation, query, rating, resolvingRequestedFolder, serverGroup, sort, tagFilters],
   );
   const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     currentId,
@@ -195,7 +222,7 @@ export default function FoldersPage() {
     loadPrevious,
     pageSize,
     resetKey: JSON.stringify([currentId, resolvingRequestedFolder, includeSubfolders, rating, orientation, sort, query, groupMode]),
-    searchParams,
+    searchParams: liveSearchParams,
   });
 
   const mergeReadyAssets = useCallback(
@@ -216,12 +243,12 @@ export default function FoldersPage() {
     if (eventsConnected || !current || resolvingRequestedFolder) return undefined;
     const timer = window.setInterval(() => {
       void api
-        .folderAssets(currentId, 1, pageSize, sort, query, includeSubfolders, serverGroup, rating, orientation)
+        .folderAssets(currentId, 1, pageSize, sort, query, includeSubfolders, serverGroup, rating, orientation, serializeTagFilters(tagFilters))
         .then((result) => mergeReadyAssets(result.items))
         .catch(() => undefined);
     }, 30000);
     return () => window.clearInterval(timer);
-  }, [current, currentId, eventsConnected, includeSubfolders, mergeReadyAssets, orientation, query, rating, resolvingRequestedFolder, serverGroup, sort]);
+  }, [current, currentId, eventsConnected, includeSubfolders, mergeReadyAssets, orientation, query, rating, resolvingRequestedFolder, serverGroup, sort, tagFilters]);
 
   const currentPageState = useCallback(
     (): FoldersPageState => ({
@@ -235,8 +262,9 @@ export default function FoldersPage() {
       rating,
       sidebarExpanded: sidebarState.sidebarExpanded,
       sort,
+      tagFilters,
     }),
-    [collapsedFolderKeys, currentId, getGridState, groupMode, includeSubfolders, orientation, query, rating, sidebarState.sidebarExpanded, sort],
+    [collapsedFolderKeys, currentId, getGridState, groupMode, includeSubfolders, orientation, query, rating, sidebarState.sidebarExpanded, sort, tagFilters],
   );
 
   const saveCurrentState = useCallback(() => {
@@ -259,10 +287,11 @@ export default function FoldersPage() {
         rating,
         recursive: includeSubfolders ? 1 : 0,
         sort,
+        combinedTags: serializeTagFilters(tagFilters),
       },
       foldersURLKeys,
     );
-  }, [current, currentId, groupMode, includeSubfolders, location, navigate, orientation, query, rating, requestedFolderRelPath, searchParams, sort]);
+  }, [current, currentId, groupMode, includeSubfolders, liveSearchText, location, navigate, orientation, query, rating, requestedFolderRelPath, sort, tagFilters]);
 
   const handlePersistentGridScrollState = useCallback(
     (state: { ratio: number; scrollTop: number }) => {
@@ -281,7 +310,7 @@ export default function FoldersPage() {
         return;
       }
       try {
-        const result = await api.folderAnchors(currentId, pageSize, sort, query, includeSubfolders, serverGroup, rating, orientation);
+        const result = await api.folderAnchors(currentId, pageSize, sort, query, includeSubfolders, serverGroup, rating, orientation, serializeTagFilters(tagFilters));
         if (live) {
           setAnchors(result.items);
           setTotalCount(result.total);
@@ -297,7 +326,7 @@ export default function FoldersPage() {
     return () => {
       live = false;
     };
-  }, [currentId, includeSubfolders, orientation, query, rating, resolvingRequestedFolder, serverGroup, sort]);
+  }, [currentId, includeSubfolders, orientation, query, rating, resolvingRequestedFolder, serverGroup, sort, tagFilters]);
 
   const handleOpenAsset = useCallback(() => {
     saveCurrentState();
@@ -316,7 +345,7 @@ export default function FoldersPage() {
   useEffect(() => {
     const selected = tree.find((folder) => folderID(folder) === currentId);
     if (!selected) return;
-    const ancestorKeys = folderOpenPathKeys(selected, folderByRelPath);
+    const ancestorKeys = folderAncestorPathKeys(selected, folderByRelPath);
     if (ancestorKeys.length === 0) return;
     setCollapsedFolderKeys((value) => {
       const next = new Set(value);
@@ -355,12 +384,13 @@ export default function FoldersPage() {
             rating,
             recursive: includeSubfolders ? 1 : 0,
             sort,
+            combinedTags: serializeTagFilters(tagFilters),
           },
           foldersURLKeys,
         );
       }
     },
-    [groupMode, includeSubfolders, location, navigate, orientation, query, rating, sort],
+    [groupMode, includeSubfolders, location, navigate, orientation, query, rating, sort, tagFilters],
   );
 
   useEffect(() => {
@@ -388,17 +418,19 @@ export default function FoldersPage() {
 
   const collapseOtherFolders = useCallback(() => {
     const selected = tree.find((folder) => folderID(folder) === currentId);
-    const keepOpen = new Set(selected ? folderOpenPathKeys(selected, folderByRelPath) : []);
+    const keepOpen = new Set(selected ? folderAncestorPathKeys(selected, folderByRelPath) : []);
     setCollapsedFolderKeys(new Set(tree.filter((folder) => (childrenByParent.get(folder.relPath)?.length ?? 0) > 0 && !keepOpen.has(folder.relPath)).map((folder) => folder.relPath)));
   }, [childrenByParent, currentId, folderByRelPath, tree]);
 
   useSidebarPanel(
     'folders',
     <div className="sidebar-control-stack sidebar-folder-panel">
-      <SidebarRatingFilter value={rating} onChange={handleRatingChange} />
-      <SidebarButtonGroup columns={3} label="方向" value={orientation} options={sidebarOrientationOptions} onChange={setOrientation} />
-      <SortControls sort={sort} onChange={setSort} />
-      <AssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
+      <SidebarFilterIconRow>
+        <SidebarOrientationFilter value={orientation} onChange={setOrientation} />
+        <SidebarRatingFilter value={rating} onChange={handleRatingChange} />
+        <CompactAssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
+        <CompactSortControls sort={sort} onChange={setSort} />
+      </SidebarFilterIconRow>
       <div className="sidebar-folder-action-row">
         <button className="sidebar-command" type="button" onClick={collapseOtherFolders}>
           <ChevronsUp size={15} />
@@ -409,7 +441,9 @@ export default function FoldersPage() {
         childrenByParent={childrenByParent}
         collapsedKeys={collapsedFolderKeys}
         currentId={currentId}
+        error={treeError}
         includeSubfolders={includeSubfolders}
+        loading={treeLoading}
         onSelect={selectFolder}
         onToggle={toggleFolderCollapsed}
         treeRef={folderTreeRef}
@@ -432,6 +466,8 @@ export default function FoldersPage() {
       childrenByParent,
       collapsedFolderKeys,
       currentId,
+      treeError,
+      treeLoading,
       groupMode,
       handleRatingChange,
       includeSubfolders,
@@ -468,7 +504,7 @@ export default function FoldersPage() {
               onLoadPrevious={loadPreviousPage}
               onOpenAsset={handleOpenAsset}
               onOpenViewer={handleOpenViewer}
-              onAssetMissing={(asset) => mutateItems((value) => removeAssetById(value, asset.id))}
+              onBatchRemoveAssets={(ids) => mutateItems((current) => current.filter((asset) => !ids.includes(asset.id)))}
               onPressPreviewChange={setPressPreviewAsset}
               onScrollRatioChange={setScrollRatio}
               onScrollStateChange={handlePersistentGridScrollState}
@@ -477,6 +513,9 @@ export default function FoldersPage() {
               focusAssetId={focusAssetId}
               groupMode={groupMode}
               sort={sort}
+              onSortChange={setSort}
+              selectedTags={tagFilters}
+              onTagFilterChange={setTagFilters}
               scrollSignal={scrollResetSignal}
               scrollTarget={scrollTarget}
               scrollTopTarget={scrollTopTarget}
@@ -484,7 +523,7 @@ export default function FoldersPage() {
                 appendViewerReturnParams(
                   `/viewer/${asset.id}?context=folder&folderId=${currentId}&sort=${sort}&q=${encodeURIComponent(query)}&recursive=${
                     includeSubfolders ? 1 : 0
-                  }${ratingViewerParam(rating)}${orientationViewerParam(orientation)}${serverGroup ? `&group=${serverGroup}` : ''}`,
+                  }${serializeTagFilters(tagFilters) ? `&combinedTags=${encodeURIComponent(serializeTagFilters(tagFilters)!)}` : ''}${ratingViewerParam(rating)}${orientationViewerParam(orientation)}${serverGroup ? `&group=${serverGroup}` : ''}`,
                   currentPageReturnPath(),
                   currentPageState(),
                 )
@@ -527,6 +566,7 @@ function foldersStateFromSearchParams(params: URLSearchParams, fallback: Folders
     query: params.get('q') ?? (hasFolderParams ? '' : base.query),
     rating: params.has('rating') ? assetRatingParam(params.get('rating')) ?? base.rating : base.rating,
     sort: isSortKey(sort) ? sort : base.sort,
+    tagFilters: params.has('combinedTags') ? parseTagFilters(params.get('combinedTags')) : base.tagFilters ?? [],
   };
 }
 
@@ -556,7 +596,9 @@ function SidebarFolderTree({
   childrenByParent,
   collapsedKeys,
   currentId,
+  error,
   includeSubfolders,
+  loading,
   onSelect,
   onToggle,
   treeRef,
@@ -564,16 +606,18 @@ function SidebarFolderTree({
   childrenByParent: Map<string | null, Folder[]>;
   collapsedKeys: Set<string>;
   currentId: number;
+  error: string;
   includeSubfolders: boolean;
+  loading: boolean;
   onSelect: (folder: Folder) => void;
   onToggle: (key: string) => void;
   treeRef: Ref<HTMLDivElement>;
 }) {
-  const roots = childrenByParent.get(null) ?? [];
+  const roots = visibleSidebarFolderRoots(childrenByParent);
   return (
     <div className="sidebar-folder-tree" role="tree" aria-label="文件夹" ref={treeRef}>
       {roots.length === 0 ? (
-        <div className="muted-line">暂无文件夹</div>
+        <div className={error ? 'error-line' : 'muted-line'}>{loading ? '正在加载文件夹' : error || '暂无文件夹'}</div>
       ) : (
         roots.map((folder) => (
           <SidebarFolderNode
@@ -591,6 +635,18 @@ function SidebarFolderTree({
       )}
     </div>
   );
+}
+
+function visibleSidebarFolderRoots(childrenByParent: Map<string | null, Folder[]>) {
+  const roots = childrenByParent.get(null) ?? [];
+  const virtualRoot = roots.find((folder) => folder.relPath === '');
+  const visibleRoots = virtualRoot
+    ? [...(childrenByParent.get(virtualRoot.relPath) ?? []), ...roots.filter((folder) => folder.relPath !== virtualRoot.relPath)]
+    : roots;
+  return visibleRoots.flatMap((folder) => {
+    const children = childrenByParent.get(folder.relPath) ?? [];
+    return folder.name.trim().toLowerCase() === 'nas' && children.length > 0 ? children : [folder];
+  });
 }
 
 function SidebarFolderNode({
@@ -661,12 +717,19 @@ function SidebarFolderNode({
   );
 }
 
-function folderOpenPathKeys(folder: Folder, folderByRelPath: Map<string, Folder>) {
-  const result: string[] = [folder.relPath];
+function folderAncestorPathKeys(folder: Folder, folderByRelPath: Map<string, Folder>) {
+  const result: string[] = [];
   let parentKey = folder.parentRelPath;
   while (parentKey !== null) {
     result.push(parentKey);
     parentKey = folderByRelPath.get(parentKey)?.parentRelPath ?? null;
   }
   return result;
+}
+
+function initialCollapsedFolderKeys(tree: Folder[], selected?: Folder) {
+  const foldersByRelPath = new Map(tree.map((folder) => [folder.relPath, folder]));
+  const keepOpen = new Set(selected ? folderAncestorPathKeys(selected, foldersByRelPath) : []);
+  const parentKeys = new Set(tree.map((folder) => folder.parentRelPath).filter((key): key is string => key !== null));
+  return new Set(Array.from(parentKeys).filter((key) => !keepOpen.has(key)));
 }

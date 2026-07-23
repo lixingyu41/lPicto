@@ -99,6 +99,13 @@ func (s *Scanner) addExistingWatches(watcher *fsnotify.Watcher) {
 }
 
 func (s *Scanner) handleWatchEvent(watcher *fsnotify.Watcher, event fsnotify.Event) (string, string, bool) {
+	if s.Sources != nil {
+		if rel, err := s.Store.RelPath(event.Name); err == nil {
+			if available, _ := s.Sources.AvailableForRel(rel); !available {
+				return "", "", false
+			}
+		}
+	}
 	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		s.handleRemovedPath(event.Name)
 		if root := s.watchRootForPath(event.Name); root != "" && s.Jobs != nil {

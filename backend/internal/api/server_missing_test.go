@@ -2,9 +2,7 @@ package api
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -21,7 +19,7 @@ import (
 	"lpicto/backend/internal/storage"
 )
 
-func TestOriginalMissingSourceMarksAssetDeleted(t *testing.T) {
+func TestOriginalMissingSourceKeepsAssetUnavailable(t *testing.T) {
 	server, database, _ := testMissingSourceServer(t)
 	id := testInsertAsset(t, database, "missing.jpg", "0123456789abcdefabcd", model.MediaTypeImage)
 
@@ -29,13 +27,13 @@ func TestOriginalMissingSourceMarksAssetDeleted(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/api/assets/"+int64String(id)+"/original", nil)
 	server.ServeHTTP(recorder, request)
 
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", recorder.Code)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
 	}
-	assertAssetDeleted(t, database, id)
+	assertAssetActive(t, database, id)
 }
 
-func TestCacheThumbMissingSourceMarksAssetDeleted(t *testing.T) {
+func TestCacheThumbMissingSourceKeepsAsset(t *testing.T) {
 	server, database, _ := testMissingSourceServer(t)
 	cacheKey := "fedcba9876543210fedc"
 	id := testInsertAsset(t, database, "missing.jpg", cacheKey, model.MediaTypeImage)
@@ -47,7 +45,7 @@ func TestCacheThumbMissingSourceMarksAssetDeleted(t *testing.T) {
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", recorder.Code)
 	}
-	assertAssetDeleted(t, database, id)
+	assertAssetActive(t, database, id)
 }
 
 func TestMissingPhotoRootDoesNotMarkAssetDeleted(t *testing.T) {
@@ -61,8 +59,8 @@ func TestMissingPhotoRootDoesNotMarkAssetDeleted(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/api/assets/"+int64String(id)+"/original", nil)
 	server.ServeHTTP(recorder, request)
 
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", recorder.Code)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
 	}
 	if _, err := database.GetAsset(context.Background(), id); err != nil {
 		t.Fatalf("GetAsset err = %v, want active asset", err)
@@ -197,18 +195,18 @@ func testInsertAsset(t *testing.T, database *db.DB, relPath string, cacheKey str
 	return id
 }
 
-func assertAssetDeleted(t *testing.T, database *db.DB, id int64) {
+func assertAssetActive(t *testing.T, database *db.DB, id int64) {
 	t.Helper()
-	if _, err := database.GetAsset(context.Background(), id); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("GetAsset err = %v, want sql.ErrNoRows", err)
+	if _, err := database.GetAsset(context.Background(), id); err != nil {
+		t.Fatalf("GetAsset err = %v, want active asset", err)
 	}
-	var deletedAt sql.NullTime
-	err := database.Conn().QueryRowContext(context.Background(), `SELECT deleted_at FROM media_asset WHERE id = $1`, id).Scan(&deletedAt)
+	var deleted bool
+	err := database.Conn().QueryRowContext(context.Background(), `SELECT deleted_at IS NOT NULL FROM media_asset WHERE id = $1`, id).Scan(&deleted)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !deletedAt.Valid {
-		t.Fatalf("DeletedAt = nil, want set")
+	if deleted {
+		t.Fatal("asset was deleted while its source was unavailable")
 	}
 }
 

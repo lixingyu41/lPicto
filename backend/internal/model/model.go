@@ -5,6 +5,7 @@ type Asset struct {
 	RelPath           string
 	ParentRelPath     string
 	Filename          string
+	FilenameSortKey   string
 	Ext               string
 	MediaType         string
 	MimeType          *string
@@ -25,6 +26,10 @@ type Asset struct {
 	VideoProxyStatus  string
 	Rotation          int
 	Rating            int
+	Hidden            bool
+	SHA256            *string
+	HasSubtitle       bool
+	HasDanmaku        bool
 	MetadataJSON      *string
 	NFOJSON           *string
 	NFOSearchText     *string
@@ -48,6 +53,7 @@ type Folder struct {
 
 type ScanRun struct {
 	ID            int64
+	TaskType      string
 	Status        string
 	StartedAt     int64
 	FinishedAt    *int64
@@ -57,15 +63,6 @@ type ScanRun struct {
 	AssetsDeleted int
 	Errors        int
 	LastError     *string
-}
-
-type TimelineGroup struct {
-	Key          string
-	Label        string
-	Start        int64
-	End          int64
-	Count        int
-	CoverAssetID *int64
 }
 
 type AssetPreference struct {
@@ -83,6 +80,7 @@ type Album struct {
 	OrientationFilter string
 	AssetCount        int
 	CoverAssetID      *int64
+	StatsUpdatedAt    int64
 	CreatedAt         int64
 	UpdatedAt         int64
 	Sources           []AlbumSource
@@ -104,6 +102,32 @@ type AlbumSource struct {
 	MediaTypeFilter   string
 	OrientationFilter string
 	CreatedAt         int64
+}
+
+type SmartCollection struct {
+	ID        int64
+	Name      string
+	RuleJSON  string
+	CreatedAt int64
+	UpdatedAt int64
+}
+
+type Collection struct {
+	ID         string
+	Name       string
+	Kind       string
+	SystemKind string
+	AssetCount int
+	RuleJSON   *string
+	CreatedAt  int64
+	UpdatedAt  int64
+}
+
+type DuplicateGroup struct {
+	Key    string
+	Size   int64
+	SHA256 string
+	Items  []Asset
 }
 
 type Page[T any] struct {

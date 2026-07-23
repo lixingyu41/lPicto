@@ -25,6 +25,7 @@ type Processor struct {
 	CommandTimeout  time.Duration
 	Events          *events.Bus
 	Logger          *slog.Logger
+	Sources         *storage.SourceHealth
 }
 
 func (p Processor) Handle(ctx context.Context, task jobs.Task) error {
@@ -32,12 +33,28 @@ func (p Processor) Handle(ctx context.Context, task jobs.Task) error {
 	case "thumb":
 		return p.process(ctx, task.AssetID, "thumbs", "thumb_status", p.ThumbLongEdge, 76)
 	case "video_poster":
-		return p.process(ctx, task.AssetID, "thumbs", "thumb_status", p.ThumbLongEdge, 76)
+		return p.processVideoPoster(ctx, task.AssetID)
 	case "preview":
 		return p.process(ctx, task.AssetID, "previews", "preview_status", p.PreviewLongEdge, p.PreviewQuality)
 	default:
 		return nil
 	}
+}
+
+func (p Processor) processVideoPoster(ctx context.Context, assetID int64) error {
+	asset, err := p.DB.GetAsset(ctx, assetID)
+	if err != nil {
+		return err
+	}
+	if asset.MediaType != model.MediaTypeVideo {
+		return p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusNotRequired, nil)
+	}
+	if err := p.process(ctx, assetID, "thumbs", "thumb_status", p.ThumbLongEdge, 76); err != nil {
+		message := publicError(err)
+		_ = p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusError, &message)
+		return err
+	}
+	return p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusReady, nil)
 }
 
 func (p Processor) process(ctx context.Context, assetID int64, kind string, statusField string, longEdge int, quality int) error {
@@ -50,6 +67,14 @@ func (p Processor) process(ctx context.Context, assetID int64, kind string, stat
 	}
 	if statusField == "preview_status" && asset.BrowserPlayable {
 		return p.DB.SetAssetWorkStatus(ctx, assetID, statusField, model.StatusNotRequired, nil)
+	}
+	if p.Sources != nil {
+		if available, _ := p.Sources.AvailableForRel(asset.RelPath); !available {
+			if p.Logger != nil {
+				p.Logger.Info("skip thumbnail work because storage is unavailable", "assetID", asset.ID, "relPath", asset.RelPath)
+			}
+			return nil
+		}
 	}
 	source, err := p.Store.PhotoPath(asset.RelPath)
 	if err != nil {
@@ -74,7 +99,10 @@ func (p Processor) processVideoThumb(ctx context.Context, asset model.Asset, sou
 		return err
 	}
 	if fileExists(dest) {
-		return p.setReady(ctx, asset.ID, "thumb_status")
+		if err := p.setReady(ctx, asset.ID, "thumb_status"); err != nil {
+			return err
+		}
+		return p.DB.SetAssetWorkStatus(ctx, asset.ID, "video_poster_status", model.StatusReady, nil)
 	}
 	if err := p.DB.SetAssetWorkStatus(ctx, asset.ID, "thumb_status", model.StatusProcessing, nil); err != nil {
 		return err
@@ -117,7 +145,10 @@ func (p Processor) processVideoThumb(ctx context.Context, asset model.Asset, sou
 		_ = p.DB.SetAssetWorkStatus(ctx, asset.ID, "thumb_status", model.StatusError, &message)
 		return err
 	}
-	return p.setReady(ctx, asset.ID, "thumb_status")
+	if err := p.setReady(ctx, asset.ID, "thumb_status"); err != nil {
+		return err
+	}
+	return p.DB.SetAssetWorkStatus(ctx, asset.ID, "video_poster_status", model.StatusReady, nil)
 }
 
 func (p Processor) processAsset(ctx context.Context, asset model.Asset, kind string, statusField string, longEdge int, quality int, source string) error {
@@ -196,6 +227,13 @@ func (p Processor) deleteIfSourceMissing(ctx context.Context, asset model.Asset,
 	}
 	missing, err := sourceFileMissing(source)
 	if err != nil {
+		p.Sources.RecordSourceError(asset.RelPath, err)
+		if storage.IsSourceUnavailable(err) {
+			if p.Logger != nil {
+				p.Logger.Warn("skip thumbnail work because storage became unavailable", "assetID", asset.ID, "relPath", asset.RelPath, "reason", reason)
+			}
+			return true, nil
+		}
 		return false, err
 	}
 	if !missing {

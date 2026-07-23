@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 
 	"lpicto/backend/internal/config"
 	"lpicto/backend/internal/db"
@@ -31,13 +32,14 @@ import (
 )
 
 type Server struct {
-	cfg     config.Config
-	db      *db.DB
-	store   storage.Store
-	scanner ScanController
-	jobs    *jobs.Manager
-	events  *events.Bus
-	logger  *slog.Logger
+	cfg          config.Config
+	db           *db.DB
+	store        storage.Store
+	scanner      ScanController
+	jobs         *jobs.Manager
+	events       *events.Bus
+	logger       *slog.Logger
+	sourceHealth *storage.SourceHealth
 
 	cacheMu         sync.Mutex
 	cacheStats      CacheStatsDTO
@@ -51,6 +53,7 @@ type Server struct {
 
 	cleanupMu     sync.Mutex
 	cleanupStatus CleanupStatusDTO
+	cleanupCancel context.CancelFunc
 
 	sourceDirMu    sync.Mutex
 	sourceDirCache map[string]sourceDirCacheEntry
@@ -61,9 +64,12 @@ type Server struct {
 	libraryCountsAt         time.Time
 	libraryCountsRefreshing bool
 
-	videoProxyMu     sync.Mutex
-	videoProxyStates map[string]*videoProxyRuntime
-	videoProxySlots  chan struct{}
+	videoProxyMu               sync.Mutex
+	videoProxyStates           map[string]*videoProxyRuntime
+	videoSegmentStates         map[string]*videoSegmentRuntime
+	videoSegmentIgnoreEditList map[string]bool
+	videoSegmentSequence       uint64
+	videoProxySlots            chan struct{}
 
 	folderRefreshSem chan struct{}
 
@@ -78,6 +84,9 @@ type ScanController interface {
 	RequestCountScanRoots(reason string, roots []string) scanner.CommandResult
 	RequestMetadataScan(reason string) scanner.CommandResult
 	RequestMetadataScanRoots(reason string, roots []string) scanner.CommandResult
+	RequestMetadataScanPaths(reason string, roots []string, paths []string) scanner.CommandResult
+	RequestThumbnailContinue(reason string) scanner.CommandResult
+	RequestThumbnailContinueRoots(reason string, roots []string) scanner.CommandResult
 	RequestThumbnailRebuild(reason string) scanner.CommandResult
 	RequestThumbnailRebuildRoots(reason string, roots []string) scanner.CommandResult
 	RequestStop() scanner.CommandResult
@@ -90,17 +99,39 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 		liveVideoProxyMaxActive = 1
 	}
 	s := &Server{
-		cfg: cfg, db: database, store: store, scanner: scan, jobs: queue, events: bus, logger: logger,
-		videoProxyStates:  map[string]*videoProxyRuntime{},
-		videoProxySlots:   make(chan struct{}, liveVideoProxyMaxActive),
-		folderRefreshSem:  make(chan struct{}, 4),
-		staticDir:         findStaticDir(cfg.StaticDir),
+		cfg:                        cfg,
+		db:                         database,
+		store:                      store,
+		scanner:                    scan,
+		jobs:                       queue,
+		events:                     bus,
+		logger:                     logger,
+		sourceHealth:               storage.NewSourceHealth(store, 15*time.Second, cfg.RedisURL),
+		videoProxyStates:           map[string]*videoProxyRuntime{},
+		videoSegmentStates:         map[string]*videoSegmentRuntime{},
+		videoSegmentIgnoreEditList: map[string]bool{},
+		videoProxySlots:            make(chan struct{}, liveVideoProxyMaxActive),
+		folderRefreshSem:           make(chan struct{}, 4),
+		staticDir:                  findStaticDir(cfg.StaticDir),
+	}
+	if _, cached, err := database.GetSystemCollectionCounts(context.Background()); err != nil {
+		if logger != nil {
+			logger.Warn("read system collection count cache during startup failed", "error", err)
+		}
+	} else if !cached {
+		if _, err := database.RefreshSystemCollectionCounts(context.Background()); err != nil && logger != nil {
+			logger.Warn("initialize system collection count cache failed", "error", err)
+		}
 	}
 	s.startVideoProxySweeper()
+	s.startCacheCleanupScheduler()
+	s.startStorageHealthScheduler()
 	r := chi.NewRouter()
 	r.Use(requestLogger(logger))
+	r.Use(middleware.Compress(5))
 	r.Use(foregroundActivity)
 	r.Get("/api/health", s.health)
+	r.Get("/api/storage/status", s.storageStatus)
 	r.Get("/api/config/public", s.publicConfig)
 	r.Get("/api/events", s.eventStream)
 	r.Post("/api/scan", s.triggerScan)
@@ -109,22 +140,52 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Post("/api/scan/pause", s.pauseScan)
 	r.Post("/api/scan/rebuild", s.rebuildScan)
 	r.Post("/api/scan/thumbnails/rebuild", s.thumbnailRebuildScan)
+	r.Post("/api/scan/thumbnails/continue", s.thumbnailContinueScan)
 	r.Get("/api/scan/status", s.scanStatus)
 	r.Get("/api/scan/runs", s.scanRuns)
 	r.Get("/api/settings/progress", s.settingsProgress)
 	r.Get("/api/settings/activity", s.settingsActivity)
+	r.Get("/api/settings/tasks", s.systemTasks)
+	r.Post("/api/settings/tasks/{id}/run", s.runSystemTask)
+	r.Post("/api/settings/tasks/{id}/stop", s.stopSystemTask)
+	r.Get("/api/settings/video-proxy", s.videoProxySettings)
+	r.Put("/api/settings/video-proxy", s.updateVideoProxySettings)
 	r.Get("/api/settings/libraries", s.scanLibraries)
 	r.Post("/api/settings/libraries", s.addScanLibrary)
 	r.Put("/api/settings/libraries/{id}", s.updateScanLibrary)
 	r.Delete("/api/settings/libraries/{id}", s.removeScanLibrary)
+	r.Put("/api/settings/libraries/{id}/ai-focus", s.updateScanLibraryAIFocus)
+	r.Post("/api/settings/libraries/{id}/ai/reindex", s.reindexScanLibraryAI)
 	r.Post("/api/settings/libraries/{id}/scan", s.scanLibrary)
 	r.Post("/api/settings/libraries/{id}/scan/count", s.countScanLibrary)
 	r.Post("/api/settings/libraries/{id}/scan/metadata", s.metadataScanLibrary)
 	r.Post("/api/settings/libraries/{id}/thumbnails/rebuild", s.thumbnailRebuildLibrary)
+	r.Post("/api/settings/libraries/{id}/thumbnails/continue", s.thumbnailContinueLibrary)
 	r.Get("/api/settings/scan-folders", s.scanFolders)
 	r.Post("/api/settings/scan-folders", s.addScanFolder)
 	r.Delete("/api/settings/scan-folders", s.removeScanFolder)
 	r.Get("/api/source-folders", s.sourceFolders)
+	r.Get("/api/tags", s.tags)
+	r.Post("/api/tags", s.createTag)
+	r.Put("/api/tags/{id}", s.updateTag)
+	r.Delete("/api/tags/{id}", s.deleteTag)
+	r.Post("/api/tags/merge", s.mergeTags)
+	r.Get("/api/collections", s.collections)
+	r.Post("/api/collections", s.createCollection)
+	r.Put("/api/collections/{id}", s.updateCollection)
+	r.Delete("/api/collections/{id}", s.deleteCollection)
+	r.Get("/api/collections/{id}/assets", s.collectionAssets)
+	r.Get("/api/collections/{id}/anchors", s.collectionAnchors)
+	r.Get("/api/ai/status", s.aiStatus)
+	r.Get("/api/ai/settings", s.aiSettings)
+	r.Put("/api/ai/settings", s.updateAISettings)
+	r.Post("/api/ai/run", s.runAIManually)
+	r.Post("/api/ai/stop", s.stopAIManually)
+	r.Post("/api/ai/reindex", s.reindexAI)
+	r.Post("/api/ai/retry-failed", s.retryFailedAI)
+	r.Get("/api/ai/tags", s.aiTags)
+	r.Get("/api/duplicates", s.duplicateGroups)
+	r.Get("/api/duplicates/selection", s.duplicateSelection)
 	r.Get("/api/album-groups", s.albumGroups)
 	r.Post("/api/album-groups", s.createAlbumGroup)
 	r.Get("/api/albums", s.albums)
@@ -136,11 +197,11 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Post("/api/albums/{id}/refresh", s.refreshAlbum)
 	r.Get("/api/albums/{id}/anchors", s.albumAnchors)
 	r.Get("/api/albums/{id}/assets", s.albumAssets)
+	r.Post("/api/albums/{id}/assets", s.addAlbumAssets)
+	r.Delete("/api/albums/{id}/assets", s.removeAlbumAssets)
 	r.Get("/api/library/assets", s.libraryAssets)
 	r.Get("/api/library/anchors", s.libraryAnchors)
-	r.Get("/api/search/assets", s.searchAssets)
-	r.Get("/api/search/anchors", s.searchAnchors)
-	r.Get("/api/search/nfo-options", s.searchNFOOptions)
+	r.Get("/api/library/nfo-options", s.libraryNFOOptions)
 	r.Get("/api/folders", s.folders)
 	r.Get("/api/folders/tree", s.folderTree)
 	r.Get("/api/folders/by-path", s.folderByPath)
@@ -148,8 +209,20 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Get("/api/folders/{id}/assets", s.folderAssets)
 	r.Get("/api/folders/{id}/anchors", s.folderAnchors)
 	r.Get("/api/assets/{id}", s.asset)
+	r.Get("/api/assets/{id}/ai", s.assetAI)
+	r.Post("/api/assets/{id}/ai/reanalyze", s.reanalyzeAssetAI)
+	r.Post("/api/assets/batch/tags", s.batchAddTag)
+	r.Post("/api/assets/batch/rating", s.batchSetRating)
+	r.Post("/api/assets/batch/rotation", s.batchSetRotation)
+	r.Post("/api/assets/batch/album", s.batchAddToAlbum)
+	r.Post("/api/assets/batch/hide", s.batchHide)
+	r.Post("/api/assets/batch/unhide", s.batchUnhide)
+	r.Post("/api/assets/batch/delete", s.batchDelete)
 	r.Get("/api/assets/{id}/delete-plan", s.assetDeletePlan)
 	r.Post("/api/assets/{id}/delete", s.deleteAsset)
+	r.Get("/api/assets/{id}/tags", s.assetTags)
+	r.Post("/api/assets/{id}/tags", s.addAssetTag)
+	r.Delete("/api/assets/{id}/tags", s.removeAssetTag)
 	r.Get("/api/assets/{id}/preferences", s.assetPreferences)
 	r.Put("/api/assets/{id}/preferences", s.updateAssetPreferences)
 	r.Get("/api/assets/{id}/sidecars", s.assetSidecars)
@@ -163,6 +236,11 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Get("/api/assets/{id}/video", s.video)
 	r.Head("/api/assets/{id}/video", s.video)
 	r.Get("/api/assets/{id}/video-poster", s.videoPoster)
+	r.Get("/api/assets/{id}/hls/playlist.m3u8", s.videoHLSPlaylist)
+	r.Get("/api/assets/{id}/hls/status", s.videoHLSStatus)
+	r.Post("/api/assets/{id}/hls/prewarm", s.videoHLSPrewarm)
+	r.Post("/api/assets/{id}/hls/session/stop", s.videoHLSSessionStop)
+	r.Get("/api/assets/{id}/hls/segments/{segment}", s.videoHLSSegment)
 	r.Get("/api/assets/{id}/video-proxy/status", s.videoProxyStatus)
 	r.Post("/api/assets/{id}/video-proxy/keepalive", s.videoProxyKeepalive)
 	r.Get("/api/assets/{id}/video-proxy", s.videoProxy)
@@ -189,18 +267,43 @@ func isForegroundRequest(path string) bool {
 	}
 	return strings.HasPrefix(path, "/api/library/") ||
 		strings.HasPrefix(path, "/api/albums") ||
-		strings.HasPrefix(path, "/api/search/") ||
+		strings.HasPrefix(path, "/api/collections") ||
+		strings.HasPrefix(path, "/api/tags") ||
+		strings.HasPrefix(path, "/api/duplicates") ||
 		strings.HasPrefix(path, "/api/folders") ||
 		strings.HasPrefix(path, "/api/assets/") ||
+		strings.HasPrefix(path, "/api/ai/") ||
 		strings.HasPrefix(path, "/api/cache/")
 }
 
 func isStreamingAssetRequest(path string) bool {
-	return strings.HasSuffix(path, "/video") || strings.HasSuffix(path, "/video-proxy")
+	return strings.HasSuffix(path, "/video") || strings.HasSuffix(path, "/video-proxy") || strings.Contains(path, "/hls/")
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) storageStatus(w http.ResponseWriter, r *http.Request) {
+	statuses := s.sourceHealth.Statuses()
+	for _, status := range statuses {
+		if relPath, err := s.db.SourceHealthSample(r.Context(), status.RootID); err == nil {
+			s.sourceHealth.ProbeAsset(relPath)
+		}
+	}
+	statuses = s.sourceHealth.Statuses()
+	available := true
+	for _, status := range statuses {
+		if !status.Available {
+			available = false
+			break
+		}
+	}
+	message := ""
+	if !available {
+		message = "存储不可达，扫描、缩略图和 AI 分析已暂停；已有媒体和文件夹缓存仍可浏览。"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"available": available, "message": message, "roots": statuses})
 }
 
 func scanCommandResponse(result scanner.CommandResult) map[string]any {
@@ -221,6 +324,8 @@ func (s *Server) publicConfig(w http.ResponseWriter, r *http.Request) {
 		"videoProxyEnabled":       s.cfg.VideoProxyEnabled,
 		"liveVideoProxyMaxActive": s.cfg.LiveVideoProxyMaxActive,
 		"videoProxyMaxHeight":     s.cfg.VideoProxyMaxHeight,
+		"videoSegmentSeconds":     s.cfg.VideoSegmentSeconds,
+		"videoPreloadSegments":    s.cfg.VideoPreloadSegments,
 	})
 }
 
@@ -311,6 +416,11 @@ func (s *Server) thumbnailRebuildScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 }
 
+func (s *Server) thumbnailContinueScan(w http.ResponseWriter, r *http.Request) {
+	result := s.scanner.RequestThumbnailContinue("thumb_continue")
+	writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
+}
+
 func (s *Server) pauseScan(w http.ResponseWriter, r *http.Request) {
 	result := s.scanner.RequestStop()
 	writeJSON(w, http.StatusOK, scanCommandResponse(result))
@@ -344,50 +454,13 @@ func (s *Server) scanRuns(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) timelineGroups(w http.ResponseWriter, r *http.Request) {
-	page, pageSize := s.page(r, 24)
-	unit := r.URL.Query().Get("unit")
-	if unit != "year" && unit != "day" {
-		unit = "month"
-	}
-	groups, err := s.db.TimelineGroups(r.Context(), unit, page, pageSize)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "timeline_groups_failed", "读取时间线失败")
-		return
-	}
-	writeJSON(w, http.StatusOK, PageDTO[TimelineGroupDTO]{
-		Items: timelineGroupDTOs(groups.Items), Page: groups.Page, PageSize: groups.PageSize, HasMore: groups.HasMore,
-	})
-}
-
-func (s *Server) timelineAssets(w http.ResponseWriter, r *http.Request) {
-	page, pageSize := s.page(r, s.cfg.PageSizeDefault)
-	opts := db.AssetListOptions{Page: page, PageSize: pageSize, From: int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to")}
-	assets, err := s.db.ListTimelineAssets(r.Context(), opts)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "timeline_assets_failed", "读取时间线资源失败")
-		return
-	}
-	writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{
-		Items: assetDTOs(assets.Items), Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore,
-	})
-}
-
 func (s *Server) libraryAssets(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	page, pageSize := s.page(r, s.cfg.PageSizeDefault)
-	typeFilter := safeType(r.URL.Query().Get("type"))
-	if typeFilter == "all" {
-		typeFilter = ""
-	}
-	opts := db.AssetListOptions{
-		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
-		Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-		Orientation:     searchOrientation(r),
-		AlbumUnassigned: albumUnassignedQuery(r),
-		AlbumIDs:        int64ListQuery(r, "albumIds"),
-	}
+	opts := s.libraryAssetOptions(r, page, pageSize)
 	if albumID := int64QueryPtr(r, "albumId"); albumID != nil {
 		assets, err := s.db.ListAlbumAssets(r.Context(), *albumID, opts)
+		s.recordFilterTiming(w, r, started)
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "album_not_found", "相册不存在")
 			return
@@ -396,39 +469,32 @@ func (s *Server) libraryAssets(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "library_assets_failed", "读取图库失败")
 			return
 		}
-		writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{
-			Items: assetDTOs(assets.Items), Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore,
-		})
+		items, err := s.listAssetDTOs(r, assets.Items)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "library_assets_failed", "读取 AI 摘要失败")
+			return
+		}
+		writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{Items: items, Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore})
 		return
 	}
-	assets, err := s.db.ListLibraryAssets(r.Context(), opts)
+	assets, err := s.db.SearchAssets(r.Context(), opts)
+	s.recordFilterTiming(w, r, started)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "library_assets_failed", "读取图库失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{
-		Items: assetDTOs(assets.Items), Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore,
-	})
+	items, err := s.listAssetDTOs(r, assets.Items)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "library_assets_failed", "读取 AI 摘要失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{Items: items, Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore})
 }
 
 func (s *Server) libraryAnchors(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
-	typeFilter := safeType(r.URL.Query().Get("type"))
-	if typeFilter == "all" {
-		typeFilter = ""
-	}
-	opts := db.AssetListOptions{
-		PageSize:        pageSize,
-		Type:            typeFilter,
-		Sort:            safeSort(r.URL.Query().Get("sort")),
-		Group:           safeGroup(r.URL.Query().Get("group")),
-		Query:           strings.TrimSpace(r.URL.Query().Get("q")),
-		VisibleOnly:     visibleOnly(r),
-		Rating:          ratingQueryPtr(r, "rating"),
-		Orientation:     searchOrientation(r),
-		AlbumUnassigned: albumUnassignedQuery(r),
-		AlbumIDs:        int64ListQuery(r, "albumIds"),
-	}
+	opts := s.libraryAssetOptions(r, 1, pageSize)
 	var anchorResult db.LibraryAnchorResult
 	var err error
 	if albumID := int64QueryPtr(r, "albumId"); albumID != nil {
@@ -438,8 +504,9 @@ func (s *Server) libraryAnchors(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		anchorResult, err = s.db.LibraryAnchors(r.Context(), opts)
+		anchorResult, err = s.db.SearchAnchors(r.Context(), opts)
 	}
+	s.recordFilterTiming(w, r, started)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "library_anchors_failed", "读取图库索引失败")
 		return
@@ -447,31 +514,7 @@ func (s *Server) libraryAnchors(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": libraryAnchorDTOs(anchorResult.Items), "total": anchorResult.Total})
 }
 
-func (s *Server) searchAssets(w http.ResponseWriter, r *http.Request) {
-	page, pageSize := s.page(r, s.cfg.PageSizeDefault)
-	opts := s.searchAssetOptions(r, page, pageSize)
-	assets, err := s.db.SearchAssets(r.Context(), opts)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "search_assets_failed", "搜索资源失败")
-		return
-	}
-	writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{
-		Items: assetDTOs(assets.Items), Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore,
-	})
-}
-
-func (s *Server) searchAnchors(w http.ResponseWriter, r *http.Request) {
-	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
-	opts := s.searchAssetOptions(r, 1, pageSize)
-	anchorResult, err := s.db.SearchAnchors(r.Context(), opts)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "search_anchors_failed", "读取搜索索引失败")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": libraryAnchorDTOs(anchorResult.Items), "total": anchorResult.Total})
-}
-
-func (s *Server) searchNFOOptions(w http.ResponseWriter, r *http.Request) {
+func (s *Server) libraryNFOOptions(w http.ResponseWriter, r *http.Request) {
 	field := safeNFOOptionField(r.URL.Query().Get("field"))
 	if field == "" {
 		writeError(w, http.StatusBadRequest, "nfo_field_invalid", "NFO 字段不支持")
@@ -564,6 +607,7 @@ func (s *Server) folder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) folderAssets(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	id, ok := s.idParam(w, r)
 	if !ok {
 		return
@@ -572,9 +616,10 @@ func (s *Server) folderAssets(w http.ResponseWriter, r *http.Request) {
 	opts := db.AssetListOptions{
 		Page: page, PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-		Orientation: searchOrientation(r),
+		Orientation: searchOrientation(r), CombinedTags: combinedTagsQuery(r),
 	}
 	assets, err := s.db.ListFolderAssets(r.Context(), id, opts)
+	s.recordFilterTiming(w, r, started)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "folder_not_found", "文件夹不存在")
 		return
@@ -583,12 +628,35 @@ func (s *Server) folderAssets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "folder_assets_failed", "读取文件夹资源失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{
-		Items: assetDTOs(assets.Items), Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore,
-	})
+	items, err := s.listAssetDTOs(r, assets.Items)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "folder_assets_failed", "读取 AI 摘要失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, PageDTO[AssetDTO]{Items: items, Page: assets.Page, PageSize: assets.PageSize, HasMore: assets.HasMore})
+}
+
+func (s *Server) listAssetDTOs(r *http.Request, assets []model.Asset) ([]AssetDTO, error) {
+	if !boolQuery(r, "includeAiSummary", false) {
+		return assetDTOs(assets), nil
+	}
+	ids := make([]int64, 0, len(assets))
+	for _, asset := range assets {
+		ids = append(ids, asset.ID)
+	}
+	summaries, err := s.db.AssetAISummaries(r.Context(), ids)
+	if err != nil {
+		return nil, err
+	}
+	manualTags, err := s.db.AssetTagsByAssetIDs(r.Context(), ids)
+	if err != nil {
+		return nil, err
+	}
+	return assetDTOsWithListSummaries(assets, summaries, manualTags), nil
 }
 
 func (s *Server) folderAnchors(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	id, ok := s.idParam(w, r)
 	if !ok {
 		return
@@ -597,9 +665,10 @@ func (s *Server) folderAnchors(w http.ResponseWriter, r *http.Request) {
 	opts := db.AssetListOptions{
 		PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-		Orientation: searchOrientation(r),
+		Orientation: searchOrientation(r), CombinedTags: combinedTagsQuery(r),
 	}
 	anchorResult, err := s.db.FolderAnchors(r.Context(), id, opts)
+	s.recordFilterTiming(w, r, started)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "folder_not_found", "文件夹不存在")
 		return
@@ -625,7 +694,7 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contextName := r.URL.Query().Get("context")
-	if contextName != "folder" && contextName != "album" && contextName != "search" && contextName != "rating" {
+	if contextName != "folder" && contextName != "album" && contextName != "collection" {
 		contextName = "library"
 	}
 	typeFilter := safeType(r.URL.Query().Get("type"))
@@ -640,14 +709,20 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 	opts := db.NeighborOptions{
 		Context: contextName, AssetID: id, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), FolderID: folderID,
-		From: int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: 5, Recursive: boolQuery(r, "recursive", false),
-		NFOQuery: strings.TrimSpace(r.URL.Query().Get("nfo")),
-		NFOActor: strings.TrimSpace(r.URL.Query().Get("nfoActor")),
-		NFOID:    strings.TrimSpace(r.URL.Query().Get("nfoId")),
-		NFOTag:   strings.TrimSpace(r.URL.Query().Get("nfoTag")),
-		NFOTitle: strings.TrimSpace(r.URL.Query().Get("nfoTitle")),
-		NFOYear:  strings.TrimSpace(r.URL.Query().Get("nfoYear")),
-		MinWidth: intQueryPtr(r, "widthMin"), MaxWidth: intQueryPtr(r, "widthMax"),
+		CombinedQuery: strings.TrimSpace(r.URL.Query().Get("combinedQuery")),
+		From:          int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: 5, Recursive: boolQuery(r, "recursive", false),
+		NFOQuery:      strings.TrimSpace(r.URL.Query().Get("nfo")),
+		NFOActor:      strings.TrimSpace(r.URL.Query().Get("nfoActor")),
+		NFOID:         strings.TrimSpace(r.URL.Query().Get("nfoId")),
+		NFOTag:        strings.TrimSpace(r.URL.Query().Get("nfoTag")),
+		ManualTag:     strings.TrimSpace(r.URL.Query().Get("manualTag")),
+		CombinedTag:   strings.TrimSpace(r.URL.Query().Get("combinedTag")),
+		CombinedTags:  combinedTagsQuery(r),
+		AIDescription: strings.TrimSpace(r.URL.Query().Get("aiDescription")),
+		AITag:         strings.TrimSpace(r.URL.Query().Get("aiTag")),
+		NFOTitle:      strings.TrimSpace(r.URL.Query().Get("nfoTitle")),
+		NFOYear:       strings.TrimSpace(r.URL.Query().Get("nfoYear")),
+		MinWidth:      intQueryPtr(r, "widthMin"), MaxWidth: intQueryPtr(r, "widthMax"),
 		MinHeight: intQueryPtr(r, "heightMin"), MaxHeight: intQueryPtr(r, "heightMax"),
 		MatchAnyAxis: dimensionMode(r) == "both",
 		MinDuration:  float64QueryPtr(r, "durationMin"), MaxDuration: float64QueryPtr(r, "durationMax"),
@@ -656,10 +731,18 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		Rating:          ratingQueryPtr(r, "rating"),
 		AlbumUnassigned: albumUnassignedQuery(r),
 		AlbumIDs:        int64ListQuery(r, "albumIds"),
+		VisibleOnly:     visibleOnly(r),
 	}
 	var result db.Neighbors
 	var err error
-	if contextName == "album" || albumID != nil {
+	if contextName == "collection" {
+		collectionID := strings.TrimSpace(r.URL.Query().Get("collectionId"))
+		if collectionID == "" {
+			writeError(w, http.StatusBadRequest, "collection_required", "集合 ID 缺失")
+			return
+		}
+		result, err = s.collectionNeighborsForAsset(r.Context(), collectionID, id, s.collectionAssetOptions(r, 1, s.cfg.PageSizeDefault), opts.Limit)
+	} else if contextName == "album" || albumID != nil {
 		if albumID == nil {
 			writeError(w, http.StatusBadRequest, "album_required", "相册 ID 缺失")
 			return
@@ -687,7 +770,7 @@ func (s *Server) assetPosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contextName := r.URL.Query().Get("context")
-	if contextName != "folder" && contextName != "album" && contextName != "search" && contextName != "rating" {
+	if contextName != "folder" && contextName != "album" && contextName != "collection" {
 		contextName = "library"
 	}
 	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
@@ -708,7 +791,7 @@ func (s *Server) assetPosition(w http.ResponseWriter, r *http.Request) {
 		result, err = s.db.FolderAssetPosition(r.Context(), *folderID, id, db.AssetListOptions{
 			PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 			Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-			Orientation: searchOrientation(r),
+			ManualTag: strings.TrimSpace(r.URL.Query().Get("manualTag")), Orientation: searchOrientation(r),
 		})
 	case "album":
 		if albumID == nil {
@@ -718,23 +801,21 @@ func (s *Server) assetPosition(w http.ResponseWriter, r *http.Request) {
 		result, err = s.db.AlbumAssetPosition(r.Context(), *albumID, id, db.AssetListOptions{
 			PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 			Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-			Orientation: searchOrientation(r),
+			ManualTag: strings.TrimSpace(r.URL.Query().Get("manualTag")), Orientation: searchOrientation(r),
 		})
-	case "search":
-		opts := s.searchAssetOptions(r, 1, pageSize)
-		result, err = s.db.AssetPosition(r.Context(), id, opts, true)
-	default:
-		opts := db.AssetListOptions{
-			PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
-			Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-			Orientation:     searchOrientation(r),
-			AlbumUnassigned: albumUnassignedQuery(r),
-			AlbumIDs:        int64ListQuery(r, "albumIds"),
+	case "collection":
+		collectionID := strings.TrimSpace(r.URL.Query().Get("collectionId"))
+		if collectionID == "" {
+			writeError(w, http.StatusBadRequest, "collection_required", "集合 ID 缺失")
+			return
 		}
+		result, err = s.collectionPositionForAsset(r.Context(), collectionID, id, s.collectionAssetOptions(r, 1, pageSize))
+	default:
+		opts := s.libraryAssetOptions(r, 1, pageSize)
 		if albumID != nil {
 			result, err = s.db.AlbumAssetPosition(r.Context(), *albumID, id, opts)
 		} else {
-			result, err = s.db.AssetPosition(r.Context(), id, opts, false)
+			result, err = s.db.AssetPosition(r.Context(), id, opts, true)
 		}
 	}
 	if errors.Is(err, sql.ErrNoRows) {
@@ -776,6 +857,10 @@ func (s *Server) cacheThumb(w http.ResponseWriter, r *http.Request) {
 	}
 	file, err := os.Open(path)
 	if err != nil {
+		if s.recoverMissingThumbCache(r.Context(), cacheKey) {
+			serveMissingThumbPlaceholder(w, cacheKey)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}
@@ -789,6 +874,35 @@ func (s *Server) cacheThumb(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("ETag", `"`+cacheKey+`"`)
 	http.ServeContent(w, r, name, info.ModTime(), file)
+}
+
+func (s *Server) recoverMissingThumbCache(ctx context.Context, cacheKey string) bool {
+	asset, ok := s.assetByCacheKey(ctx, cacheKey)
+	if !ok {
+		return false
+	}
+	if available, _ := s.sourceHealth.AvailableForRel(asset.RelPath); !available {
+		return false
+	}
+	if err := s.db.SetAssetWorkStatus(ctx, asset.ID, "thumb_status", model.StatusPending, nil); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("reset missing thumb cache failed", "assetID", asset.ID, "cacheKey", cacheKey, "error", err)
+		}
+	} else if s.logger != nil {
+		s.logger.Info("missing thumb cache reset", "assetID", asset.ID, "cacheKey", cacheKey)
+	}
+	if s.jobs != nil {
+		s.jobs.Enqueue(jobs.Task{Type: "thumb", AssetID: asset.ID})
+	}
+	return true
+}
+
+func serveMissingThumbPlaceholder(w http.ResponseWriter, cacheKey string) {
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("ETag", `W/"missing-thumb-`+cacheKey+`"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>`))
 }
 
 func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
@@ -944,23 +1058,30 @@ func boolQuery(r *http.Request, key string, fallback bool) bool {
 }
 
 func visibleOnly(r *http.Request) bool {
-	return strings.ToLower(strings.TrimSpace(r.URL.Query().Get("visible"))) != "all"
+	return strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("visible")), "ready")
 }
 
-func (s *Server) searchAssetOptions(r *http.Request, page int, pageSize int) db.AssetListOptions {
+func (s *Server) libraryAssetOptions(r *http.Request, page int, pageSize int) db.AssetListOptions {
 	typeFilter := safeType(r.URL.Query().Get("type"))
 	if typeFilter == "all" {
 		typeFilter = ""
 	}
 	return db.AssetListOptions{
 		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
-		Query: strings.TrimSpace(r.URL.Query().Get("q")), NFOQuery: strings.TrimSpace(r.URL.Query().Get("nfo")),
-		NFOActor: strings.TrimSpace(r.URL.Query().Get("nfoActor")),
-		NFOID:    strings.TrimSpace(r.URL.Query().Get("nfoId")),
-		NFOTag:   strings.TrimSpace(r.URL.Query().Get("nfoTag")),
-		NFOTitle: strings.TrimSpace(r.URL.Query().Get("nfoTitle")),
-		NFOYear:  strings.TrimSpace(r.URL.Query().Get("nfoYear")),
-		From:     int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), VisibleOnly: visibleOnly(r),
+		Query:         strings.TrimSpace(r.URL.Query().Get("q")),
+		CombinedQuery: strings.TrimSpace(r.URL.Query().Get("combinedQuery")),
+		NFOQuery:      strings.TrimSpace(r.URL.Query().Get("nfo")),
+		NFOActor:      strings.TrimSpace(r.URL.Query().Get("nfoActor")),
+		NFOID:         strings.TrimSpace(r.URL.Query().Get("nfoId")),
+		NFOTag:        strings.TrimSpace(r.URL.Query().Get("nfoTag")),
+		ManualTag:     strings.TrimSpace(r.URL.Query().Get("manualTag")),
+		CombinedTag:   strings.TrimSpace(r.URL.Query().Get("combinedTag")),
+		CombinedTags:  combinedTagsQuery(r),
+		AIDescription: strings.TrimSpace(r.URL.Query().Get("aiDescription")),
+		AITag:         strings.TrimSpace(r.URL.Query().Get("aiTag")),
+		NFOTitle:      strings.TrimSpace(r.URL.Query().Get("nfoTitle")),
+		NFOYear:       strings.TrimSpace(r.URL.Query().Get("nfoYear")),
+		From:          int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), VisibleOnly: visibleOnly(r),
 		MinWidth: intQueryPtr(r, "widthMin"), MaxWidth: intQueryPtr(r, "widthMax"),
 		MinHeight: intQueryPtr(r, "heightMin"), MaxHeight: intQueryPtr(r, "heightMax"),
 		MatchAnyAxis: dimensionMode(r) == "both",
@@ -1187,6 +1308,20 @@ func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 			logger.Info("http", "method", r.Method, "path", r.URL.Path, "elapsed", time.Since(start).String())
 		})
 	}
+}
+
+func (s *Server) recordFilterTiming(w http.ResponseWriter, r *http.Request, started time.Time) {
+	elapsed := time.Since(started)
+	w.Header().Set("Server-Timing", fmt.Sprintf("db;dur=%.3f", float64(elapsed.Microseconds())/1000))
+	if elapsed < 500*time.Millisecond {
+		return
+	}
+	keys := make([]string, 0, len(r.URL.Query()))
+	for key := range r.URL.Query() {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	s.logger.Warn("slow media filter", "path", r.URL.Path, "elapsed", elapsed.String(), "filter_keys", strings.Join(keys, ","))
 }
 
 func Start(ctx context.Context, addr string, handler http.Handler, logger *slog.Logger) error {
