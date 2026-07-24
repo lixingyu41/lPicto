@@ -200,6 +200,17 @@ export default function SettingsPage() {
     }
   }, [refreshActivity, refreshLibraries, refreshVideoProxySettings]);
 
+  const resetMediaLibrary = useCallback(async (confirmation: string) => {
+    const result = await api.resetMediaLibrary(confirmation);
+    const [activity, libraryResult] = await Promise.all([api.settingsActivity(), api.scanLibraries()]);
+    applyScanStatus(activity.scan);
+    setProgress(activity.progress);
+    setCleanup(activity.cleanup);
+    setLibraries(libraryResult.items);
+    setSystemTasks([]);
+    return result;
+  }, [applyScanStatus]);
+
   useEffect(() => {
     void refreshInitial();
   }, [refreshInitial]);
@@ -512,7 +523,7 @@ export default function SettingsPage() {
 
             {activeSettingsSection === 'cache' && (
               <section className="settings-section cache-settings-section">
-                <CacheManager cleanup={cleanup} progress={progress} />
+                <CacheManager cleanup={cleanup} progress={progress} onReset={resetMediaLibrary} />
                 <section className="settings-panel settings-section">
                   <div className="settings-panel-title">视频播放处理</div>
                   <div className="muted-line cache-policy-intro">此设置仅保存在当前浏览器。浏览器优先会直接读取原文件并使用本机硬件解码；格式不受支持时自动回退服务器转码。</div>

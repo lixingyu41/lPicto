@@ -193,6 +193,10 @@ func (m *Manager) ClearAIQueue(ctx context.Context) error {
 	return nil
 }
 
+func (m *Manager) ClearAllQueues(ctx context.Context) error {
+	return m.ClearQueues(ctx, redisAllTaskTypes...)
+}
+
 // ClearQueues removes queued work of the requested types. Active work is allowed
 // to finish; callers reset any stale processing state after the queue is drained.
 func (m *Manager) ClearQueues(ctx context.Context, taskTypes ...string) error {

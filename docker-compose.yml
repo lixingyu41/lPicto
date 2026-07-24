@@ -70,6 +70,8 @@ services:
         source: *media-source
         target: /Media
         read_only: true
+        bind:
+          propagation: rslave
       - type: bind
         source: *cache-source
         target: /cache

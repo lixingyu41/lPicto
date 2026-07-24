@@ -14,6 +14,14 @@ func TestOperationNotPermittedMarksSourceUnavailable(t *testing.T) {
 	}
 }
 
+func TestSourceProbeTimeoutMarksSourceUnavailable(t *testing.T) {
+	for _, message := range []string{"source probe timed out", "source read timed out after 2s"} {
+		if !IsSourceUnavailable(errors.New(message)) {
+			t.Fatalf("%q was not recognized as unavailable", message)
+		}
+	}
+}
+
 func TestNormalizeRelPathSafety(t *testing.T) {
 	got, err := NormalizeRelPath(`2024\IMG_001.jpg`)
 	if err != nil {

@@ -34,6 +34,7 @@ import type {
   ScanRun,
   ScanLibrary,
   LibraryFilterParams,
+  MediaLibraryResetResult,
   ScanFolder,
   ScanLibrariesResponse,
   SettingsActivity,
@@ -64,14 +65,14 @@ export interface VideoProxySessionContext {
   sessionId?: string;
 }
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
+async function request<T>(url: string, init?: RequestInit, timeoutMs = requestTimeoutMs): Promise<T> {
   const controller = new AbortController();
   const upstreamSignal = init?.signal;
   let timedOut = false;
   const timeoutID = window.setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, requestTimeoutMs);
+  }, timeoutMs);
   const abortFromUpstream = () => controller.abort();
   if (upstreamSignal?.aborted) {
     controller.abort();
@@ -171,6 +172,12 @@ export const api = {
   scanRuns: (page = 1, pageSize = 20) => request<Page<ScanRun>>(`/api/scan/runs${qs({ page, pageSize })}`),
   settingsProgress: () => request<ProcessingProgress>('/api/settings/progress'),
   settingsActivity: () => request<SettingsActivity>('/api/settings/activity'),
+  resetMediaLibrary: (confirmation: string) =>
+    request<MediaLibraryResetResult>('/api/settings/media-library/reset', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirmation }),
+    }, 180_000),
   systemTasks: () => request<{ items: SystemTask[] }>('/api/settings/tasks'),
   runSystemTask: (id: string, action: string, libraryId: string | null) =>
     request<{ accepted: boolean; count?: number; state?: string }>(`/api/settings/tasks/${encodeURIComponent(id)}/run`, {

@@ -59,6 +59,18 @@ func TestNormalizeScanLibraries(t *testing.T) {
 	}
 }
 
+func TestNormalizeScanLibrariesPreservesAIFocus(t *testing.T) {
+	got, err := NormalizeScanLibraries([]ScanLibrary{{
+		ID: "vid", Name: "VID", Roots: []string{"VID"}, AIFocus: "  车型、服装款式  ",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].AIFocus != "车型、服装款式" {
+		t.Fatalf("AI focus was not preserved: %#v", got)
+	}
+}
+
 func TestScanRootsFromLibraries(t *testing.T) {
 	roots := ScanRoots([]ScanLibrary{
 		{ID: "a", Name: "A", Roots: []string{"Photo"}},

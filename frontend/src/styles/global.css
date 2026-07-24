@@ -3745,6 +3745,51 @@ input {
   margin: -5px 0 12px;
 }
 
+.media-library-reset-panel {
+  border-color: color-mix(in srgb, var(--danger) 26%, var(--line));
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--danger) 7%, transparent), transparent 58%),
+    var(--panel);
+}
+
+.media-library-reset-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.media-library-reset-heading > div {
+  min-width: 0;
+}
+
+.media-library-reset-heading .settings-panel-title {
+  margin-bottom: 5px;
+}
+
+.media-library-reset-heading .command-button {
+  flex: 0 0 auto;
+}
+
+.media-library-reset-result {
+  margin-top: 12px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--success) 10%, transparent);
+  padding: 9px 11px;
+  color: var(--success);
+  font-size: 12px;
+}
+
+.media-library-reset-confirmation {
+  display: grid;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.media-library-reset-confirmation input {
+  width: 100%;
+}
+
 .cache-summary-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
@@ -5249,6 +5294,17 @@ button:active,
 .task-confirmation-content p {
   margin: 4px 0 0;
   line-height: 1.55;
+}
+
+.media-library-reset-dialog .task-confirmation-content > label {
+  display: grid;
+}
+
+@media (max-width: 720px) {
+  .media-library-reset-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 
 .system-task-progress {

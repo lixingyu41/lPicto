@@ -33,6 +33,30 @@ func TestOriginalMissingSourceKeepsAssetUnavailable(t *testing.T) {
 	assertAssetActive(t, database, id)
 }
 
+func TestOriginalReadableSourceStillSupportsRanges(t *testing.T) {
+	server, database, root := testMissingSourceServer(t)
+	const contents = "0123456789"
+	if err := os.MkdirAll(filepath.Join(root, "Library"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Library", "readable.jpg"), []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id := testInsertAsset(t, database, "Library/readable.jpg", "1234567890abcdefabcd", model.MediaTypeImage)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/assets/"+int64String(id)+"/original", nil)
+	request.Header.Set("Range", "bytes=2-5")
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", recorder.Code)
+	}
+	if recorder.Body.String() != contents[2:6] {
+		t.Fatalf("body = %q, want %q", recorder.Body.String(), contents[2:6])
+	}
+}
+
 func TestCacheThumbMissingSourceKeepsAsset(t *testing.T) {
 	server, database, _ := testMissingSourceServer(t)
 	cacheKey := "fedcba9876543210fedc"

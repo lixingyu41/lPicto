@@ -58,6 +58,7 @@ type videoProxyRuntime struct {
 	ActiveStream int
 	Sessions     map[string]*videoProxySession
 	Done         chan struct{}
+	Cancel       context.CancelFunc
 }
 
 type videoProxySession struct {
@@ -357,6 +358,11 @@ func (s *Server) runVideoProxyTranscode(asset model.Asset, runtimeKey string, st
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
+	s.videoProxyMu.Lock()
+	if state := s.videoProxyStates[runtimeKey]; state != nil {
+		state.Cancel = cancel
+	}
+	s.videoProxyMu.Unlock()
 	idleErr := make(chan error, 1)
 	go s.cancelVideoProxyTranscodeWhenIdle(ctx, cancel, runtimeKey, idleErr)
 	releaseSlot, err := s.acquireVideoProxySlot(ctx)
@@ -688,6 +694,7 @@ func (s *Server) finishVideoProxyTranscode(asset model.Asset, runtimeKey string,
 	if state != nil {
 		state.Queued = false
 		state.Transcoding = false
+		state.Cancel = nil
 		state.UpdatedAt = now
 		state.ExpiresAt = now.Add(cacheSettings.TTL)
 		if idleStop {

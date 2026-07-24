@@ -431,6 +431,13 @@ export interface CleanupStatus {
   updatedAt: number;
 }
 
+export interface MediaLibraryResetResult {
+  reset: boolean;
+  deletedAssets: number;
+  deletedFiles: number;
+  releasedBytes: number;
+}
+
 export interface SettingsActivity {
   scan: ScanStatus;
   progress: ProcessingProgress;

@@ -51,9 +51,11 @@ type Server struct {
 	progressStatsAt    time.Time
 	progressRefreshing bool
 
-	cleanupMu     sync.Mutex
-	cleanupStatus CleanupStatusDTO
-	cleanupCancel context.CancelFunc
+	cleanupMu      sync.Mutex
+	cleanupStatus  CleanupStatusDTO
+	cleanupCancel  context.CancelFunc
+	mediaResetMu   sync.Mutex
+	mediaResetting bool
 
 	sourceDirMu    sync.Mutex
 	sourceDirCache map[string]sourceDirCacheEntry
@@ -148,6 +150,7 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Get("/api/settings/tasks", s.systemTasks)
 	r.Post("/api/settings/tasks/{id}/run", s.runSystemTask)
 	r.Post("/api/settings/tasks/{id}/stop", s.stopSystemTask)
+	r.Post("/api/settings/media-library/reset", s.resetMediaLibrary)
 	r.Get("/api/settings/video-proxy", s.videoProxySettings)
 	r.Put("/api/settings/video-proxy", s.updateVideoProxySettings)
 	r.Get("/api/settings/libraries", s.scanLibraries)
@@ -978,13 +981,25 @@ func (s *Server) serveVideoAsset(w http.ResponseWriter, r *http.Request, asset m
 }
 
 func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, asset model.Asset, _ bool) {
+	if available, _ := s.sourceHealth.AvailableForRel(asset.RelPath); !available {
+		writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
+		return
+	}
 	path, err := s.store.PhotoPath(asset.RelPath)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "asset_not_found", "资源不存在")
 		return
 	}
-	file, err := os.Open(path)
+	file, info, err := openReadableSource(path, 2*time.Second)
 	if err != nil {
+		if storage.IsSourceUnavailable(err) {
+			s.sourceHealth.RecordSourceError(asset.RelPath, err)
+			if s.logger != nil {
+				s.logger.Warn("serve media source unavailable", "assetID", asset.ID, "relPath", asset.RelPath, "error", err)
+			}
+			writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
+			return
+		}
 		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
 			return
@@ -993,8 +1008,7 @@ func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || info.IsDir() {
+	if info.IsDir() {
 		writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
 		return
 	}
@@ -1011,6 +1025,45 @@ func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, 
 		w.Header().Set("X-Accel-Buffering", "no")
 	}
 	http.ServeContent(w, r, asset.Filename, info.ModTime(), file)
+}
+
+type readableSourceResult struct {
+	file *os.File
+	info os.FileInfo
+	err  error
+}
+
+func openReadableSource(path string, timeout time.Duration) (*os.File, os.FileInfo, error) {
+	result := make(chan readableSourceResult)
+	cancelled := make(chan struct{})
+	go func() {
+		file, err := os.Open(path)
+		var info os.FileInfo
+		if err == nil {
+			info, err = file.Stat()
+		}
+		if err == nil && !info.IsDir() && info.Size() > 0 {
+			var probe [1]byte
+			_, err = file.ReadAt(probe[:], 0)
+		}
+		value := readableSourceResult{file: file, info: info, err: err}
+		select {
+		case result <- value:
+		case <-cancelled:
+			if file != nil {
+				_ = file.Close()
+			}
+		}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case value := <-result:
+		return value.file, value.info, value.err
+	case <-timer.C:
+		close(cancelled)
+		return nil, nil, fmt.Errorf("source read timed out after %s", timeout)
+	}
 }
 
 func (s *Server) static(w http.ResponseWriter, r *http.Request) {

@@ -375,6 +375,7 @@ func NormalizeScanLibraries(libraries []ScanLibrary) ([]ScanLibrary, error) {
 			ID:              id,
 			Name:            name,
 			Roots:           roots,
+			AIFocus:         strings.TrimSpace(library.AIFocus),
 			DiscoveredFiles: library.DiscoveredFiles,
 			DiscoveredAt:    library.DiscoveredAt,
 		})

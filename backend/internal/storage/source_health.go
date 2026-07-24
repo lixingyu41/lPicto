@@ -36,6 +36,8 @@ type SourceHealthStatus struct {
 	CheckedAt int64  `json:"checkedAt"`
 }
 
+const sourceProbeTimeout = 2 * time.Second
+
 func NewSourceHealth(store Store, ttl time.Duration, redisURLs ...string) *SourceHealth {
 	if ttl <= 0 {
 		ttl = 15 * time.Second
@@ -196,15 +198,25 @@ func (h *SourceHealth) probeRoots() []Root {
 
 func probeSourceRoot(root Root) SourceHealthStatus {
 	status := SourceHealthStatus{RootID: root.ID, Available: true, CheckedAt: time.Now().Unix()}
-	dir, err := os.Open(root.Path)
-	if err != nil {
-		status.Available = false
-		status.Message = err.Error()
-		return status
+	result := make(chan error, 1)
+	go func() {
+		dir, err := os.Open(root.Path)
+		if err == nil {
+			_, err = dir.Readdirnames(1)
+			if err == io.EOF {
+				err = nil
+			}
+			_ = dir.Close()
+		}
+		result <- err
+	}()
+	var err error
+	select {
+	case err = <-result:
+	case <-time.After(sourceProbeTimeout):
+		err = errors.New("source probe timed out")
 	}
-	defer dir.Close()
-	_, err = dir.Readdirnames(1)
-	if err != nil && err != io.EOF {
+	if err != nil {
 		status.Available = false
 		status.Message = err.Error()
 	}
@@ -213,11 +225,24 @@ func probeSourceRoot(root Root) SourceHealthStatus {
 
 func probeSourceFile(root Root, path string) SourceHealthStatus {
 	status := SourceHealthStatus{RootID: root.ID, Available: true, CheckedAt: time.Now().Unix()}
-	file, err := os.Open(path)
-	if err == nil {
-		var one [1]byte
-		_, err = file.Read(one[:])
-		_ = file.Close()
+	result := make(chan error, 1)
+	go func() {
+		file, err := os.Open(path)
+		if err == nil {
+			var one [1]byte
+			_, err = file.Read(one[:])
+			if err == io.EOF {
+				err = nil
+			}
+			_ = file.Close()
+		}
+		result <- err
+	}()
+	var err error
+	select {
+	case err = <-result:
+	case <-time.After(sourceProbeTimeout):
+		err = errors.New("source probe timed out")
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		// The filesystem answered the lookup. The root is healthy; this is a
@@ -243,7 +268,7 @@ func IsSourceUnavailable(err error) bool {
 
 func IsSourceUnavailablePath(message string) bool {
 	message = strings.ToLower(message)
-	return strings.Contains(message, "no such device") || strings.Contains(message, "stale file handle") || strings.Contains(message, "input/output error") || strings.Contains(message, "transport endpoint is not connected") || strings.Contains(message, "operation not permitted") || strings.Contains(message, "nfs")
+	return strings.Contains(message, "no such device") || strings.Contains(message, "stale file handle") || strings.Contains(message, "input/output error") || strings.Contains(message, "transport endpoint is not connected") || strings.Contains(message, "operation not permitted") || strings.Contains(message, "source probe timed out") || strings.Contains(message, "source read timed out") || strings.Contains(message, "nfs")
 }
 
 func (h *SourceHealth) globalUnavailable(rootID string) (SourceHealthStatus, bool) {

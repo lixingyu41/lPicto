@@ -1,6 +1,6 @@
 """Curated Chinese-CLIP taxonomy without generated compound labels."""
 
-TAXONOMY_VERSION = "lpicto-zh-329-v2"
+TAXONOMY_VERSION = "lpicto-zh-compound-v4"
 
 _BASE = """
 人物 男人 女人 男孩 女孩 婴儿 老人 家庭 朋友 情侣 人群 肖像 自拍 合影 婚礼 毕业 生日 聚会 演出 舞蹈 音乐会 运动员 游客 工人 厨师 医生 警察

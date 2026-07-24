@@ -138,11 +138,11 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 		return p.fail(ctx, asset.ID, asset.CacheKey, err, true)
 	}
 	description := strings.TrimSpace(result.Description)
-	if n := len([]rune(description)); n < 20 || n > 80 {
-		return p.fail(ctx, asset.ID, asset.CacheKey, fmt.Errorf("description length %d outside 20..80", n), true)
+	if n := len([]rune(description)); n < 30 || n > 140 {
+		return p.fail(ctx, asset.ID, asset.CacheKey, fmt.Errorf("description length %d outside 30..140", n), true)
 	}
-	if len(result.Tags) > 5 {
-		result.Tags = result.Tags[:5]
+	if len(result.Tags) > 10 {
+		result.Tags = result.Tags[:10]
 	}
 	if len(result.SampledFrames) == 0 {
 		result.SampledFrames = json.RawMessage("[]")
