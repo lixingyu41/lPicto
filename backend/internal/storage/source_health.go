@@ -83,6 +83,25 @@ func (h *SourceHealth) AvailableRoot(root Root) (bool, SourceHealthStatus) {
 	return status.Available, status
 }
 
+func (h *SourceHealth) CachedAvailableForRel(rel string) (bool, SourceHealthStatus) {
+	if h == nil {
+		return true, SourceHealthStatus{Available: true}
+	}
+	root, err := h.probeRootForRel(rel)
+	if err != nil {
+		return false, SourceHealthStatus{Available: false, Message: err.Error()}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if global, ok := h.globalUnavailable(root.ID); ok {
+		return false, global
+	}
+	if current, ok := h.entries[root.ID]; ok {
+		return current.Available, current
+	}
+	return true, SourceHealthStatus{RootID: root.ID, Available: true, Message: "尚未在读取窗口验证"}
+}
+
 func (h *SourceHealth) MarkUnavailableForRel(rel string, err error) {
 	if h == nil || err == nil {
 		return
@@ -156,6 +175,32 @@ func (h *SourceHealth) Statuses() []SourceHealthStatus {
 	for _, root := range roots {
 		_, status := h.AvailableRoot(root)
 		statuses = append(statuses, status)
+	}
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].RootID < statuses[j].RootID })
+	return statuses
+}
+
+// CachedStatuses reports the last known state without touching source paths.
+// Use this for UI polling and idle monitors so an NFS disk can remain asleep.
+func (h *SourceHealth) CachedStatuses() []SourceHealthStatus {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	statuses := make([]SourceHealthStatus, 0, len(h.entries)+len(h.store.Roots))
+	seen := map[string]struct{}{}
+	for _, status := range h.entries {
+		statuses = append(statuses, status)
+		seen[status.RootID] = struct{}{}
+	}
+	for _, root := range h.store.Roots {
+		if _, ok := seen[root.ID]; ok {
+			continue
+		}
+		statuses = append(statuses, SourceHealthStatus{
+			RootID: root.ID, Available: true, Message: "尚未在读取窗口验证",
+		})
 	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].RootID < statuses[j].RootID })
 	return statuses

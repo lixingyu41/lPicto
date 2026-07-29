@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
-import { ChevronRight, EyeOff, Image as ImageIcon, Images, ListChecks, MonitorSmartphone, RectangleHorizontal, RectangleVertical, RotateCw, Sparkles, Square, Star, StarOff, Tags, Trash2, Video } from 'lucide-react';
+import { ChevronRight, Database, EyeOff, Image as ImageIcon, Images, ListChecks, MonitorSmartphone, RectangleHorizontal, RectangleVertical, RotateCw, Sparkles, Square, Star, StarOff, Tags, Trash2, Video } from 'lucide-react';
 import type { Album, AlbumGroup, AssetKind, AssetRating, OrientationFilter } from '../types/api';
 import { CompactSidebarMenu, CompactSidebarMenuGroup } from './CompactSidebarMenu';
 import {
@@ -143,11 +143,11 @@ function SidebarBatchSelectionMenu() {
     { disabled: selectionDisabled, icon: <RotateCw size={18} />, key: 'rotate', label: '批量旋转', onSelect: () => dispatchAssetGridBatchCommand('rotate') },
     { disabled: selectionDisabled, icon: <EyeOff size={18} />, key: 'hide', label: '批量隐藏', onSelect: () => dispatchAssetGridBatchCommand('hide') },
     { disabled: selectionDisabled, icon: <Trash2 size={18} />, key: 'delete', label: '批量删除', onSelect: () => dispatchAssetGridBatchCommand('delete') },
+    { disabled: selectionDisabled, icon: <Database size={18} />, key: 'delete-records', label: '删除记录', onSelect: () => dispatchAssetGridBatchCommand('delete-records') },
   ];
   return (
     <CompactSidebarMenu
       ariaLabel={`多选，已选择 ${state.selectedCount} 个`}
-      persistent
       title={`多选 · ${state.selectedCount} 个`}
       trigger={<ListChecks size={18} />}
       options={options}

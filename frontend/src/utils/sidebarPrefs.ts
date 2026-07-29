@@ -1,10 +1,13 @@
 import type { SidebarPanelTarget } from '../components/SidebarContext';
 
 export type PrimarySidebarPanelTarget = 'library' | 'albums' | 'folders' | 'collections' | 'settings';
+export type CollapsedSidebarContent = 'icon' | 'character';
 
 const sidebarSecondaryKey = 'lpicto.sidebarSecondaryExpanded';
 const sidebarWidthsKey = 'lpicto.sidebarWidths';
 const sidebarCollapsedKey = 'lpicto.sidebarCollapsed';
+const collapsedSidebarContentKey = 'lpicto.collapsedSidebarContent';
+export const sidebarAppearanceChanged = 'lpicto-sidebar-appearance-changed';
 export const sidebarPrimaryWidth = 122;
 const sidebarWidthDefaults = { primary: sidebarPrimaryWidth, secondary: 268 };
 const sidebarWidthLimits = {
@@ -67,6 +70,23 @@ export function loadSidebarCollapsed() {
 export function saveSidebarCollapsed(collapsed: boolean) {
   try {
     window.localStorage.setItem(sidebarCollapsedKey, String(collapsed));
+  } catch {
+    // Ignore storage failures; the current session state still works.
+  }
+}
+
+export function loadCollapsedSidebarContent(): CollapsedSidebarContent {
+  try {
+    return window.localStorage.getItem(collapsedSidebarContentKey) === 'character' ? 'character' : 'icon';
+  } catch {
+    return 'icon';
+  }
+}
+
+export function saveCollapsedSidebarContent(content: CollapsedSidebarContent) {
+  try {
+    window.localStorage.setItem(collapsedSidebarContentKey, content);
+    window.dispatchEvent(new Event(sidebarAppearanceChanged));
   } catch {
     // Ignore storage failures; the current session state still works.
   }

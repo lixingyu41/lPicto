@@ -66,7 +66,7 @@ type Config struct {
 
 func Load() (Config, error) {
 	scanMinutes := intEnv("SCAN_INTERVAL_MINUTES", 0)
-	fileCountScanMinutes := intEnv("FILE_COUNT_SCAN_INTERVAL_MINUTES", 10)
+	fileCountScanMinutes := intEnv("FILE_COUNT_SCAN_INTERVAL_MINUTES", 0)
 	photoRoot := stringEnv("MEDIA_ROOT", "/Media")
 	photoRoots, err := photoRootsEnv("PHOTO_ROOTS", photoRoot)
 	if err != nil {
@@ -108,7 +108,7 @@ func Load() (Config, error) {
 		BackgroundStartGap:           time.Duration(backgroundStartGapMS) * time.Millisecond,
 		PageSizeDefault:              intEnv("PAGE_SIZE_DEFAULT", 100),
 		PageSizeMax:                  intEnv("PAGE_SIZE_MAX", 500),
-		EnableFSWatch:                boolEnv("ENABLE_FS_WATCH", true),
+		EnableFSWatch:                boolEnv("ENABLE_FS_WATCH", false),
 		ThumbLongEdge:                intEnv("THUMB_LONG_EDGE", 320),
 		PreviewLongEdge:              intEnv("PREVIEW_LONG_EDGE", 2560),
 		PreviewQuality:               intEnv("PREVIEW_QUALITY", 82),

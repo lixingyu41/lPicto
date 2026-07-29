@@ -143,7 +143,21 @@ export interface AssetTag {
   createdAt: number;
 }
 
-export interface AssetAITag { tag: string; confidence: number; }
+export interface AITagFacet {
+  facetKey: string;
+  nodeId: string;
+  nodeIds: string[];
+  labels: string[];
+}
+export interface AssetAITag {
+  tag: string;
+  confidence: number;
+  categoryKey?: string;
+  categoryLabel?: string;
+  subjectKey?: string;
+  subjectLabel?: string;
+  facets?: AITagFacet[];
+}
 export interface AIColor { hex: string; weight: number; }
 export interface AssetAIResult {
   assetId: number;
@@ -158,9 +172,19 @@ export interface AssetAIResult {
   updatedAt?: string;
 }
 export interface AITagSummary { tag: string; count: number; aiCount: number; manualCount: number; manualAdded: boolean; manualTagId?: number; }
+export interface AITagTreeNode {
+  id: string;
+  parentId?: string;
+  label: string;
+  depth: number;
+  count: number;
+  facetKey: string;
+  source: 'ai' | 'manual';
+}
 export interface AIStatus {
   total: number; pending: number; processing: number; ready: number; failed: number; stale: number;
   queued: number; active: number; perMinute: number; etaSeconds: number | null;
+  staged: number; stagedBytes: number; sourceReading: boolean; pausedReason: string;
 }
 export interface AISettings { autoAnalyze: boolean; manualRun: boolean; }
 export interface SourceHealth { rootId: string; available: boolean; message?: string; checkedAt: number; }
@@ -177,7 +201,9 @@ export interface SystemTask {
   lastFinishedAt: number | null;
   nextRunAt: number | null;
   durationSeconds: number | null;
+  averageSecondsPerItem: number | null;
   message: string;
+  blockedReason?: string;
   lastError: string;
   processed: number;
   failedCount: number;
@@ -283,6 +309,7 @@ export interface LibraryFilterParams {
   manualTag?: string;
   combinedTag?: string;
   combinedTags?: string;
+  tagNodes?: string;
   aiDescription?: string;
   aiTag?: string;
   nfoTitle?: string;
@@ -406,6 +433,11 @@ export interface CacheStats {
   fileCount: number;
   updatedAt: number;
   refreshing: boolean;
+  maxBytes: number;
+  minFreeBytes: number;
+  freeBytes: number;
+  reclaimableBytes: number;
+  byKind: Record<string, number>;
 }
 
 export interface ProcessingProgress {

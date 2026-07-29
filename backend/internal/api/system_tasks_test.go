@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/scanner"
 )
 
 func TestVisibleOnlyRequiresExplicitReadyFilter(t *testing.T) {
@@ -33,6 +34,16 @@ func TestSystemTaskResultLabels(t *testing.T) {
 	}
 }
 
+func TestLibraryReconcileTaskUsesManualReconcileAction(t *testing.T) {
+	item := scanSystemTask("library_scan", "图库文件对账", "对账", nil, scanner.Status{})
+	if got := taskActionIDs(item.Actions); got != "reconcile,stop" {
+		t.Fatalf("reconcile actions = %q", got)
+	}
+	if item.Actions[0].Label != "开始对账" || !item.Actions[0].Enabled {
+		t.Fatalf("reconcile action = %#v", item.Actions[0])
+	}
+}
+
 func TestInterruptedScanAndMediaErrorsUseReadableMessages(t *testing.T) {
 	errorText := "[h264] Invalid NAL unit size; Error splitting the input into NAL units"
 	relPath := "相册/损坏视频.mp4"
@@ -56,6 +67,7 @@ func TestTaskFailureTranslatesKnownServiceErrors(t *testing.T) {
 		"AI service: [Errno 111] Connection refused":                                            "AI 描述模型临时退出，自动重试一次后仍失败",
 		"ai_transient: Server disconnected without sending a response.":                         "AI 描述模型运行中断，自动重试一次后仍失败",
 		"ai_transient: model response does not contain a JSON object":                           "AI 模型输出格式不正确，自动重试一次后仍失败",
+		"ai_media: AI service 500: model_output_invalid: bad json":                              "AI 模型输出格式错误，已自动重新生成 1 次",
 		"ai_media: ffmpeg returned non-zero exit status 69":                                     "无法从该媒体提取 AI 分析画面",
 		"ai_media: Output file #0 does not contain any stream":                                  "媒体中没有可供 AI 分析的视频画面",
 	}
@@ -66,12 +78,43 @@ func TestTaskFailureTranslatesKnownServiceErrors(t *testing.T) {
 	}
 }
 
+func TestTaskFailureIncludesStructuredModelOutputDetail(t *testing.T) {
+	reason := `AI service 500 Internal Server Error: {"detail":{"code":"model_output_invalid","message":"模型输出格式错误","parseError":"缺少 JSON 逗号","finishReason":"stop","output":"{\"description\":\"测试\" \"tags\":[]}"}}`
+	got := readableTaskError(reason)
+	for _, part := range []string{
+		"AI 模型输出格式错误，已自动重新生成 1 次",
+		"解析原因：缺少 JSON 逗号",
+		"结束原因：stop",
+		`模型原始输出：`,
+		`{"description":"测试" "tags":[]}`,
+	} {
+		if !strings.Contains(got, part) {
+			t.Fatalf("readable model output error %q does not contain %q", got, part)
+		}
+	}
+}
+
+func TestTaskFailureIncludesBothModelOutputAttempts(t *testing.T) {
+	reason := `AI service 500 Internal Server Error: {"detail":{"code":"model_output_invalid","message":"模型输出格式错误","attempts":[{"attempt":1,"parseError":"缺少逗号","finishReason":"stop","output":"第一次输出"},{"attempt":2,"parseError":"没有 JSON 对象","finishReason":"length","output":"第二次输出"}]}}`
+	got := readableTaskError(reason)
+	for _, part := range []string{
+		"第 1 次解析原因：缺少逗号",
+		"第 1 次模型原始输出：\n第一次输出",
+		"第 2 次解析原因：没有 JSON 对象",
+		"第 2 次模型原始输出：\n第二次输出",
+	} {
+		if !strings.Contains(got, part) {
+			t.Fatalf("two-attempt model error %q does not contain %q", got, part)
+		}
+	}
+}
+
 func TestAIAnalysisTaskOffersRetryForFailures(t *testing.T) {
-	item := aiAnalysisSystemTask(db.AIStatus{Total: 10, Ready: 7, Failed: 3}, db.AIActivity{}, 0, 0)
+	item := aiAnalysisSystemTask(db.AIStatus{Total: 10, Ready: 7, Failed: 3}, db.AIActivity{}, 0, 0, false)
 	if item.Status != "failed" || !item.CanRetry || item.FailedCount != 3 {
 		t.Fatalf("AI analysis task = %#v", item)
 	}
-	item = aiAnalysisSystemTask(db.AIStatus{Total: 10, Ready: 7, Failed: 3}, db.AIActivity{}, 0, 1)
+	item = aiAnalysisSystemTask(db.AIStatus{Total: 10, Ready: 7, Failed: 3}, db.AIActivity{}, 0, 1, false)
 	if item.Status != "running" || !item.CanRetry {
 		t.Fatalf("active AI analysis task = %#v", item)
 	}
@@ -85,6 +128,7 @@ func TestRunningAITaskUsesWholeRunDuration(t *testing.T) {
 		db.AIActivity{LastStartedAt: &activityStarted, LastFinishedAt: &activityFinished},
 		0,
 		1,
+		false,
 	)
 	applyRunningTaskDuration(&item, &db.SystemTaskState{Status: "running", LastStartedAt: &runStarted}, 160)
 	if item.LastStartedAt == nil || *item.LastStartedAt != 100 || item.LastFinishedAt != nil {
@@ -116,21 +160,24 @@ func TestThumbnailTaskUsesAggregateQueueState(t *testing.T) {
 
 func TestStandardTaskActions(t *testing.T) {
 	thumbnail := thumbnailSystemTask(db.WorkStatusCounts{Total: 10, Ready: 3, Pending: 5, Error: 2}, 0, 0)
-	if got := taskActionIDs(thumbnail.Actions); got != "continue,retry_failed,rebuild,stop" {
+	if got := taskActionIDs(thumbnail.Actions); got != "start,retry_failed,rebuild,stop" {
 		t.Fatalf("thumbnail actions = %#v", thumbnail.Actions)
+	}
+	if thumbnail.Actions[0].Label != "手动开始" {
+		t.Fatalf("thumbnail start label = %#v", thumbnail.Actions[0])
 	}
 	if thumbnail.Actions[1].Label != "重试失败（2）" || thumbnail.Actions[2].Label != "全部重建" || !thumbnail.Actions[2].RequiresConfirmation {
 		t.Fatalf("thumbnail labels = %#v", thumbnail.Actions)
 	}
-	aiTask := aiAnalysisSystemTask(db.AIStatus{Total: 10, Pending: 7, Failed: 2, Ready: 1}, db.AIActivity{}, 0, 0)
+	aiTask := aiAnalysisSystemTask(db.AIStatus{Total: 10, Pending: 7, Failed: 2, Ready: 1}, db.AIActivity{}, 0, 0, false)
 	if got := taskActionIDs(aiTask.Actions); got != "continue,retry_failed,rebuild,stop" {
 		t.Fatalf("AI actions = %#v", aiTask.Actions)
 	}
 	failedOnly := thumbnailSystemTask(db.WorkStatusCounts{Total: 2, Error: 2}, 0, 0)
 	if !failedOnly.Actions[0].Enabled {
-		t.Fatalf("continue should be enabled for failed work: %#v", failedOnly.Actions)
+		t.Fatalf("manual start should be enabled for failed work: %#v", failedOnly.Actions)
 	}
-	failedAIOnly := aiAnalysisSystemTask(db.AIStatus{Total: 2, Failed: 2}, db.AIActivity{}, 0, 0)
+	failedAIOnly := aiAnalysisSystemTask(db.AIStatus{Total: 2, Failed: 2}, db.AIActivity{}, 0, 0, false)
 	if !failedAIOnly.Actions[0].Enabled {
 		t.Fatalf("AI continue should be enabled for failed work: %#v", failedAIOnly.Actions)
 	}
@@ -138,6 +185,25 @@ func TestStandardTaskActions(t *testing.T) {
 	for _, action := range running.Actions {
 		if action.Enabled != (action.ID == "stop") {
 			t.Fatalf("running action %q enabled = %v", action.ID, action.Enabled)
+		}
+	}
+	runningWithFailures := thumbnailSystemTask(db.WorkStatusCounts{Total: 10, Pending: 7, Error: 3}, 1, 0)
+	for _, action := range runningWithFailures.Actions {
+		wantEnabled := action.ID == "retry_failed" || action.ID == "stop"
+		if action.Enabled != wantEnabled {
+			t.Fatalf("running task with failures action %q enabled = %v, want %v", action.ID, action.Enabled, wantEnabled)
+		}
+	}
+}
+
+func TestAIAnalysisTaskShowsRequestedRunWhilePreparing(t *testing.T) {
+	item := aiAnalysisSystemTask(db.AIStatus{Total: 10, Pending: 10}, db.AIActivity{}, 0, 0, true)
+	if item.Status != "running" {
+		t.Fatalf("requested AI analysis status = %q, want running", item.Status)
+	}
+	for _, action := range item.Actions {
+		if action.Enabled != (action.ID == "stop") {
+			t.Fatalf("preparing action %q enabled = %v", action.ID, action.Enabled)
 		}
 	}
 }

@@ -2,12 +2,14 @@ package thumb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
 
+	"lpicto/backend/internal/cachepolicy"
 	"lpicto/backend/internal/db"
 	"lpicto/backend/internal/events"
 	"lpicto/backend/internal/jobs"
@@ -26,19 +28,30 @@ type Processor struct {
 	Events          *events.Bus
 	Logger          *slog.Logger
 	Sources         *storage.SourceHealth
+	CachePolicy     *cachepolicy.Manager
 }
 
 func (p Processor) Handle(ctx context.Context, task jobs.Task) error {
+	batchID, _ := p.DB.BeginSourceIOBatch(context.Background(), task.Type, 80)
+	var runErr error
+	defer func() {
+		state, message := "success", ""
+		if errors.Is(runErr, jobs.ErrPlaybackPriority) || ctx.Err() != nil {
+			state, message = "preempted", "当前媒体播放已抢占 NAS 读取"
+		} else if runErr != nil {
+			state, message = "failed", runErr.Error()
+		}
+		_ = p.DB.FinishSourceIOBatch(context.Background(), batchID, state, 1, 0, message)
+	}()
 	switch task.Type {
 	case "thumb":
-		return p.process(ctx, task.AssetID, "thumbs", "thumb_status", p.ThumbLongEdge, 76)
+		runErr = p.process(ctx, task.AssetID, "thumbs", "thumb_status", p.ThumbLongEdge, 76)
 	case "video_poster":
-		return p.processVideoPoster(ctx, task.AssetID)
+		runErr = p.processVideoPoster(ctx, task.AssetID)
 	case "preview":
-		return p.process(ctx, task.AssetID, "previews", "preview_status", p.PreviewLongEdge, p.PreviewQuality)
-	default:
-		return nil
+		runErr = p.process(ctx, task.AssetID, "previews", "preview_status", p.PreviewLongEdge, p.PreviewQuality)
 	}
+	return runErr
 }
 
 func (p Processor) processVideoPoster(ctx context.Context, assetID int64) error {
@@ -50,6 +63,10 @@ func (p Processor) processVideoPoster(ctx context.Context, assetID int64) error 
 		return p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusNotRequired, nil)
 	}
 	if err := p.process(ctx, assetID, "thumbs", "thumb_status", p.ThumbLongEdge, 76); err != nil {
+		if errors.Is(err, jobs.ErrPlaybackPriority) || errors.Is(err, context.Canceled) {
+			_ = p.DB.SetAssetWorkStatus(context.Background(), assetID, "video_poster_status", model.StatusPending, nil)
+			return jobs.ErrPlaybackPriority
+		}
 		message := publicError(err)
 		_ = p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusError, &message)
 		return err
@@ -112,6 +129,13 @@ func (p Processor) processVideoThumb(ctx context.Context, asset model.Asset, sou
 	_ = os.Remove(tmpFrame)
 	_ = os.Remove(tmpThumb)
 	if _, err := util.RunLowPriorityCommand(ctx, p.timeout(), "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", "1", "-i", source, "-frames:v", "1", "-q:v", "3", tmpFrame); err != nil {
+		if ctx.Err() != nil {
+			_ = p.DB.SetAssetWorkStatus(context.Background(), asset.ID, "thumb_status", model.StatusPending, nil)
+			_ = p.DB.SetAssetWorkStatus(context.Background(), asset.ID, "video_poster_status", model.StatusPending, nil)
+			_ = os.Remove(tmpFrame)
+			_ = os.Remove(tmpThumb)
+			return jobs.ErrPlaybackPriority
+		}
 		deleted, deleteErr := p.deleteIfSourceMissing(ctx, asset, "video_thumb_source_missing")
 		if deleteErr != nil {
 			return deleteErr
@@ -129,6 +153,12 @@ func (p Processor) processVideoThumb(ctx context.Context, asset model.Asset, sou
 	}
 	args := []string{tmpFrame, "-s", fmt.Sprintf("%dx%d", p.ThumbLongEdge, p.ThumbLongEdge), "-o", fmt.Sprintf("%s[Q=%d]", tmpThumb, 76)}
 	if _, err := util.RunLowPriorityCommand(ctx, p.timeout(), "vipsthumbnail", args...); err != nil {
+		if ctx.Err() != nil {
+			_ = p.DB.SetAssetWorkStatus(context.Background(), asset.ID, "thumb_status", model.StatusPending, nil)
+			_ = os.Remove(tmpFrame)
+			_ = os.Remove(tmpThumb)
+			return jobs.ErrPlaybackPriority
+		}
 		message := publicError(err)
 		_ = p.DB.SetAssetWorkStatus(ctx, asset.ID, "thumb_status", model.StatusError, &message)
 		_ = os.Remove(tmpFrame)
@@ -148,6 +178,10 @@ func (p Processor) processVideoThumb(ctx context.Context, asset model.Asset, sou
 	if err := p.setReady(ctx, asset.ID, "thumb_status"); err != nil {
 		return err
 	}
+	if p.CachePolicy != nil {
+		assetID := asset.ID
+		p.CachePolicy.Register(context.Background(), "thumbs", asset.CacheKey, dest, &assetID, 0)
+	}
 	return p.DB.SetAssetWorkStatus(ctx, asset.ID, "video_poster_status", model.StatusReady, nil)
 }
 
@@ -166,6 +200,11 @@ func (p Processor) processAsset(ctx context.Context, asset model.Asset, kind str
 	_ = os.Remove(tmp)
 	args := []string{source, "-s", fmt.Sprintf("%dx%d", longEdge, longEdge), "-o", fmt.Sprintf("%s[Q=%d]", tmp, quality)}
 	if _, err := util.RunLowPriorityCommand(ctx, p.timeout(), "vipsthumbnail", args...); err != nil {
+		if ctx.Err() != nil {
+			_ = p.DB.SetAssetWorkStatus(context.Background(), asset.ID, statusField, model.StatusPending, nil)
+			_ = os.Remove(tmp)
+			return jobs.ErrPlaybackPriority
+		}
 		deleted, deleteErr := p.deleteIfSourceMissing(ctx, asset, "image_thumb_source_missing")
 		if deleteErr != nil {
 			return deleteErr
@@ -187,6 +226,10 @@ func (p Processor) processAsset(ctx context.Context, asset model.Asset, kind str
 		message := publicError(err)
 		_ = p.DB.SetAssetWorkStatus(ctx, asset.ID, statusField, model.StatusError, &message)
 		return err
+	}
+	if p.CachePolicy != nil {
+		assetID := asset.ID
+		p.CachePolicy.Register(context.Background(), kind, asset.CacheKey, dest, &assetID, 0)
 	}
 	return p.setReady(ctx, asset.ID, statusField)
 }

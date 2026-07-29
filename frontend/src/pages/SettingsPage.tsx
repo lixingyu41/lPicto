@@ -7,7 +7,20 @@ import type { AISettings, CleanupStatus, ProcessingProgress, ScanLibrary, ScanLi
 import { useAssetReadyEvents, useScanStatusEvents } from '../hooks/useAssetReadyEvents';
 import { loadGridRowHeightLevel, saveGridRowHeightLevel, type GridRowHeightLevel } from '../utils/gridPrefs';
 import { loadThemeMode, saveThemeMode, type ThemeMode } from '../utils/themePrefs';
-import { imageSlideshowSecondsRange, loadViewerPrefs, playbackModeOptions, playbackRates, saveViewerPrefs, type ViewerPrefs } from '../utils/viewerPrefs';
+import {
+  imageSlideshowSecondsRange,
+  loadViewerPrefs,
+  playbackModeOptions,
+  playbackRates,
+  saveViewerPrefs,
+  videoPlaybackDelaySecondsRange,
+  type ViewerPrefs,
+} from '../utils/viewerPrefs';
+import {
+  loadCollapsedSidebarContent,
+  saveCollapsedSidebarContent,
+  type CollapsedSidebarContent,
+} from '../utils/sidebarPrefs';
 import {
   mediaLayoutDefinition,
   mediaLayoutDefinitions,
@@ -35,6 +48,7 @@ export default function SettingsPage() {
   const [error, setError] = useState<string | null>(null);
   const [rowHeightLevel, setRowHeightLevel] = useState<GridRowHeightLevel>(() => loadGridRowHeightLevel());
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => loadThemeMode());
+  const [collapsedSidebarContent, setCollapsedSidebarContent] = useState<CollapsedSidebarContent>(() => loadCollapsedSidebarContent());
   const [viewerPrefs, setViewerPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
   const [mediaViewPrefs, setMediaViewPrefs] = useState<MediaViewPreferences>(() => loadMediaViewPreferences());
   const [draggedMediaColumn, setDraggedMediaColumn] = useState<MediaColumnId | null>(null);
@@ -48,8 +62,10 @@ export default function SettingsPage() {
   const [aiSettings, setAISettings] = useState<AISettings | null>(null);
   const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
   const [aiSettingsSaving, setAISettingsSaving] = useState(false);
+  const [aiStopping, setAIStopping] = useState(false);
   const [systemTasks, setSystemTasks] = useState<SystemTask[]>([]);
   const [taskActionBusy, setTaskActionBusy] = useState<string | null>(null);
+  const [stoppingTaskIds, setStoppingTaskIds] = useState<Set<string>>(() => new Set());
   const [taskScopes, setTaskScopes] = useState<Record<string, string>>({});
   const [taskConfirmation, setTaskConfirmation] = useState<{
     task: SystemTask;
@@ -236,14 +252,44 @@ export default function SettingsPage() {
   useEffect(() => {
     if (activeSettingsSection !== 'tasks') return;
     let live = true;
-    const refresh = () => void api.systemTasks()
-      .then((result) => { if (live) setSystemTasks(result.items); })
-      .catch((err) => { if (live) setError(err instanceof Error ? err.message : '读取任务状态失败'); });
-    refresh();
-    const timer = window.setInterval(refresh, 10_000);
+    let timer: number | null = null;
+    const schedule = (delay: number) => {
+      if (!live) return;
+      timer = window.setTimeout(refresh, delay);
+    };
+    const refresh = async () => {
+      try {
+        const result = await api.systemTasks();
+        if (!live) return;
+        setSystemTasks(result.items);
+        setStoppingTaskIds((current) => {
+          const next = new Set(Array.from(current).filter((id) => result.items.some((task) => task.id === id && task.status === 'running')));
+          return next.size === current.size ? current : next;
+        });
+        const activelyChanging = result.items.some((task) =>
+          task.status === 'running' ||
+          (task.progress?.queued ?? 0) > 0 ||
+          (task.progress?.processing ?? 0) > 0
+        );
+        schedule(document.visibilityState === 'visible' ? (activelyChanging ? 1_000 : 5_000) : 10_000);
+      } catch (err) {
+        if (!live) return;
+        setError(err instanceof Error ? err.message : '读取任务状态失败');
+        schedule(document.visibilityState === 'visible' ? 5_000 : 10_000);
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (!live || document.visibilityState !== 'visible') return;
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+      void refresh();
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    void refresh();
     return () => {
       live = false;
-      window.clearInterval(timer);
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [activeSettingsSection]);
 
@@ -331,10 +377,14 @@ export default function SettingsPage() {
   async function executeSystemTask(task: SystemTask, action: SystemTask['actions'][number], selectedScope: string) {
     if (taskActionBusy) return;
     const key = `${task.id}:${action.id}`;
+    const stopping = action.id === 'stop';
+    if (stopping) {
+      setStoppingTaskIds((current) => new Set(current).add(task.id));
+    }
     setTaskActionBusy(key);
     setError(null);
     try {
-      if (action.id === 'stop') {
+      if (stopping) {
         await api.stopSystemTask(task.id);
       } else {
         await api.runSystemTask(task.id, action.id, selectedScope === 'all' ? null : selectedScope);
@@ -345,7 +395,20 @@ export default function SettingsPage() {
         refreshLibraries(),
       ]);
       setSystemTasks(tasksResult.items);
+      setStoppingTaskIds((current) => {
+        if (!current.has(task.id) || tasksResult.items.some((item) => item.id === task.id && item.status === 'running')) return current;
+        const next = new Set(current);
+        next.delete(task.id);
+        return next;
+      });
     } catch (err) {
+      if (stopping) {
+        setStoppingTaskIds((current) => {
+          const next = new Set(current);
+          next.delete(task.id);
+          return next;
+        });
+      }
       setError(err instanceof Error ? err.message : '执行任务失败');
     } finally {
       setTaskActionBusy(null);
@@ -363,8 +426,8 @@ export default function SettingsPage() {
   }
 
   function updateViewerPrefs(next: ViewerPrefs) {
-    setViewerPrefs(next);
     saveViewerPrefs(next);
+    setViewerPrefs(loadViewerPrefs());
   }
 
   function updateMediaViewPrefs(next: MediaViewPreferences) {
@@ -411,6 +474,11 @@ export default function SettingsPage() {
     saveGridRowHeightLevel(next);
   }
 
+  function updateCollapsedSidebarContent(next: CollapsedSidebarContent) {
+    setCollapsedSidebarContent(next);
+    saveCollapsedSidebarContent(next);
+  }
+
   async function saveVideoProxySettings() {
     const ttlMinutes = Number(videoProxyTTLMinutes);
     const maxCacheGB = Number(videoProxyMaxCacheGB);
@@ -453,16 +521,26 @@ export default function SettingsPage() {
 
   async function toggleAIManualRun() {
     if (!aiSettings || aiSettings.autoAnalyze || aiSettingsSaving) return;
+    const stopping = aiSettings.manualRun;
+    if (stopping) setAIStopping(true);
     setAISettingsSaving(true);
     setError(null);
     try {
-      const saved = aiSettings.manualRun
+      const saved = stopping
         ? await api.stopAIManually()
         : (await api.runAIManually()).settings;
       setAISettings(saved);
+      if (stopping) {
+        for (let attempt = 0; attempt < 30; attempt += 1) {
+          const status = await api.aiStatus();
+          if (status.active === 0 && status.queued === 0) break;
+          await new Promise((resolve) => window.setTimeout(resolve, 500));
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : '切换手动 AI 分析失败');
     } finally {
+      setAIStopping(false);
       setAISettingsSaving(false);
     }
   }
@@ -523,7 +601,15 @@ export default function SettingsPage() {
 
             {activeSettingsSection === 'cache' && (
               <section className="settings-section cache-settings-section">
-                <CacheManager cleanup={cleanup} progress={progress} onReset={resetMediaLibrary} />
+                <CacheManager
+                  cleanup={cleanup}
+                  progress={progress}
+                  onReset={resetMediaLibrary}
+                  onCleanup={async () => {
+                    await api.runSystemTask('cache_cleanup', 'cleanup', null);
+                    await refreshActivity();
+                  }}
+                />
                 <section className="settings-panel settings-section">
                   <div className="settings-panel-title">视频播放处理</div>
                   <div className="muted-line cache-policy-intro">此设置仅保存在当前浏览器。浏览器优先会直接读取原文件并使用本机硬件解码；格式不受支持时自动回退服务器转码。</div>
@@ -627,6 +713,25 @@ export default function SettingsPage() {
                     ))}
                   </div>
                 </div>
+                <div className="settings-field settings-field-wide settings-field-spaced">
+                  <span>一级菜单折叠样式</span>
+                  <div className="settings-segmented">
+                    <button
+                      className={collapsedSidebarContent === 'icon' ? 'active' : ''}
+                      type="button"
+                      onClick={() => updateCollapsedSidebarContent('icon')}
+                    >
+                      图标
+                    </button>
+                    <button
+                      className={collapsedSidebarContent === 'character' ? 'active' : ''}
+                      type="button"
+                      onClick={() => updateCollapsedSidebarContent('character')}
+                    >
+                      单字
+                    </button>
+                  </div>
+                </div>
               </section>
             )}
 
@@ -681,6 +786,20 @@ export default function SettingsPage() {
                       ))}
                     </div>
                   </div>
+                  <label className="settings-field settings-field-wide">
+                    <span>视频播放延迟（秒）</span>
+                    <input
+                      max={videoPlaybackDelaySecondsRange.max}
+                      min={videoPlaybackDelaySecondsRange.min}
+                      step={0.1}
+                      type="number"
+                      value={viewerPrefs.videoPlaybackDelaySeconds}
+                      onChange={(event) => updateViewerPrefs({
+                        ...viewerPrefs,
+                        videoPlaybackDelaySeconds: Number(event.target.value),
+                      })}
+                    />
+                  </label>
                   </div>
                 </section>
                 <section className="settings-panel">
@@ -837,6 +956,7 @@ export default function SettingsPage() {
                 busy={aiSettingsSaving}
                 libraries={libraries}
                 settings={aiSettings}
+                stopping={aiStopping}
 				storageAvailable={storageStatus?.available !== false}
                 onAutomaticChange={(enabled) => void updateAIAutomatic(enabled)}
                 onReanalyzeLibrary={reanalyzeLibraryAI}
@@ -850,6 +970,7 @@ export default function SettingsPage() {
                 actionBusy={taskActionBusy}
                 libraries={libraries}
                 scopes={taskScopes}
+                stoppingTaskIds={stoppingTaskIds}
                 tasks={systemTasks}
                 onAction={runSystemTask}
                 onScopeChange={(taskId, libraryId) => setTaskScopes((current) => ({ ...current, [taskId]: libraryId }))}
@@ -890,7 +1011,8 @@ function AISettingsPanel({
   busy,
   libraries,
   settings,
-	storageAvailable,
+  stopping,
+  storageAvailable,
   onAutomaticChange,
   onReanalyzeLibrary,
   onSaveLibraryFocus,
@@ -899,6 +1021,7 @@ function AISettingsPanel({
   busy: boolean;
   libraries: ScanLibrary[];
   settings: AISettings | null;
+  stopping: boolean;
 	storageAvailable: boolean;
   onAutomaticChange: (enabled: boolean) => void;
   onReanalyzeLibrary: (id: string) => Promise<{ accepted: boolean; count: number; libraryId: string }>;
@@ -934,14 +1057,15 @@ function AISettingsPanel({
           <span>自动分析新增媒体并持续补齐图库</span>
         </label>
         <div className="settings-help-line">
-			<span>{!storageAvailable ? '停' : settings.autoAnalyze ? '自动模式运行中' : settings.manualRun ? '手动全库分析运行中' : '自动分析已关闭'}</span>
+			<span>{stopping ? '正在停止分析…' : !storageAvailable ? '停' : settings.autoAnalyze ? '自动模式运行中' : settings.manualRun ? '手动全库分析运行中' : '自动分析已关闭'}</span>
           <button
             className="settings-save-button"
             disabled={busy || settings.autoAnalyze}
             type="button"
             onClick={onToggleManual}
           >
-            {busy ? '处理中' : settings.manualRun ? '停止手动分析' : '手动开始'}
+            {stopping && <span aria-hidden="true" className="button-progress-spinner" />}
+            {stopping ? '正在停止' : busy ? '处理中' : settings.manualRun ? '停止手动分析' : '手动开始'}
           </button>
         </div>
       </div>
@@ -1063,10 +1187,11 @@ function taskScopeLabel(scope: string, libraries: ScanLibrary[]) {
   return libraries.find((library) => library.id === scope)?.name ?? '所选图库';
 }
 
-function TaskSettingsPanel({ actionBusy, libraries, scopes, tasks, onAction, onScopeChange }: {
+function TaskSettingsPanel({ actionBusy, libraries, scopes, stoppingTaskIds, tasks, onAction, onScopeChange }: {
   actionBusy: string | null;
   libraries: ScanLibrary[];
   scopes: Record<string, string>;
+  stoppingTaskIds: Set<string>;
   tasks: SystemTask[];
   onAction: (task: SystemTask, action: SystemTask['actions'][number]) => void;
   onScopeChange: (taskId: string, libraryId: string) => void;
@@ -1090,6 +1215,7 @@ function TaskSettingsPanel({ actionBusy, libraries, scopes, tasks, onAction, onS
       <div className="system-task-list">
         {tasks.length === 0 && <div className="muted-line">读取中</div>}
         {tasks.map((task) => {
+          const stopping = stoppingTaskIds.has(task.id);
           const finishedAt = task.status === 'running' ? null : task.lastFinishedAt;
           const durationSeconds = task.status === 'running' && task.lastStartedAt != null
             ? Math.max(0, nowSeconds - task.lastStartedAt)
@@ -1099,8 +1225,8 @@ function TaskSettingsPanel({ actionBusy, libraries, scopes, tasks, onAction, onS
           const hasDetails = hasTimeline || !task.progress || hasFailures;
           return (
             <article
-              aria-label={`${task.name}，${systemTaskStatusLabel(task.status)}`}
-              className={`system-task-card status-${task.status}`}
+              aria-label={`${task.name}，${stopping ? '正在停止' : systemTaskStatusLabel(task.status)}`}
+              className={`system-task-card status-${stopping ? 'stopping' : task.status}`}
               key={task.id}
             >
               <div className="system-task-heading">
@@ -1133,18 +1259,30 @@ function TaskSettingsPanel({ actionBusy, libraries, scopes, tasks, onAction, onS
                     return (
                       <button
                         className={`settings-save-button system-task-run-button ${action.kind}`}
-                        disabled={!action.enabled || actionBusy !== null}
+                        disabled={!action.enabled || actionBusy !== null || stopping}
                         key={action.id}
                         type="button"
                         onClick={() => onAction(task, action)}
                       >
-                        {actionBusy === key ? taskActionBusyLabel(action.id) : action.label}
+                        {(actionBusy === key || (stopping && action.id === 'stop')) && <span aria-hidden="true" className="button-progress-spinner" />}
+                        {stopping && action.id === 'stop' ? '正在停止' : actionBusy === key ? taskActionBusyLabel(action.id) : action.label}
                       </button>
                     );
                   })}
                 </div>
               </div>
-              {task.progress && <SystemTaskProgress task={task} />}
+              {task.progress && (
+                <SystemTaskProgress
+                  averageSecondsPerItem={task.averageSecondsPerItem}
+                  task={task}
+                />
+              )}
+              {task.blockedReason && (
+                <div className="system-task-blocked-reason" role="status">
+                  <span aria-hidden="true" className="system-task-blocked-indicator" />
+                  {task.blockedReason}
+                </div>
+              )}
               {hasDetails && <div className="system-task-details">
                 {hasTimeline && (
                   <div className="system-task-timeline">
@@ -1194,7 +1332,7 @@ function SystemTaskFailures({ task, onOpen }: { task: SystemTask; onOpen: (path:
   );
 }
 
-function SystemTaskProgress({ task }: { task: SystemTask }) {
+function SystemTaskProgress({ averageSecondsPerItem, task }: { averageSecondsPerItem: number | null; task: SystemTask }) {
   const progress = task.progress!;
   const percent = progress.total > 0 ? Math.min(100, progress.completed / progress.total * 100) : 0;
   const stats = [
@@ -1212,12 +1350,24 @@ function SystemTaskProgress({ task }: { task: SystemTask }) {
           <div className={`system-task-stat ${stat.tone}`} key={stat.label}>
             <strong>{stat.value.toLocaleString()}</strong>
             <span>{stat.label}</span>
+            {stat.label === '处理中' && task.status === 'running' && averageSecondsPerItem != null && (
+              <small>{formatAverageTaskRate(averageSecondsPerItem)}</small>
+            )}
           </div>
         ))}
       </div>
       <div className="progress-bar"><div className="progress-fill" style={{ width: `${percent}%` }} /></div>
     </div>
   );
+}
+
+function formatAverageTaskRate(secondsPerItem: number) {
+  if (!Number.isFinite(secondsPerItem) || secondsPerItem <= 0) return '平均 0 秒/项';
+  const rate = 1 / secondsPerItem;
+  if (rate >= 10) return `平均 ${rate.toFixed(1)} 项/秒`;
+  if (rate >= 1) return `平均 ${rate.toFixed(2)} 项/秒`;
+  if (secondsPerItem >= 60) return `平均 ${(secondsPerItem / 60).toFixed(1)} 分钟/项`;
+  return `平均 ${secondsPerItem.toFixed(1)} 秒/项`;
 }
 
 function systemTaskStatusLabel(status: SystemTask['status']) {

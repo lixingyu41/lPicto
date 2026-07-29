@@ -30,8 +30,8 @@ $archive = Join-Path $PSScriptRoot 'lpicto-deploy.tgz'
 $localRunner = Join-Path ([System.IO.Path]::GetTempPath()) 'lpicto-deploy-run.sh'
 $localAIModels = Join-Path $env:LOCALAPPDATA 'lPicto\ai-models'
 $aiModelFiles = @(
-    @{ Rel = 'Qwen3VL-2B-Instruct-Q4_K_M.gguf'; Size = 1107409952L; SHA = '089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae'; URL = 'https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/52d6c8ffea26cc873ac5ad116f8631268d7eb503/Qwen3VL-2B-Instruct-Q4_K_M.gguf' },
-    @{ Rel = 'mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf'; Size = 445053216L; SHA = 'f9a68fabba69c3b81e153367b2c7521030b0fa8bb0de400c9599c8e6725f9c82'; URL = 'https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/52d6c8ffea26cc873ac5ad116f8631268d7eb503/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf' },
+    @{ Rel = 'Qwen3VL-8B-Instruct-Q4_K_M.gguf'; Size = 5027784800L; SHA = '67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2'; URL = 'https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/Qwen3VL-8B-Instruct-Q4_K_M.gguf' },
+    @{ Rel = 'mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf'; Size = 752289728L; SHA = 'c6ba85508d82f42590e6eb77d5340369ab6fecf107a7561d809523d8aa5f3bfd'; URL = 'https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf' },
     @{ Rel = 'chinese-clip/onnx/model.onnx'; Size = 753665706L; SHA = 'd4e282affd5f09e196856cc63fbd0e77c576f598fdf6f6bb78ee61f1ef7cd770'; URL = 'https://huggingface.co/Xenova/chinese-clip-vit-base-patch16/resolve/f26904860903e70e050b8f48255e5f48401816e9/onnx/model.onnx' }
 )
 
@@ -47,9 +47,12 @@ function Prepare-LocalAIModels {
         if (Test-LockedFile $target $model.Size $model.SHA) { continue }
         New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
         $part = "$target.part"
-        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        if ((Test-Path -LiteralPath $part) -and (Get-Item -LiteralPath $part).Length -gt $model.Size) {
+            Remove-Item -LiteralPath $part -Force
+        }
         Write-Host "   下载 $($model.Rel) ($($model.Size) 字节)"
-        Invoke-WebRequest -Uri $model.URL -OutFile $part -MaximumRedirection 8
+        & curl.exe --location --fail --retry 5 --retry-all-errors --continue-at - --output $part $model.URL
+        if ($LASTEXITCODE -ne 0) { Stop-Deploy "模型下载失败：$($model.Rel)" }
         if (-not (Test-LockedFile $part $model.Size $model.SHA)) { Stop-Deploy "模型校验失败：$($model.Rel)" }
         Move-Item -LiteralPath $part -Destination $target -Force
     }
@@ -87,14 +90,6 @@ if ! docker info >/dev/null 2>&1; then
   fi
   docker_cmd() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' docker "$@"; }
 fi
-
-sudo_cmd() {
-  if [ "$(id -u)" = 0 ]; then
-    "$@"
-  else
-    printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"
-  fi
-}
 
 compose() {
   docker_cmd compose "${COMPOSE_FILES[@]}" "$@"
@@ -149,13 +144,16 @@ upsert_env LPICTO_CACHE ./data/cache "$STAGING/.env"
 upsert_env FFMPEG_HWACCEL none "$STAGING/.env"
 upsert_env LIVE_VIDEO_PROXY_MAX_ACTIVE 1 "$STAGING/.env"
 upsert_env VIDEO_PRELOAD_SEGMENTS 5 "$STAGING/.env"
+upsert_env ENABLE_FS_WATCH false "$STAGING/.env"
+upsert_env FILE_COUNT_SCAN_INTERVAL_MINUTES 0 "$STAGING/.env"
+upsert_env SCAN_INTERVAL_MINUTES 0 "$STAGING/.env"
 mkdir -p "$STAGING/data/app" "$STAGING/data/cache"
 
 echo '校验本机上传的锁定版本 AI 模型（旧服务保持运行）'
 test -d "$MODEL_UPLOAD" || { echo "错误：找不到模型上传目录 $MODEL_UPLOAD"; exit 13; }
 cd "$MODEL_UPLOAD"
-echo '089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae  Qwen3VL-2B-Instruct-Q4_K_M.gguf' | sha256sum -c -
-echo 'f9a68fabba69c3b81e153367b2c7521030b0fa8bb0de400c9599c8e6725f9c82  mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf' | sha256sum -c -
+echo '67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2  Qwen3VL-8B-Instruct-Q4_K_M.gguf' | sha256sum -c -
+echo 'c6ba85508d82f42590e6eb77d5340369ab6fecf107a7561d809523d8aa5f3bfd  mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf' | sha256sum -c -
 echo 'd4e282affd5f09e196856cc63fbd0e77c576f598fdf6f6bb78ee61f1ef7cd770  chinese-clip/onnx/model.onnx' | sha256sum -c -
 if [ -d "$PROJECT/data/app" ]; then MODEL_DEST="$PROJECT/data/app/ai-models"; else MODEL_DEST="$STAGING/data/app/ai-models"; fi
 mkdir -p "$MODEL_DEST"
@@ -197,8 +195,8 @@ fi
 mv "$STAGING" "$PROJECT"
 trap - EXIT
 echo '修复共享缓存目录权限'
-sudo_cmd chown -R 10001:999 "$PROJECT/data/cache"
-sudo_cmd chmod -R u+rwX,g+rwX,o-rwx "$PROJECT/data/cache"
+docker_cmd run --rm -v "$PROJECT/data/cache:/cache" --entrypoint sh redis:7-alpine \
+  -c 'chown -R 10001:999 /cache && chmod -R u+rwX,g+rwX,o-rwx /cache'
 rm -f "$ARCHIVE"
 rm -rf "$MODEL_UPLOAD"
 
@@ -245,7 +243,7 @@ for service in api; do
   fi
 done
 compose exec -T api sh -lc 'test -r /Media && touch /cache/.api-write-check && rm /cache/.api-write-check'
-compose exec -T ai sh -lc 'test -r /Media && test -r /cache && test -r /models/Qwen3VL-2B-Instruct-Q4_K_M.gguf'
+compose exec -T ai sh -lc 'test -r /Media && test -r /cache && test -r /models/Qwen3VL-8B-Instruct-Q4_K_M.gguf'
 compose exec -T postgres pg_isready -U media -d media
 test "$(compose exec -T redis redis-cli ping | tr -d '\r')" = PONG
 curl -fsS http://127.0.0.1:18080/api/settings/progress >/dev/null
@@ -279,12 +277,12 @@ echo '远端部署完成'
 
 try {
     Write-Step "检查本地部署工具"
-    foreach ($command in @('ssh', 'scp', 'sshpass', 'tar')) {
+    foreach ($command in @('ssh', 'scp', 'sshpass', 'tar', 'curl.exe')) {
         if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
             Stop-Deploy "缺少命令：$command"
         }
     }
-    Write-OK "ssh、scp、sshpass 和 tar 均可用"
+    Write-OK "ssh、scp、sshpass、tar 和 curl 均可用"
 
     Write-Step "检查远端 SSH 连接"
     $env:SSHPASS = $Password
@@ -323,9 +321,21 @@ try {
     Write-Step "上传源码和远端执行器"
     & sshpass -e scp @sshOptions $archive "${remote}:${remoteArchive}"
     if ($LASTEXITCODE -ne 0) { Stop-Deploy "上传源码归档失败" }
-    & sshpass -e ssh @sshOptions $remote "rm -rf ${remoteHome}/lpicto-ai-models-upload"
-    & sshpass -e scp @sshOptions -r $localAIModels "${remote}:${remoteHome}/lpicto-ai-models-upload"
-    if ($LASTEXITCODE -ne 0) { Stop-Deploy "上传 AI 模型失败" }
+    & sshpass -e ssh @sshOptions $remote "rm -rf ${remoteHome}/lpicto-ai-models-upload && mkdir -p ${remoteHome}/lpicto-ai-models-upload"
+    if ($LASTEXITCODE -ne 0) { Stop-Deploy "创建远端 AI 模型上传目录失败" }
+    foreach ($model in ($aiModelFiles | Where-Object { $_.Rel -notlike '*/*' })) {
+        $remoteModelPath = "${remoteHome}/lpicto/data/app/ai-models/$($model.Rel)"
+        & sshpass -e ssh @sshOptions $remote "test -f '$remoteModelPath' && echo '$($model.SHA)  $remoteModelPath' | sha256sum -c - >/dev/null && cp '$remoteModelPath' '${remoteHome}/lpicto-ai-models-upload/'"
+        if ($LASTEXITCODE -eq 0) { continue }
+        & sshpass -e scp @sshOptions (Join-Path $localAIModels $model.Rel) "${remote}:${remoteHome}/lpicto-ai-models-upload/"
+        if ($LASTEXITCODE -ne 0) { Stop-Deploy "上传 AI 模型失败：$($model.Rel)" }
+    }
+    $remoteClipRoot = "${remoteHome}/lpicto/data/app/ai-models/chinese-clip"
+    & sshpass -e ssh @sshOptions $remote "test -f '$remoteClipRoot/onnx/model.onnx' && echo 'd4e282affd5f09e196856cc63fbd0e77c576f598fdf6f6bb78ee61f1ef7cd770  $remoteClipRoot/onnx/model.onnx' | sha256sum -c - >/dev/null && cp -a '$remoteClipRoot' '${remoteHome}/lpicto-ai-models-upload/'"
+    if ($LASTEXITCODE -ne 0) {
+        & sshpass -e scp @sshOptions -r (Join-Path $localAIModels 'chinese-clip') "${remote}:${remoteHome}/lpicto-ai-models-upload/"
+        if ($LASTEXITCODE -ne 0) { Stop-Deploy "上传 Chinese-CLIP 模型失败" }
+    }
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($localRunner, ($remoteRunner -replace "`r", ""), $utf8NoBom)
     & sshpass -e scp @sshOptions $localRunner "${remote}:${remoteScript}"

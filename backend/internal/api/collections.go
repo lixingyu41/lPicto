@@ -133,7 +133,7 @@ func (s *Server) collectionAssets(w http.ResponseWriter, r *http.Request) {
 	} else if tag, ok := parseCombinedTagCollectionID(id); ok {
 		opts.CombinedTag = tag
 		pageResult, err = s.db.SearchAssets(r.Context(), opts)
-	} else if id == "tags" && len(opts.CombinedTags) > 0 {
+	} else if id == "tags" && (len(opts.CombinedTags) > 0 || len(opts.TagNodes) > 0) {
 		pageResult, err = s.db.SearchAssets(r.Context(), opts)
 	} else if smartID, ok := parseSmartCollectionID(id); ok {
 		collection, getErr := s.db.GetSmartCollection(r.Context(), smartID)
@@ -178,7 +178,7 @@ func (s *Server) collectionAnchors(w http.ResponseWriter, r *http.Request) {
 	} else if tag, ok := parseCombinedTagCollectionID(id); ok {
 		opts.CombinedTag = tag
 		result, err = s.db.SearchAnchors(r.Context(), opts)
-	} else if id == "tags" && len(opts.CombinedTags) > 0 {
+	} else if id == "tags" && (len(opts.CombinedTags) > 0 || len(opts.TagNodes) > 0) {
 		result, err = s.db.SearchAnchors(r.Context(), opts)
 	} else if smartID, ok := parseSmartCollectionID(id); ok {
 		collection, getErr := s.db.GetSmartCollection(r.Context(), smartID)
@@ -240,7 +240,7 @@ func (s *Server) resolveDynamicCollectionOptions(ctx context.Context, collection
 		opts.CombinedTag = tag
 		return opts, nil
 	}
-	if collectionID == "tags" && len(opts.CombinedTags) > 0 {
+	if collectionID == "tags" && (len(opts.CombinedTags) > 0 || len(opts.TagNodes) > 0) {
 		return opts, nil
 	}
 	if smartID, ok := parseSmartCollectionID(collectionID); ok {
@@ -319,7 +319,7 @@ func (s *Server) collectionAssetOptions(r *http.Request, page int, pageSize int)
 	return db.AssetListOptions{
 		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		CombinedQuery: strings.TrimSpace(r.URL.Query().Get("combinedQuery")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-		ManualTag: strings.TrimSpace(r.URL.Query().Get("manualTag")), CombinedTag: strings.TrimSpace(r.URL.Query().Get("combinedTag")), CombinedTags: combinedTagsQuery(r), AIDescription: strings.TrimSpace(r.URL.Query().Get("aiDescription")), AITag: strings.TrimSpace(r.URL.Query().Get("aiTag")), Orientation: searchOrientation(r),
+		ManualTag: strings.TrimSpace(r.URL.Query().Get("manualTag")), CombinedTag: strings.TrimSpace(r.URL.Query().Get("combinedTag")), CombinedTags: combinedTagsQuery(r), TagNodes: tagNodesQuery(r), AIDescription: strings.TrimSpace(r.URL.Query().Get("aiDescription")), AITag: strings.TrimSpace(r.URL.Query().Get("aiTag")), Orientation: searchOrientation(r),
 	}
 }
 
@@ -340,6 +340,7 @@ func optionsFromCollectionRule(rule *string, page int, pageSize int) db.AssetLis
 	opts.ManualTag = stringRule(raw, "manualTag")
 	opts.CombinedTag = stringRule(raw, "combinedTag")
 	opts.CombinedTags = stringListRule(raw, "combinedTags")
+	opts.TagNodes = tagNodeListRule(raw, "tagNodes")
 	opts.AIDescription = stringRule(raw, "aiDescription")
 	opts.AITag = stringRule(raw, "aiTag")
 	opts.NFOTitle = stringRule(raw, "nfoTitle")
@@ -396,6 +397,9 @@ func mergeCollectionOptions(base db.AssetListOptions, override db.AssetListOptio
 	if len(override.CombinedTags) > 0 {
 		base.CombinedTags = override.CombinedTags
 	}
+	if len(override.TagNodes) > 0 {
+		base.TagNodes = override.TagNodes
+	}
 	if override.AIDescription != "" {
 		base.AIDescription = override.AIDescription
 	}
@@ -443,6 +447,37 @@ func stringListRule(raw map[string]any, key string) []string {
 		}
 		seen[tag] = struct{}{}
 		out = append(out, tag)
+		if len(out) == 32 {
+			break
+		}
+	}
+	return out
+}
+
+func tagNodeListRule(raw map[string]any, key string) []string {
+	values, ok := raw[key].([]any)
+	if !ok {
+		if encoded, stringOK := raw[key].(string); stringOK {
+			if err := json.Unmarshal([]byte(encoded), &values); err != nil {
+				return nil
+			}
+		} else {
+			return nil
+		}
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		node, ok := value.(string)
+		node = strings.TrimSpace(node)
+		if !ok || len([]rune(node)) > 160 || (!strings.HasPrefix(node, "ai:") && !strings.HasPrefix(node, "manual:")) {
+			continue
+		}
+		if _, exists := seen[node]; exists {
+			continue
+		}
+		seen[node] = struct{}{}
+		out = append(out, node)
 		if len(out) == 32 {
 			break
 		}
@@ -554,6 +589,34 @@ func combinedTagsQuery(r *http.Request) []string {
 		}
 	}
 	return out
+}
+
+func tagNodesQuery(r *http.Request) []string {
+	raw := strings.TrimSpace(r.URL.Query().Get("tagNodes"))
+	if raw == "" {
+		return nil
+	}
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	valid := make([]string, 0, len(values))
+	for _, value := range values {
+		node := strings.TrimSpace(value)
+		if len([]rune(node)) > 160 || (!strings.HasPrefix(node, "ai:") && !strings.HasPrefix(node, "manual:")) {
+			continue
+		}
+		if _, exists := seen[node]; exists {
+			continue
+		}
+		seen[node] = struct{}{}
+		valid = append(valid, node)
+		if len(valid) == 32 {
+			break
+		}
+	}
+	return valid
 }
 
 func chiParam(r *http.Request, key string) string {

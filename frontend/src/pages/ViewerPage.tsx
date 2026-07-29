@@ -1,10 +1,21 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+  type RefObject,
+} from 'react';
 import { useLocation, useNavigate, useParams, useSearchParams, type Location } from 'react-router-dom';
-import { Check, FolderOpen, GripHorizontal, Info, LogOut, Plus, X } from 'lucide-react';
+import { Check, FolderOpen, GripHorizontal, LogOut, Plus, X } from 'lucide-react';
 import { api } from '../api/client';
 import type {
   Asset,
 	AssetAIResult,
+  AssetAITag,
   AssetDeletePlan,
   AssetDeleteResult,
   AssetRating,
@@ -16,13 +27,14 @@ import type {
   VideoSegmentStatus,
 } from '../types/api';
 import AssetDeleteDialog from '../components/AssetDeleteDialog';
+import AssetRecordDeleteDialog from '../components/AssetRecordDeleteDialog';
 import RatingStars, { normalizeAssetRating } from '../components/RatingStars';
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format';
 import ImageViewer from '../viewer/ImageViewer';
 import VideoViewer, { type VideoPlaybackInfo } from '../viewer/VideoViewer';
 import type { ViewerMediaLayerMode } from '../viewer/mediaLayer';
 import { useKeyboard } from '../hooks/useKeyboard';
-import { useRestoreSidebarState, useSidebarPanel, type SidebarReturnState } from '../components/SidebarContext';
+import { useRestoreSidebarState, type SidebarReturnState } from '../components/SidebarContext';
 import { nextRotation } from '../utils/rotation';
 import {
   decodeReturnState,
@@ -40,6 +52,12 @@ import {
   type ViewerPrefs,
 } from '../utils/viewerPrefs';
 import { waterfallPageSize } from '../utils/waterfallPaging';
+import {
+  fitViewerPanelWidth,
+  loadViewerPanelWidth,
+  normalizeViewerPanelWidth,
+  saveViewerPanelWidth,
+} from '../utils/viewerPanelPrefs';
 
 interface WheelBase {
   current: Asset;
@@ -87,6 +105,7 @@ const neighborParamKeys = new Set([
 	'combinedQuery',
 	'combinedTag',
 	'combinedTags',
+	'tagNodes',
 	'aiDescription',
 	'aiTag',
   'nfo',
@@ -120,6 +139,8 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const [assetTags, setAssetTags] = useState<AssetTag[]>([]);
 	const [assetAI, setAssetAI] = useState<AssetAIResult | null>(null);
 	const [assetAIError, setAssetAIError] = useState<string | null>(null);
+  const [aiTagError, setAITagError] = useState<string | null>(null);
+  const [aiTagSaving, setAITagSaving] = useState(false);
   const [tagDraft, setTagDraft] = useState('');
   const [tagError, setTagError] = useState<string | null>(null);
   const [tagSaving, setTagSaving] = useState(false);
@@ -134,17 +155,22 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
+  const [recordDeleteDialogOpen, setRecordDeleteDialogOpen] = useState(false);
+  const [recordDeleteError, setRecordDeleteError] = useState<string | null>(null);
+  const [recordDeleteSubmitting, setRecordDeleteSubmitting] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [assetInfoCollapsed, setAssetInfoCollapsed] = useState(false);
+  const [viewerPanelWidth, setViewerPanelWidth] = useState(() => loadViewerPanelWidth());
+  const [viewerAvailableWidth, setViewerAvailableWidth] = useState(() => window.innerWidth);
   const wheelBase = useRef<WheelBase | null>(null);
   const wheelDelta = useRef(0);
   const wheelGestureLocked = useRef(false);
   const wheelGestureTimer = useRef<number | null>(null);
   const viewerRef = useRef<HTMLElement | null>(null);
   const viewerBodyRef = useRef<HTMLDivElement | null>(null);
-  const [mediaContextMenu, setMediaContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const viewerPanelResizeCleanupRef = useRef<(() => void) | null>(null);
   const [mediaDetailsOpen, setMediaDetailsOpen] = useState(false);
-  const [mediaDetailsPosition, setMediaDetailsPosition] = useState({ x: 16, y: 16 });
+  const mediaDetailsPosition = useMemo(() => ({ x: 16, y: 16 }), []);
   const viewerReturnStateRef = useRef(decodeReturnState<Partial<SidebarReturnState>>(searchParams.get('returnState'), {}));
   const restoreSidebarState = useRestoreSidebarState();
   const viewerLocationState = location.state as ViewerLocationState | null;
@@ -162,6 +188,23 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const displayedMediaKeyRef = useRef('');
   const failedMediaKeyRef = useRef('');
   const lastNavigationDirection = useRef<-1 | 0 | 1>(0);
+
+  useLayoutEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    const updateWidth = () => setViewerAvailableWidth(viewer.getBoundingClientRect().width);
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(viewer);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(
+    () => () => {
+      viewerPanelResizeCleanupRef.current?.();
+    },
+    [],
+  );
 
   const query = useMemo(() => {
     const result: Record<string, string> = {};
@@ -312,7 +355,6 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   useEffect(() => {
     setVideoProxyRuntime(null);
     setVideoPlaybackInfo(null);
-    setMediaContextMenu(null);
     setDeleteDialogOpen(false);
     setDeletePlan(null);
     setDeleteError(null);
@@ -332,21 +374,10 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
 				setAssetAI(null); setAssetAIError(err instanceof Error ? err.message : '读取 AI 结果失败');
 			}
 		}
-		setAssetAI(null); setAssetAIError(null);
+		setAssetAI(null); setAssetAIError(null); setAITagError(null);
 		if (current) void loadAI(current);
 		return () => { live = false; window.clearTimeout(timer); };
 	}, [current?.id]);
-
-  useEffect(() => {
-    if (!mediaContextMenu) return;
-    const close = () => setMediaContextMenu(null);
-    window.addEventListener('pointerdown', close);
-    window.addEventListener('blur', close);
-    return () => {
-      window.removeEventListener('pointerdown', close);
-      window.removeEventListener('blur', close);
-    };
-  }, [mediaContextMenu]);
 
   useEffect(() => {
     if (activeNeighborAssetId === null) return;
@@ -676,6 +707,38 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     }
   }, [current, deletePlan, deleteSubmitting, goAfterDelete]);
 
+  const openRecordDeleteDialog = useCallback(() => {
+    if (!current) return;
+    setRecordDeleteError(null);
+    setRecordDeleteSubmitting(false);
+    setRecordDeleteDialogOpen(true);
+  }, [current?.id]);
+
+  const closeRecordDeleteDialog = useCallback(() => {
+    if (recordDeleteSubmitting) return;
+    setRecordDeleteDialogOpen(false);
+    setRecordDeleteError(null);
+  }, [recordDeleteSubmitting]);
+
+  const confirmDeleteAssetRecord = useCallback(async () => {
+    if (!current || recordDeleteSubmitting) return;
+    setRecordDeleteSubmitting(true);
+    setRecordDeleteError(null);
+    try {
+      const result = await api.deleteAssetRecord(current.id);
+      if (result.deletedAssetIds.includes(current.id)) {
+        setRecordDeleteDialogOpen(false);
+        goAfterDelete(result);
+        return;
+      }
+      setRecordDeleteError('媒体记录已经不存在');
+    } catch (err) {
+      setRecordDeleteError(err instanceof Error ? err.message : '删除媒体记录失败');
+    } finally {
+      setRecordDeleteSubmitting(false);
+    }
+  }, [current, goAfterDelete, recordDeleteSubmitting]);
+
   const rotateCurrentAsset = useCallback(async () => {
     if (!current) return;
     const pref = await api.updateAssetPreferences(current.id, nextRotation(current.rotation));
@@ -727,6 +790,43 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     }
   }, [current, tagSaving]);
 
+  const saveCurrentAITag = useCallback(async (payload: {
+    previousTag?: string;
+    tag: string;
+    categoryKey: string;
+    subjectKey: string;
+  }) => {
+    if (!current || aiTagSaving) return false;
+    setAITagSaving(true);
+    setAITagError(null);
+    try {
+      const result = await api.replaceAssetAITag(current.id, payload);
+      setAssetAI(result);
+      return true;
+    } catch (err) {
+      setAITagError(err instanceof Error ? err.message : '保存 AI 标签失败');
+      return false;
+    } finally {
+      setAITagSaving(false);
+    }
+  }, [aiTagSaving, current]);
+
+  const removeCurrentAITag = useCallback(async (tag: string) => {
+    if (!current || aiTagSaving) return false;
+    setAITagSaving(true);
+    setAITagError(null);
+    try {
+      const result = await api.deleteAssetAITag(current.id, tag);
+      setAssetAI(result);
+      return true;
+    } catch (err) {
+      setAITagError(err instanceof Error ? err.message : '删除 AI 标签失败');
+      return false;
+    } finally {
+      setAITagSaving(false);
+    }
+  }, [aiTagSaving, current]);
+
   const searchByNFOValue = useCallback(
     (field: NFOFilterField | 'nfo', value: string) => {
       const query = new URLSearchParams();
@@ -747,7 +847,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   );
 
   const toggleFullscreen = useCallback(() => {
-    const target = fullscreenTarget(viewerRef.current);
+    const target = viewerBodyRef.current;
     if (document.fullscreenElement) {
       void document.exitFullscreen();
       return;
@@ -757,9 +857,37 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     }
   }, []);
 
+  const startViewerPanelResize = useCallback(
+    (event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      viewerPanelResizeCleanupRef.current?.();
+      const startX = event.clientX;
+      const startWidth = fitViewerPanelWidth(viewerPanelWidth, viewerAvailableWidth);
+      document.body.classList.add('viewer-panel-resizing');
+      const onPointerMove = (moveEvent: globalThis.PointerEvent) => {
+        const width = normalizeViewerPanelWidth(startWidth - (moveEvent.clientX - startX));
+        setViewerPanelWidth(width);
+        saveViewerPanelWidth(width);
+      };
+      const endResize = () => {
+        document.body.classList.remove('viewer-panel-resizing');
+        window.removeEventListener('pointermove', onPointerMove);
+        window.removeEventListener('pointerup', endResize);
+        window.removeEventListener('pointercancel', endResize);
+        viewerPanelResizeCleanupRef.current = null;
+      };
+      viewerPanelResizeCleanupRef.current = endResize;
+      window.addEventListener('pointermove', onPointerMove);
+      window.addEventListener('pointerup', endResize);
+      window.addEventListener('pointercancel', endResize);
+    },
+    [viewerAvailableWidth, viewerPanelWidth],
+  );
+
   useEffect(() => {
     function onFullscreenChange() {
-      const target = fullscreenTarget(viewerRef.current);
+      const target = viewerBodyRef.current;
       const fullscreenElement = document.fullscreenElement;
       setFullscreen(Boolean(fullscreenElement && target && (fullscreenElement === target || fullscreenElement.contains(target))));
     }
@@ -770,10 +898,6 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   useKeyboard(
     useCallback(
       (event: KeyboardEvent) => {
-        if (event.key === 'Escape' && mediaContextMenu) {
-          setMediaContextMenu(null);
-          return;
-        }
         if (event.key === 'Escape' && mediaDetailsOpen) {
           setMediaDetailsOpen(false);
           return;
@@ -783,26 +907,36 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           if (event.key === 'Escape') closeDeleteDialog();
           return;
         }
+        if (recordDeleteDialogOpen) {
+          if (event.key === 'Escape') closeRecordDeleteDialog();
+          return;
+        }
         if (event.key === 'Escape') leave();
         if (event.key.toLowerCase() === 'f') toggleFullscreen();
         if (event.key === 'ArrowLeft' || event.key.toLowerCase() === 'a') goAsset(activeNeighbors?.previous[0], -1);
         if (event.key === 'ArrowRight' || event.key.toLowerCase() === 'd') goAsset(activeNeighbors?.next[0], 1);
       },
-      [activeNeighbors, closeDeleteDialog, deleteDialogOpen, goAsset, leave, mediaContextMenu, mediaDetailsOpen, toggleFullscreen],
+      [activeNeighbors, closeDeleteDialog, closeRecordDeleteDialog, deleteDialogOpen, goAsset, leave, mediaDetailsOpen, recordDeleteDialogOpen, toggleFullscreen],
     ),
   );
 
-  useSidebarPanel(
-    'viewer',
+  useEffect(() => {
+    if (overlay) return;
+    restoreSidebarState(viewerReturnStateRef.current);
+  }, [overlay, restoreSidebarState]);
+
+  const viewerInfoPanel = (
     <ViewerSidebarPanel
       asset={current}
       error={error}
       sidecarError={sidecarError}
       sidecars={sidecars}
       tags={assetTags}
-		preloadIndicators={viewerPreloadIndicators}
-		aiResult={assetAI}
-		aiError={assetAIError}
+      preloadIndicators={viewerPreloadIndicators}
+      aiResult={assetAI}
+      aiError={assetAIError}
+      aiTagError={aiTagError}
+      aiTagSaving={aiTagSaving}
       tagDraft={tagDraft}
       tagError={tagError}
       tagSaving={tagSaving}
@@ -814,38 +948,12 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       onTagDraftChange={setTagDraft}
       onAddTag={() => void addCurrentAssetTag()}
       onRemoveTag={(tag) => void removeCurrentAssetTag(tag)}
-		onSelectAITag={(tag) => navigate(`/collections?collection=tags&tags=${encodeURIComponent(JSON.stringify([tag]))}`)}
-		onReanalyzeAI={() => current && void api.reanalyzeAssetAI(current.id).then(() => setAssetAI((value) => value ? { ...value, status: 'pending', error: undefined } : value))}
+      onSaveAITag={saveCurrentAITag}
+      onRemoveAITag={removeCurrentAITag}
+      onReanalyzeAI={() => current && void api.reanalyzeAssetAI(current.id).then(() => setAssetAI((value) => value ? { ...value, status: 'pending', error: undefined } : value))}
       onRatingChange={(rating) => void rateCurrentAsset(rating)}
-    />,
-    [
-      current?.id,
-      current?.rating,
-      current?.rotation,
-      error,
-      sidecarError,
-      sidecars,
-      assetTags,
-		viewerPreloadIndicators,
-		assetAI,
-		assetAIError,
-      tagDraft,
-      tagError,
-      tagSaving,
-      assetInfoCollapsed,
-      leave,
-      openAssetFolder,
-      searchByNFOValue,
-      addCurrentAssetTag,
-      removeCurrentAssetTag,
-      rateCurrentAsset,
-    ],
+    />
   );
-
-  useEffect(() => {
-    if (overlay) return;
-    restoreSidebarState(viewerReturnStateRef.current);
-  }, [overlay, restoreSidebarState]);
 
   const renderMediaLayer = (asset: Asset) => {
     const key = mediaReadyKey(asset.id, asset.cacheKey);
@@ -871,11 +979,13 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
         {asset.mediaType === 'image' ? (
         <ImageViewer
           asset={asset}
-          deleting={deleteLoading || deleteSubmitting}
+          deleting={deleteLoading || deleteSubmitting || recordDeleteSubmitting}
           fullscreen={fullscreen}
           layerMode={layerMode}
           preloadEnabled={preloadEnabled}
           onDelete={openDeleteDialog}
+          onDeleteRecord={openRecordDeleteDialog}
+          mediaDetailsOpen={mediaDetailsOpen}
           onMediaError={handleMediaError}
           onMediaReady={handleMediaReady}
           playbackMode={viewerPrefs.playbackMode}
@@ -883,6 +993,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onPlaybackEnded={playNextAsset}
           onPlaybackModeChange={updatePlaybackMode}
           onRotate={() => void rotateCurrentAsset()}
+          onToggleMediaDetails={() => setMediaDetailsOpen((open) => !open)}
           onToggleFullscreen={toggleFullscreen}
         />
         ) : (
@@ -896,9 +1007,11 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           selectedSubtitleId={selectedSubtitleId}
           subtitles={layerMode === 'active' ? sidecars?.subtitles ?? [] : []}
           subtitlesEnabled={layerMode === 'active' && subtitlesEnabled}
-          deleting={deleteLoading || deleteSubmitting}
+          deleting={deleteLoading || deleteSubmitting || recordDeleteSubmitting}
           onDanmakuPrefChange={updateDanmakuPref}
           onDelete={openDeleteDialog}
+          onDeleteRecord={openRecordDeleteDialog}
+          mediaDetailsOpen={mediaDetailsOpen}
           onMediaError={handleMediaError}
           onMediaReady={handleMediaReady}
           onPriorityPreloadComplete={handlePriorityPreloadComplete}
@@ -909,6 +1022,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onRotate={() => void rotateCurrentAsset()}
           onSelectedSubtitleChange={updateSelectedSubtitle}
           onSubtitlesEnabledChange={updateSubtitlesEnabled}
+          onToggleMediaDetails={() => setMediaDetailsOpen((open) => !open)}
           onToggleFullscreen={toggleFullscreen}
           onProxyRuntimeChange={handleCurrentProxyRuntimeChange}
         />
@@ -917,51 +1031,30 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     );
   };
 
+  const viewerStyle = {
+    '--viewer-info-width': `${fitViewerPanelWidth(viewerPanelWidth, viewerAvailableWidth)}px`,
+  } as CSSProperties;
+
   return (
     <>
       <section
         ref={viewerRef}
         className={overlay ? 'viewer-page viewer-overlay' : 'viewer-page'}
+        style={viewerStyle}
       >
         <div
           ref={viewerBodyRef}
           className="viewer-body"
           onContextMenu={(event) => {
             if (!(event.target instanceof Element) || !event.target.closest('.image-stage, .video-stage')) return;
+            if (event.target.closest('[data-viewer-wheel-control]')) return;
             event.preventDefault();
-            const rect = event.currentTarget.getBoundingClientRect();
-            setMediaContextMenu({
-              x: Math.max(8, Math.min(event.clientX - rect.left, rect.width - 188)),
-              y: Math.max(8, Math.min(event.clientY - rect.top, rect.height - 48)),
-            });
+            leave();
           }}
         >
           {mediaWindow.map(renderMediaLayer)}
           {currentMediaFailed && mediaLoadFailure && (
             <div className="viewer-media-load-error" role="status">{mediaLoadFailure.message}</div>
-          )}
-          {mediaContextMenu && (
-            <div
-              className="viewer-media-context-menu"
-              data-viewer-wheel-control
-              role="menu"
-              style={{ left: mediaContextMenu.x, top: mediaContextMenu.y }}
-              onContextMenu={(event) => event.preventDefault()}
-              onPointerDown={(event) => event.stopPropagation()}
-            >
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  setMediaDetailsPosition(mediaContextMenu);
-                  setMediaDetailsOpen(true);
-                  setMediaContextMenu(null);
-                }}
-              >
-                <Info size={16} />
-                <span>媒体详情</span>
-              </button>
-            </div>
           )}
           {mediaDetailsOpen && current && (
             <MediaDetailsCard
@@ -974,6 +1067,16 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
             />
           )}
         </div>
+        <button
+          aria-label="调整查看器信息栏宽度"
+          className="viewer-info-resize-handle"
+          title="拖动调整查看器信息栏宽度"
+          type="button"
+          onPointerDown={startViewerPanelResize}
+        />
+        <aside className="viewer-info-panel" data-viewer-wheel-control>
+          {viewerInfoPanel}
+        </aside>
       </section>
       {deleteDialogOpen && (
         <AssetDeleteDialog
@@ -985,16 +1088,21 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onConfirm={() => void confirmDeleteAsset()}
         />
       )}
+      {recordDeleteDialogOpen && current && (
+        <AssetRecordDeleteDialog
+          asset={current}
+          error={recordDeleteError}
+          submitting={recordDeleteSubmitting}
+          onClose={closeRecordDeleteDialog}
+          onConfirm={() => void confirmDeleteAssetRecord()}
+        />
+      )}
     </>
   );
 }
 
 function isAbortError(err: unknown) {
   return err instanceof DOMException && err.name === 'AbortError';
-}
-
-function fullscreenTarget(viewer: HTMLElement | null) {
-  return viewer?.closest<HTMLElement>('.viewer-shell-overlay') ?? viewer;
 }
 
 function assetIdFromPath(pathname: string) {
@@ -1074,6 +1182,8 @@ function ViewerSidebarPanel({
 	preloadIndicators,
 	aiResult,
 	aiError,
+  aiTagError,
+  aiTagSaving,
   tagDraft,
   tagError,
   tagSaving,
@@ -1085,7 +1195,8 @@ function ViewerSidebarPanel({
   onTagDraftChange,
   onAddTag,
   onRemoveTag,
-	onSelectAITag,
+  onSaveAITag,
+  onRemoveAITag,
 	onReanalyzeAI,
   onRatingChange,
 }: {
@@ -1097,6 +1208,8 @@ function ViewerSidebarPanel({
 	preloadIndicators: ViewerLoadIndicatorStatus[];
 	aiResult: AssetAIResult | null;
 	aiError: string | null;
+  aiTagError: string | null;
+  aiTagSaving: boolean;
   tagDraft: string;
   tagError: string | null;
   tagSaving: boolean;
@@ -1108,7 +1221,8 @@ function ViewerSidebarPanel({
   onTagDraftChange: (value: string) => void;
   onAddTag: () => void;
   onRemoveTag: (tag: string) => void;
-	onSelectAITag: (tag: string) => void;
+  onSaveAITag: (payload: { previousTag?: string; tag: string; categoryKey: string; subjectKey: string }) => Promise<boolean>;
+  onRemoveAITag: (tag: string) => Promise<boolean>;
 	onReanalyzeAI: () => void;
   onRatingChange: (rating: AssetRating) => void;
 }) {
@@ -1194,10 +1308,15 @@ function ViewerSidebarPanel({
 			{aiResult?.status === 'processing' && <div className="sidebar-empty-line">处理中</div>}
 			{aiResult?.status === 'failed' && <div className="sidebar-error">{aiResult.error || '分析失败'} <button type="button" onClick={onReanalyzeAI}>重试</button></div>}
 			{aiResult?.status === 'ready' && <p className="sidebar-ai-description">{aiResult.description}</p>}
-			<div className="sidebar-control-title">AI 标签</div>
-			<div className="sidebar-asset-tag-list">
-			  {aiResult?.status === 'ready' && aiResult.tags.map((item) => <button className="sidebar-asset-tag" key={item.tag} type="button" title={`匹配度 ${item.confidence.toFixed(3)}`} onClick={() => onSelectAITag(item.tag)}>{item.tag}</button>)}
-			</div>
+            {aiResult && (
+              <ViewerEditableAITags
+                error={aiTagError}
+                saving={aiTagSaving}
+                tags={aiResult.tags ?? []}
+                onRemove={onRemoveAITag}
+                onSave={onSaveAITag}
+              />
+            )}
 		  </div>
           <div className="sidebar-control-title">星级</div>
           <RatingStars value={normalizeAssetRating(asset.rating)} onChange={onRatingChange} />
@@ -1236,6 +1355,171 @@ function ViewerSidebarPanel({
               )}
           {nfoGroups.length === 0 && nfoFieldEntries.length === 0 && sidecars.nfo.text && <pre>{sidecars.nfo.text}</pre>}
         </div>
+      )}
+    </div>
+  );
+}
+
+interface EditableAITagDraft {
+  previousTag?: string;
+  tag: string;
+  categoryKey: string;
+  subjectKey: string;
+}
+
+const closeupTagOptions = [
+  '脸部特写', '头部特写', '眼部特写', '鼻部特写', '嘴部特写', '嘴唇特写', '舌部特写', '牙齿特写', '耳部特写',
+  '颈部特写', '肩部特写', '锁骨特写', '胸部特写', '腹部特写', '肚脐特写', '腰部特写', '背部特写',
+  '手部特写', '手掌特写', '手指特写', '手臂特写', '肘部特写', '手腕特写',
+  '臀部特写', '腿部特写', '大腿特写', '膝部特写', '小腿特写', '脚踝特写', '脚部特写', '脚底特写', '脚趾特写', '全身特写',
+];
+interface EditableAITagKind {
+  key: string;
+  label: string;
+  categoryKey: string;
+  subjectKey: string;
+  options?: readonly string[];
+}
+const aiTagKinds: readonly EditableAITagKind[] = [
+  { key: 'closeup.part', label: '特写', categoryKey: 'closeup', subjectKey: 'part', options: closeupTagOptions },
+  { key: 'people.count', label: '人物数量', categoryKey: 'people', subjectKey: 'count', options: Array.from({ length: 20 }, (_, index) => `${index + 1}人`) },
+  { key: 'action.posture', label: '姿态', categoryKey: 'action', subjectKey: 'posture', options: ['坐姿', '躺姿', '站立', '蹲姿', '跪姿', '俯卧', '仰卧'] },
+  { key: 'action.activity', label: '动作', categoryKey: 'action', subjectKey: 'activity', options: ['行走', '跳舞', '做操', '跑步', '游泳', '骑行', '瑜伽', '健身', '挥手', '比心', '摆姿势'] },
+  { key: 'shoes.shoes', label: '鞋子', categoryKey: 'shoes', subjectKey: 'shoes' },
+  { key: 'socks.socks', label: '袜子', categoryKey: 'socks', subjectKey: 'socks' },
+  { key: 'clothes.top', label: '上衣', categoryKey: 'clothes', subjectKey: 'top' },
+  { key: 'clothes.outerwear', label: '外套', categoryKey: 'clothes', subjectKey: 'outerwear' },
+  { key: 'clothes.dress', label: '裙装', categoryKey: 'clothes', subjectKey: 'dress' },
+  { key: 'clothes.pants', label: '裤装', categoryKey: 'clothes', subjectKey: 'pants' },
+  { key: 'clothes.sportswear', label: '运动服', categoryKey: 'clothes', subjectKey: 'sportswear' },
+  { key: 'clothes.swimwear', label: '泳装', categoryKey: 'clothes', subjectKey: 'swimwear' },
+  { key: 'clothes.hat', label: '帽子', categoryKey: 'clothes', subjectKey: 'hat' },
+  { key: 'clothes.accessories', label: '配饰', categoryKey: 'clothes', subjectKey: 'accessories' },
+];
+
+function ViewerEditableAITags({
+  error,
+  saving,
+  tags,
+  onRemove,
+  onSave,
+}: {
+  error: string | null;
+  saving: boolean;
+  tags: AssetAITag[];
+  onRemove: (tag: string) => Promise<boolean>;
+  onSave: (draft: EditableAITagDraft) => Promise<boolean>;
+}) {
+  const [draft, setDraft] = useState<EditableAITagDraft | null>(null);
+  const selectedKindKey = draft ? `${draft.categoryKey}.${draft.subjectKey}` : '';
+  const selectedKind = aiTagKinds.find((kind) => kind.key === selectedKindKey) ?? aiTagKinds[0];
+  const fixedOptions = selectedKind.options
+    ? selectedKind.options.includes(draft?.tag ?? '')
+      ? selectedKind.options
+      : [draft?.tag ?? '', ...selectedKind.options].filter(Boolean)
+    : null;
+  const groups = [...tags.reduce((result, tag) => {
+    const category = tag.categoryLabel || '其他';
+    result.set(category, [...(result.get(category) ?? []), tag]);
+    return result;
+  }, new Map<string, AssetAITag[]>())];
+  const edit = (item: AssetAITag) => {
+    const supported = aiTagKinds.some((kind) => kind.categoryKey === item.categoryKey && kind.subjectKey === item.subjectKey);
+    const fallback = aiTagKinds[0];
+    setDraft({
+      previousTag: item.tag,
+      tag: supported ? item.tag : fallback.options?.[0] ?? '',
+      categoryKey: supported ? item.categoryKey! : fallback.categoryKey,
+      subjectKey: supported ? item.subjectKey! : fallback.subjectKey,
+    });
+  };
+  const add = () => {
+    const initial = aiTagKinds[0];
+    setDraft({
+      tag: initial.options?.[0] ?? '',
+      categoryKey: initial.categoryKey,
+      subjectKey: initial.subjectKey,
+    });
+  };
+  const changeKind = (key: string) => {
+    const kind = aiTagKinds.find((item) => item.key === key) ?? aiTagKinds[0];
+    setDraft((current) => current ? {
+      ...current,
+      categoryKey: kind.categoryKey,
+      subjectKey: kind.subjectKey,
+      tag: kind.options?.[0] ?? '',
+    } : current);
+  };
+  return (
+    <div className="viewer-editable-ai-tags">
+      <div className="viewer-ai-tags-title">
+        <div className="sidebar-control-title">AI 标签</div>
+        <button className="sidebar-asset-tag-add" disabled={saving} type="button" title="添加标签" onClick={add}>
+          <Plus size={13} />
+        </button>
+      </div>
+      {error && <div className="sidebar-error">{error}</div>}
+      <div className="sidebar-asset-tag-list">
+        {groups.map(([category, items]) => (
+          <div className="viewer-ai-tag-group" key={category}>
+            <span>{category}</span>
+            <div>
+              {items.map((item) => (
+                <span className="sidebar-asset-tag viewer-ai-tag-chip" key={item.tag}>
+                  <button
+                    disabled={saving}
+                    type="button"
+                    title={`${(item.facets ?? []).map((facet) => facet.labels.join(' / ')).join('\n')}\n点击修改`}
+                    onClick={() => edit(item)}
+                  >
+                    <small>{item.subjectLabel || category}</small>{item.tag}
+                  </button>
+                  <button
+                    disabled={saving}
+                    type="button"
+                    title={`删除 ${item.tag}`}
+                    onClick={() => void onRemove(item.tag).then((removed) => {
+                      if (removed && draft?.previousTag === item.tag) setDraft(null);
+                    })}
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      {draft && (
+        <form
+          className="viewer-ai-tag-editor"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onSave(draft).then((saved) => {
+              if (saved) setDraft(null);
+            });
+          }}
+        >
+          <select aria-label="标签分类" disabled={saving} value={selectedKind.key} onChange={(event) => changeKind(event.target.value)}>
+            {aiTagKinds.map((kind) => <option key={kind.key} value={kind.key}>{kind.label}</option>)}
+          </select>
+          {fixedOptions ? (
+            <select aria-label="标签值" disabled={saving} value={draft.tag} onChange={(event) => setDraft({ ...draft, tag: event.target.value })}>
+              {fixedOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+            </select>
+          ) : (
+            <input
+              autoFocus
+              disabled={saving}
+              maxLength={80}
+              placeholder="输入标签"
+              value={draft.tag}
+              onChange={(event) => setDraft({ ...draft, tag: event.target.value })}
+            />
+          )}
+          <button disabled={saving} type="button" title="取消" onClick={() => setDraft(null)}><X size={13} /></button>
+          <button disabled={saving || !draft.tag.trim()} type="submit" title="保存"><Check size={13} /></button>
+        </form>
       )}
     </div>
   );

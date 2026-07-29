@@ -21,43 +21,43 @@ type APIError struct {
 }
 
 type AssetDTO struct {
-	ID                int64      `json:"id"`
-	Filename          string     `json:"filename"`
-	FilenameSortKey   string     `json:"filenameSortKey"`
-	RelPath           string     `json:"relPath"`
-	ParentRelPath     string     `json:"parentRelPath"`
-	MediaType         string     `json:"mediaType"`
-	MimeType          *string    `json:"mimeType"`
-	Size              int64      `json:"size"`
-	Mtime             int64      `json:"mtime"`
-	Width             *int       `json:"width"`
-	Height            *int       `json:"height"`
-	Duration          *float64   `json:"duration"`
-	TakenAt           *int64     `json:"takenAt"`
-	TimelineAt        int64      `json:"timelineAt"`
-	ImportedAt        int64      `json:"importedAt"`
-	CacheKey          string     `json:"cacheKey"`
-	BrowserPlayable   bool       `json:"browserPlayable"`
-	ThumbStatus       string     `json:"thumbStatus"`
-	PreviewStatus     string     `json:"previewStatus"`
-	VideoPosterStatus string     `json:"videoPosterStatus"`
-	VideoProxyStatus  string     `json:"videoProxyStatus"`
-	Rotation          int        `json:"rotation"`
-	Rating            int        `json:"rating"`
-	Hidden            bool       `json:"hidden"`
-	SHA256            *string    `json:"sha256"`
-	HasSubtitle       bool       `json:"hasSubtitle"`
-	HasDanmaku        bool       `json:"hasDanmaku"`
-	FPS               *float64   `json:"fps"`
-	VideoCodec        *string    `json:"videoCodec"`
-	AudioCodec        *string    `json:"audioCodec"`
-	Container         *string    `json:"container"`
-	VideoBitrate      *int64     `json:"videoBitrate"`
-	AudioBitrate      *int64     `json:"audioBitrate"`
-	OverallBitrate    *int64     `json:"overallBitrate"`
-	AIDescription     *string    `json:"aiDescription,omitempty"`
-	AITags            []db.AITag `json:"aiTags,omitempty"`
-	Palette           []db.AIColor `json:"palette,omitempty"`
+	ID                int64         `json:"id"`
+	Filename          string        `json:"filename"`
+	FilenameSortKey   string        `json:"filenameSortKey"`
+	RelPath           string        `json:"relPath"`
+	ParentRelPath     string        `json:"parentRelPath"`
+	MediaType         string        `json:"mediaType"`
+	MimeType          *string       `json:"mimeType"`
+	Size              int64         `json:"size"`
+	Mtime             int64         `json:"mtime"`
+	Width             *int          `json:"width"`
+	Height            *int          `json:"height"`
+	Duration          *float64      `json:"duration"`
+	TakenAt           *int64        `json:"takenAt"`
+	TimelineAt        int64         `json:"timelineAt"`
+	ImportedAt        int64         `json:"importedAt"`
+	CacheKey          string        `json:"cacheKey"`
+	BrowserPlayable   bool          `json:"browserPlayable"`
+	ThumbStatus       string        `json:"thumbStatus"`
+	PreviewStatus     string        `json:"previewStatus"`
+	VideoPosterStatus string        `json:"videoPosterStatus"`
+	VideoProxyStatus  string        `json:"videoProxyStatus"`
+	Rotation          int           `json:"rotation"`
+	Rating            int           `json:"rating"`
+	Hidden            bool          `json:"hidden"`
+	SHA256            *string       `json:"sha256"`
+	HasSubtitle       bool          `json:"hasSubtitle"`
+	HasDanmaku        bool          `json:"hasDanmaku"`
+	FPS               *float64      `json:"fps"`
+	VideoCodec        *string       `json:"videoCodec"`
+	AudioCodec        *string       `json:"audioCodec"`
+	Container         *string       `json:"container"`
+	VideoBitrate      *int64        `json:"videoBitrate"`
+	AudioBitrate      *int64        `json:"audioBitrate"`
+	OverallBitrate    *int64        `json:"overallBitrate"`
+	AIDescription     *string       `json:"aiDescription,omitempty"`
+	AITags            []db.AITag    `json:"aiTags,omitempty"`
+	Palette           []db.AIColor  `json:"palette,omitempty"`
 	ManualTags        []AssetTagDTO `json:"manualTags,omitempty"`
 }
 
@@ -297,12 +297,17 @@ type QueueStatsDTO struct {
 }
 
 type CacheStatsDTO struct {
-	SizeBytes     int64 `json:"sizeBytes"`
-	CacheBytes    int64 `json:"cacheBytes"`
-	DatabaseBytes int64 `json:"databaseBytes"`
-	FileCount     int   `json:"fileCount"`
-	UpdatedAt     int64 `json:"updatedAt"`
-	Refreshing    bool  `json:"refreshing"`
+	SizeBytes        int64            `json:"sizeBytes"`
+	CacheBytes       int64            `json:"cacheBytes"`
+	DatabaseBytes    int64            `json:"databaseBytes"`
+	FileCount        int              `json:"fileCount"`
+	UpdatedAt        int64            `json:"updatedAt"`
+	Refreshing       bool             `json:"refreshing"`
+	MaxBytes         int64            `json:"maxBytes"`
+	MinFreeBytes     int64            `json:"minFreeBytes"`
+	FreeBytes        int64            `json:"freeBytes"`
+	ReclaimableBytes int64            `json:"reclaimableBytes"`
+	ByKind           map[string]int64 `json:"byKind"`
 }
 
 type ProcessingProgressDTO struct {

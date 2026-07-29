@@ -21,8 +21,9 @@ export function assetMatchesFolder(
   query: string,
   rating?: AssetRating,
   orientation?: OrientationFilter,
+  type: AssetKind = 'all',
 ) {
-  if (asset.thumbStatus !== 'ready' || !matchesQuery(asset, query) || !matchesRating(asset, rating) || !matchesOrientationFilter(asset, orientation)) return false;
+  if (asset.thumbStatus !== 'ready' || !matchesType(asset, type) || !matchesQuery(asset, query) || !matchesRating(asset, rating) || !matchesOrientationFilter(asset, orientation)) return false;
   if (recursive) {
     return folderRelPath === '' || asset.parentRelPath === folderRelPath || asset.parentRelPath.startsWith(`${folderRelPath}/`);
   }

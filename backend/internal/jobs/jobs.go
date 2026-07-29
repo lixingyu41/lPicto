@@ -41,12 +41,12 @@ var (
 )
 
 var (
-	redisControlTaskTypes  = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild"}
+	redisControlTaskTypes  = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild"}
 	redisImageTaskTypes    = []string{"thumb", "preview"}
 	redisPosterTaskTypes   = []string{"video_poster"}
 	redisAITaskTypes       = []string{"ai_analyze"}
 	redisMediaTaskTypes    = []string{"thumb", "preview", "video_poster", "video_proxy", "ai_analyze"}
-	redisAllTaskTypes      = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "thumb", "preview", "video_poster", "ai_analyze"}
+	redisAllTaskTypes      = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "thumb", "preview", "video_poster", "ai_analyze"}
 	redisPromoteTaskScript = redis.NewScript(`
 local items = redis.call('LRANGE', KEYS[1], 0, -1)
 for _, member in ipairs(items) do
@@ -258,6 +258,24 @@ func (m *Manager) PlaybackPriorityActive(ctx context.Context) (bool, error) {
 	return count > 0, err
 }
 
+// BackgroundBlocker reports why background workers currently cannot start.
+// It is read-only and safe for frequently-polled status endpoints.
+func (m *Manager) BackgroundBlocker(ctx context.Context) string {
+	if m == nil {
+		return ""
+	}
+	if active, err := m.PlaybackPriorityActive(ctx); err == nil && active {
+		return "playback"
+	}
+	if m.resources != nil {
+		return m.resources.blockedReason()
+	}
+	if ForegroundActive() {
+		return "foreground"
+	}
+	return ""
+}
+
 func (m *Manager) Stop() {
 	m.wg.Wait()
 }
@@ -382,7 +400,7 @@ func (m *Manager) Enqueue(task Task) {
 
 func knownQueueTask(taskType string) bool {
 	switch taskType {
-	case "thumb", "preview", "video_poster", "ai_analyze", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "scan_stop":
+	case "thumb", "preview", "video_poster", "ai_analyze", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "scan_stop":
 		return true
 	default:
 		return false
@@ -502,7 +520,7 @@ func (m *Manager) runTask(ctx context.Context, worker string, task Task) error {
 	}
 	taskCtx := ctx
 	stopPriorityMonitor := func() {}
-	if task.Type == "ai_analyze" && m.redis != nil {
+	if resourceManagedTask(task.Type) && m.redis != nil {
 		var cancel context.CancelCauseFunc
 		taskCtx, cancel = context.WithCancelCause(ctx)
 		done := make(chan struct{})
@@ -639,7 +657,7 @@ func (m *Manager) releaseRedisDedupe(task Task) {
 
 func redisDedupeKey(task Task) string {
 	switch task.Type {
-	case "scan_count", "scan_metadata", "thumb_continue", "thumb_rebuild":
+	case "scan_count", "scan_reconcile", "scan_metadata", "thumb_continue", "thumb_rebuild":
 		return task.Type + ":" + strings.Join(task.Roots, "\x00")
 	case "scan_metadata_paths":
 		return task.Type + ":" + strings.Join(task.Paths, "\x00")
@@ -674,7 +692,7 @@ func (m *Manager) handlerFor(taskType string) Handler {
 		return m.thumb
 	case "ai_analyze":
 		return m.ai
-	case "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "scan_stop":
+	case "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "scan_stop":
 		return m.scan
 	default:
 		return nil

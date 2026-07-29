@@ -23,7 +23,7 @@ COPY --from=llama-build /src/build/bin/llama-server /usr/local/bin/llama-server
 COPY --from=llama-build /src/build/bin/*.so* /usr/local/lib/
 COPY ai/requirements.txt /app/requirements.txt
 RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r /app/requirements.txt
-COPY ai/app.py ai/taxonomy.py ai/media_sampling.py ai/tag_logic.py ai/entrypoint.sh /app/
+COPY ai/app.py ai/taxonomy.py ai/media_sampling.py ai/tag_logic.py ai/tag_hierarchy.py ai/entrypoint.sh /app/
 RUN chmod +x /app/entrypoint.sh && useradd --system --uid 10001 --create-home ai
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false LD_LIBRARY_PATH=/usr/local/lib PATH=/opt/venv/bin:$PATH
 USER ai

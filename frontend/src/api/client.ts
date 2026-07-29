@@ -14,6 +14,7 @@ import type {
   AssetTag,
 	AssetAIResult,
 	AITagSummary,
+	AITagTreeNode,
 	AIStatus,
 	AISettings,
   AssetRating,
@@ -278,9 +279,10 @@ export const api = {
     orientation?: OrientationFilter,
     type?: AssetKind,
     combinedTags?: string,
-  ) => request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q, group, rating, orientation, type, combinedTags, includeAiSummary: includeAISummary() })}`),
-  albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags?: string) =>
-    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, sort, q, group, rating, orientation, type, combinedTags })}`),
+    tagNodes?: string,
+  ) => request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q, group, rating, orientation, type, combinedTags, tagNodes, includeAiSummary: includeAISummary() })}`),
+  albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags?: string, tagNodes?: string) =>
+    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, sort, q, group, rating, orientation, type, combinedTags, tagNodes })}`),
   albumSourceFolders: (parentRelPath: string) =>
     request<SourceFoldersResponse>(`/api/albums/source-folders${qs({ parentRelPath })}`),
   libraryAssets: (page: number, pageSize: number, params: LibraryFilterParams) =>
@@ -293,10 +295,10 @@ export const api = {
   folderTree: () => request<{ items: Folder[] }>('/api/folders/tree'),
   folderByPath: (relPath: string) => request<Folder>(`/api/folders/by-path${qs({ relPath })}`),
   folder: (id: number) => request<Folder>(`/api/folders/${id}`),
-  folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, combinedTags?: string) =>
-    request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation, combinedTags, includeAiSummary: includeAISummary() })}`),
-  folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, combinedTags?: string) =>
-    request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation, combinedTags })}`),
+  folderAssets: (id: number, page: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags?: string, tagNodes?: string) =>
+    request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation, type, combinedTags, tagNodes, includeAiSummary: includeAISummary() })}`),
+  folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags?: string, tagNodes?: string) =>
+    request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation, type, combinedTags, tagNodes })}`),
   tags: () => request<{ items: TagSummary[] }>('/api/tags'),
   createTag: (name: string) =>
     request<TagSummary>('/api/tags', {
@@ -342,9 +344,10 @@ export const api = {
     orientation?: OrientationFilter,
     type?: AssetKind,
     combinedTags: string[] = [],
-  ) => request<Page<Asset>>(`/api/collections/${collectionPathID(id)}/assets${qs({ page, pageSize, sort, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, includeAiSummary: includeAISummary() })}`),
-  collectionAnchors: (id: string, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags: string[] = []) =>
-    request<LibraryAnchorsResponse>(`/api/collections/${collectionPathID(id)}/anchors${qs({ pageSize, sort, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined })}`),
+    tagNodes: string[] = [],
+  ) => request<Page<Asset>>(`/api/collections/${collectionPathID(id)}/assets${qs({ page, pageSize, sort, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined, includeAiSummary: includeAISummary() })}`),
+  collectionAnchors: (id: string, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags: string[] = [], tagNodes: string[] = []) =>
+    request<LibraryAnchorsResponse>(`/api/collections/${collectionPathID(id)}/anchors${qs({ pageSize, sort, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined })}`),
   duplicates: () => request<{ items: DuplicateGroup[] }>('/api/duplicates'),
   duplicateSelection: () => request<{ assetIds: number[]; keepPolicy: 'oldest_imported' }>('/api/duplicates/selection'),
   addAlbumAssets: (id: number, assetIds: number[]) =>
@@ -395,9 +398,23 @@ export const api = {
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ assetIds, purgeUnavailable, refreshCollectionCounts }),
     }),
+  batchDeleteRecords: (assetIds: number[], refreshCollectionCounts = false) =>
+    request<BatchOperationResult>('/api/assets/batch/delete-records', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetIds, refreshCollectionCounts }),
+    }),
   asset: (id: number) => request<Asset>(`/api/assets/${id}`),
   assetAI: (id: number) => request<AssetAIResult>(`/api/assets/${id}/ai`),
   reanalyzeAssetAI: (id: number) => request<{ accepted: boolean; assetId: number }>(`/api/assets/${id}/ai/reanalyze`, { method: 'POST' }),
+  replaceAssetAITag: (id: number, payload: { previousTag?: string; tag: string; categoryKey: string; subjectKey: string }) =>
+    request<AssetAIResult>(`/api/assets/${id}/ai/tags`, {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  deleteAssetAITag: (id: number, tag: string) =>
+    request<AssetAIResult>(`/api/assets/${id}/ai/tags${qs({ tag })}`, { method: 'DELETE' }),
   aiStatus: () => request<AIStatus>('/api/ai/status'),
   aiSettings: () => request<AISettings>('/api/ai/settings'),
   updateAISettings: (autoAnalyze: boolean) => request<AISettings>('/api/ai/settings', {
@@ -409,9 +426,11 @@ export const api = {
   stopAIManually: () => request<AISettings>('/api/ai/stop', { method: 'POST' }),
   reindexAI: () => request<{ accepted: boolean; count: number }>('/api/ai/reindex', { method: 'POST' }),
   retryFailedAI: () => request<{ accepted: boolean; count: number }>('/api/ai/retry-failed', { method: 'POST' }),
-  aiTags: (q = '') => request<{ items: AITagSummary[] }>(`/api/ai/tags${qs({ q })}`),
+  aiTags: (q = '', tagNodes: string[] = []) =>
+    request<{ items: AITagSummary[]; tree: AITagTreeNode[] }>(`/api/ai/tags${qs({ q, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined })}`),
   assetDeletePlan: (id: number) => request<AssetDeletePlan>(`/api/assets/${id}/delete-plan`),
   deleteAsset: (id: number, token: string) => requestDeleteAsset(`/api/assets/${id}/delete`, token),
+  deleteAssetRecord: (id: number) => request<AssetDeleteResult>(`/api/assets/${id}/record`, { method: 'DELETE' }),
   assetTags: (id: number) => request<{ items: AssetTag[] }>(`/api/assets/${id}/tags`),
   addAssetTag: (id: number, tag: string) =>
     request<{ items: AssetTag[] }>(`/api/assets/${id}/tags`, {
@@ -455,6 +474,8 @@ export const api = {
     })}`, { method: 'POST', signal }),
   stopVideoSegmentSession: (id: number, session?: VideoProxySessionContext) =>
     request<{ cancelled: number }>(`/api/assets/${id}/hls/session/stop${videoSessionQuery(session)}`, { method: 'POST' }),
+  prewarmDirectVideo: (id: number, startSeconds = 0) =>
+    request<{ accepted: boolean; chunks: number }>(`/api/assets/${id}/video/cache/prewarm?start=${Math.max(0, startSeconds)}`, { method: 'POST' }),
   neighbors: (id: number, params: Record<string, string | number | undefined | null>, signal?: AbortSignal) =>
     request<Neighbors>(`/api/assets/${id}/neighbors${qs(params)}`, { signal }),
   assetPosition: (id: number, params: Record<string, string | number | undefined | null>) =>

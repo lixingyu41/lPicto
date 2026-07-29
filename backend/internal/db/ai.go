@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 )
@@ -12,9 +13,26 @@ import (
 // resets the counter and starts a new two-attempt cycle.
 const AIMaxAttempts = 2
 
+var (
+	ErrEmptyAITag = errors.New("AI tag is empty")
+	ErrAITagLimit = errors.New("AI tag limit reached")
+)
+
 type AITag struct {
-	Tag        string  `json:"tag"`
-	Confidence float64 `json:"confidence"`
+	Tag           string       `json:"tag"`
+	Confidence    float64      `json:"confidence"`
+	CategoryKey   string       `json:"categoryKey,omitempty"`
+	CategoryLabel string       `json:"categoryLabel,omitempty"`
+	SubjectKey    string       `json:"subjectKey,omitempty"`
+	SubjectLabel  string       `json:"subjectLabel,omitempty"`
+	Facets        []AITagFacet `json:"facets,omitempty"`
+}
+
+type AITagFacet struct {
+	FacetKey string   `json:"facetKey"`
+	NodeID   string   `json:"nodeId"`
+	NodeIDs  []string `json:"nodeIds"`
+	Labels   []string `json:"labels"`
 }
 
 type AIColor struct {
@@ -61,22 +79,56 @@ type AITagSummary struct {
 	ManualTagID *int64 `json:"manualTagId,omitempty"`
 }
 
+type AITagTreeNode struct {
+	ID       string `json:"id"`
+	ParentID string `json:"parentId,omitempty"`
+	Label    string `json:"label"`
+	Depth    int    `json:"depth"`
+	Count    int64  `json:"count"`
+	FacetKey string `json:"facetKey"`
+	Source   string `json:"source"`
+}
+
 type AIStatus struct {
-	Total      int64   `json:"total"`
-	Pending    int64   `json:"pending"`
-	Processing int64   `json:"processing"`
-	Ready      int64   `json:"ready"`
-	Failed     int64   `json:"failed"`
-	Stale      int64   `json:"stale"`
-	Queued     int     `json:"queued"`
-	Active     int     `json:"active"`
-	PerMinute  float64 `json:"perMinute"`
-	ETASeconds *int64  `json:"etaSeconds"`
+	Total         int64   `json:"total"`
+	Pending       int64   `json:"pending"`
+	Processing    int64   `json:"processing"`
+	Ready         int64   `json:"ready"`
+	Failed        int64   `json:"failed"`
+	Stale         int64   `json:"stale"`
+	Queued        int     `json:"queued"`
+	Active        int     `json:"active"`
+	PerMinute     float64 `json:"perMinute"`
+	ETASeconds    *int64  `json:"etaSeconds"`
+	Staged        int     `json:"staged"`
+	StagedBytes   int64   `json:"stagedBytes"`
+	SourceReading bool    `json:"sourceReading"`
+	PausedReason  string  `json:"pausedReason"`
 }
 
 type AIActivity struct {
 	LastStartedAt  *int64
 	LastFinishedAt *int64
+}
+
+func (d *DB) AIAverageSecondsPerItem(ctx context.Context) (*float64, error) {
+	var average sql.NullFloat64
+	err := d.conn.QueryRowContext(ctx, `
+SELECT AVG(GREATEST(EXTRACT(EPOCH FROM (COALESCE(r.finished_at,now())-r.started_at)),0))
+FROM asset_ai_result r
+JOIN media_asset ma ON ma.id=r.asset_id
+WHERE ma.deleted_at IS NULL
+  AND r.input_cache_key=ma.cache_key
+  AND r.started_at IS NOT NULL
+  AND (r.finished_at IS NOT NULL OR r.status='processing')`).Scan(&average)
+	if err != nil {
+		return nil, err
+	}
+	if !average.Valid {
+		return nil, nil
+	}
+	value := average.Float64
+	return &value, nil
 }
 
 func (d *DB) EnsureAIQueued(ctx context.Context, assetID int64, cacheKey string, force bool) error {
@@ -119,14 +171,120 @@ func (d *DB) SaveAIResult(ctx context.Context, assetID int64, cacheKey, descript
 		return err
 	}
 	for _, tag := range tags {
-		if strings.TrimSpace(tag.Tag) == "" {
+		tag.Tag = strings.TrimSpace(tag.Tag)
+		if tag.Tag == "" || strings.Contains(tag.Tag, "无法判断") {
 			continue
 		}
-		if _, err = tx.ExecContext(ctx, rebindPostgres(`INSERT INTO asset_ai_tag(asset_id,tag,confidence) VALUES(?,?,?)`), assetID, strings.TrimSpace(tag.Tag), tag.Confidence); err != nil {
+		if _, err = tx.ExecContext(ctx, rebindPostgres(`INSERT INTO asset_ai_tag(asset_id,tag,confidence,category_key,category_label,subject_key,subject_label) VALUES(?,?,?,?,?,?,?)`),
+			assetID, tag.Tag, tag.Confidence, fallback(tag.CategoryKey, "other"), fallback(tag.CategoryLabel, "其他"), fallback(tag.SubjectKey, "object"), fallback(tag.SubjectLabel, "物体")); err != nil {
 			return err
+		}
+		for _, facet := range tag.Facets {
+			if strings.TrimSpace(facet.FacetKey) == "" || strings.TrimSpace(facet.NodeID) == "" || len(facet.NodeIDs) == 0 || len(facet.NodeIDs) != len(facet.Labels) {
+				continue
+			}
+			if _, err = tx.ExecContext(ctx, rebindPostgres(`INSERT INTO asset_ai_tag_facet(asset_id,tag,facet_key,node_id,node_ids,labels) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING`),
+				assetID, tag.Tag, facet.FacetKey, facet.NodeID, facet.NodeIDs, facet.Labels); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
+}
+
+func (d *DB) ReplaceAITag(ctx context.Context, assetID int64, cacheKey, previousTag string, tag AITag) (AIResult, error) {
+	previousTag = strings.TrimSpace(previousTag)
+	tag.Tag = strings.TrimSpace(tag.Tag)
+	if tag.Tag == "" || strings.Contains(tag.Tag, "无法判断") {
+		return AIResult{}, ErrEmptyAITag
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return AIResult{}, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO asset_ai_result(asset_id,input_cache_key,status,updated_at)
+VALUES($1,$2,'pending',now()) ON CONFLICT(asset_id) DO NOTHING`, assetID, cacheKey); err != nil {
+		return AIResult{}, err
+	}
+	var status string
+	if err = tx.QueryRowContext(ctx, `SELECT status FROM asset_ai_result WHERE asset_id=$1 FOR UPDATE`, assetID).Scan(&status); err != nil {
+		return AIResult{}, err
+	}
+	if previousTag != "" {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM asset_ai_tag WHERE asset_id=$1 AND tag=$2`, assetID, previousTag); err != nil {
+			return AIResult{}, err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM asset_ai_tag WHERE asset_id=$1 AND category_key=$2 AND subject_key=$3 AND tag<>$4`, assetID, tag.CategoryKey, tag.SubjectKey, tag.Tag); err != nil {
+		return AIResult{}, err
+	}
+	var count int
+	var exists bool
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(BOOL_OR(tag=$2),false) FROM asset_ai_tag WHERE asset_id=$1`, assetID, tag.Tag).Scan(&count, &exists); err != nil {
+		return AIResult{}, err
+	}
+	if count >= 10 && !exists {
+		return AIResult{}, ErrAITagLimit
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO asset_ai_tag(asset_id,tag,confidence,category_key,category_label,subject_key,subject_label)
+VALUES($1,$2,$3,$4,$5,$6,$7)
+ON CONFLICT(asset_id,tag) DO UPDATE SET confidence=excluded.confidence,category_key=excluded.category_key,category_label=excluded.category_label,subject_key=excluded.subject_key,subject_label=excluded.subject_label`,
+		assetID, tag.Tag, tag.Confidence, tag.CategoryKey, tag.CategoryLabel, tag.SubjectKey, tag.SubjectLabel); err != nil {
+		return AIResult{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM asset_ai_tag_facet WHERE asset_id=$1 AND tag=$2`, assetID, tag.Tag); err != nil {
+		return AIResult{}, err
+	}
+	for _, facet := range tag.Facets {
+		if strings.TrimSpace(facet.FacetKey) == "" || strings.TrimSpace(facet.NodeID) == "" || len(facet.NodeIDs) == 0 || len(facet.NodeIDs) != len(facet.Labels) {
+			continue
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO asset_ai_tag_facet(asset_id,tag,facet_key,node_id,node_ids,labels) VALUES($1,$2,$3,$4,$5,$6)`,
+			assetID, tag.Tag, facet.FacetKey, facet.NodeID, facet.NodeIDs, facet.Labels); err != nil {
+			return AIResult{}, err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE asset_ai_result SET updated_at=now() WHERE asset_id=$1`, assetID); err != nil {
+		return AIResult{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return AIResult{}, err
+	}
+	return d.GetAIResult(ctx, assetID)
+}
+
+func (d *DB) DeleteAITag(ctx context.Context, assetID int64, tag string) (AIResult, error) {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return AIResult{}, ErrEmptyAITag
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return AIResult{}, err
+	}
+	defer tx.Rollback()
+	var status string
+	if err = tx.QueryRowContext(ctx, `SELECT status FROM asset_ai_result WHERE asset_id=$1 FOR UPDATE`, assetID).Scan(&status); err != nil {
+		return AIResult{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM asset_ai_tag WHERE asset_id=$1 AND tag=$2`, assetID, tag); err != nil {
+		return AIResult{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE asset_ai_result SET updated_at=now() WHERE asset_id=$1`, assetID); err != nil {
+		return AIResult{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return AIResult{}, err
+	}
+	return d.GetAIResult(ctx, assetID)
+}
+
+func fallback(value, defaultValue string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	return defaultValue
 }
 
 func (d *DB) MarkAIFailed(ctx context.Context, assetID int64, cacheKey, message string) (bool, error) {
@@ -143,7 +301,11 @@ WHERE asset_id=? AND input_cache_key=? AND status='processing'`, assetID, cacheK
 }
 
 func (d *DB) GetAIResult(ctx context.Context, assetID int64) (AIResult, error) {
-	var out AIResult
+	out := AIResult{
+		Tags:          []AITag{},
+		Palette:       []AIColor{},
+		SampledFrames: json.RawMessage(`[]`),
+	}
 	var description, errorText sql.NullString
 	var frames, palette []byte
 	err := d.conn.QueryRowContext(ctx, `SELECT r.asset_id,r.input_cache_key,r.status,r.description,r.tag_model,r.tag_model_version,r.description_model,r.description_model_version,r.taxonomy_version,r.sampled_frames,r.palette,r.attempts,r.error_text,r.updated_at
@@ -153,19 +315,41 @@ FROM asset_ai_result r JOIN media_asset ma ON ma.id=r.asset_id WHERE r.asset_id=
 	}
 	out.Description = description.String
 	out.Error = errorText.String
-	out.SampledFrames = append(json.RawMessage(nil), frames...)
+	if len(frames) > 0 && string(frames) != "null" {
+		out.SampledFrames = append(json.RawMessage(nil), frames...)
+	}
 	_ = json.Unmarshal(palette, &out.Palette)
-	rows, err := d.conn.QueryContext(ctx, `SELECT tag,confidence FROM asset_ai_tag WHERE asset_id=? ORDER BY confidence DESC,tag`, assetID)
+	if out.Palette == nil {
+		out.Palette = []AIColor{}
+	}
+	rows, err := d.conn.QueryContext(ctx, `SELECT t.tag,t.confidence,t.category_key,t.category_label,t.subject_key,t.subject_label,
+f.facet_key,f.node_id,COALESCE(to_jsonb(f.node_ids),'[]'::jsonb),COALESCE(to_jsonb(f.labels),'[]'::jsonb)
+FROM asset_ai_tag t LEFT JOIN asset_ai_tag_facet f ON f.asset_id=t.asset_id AND f.tag=t.tag
+WHERE t.asset_id=? ORDER BY t.confidence DESC,t.tag,f.node_id`, assetID)
 	if err != nil {
 		return AIResult{}, err
 	}
 	defer rows.Close()
+	tagIndexes := map[string]int{}
 	for rows.Next() {
 		var tag AITag
-		if err := rows.Scan(&tag.Tag, &tag.Confidence); err != nil {
+		var facetKey, nodeID sql.NullString
+		var nodeIDsJSON, labelsJSON []byte
+		if err := rows.Scan(&tag.Tag, &tag.Confidence, &tag.CategoryKey, &tag.CategoryLabel, &tag.SubjectKey, &tag.SubjectLabel, &facetKey, &nodeID, &nodeIDsJSON, &labelsJSON); err != nil {
 			return AIResult{}, err
 		}
-		out.Tags = append(out.Tags, tag)
+		var nodeIDs, labels []string
+		_ = json.Unmarshal(nodeIDsJSON, &nodeIDs)
+		_ = json.Unmarshal(labelsJSON, &labels)
+		index, exists := tagIndexes[tag.Tag]
+		if !exists {
+			index = len(out.Tags)
+			tagIndexes[tag.Tag] = index
+			out.Tags = append(out.Tags, tag)
+		}
+		if facetKey.Valid && nodeID.Valid {
+			out.Tags[index].Facets = append(out.Tags[index].Facets, AITagFacet{FacetKey: facetKey.String, NodeID: nodeID.String, NodeIDs: nodeIDs, Labels: labels})
+		}
 	}
 	return out, rows.Err()
 }
@@ -181,33 +365,59 @@ func (d *DB) AssetAISummaries(ctx context.Context, assetIDs []int64) (map[int64]
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	query := `SELECT r.asset_id,COALESCE(r.description,''),r.palette,t.tag,t.confidence
+	query := `SELECT r.asset_id,COALESCE(r.description,''),r.palette,t.tag,t.confidence,
+t.category_key,t.category_label,t.subject_key,t.subject_label,
+f.facet_key,f.node_id,COALESCE(to_jsonb(f.node_ids),'[]'::jsonb),COALESCE(to_jsonb(f.labels),'[]'::jsonb)
 FROM asset_ai_result r
 JOIN media_asset ma ON ma.id=r.asset_id AND ma.cache_key=r.input_cache_key
 LEFT JOIN asset_ai_tag t ON t.asset_id=r.asset_id
+LEFT JOIN asset_ai_tag_facet f ON f.asset_id=t.asset_id AND f.tag=t.tag
 WHERE r.status='ready' AND r.asset_id IN (` + strings.Join(placeholders, ",") + `)
-ORDER BY r.asset_id,t.confidence DESC,t.tag`
+ORDER BY r.asset_id,t.confidence DESC,t.tag,f.node_id`
 	rows, err := d.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	tagIndexes := make(map[int64]map[string]int, len(assetIDs))
 	for rows.Next() {
 		var assetID int64
 		var description string
 		var palette []byte
 		var tag sql.NullString
 		var confidence sql.NullFloat64
-		if err := rows.Scan(&assetID, &description, &palette, &tag, &confidence); err != nil {
+		var categoryKey, categoryLabel, subjectKey, subjectLabel, facetKey, nodeID sql.NullString
+		var nodeIDsJSON, labelsJSON []byte
+		if err := rows.Scan(&assetID, &description, &palette, &tag, &confidence, &categoryKey, &categoryLabel, &subjectKey, &subjectLabel, &facetKey, &nodeID, &nodeIDsJSON, &labelsJSON); err != nil {
 			return nil, err
 		}
+		var nodeIDs, labels []string
+		_ = json.Unmarshal(nodeIDsJSON, &nodeIDs)
+		_ = json.Unmarshal(labelsJSON, &labels)
 		summary := result[assetID]
 		summary.Description = description
 		if len(summary.Palette) == 0 {
 			_ = json.Unmarshal(palette, &summary.Palette)
 		}
 		if tag.Valid {
-			summary.Tags = append(summary.Tags, AITag{Tag: tag.String, Confidence: confidence.Float64})
+			indexes := tagIndexes[assetID]
+			if indexes == nil {
+				indexes = map[string]int{}
+				tagIndexes[assetID] = indexes
+			}
+			index, exists := indexes[tag.String]
+			if !exists {
+				index = len(summary.Tags)
+				indexes[tag.String] = index
+				summary.Tags = append(summary.Tags, AITag{
+					Tag: tag.String, Confidence: confidence.Float64,
+					CategoryKey: categoryKey.String, CategoryLabel: categoryLabel.String,
+					SubjectKey: subjectKey.String, SubjectLabel: subjectLabel.String,
+				})
+			}
+			if facetKey.Valid && nodeID.Valid {
+				summary.Tags[index].Facets = append(summary.Tags[index].Facets, AITagFacet{FacetKey: facetKey.String, NodeID: nodeID.String, NodeIDs: nodeIDs, Labels: labels})
+			}
 		}
 		result[assetID] = summary
 	}
@@ -276,10 +486,21 @@ func (d *DB) ResetAIProcessing(ctx context.Context) error {
 }
 
 func (d *DB) ReindexAI(ctx context.Context) (int64, error) {
-	result, err := d.conn.ExecContext(ctx, `INSERT INTO asset_ai_result(asset_id,input_cache_key,status,attempts,error_text,updated_at)
-SELECT id,cache_key,'pending',0,NULL,now() FROM media_asset WHERE deleted_at IS NULL
-ON CONFLICT(asset_id) DO UPDATE SET input_cache_key=excluded.input_cache_key,status='pending',attempts=0,error_text=NULL,updated_at=now()`)
+	tx, err := d.raw.BeginTx(ctx, nil)
 	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM asset_ai_tag`); err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO asset_ai_result(asset_id,input_cache_key,status,description,tag_model,tag_model_version,description_model,description_model_version,taxonomy_version,sampled_frames,palette,attempts,error_text,started_at,finished_at,updated_at)
+SELECT id,cache_key,'pending',NULL,'','','','','','[]'::jsonb,'[]'::jsonb,0,NULL,NULL,NULL,now() FROM media_asset WHERE deleted_at IS NULL
+ON CONFLICT(asset_id) DO UPDATE SET input_cache_key=excluded.input_cache_key,status='pending',description=NULL,tag_model='',tag_model_version='',description_model='',description_model_version='',taxonomy_version='',sampled_frames='[]'::jsonb,palette='[]'::jsonb,attempts=0,error_text=NULL,started_at=NULL,finished_at=NULL,updated_at=now()`)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return result.RowsAffected()
@@ -306,10 +527,12 @@ func (d *DB) ReindexAIForLibrary(ctx context.Context, library ScanLibrary) ([]AI
   FROM media_asset ma
   JOIN file_instance fi ON fi.asset_id=ma.id AND fi.missing=false
   WHERE ma.deleted_at IS NULL AND (` + strings.Join(conditions, " OR ") + `)
+), deleted_tags AS (
+  DELETE FROM asset_ai_tag t USING selected WHERE t.asset_id=selected.id RETURNING t.asset_id
 ), reset AS (
-  INSERT INTO asset_ai_result(asset_id,input_cache_key,status,attempts,error_text,started_at,finished_at,updated_at)
-  SELECT id,cache_key,'pending',0,NULL,NULL,NULL,now() FROM selected
-  ON CONFLICT(asset_id) DO UPDATE SET input_cache_key=excluded.input_cache_key,status='pending',attempts=0,error_text=NULL,started_at=NULL,finished_at=NULL,updated_at=now()
+  INSERT INTO asset_ai_result(asset_id,input_cache_key,status,description,tag_model,tag_model_version,description_model,description_model_version,taxonomy_version,sampled_frames,palette,attempts,error_text,started_at,finished_at,updated_at)
+  SELECT id,cache_key,'pending',NULL,'','','','','','[]'::jsonb,'[]'::jsonb,0,NULL,NULL,NULL,now() FROM selected
+  ON CONFLICT(asset_id) DO UPDATE SET input_cache_key=excluded.input_cache_key,status='pending',description=NULL,tag_model='',tag_model_version='',description_model='',description_model_version='',taxonomy_version='',sampled_frames='[]'::jsonb,palette='[]'::jsonb,attempts=0,error_text=NULL,started_at=NULL,finished_at=NULL,updated_at=now()
   RETURNING asset_id,input_cache_key
 )
 SELECT reset.asset_id,reset.input_cache_key FROM reset JOIN selected ON selected.id=reset.asset_id ORDER BY selected.sort_time DESC,reset.asset_id DESC`
@@ -410,6 +633,54 @@ GROUP BY names.tag ORDER BY COUNT(DISTINCT combined.asset_id) DESC,lower(names.t
 		if manualTagID.Valid {
 			id := manualTagID.Int64
 			item.ManualTagID = &id
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (d *DB) AITagTree(ctx context.Context, tagNodes []string) ([]AITagTreeNode, error) {
+	where, args := assetFilterSQL(AssetListOptions{TagNodes: tagNodes}, false)
+	rows, err := d.conn.QueryContext(ctx, `WITH eligible AS (
+  SELECT id AS asset_id FROM assets WHERE `+where+`
+),ai_nodes AS (
+  SELECT eligible.asset_id,
+    f.node_ids[position] AS id,
+    CASE WHEN position=1 THEN '' ELSE f.node_ids[position-1] END AS parent_id,
+    f.labels[position] AS label,
+    position AS depth,
+    CASE
+      WHEN position=1 THEN replace(f.node_ids[1],'ai:','')
+      WHEN position=2 THEN replace(f.node_ids[2],'ai:','')
+      ELSE f.facet_key
+    END AS facet_key
+  FROM asset_ai_tag_facet f
+  JOIN asset_ai_result air ON air.asset_id=f.asset_id
+  JOIN media_asset ma ON ma.id=f.asset_id
+  LEFT JOIN eligible ON eligible.asset_id=f.asset_id
+  CROSS JOIN LATERAL generate_subscripts(f.node_ids,1) AS positions(position)
+  WHERE air.status='ready' AND air.input_cache_key=ma.cache_key AND ma.deleted_at IS NULL
+),manual_nodes AS (
+  SELECT eligible.asset_id,'manual:'||tag.name AS id,'manual' AS parent_id,tag.name AS label,2 AS depth,'manual' AS facet_key
+  FROM tag LEFT JOIN asset_tag ON asset_tag.tag_id=tag.id LEFT JOIN eligible ON eligible.asset_id=asset_tag.asset_id
+)
+SELECT id,parent_id,label,depth,facet_key,COUNT(DISTINCT asset_id),'ai' AS source
+FROM ai_nodes GROUP BY id,parent_id,label,depth,facet_key
+UNION ALL
+SELECT 'manual','','自标',1,'manual',COUNT(DISTINCT asset_id),'manual' FROM manual_nodes
+UNION ALL
+SELECT id,parent_id,label,depth,facet_key,COUNT(DISTINCT asset_id),'manual'
+FROM manual_nodes GROUP BY id,parent_id,label,depth,facet_key
+ORDER BY depth,label,id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AITagTreeNode
+	for rows.Next() {
+		var item AITagTreeNode
+		if err := rows.Scan(&item.ID, &item.ParentID, &item.Label, &item.Depth, &item.FacetKey, &item.Count, &item.Source); err != nil {
+			return nil, err
 		}
 		items = append(items, item)
 	}

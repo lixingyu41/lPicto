@@ -172,7 +172,7 @@ func (s *Server) batchDelete(w http.ResponseWriter, r *http.Request) {
 		}
 		plan, err := s.buildAssetDeletePlan(asset)
 		if err != nil {
-			if payload.PurgeUnavailable && assetDeleteUnavailable(err) {
+			if assetDeleteUnavailable(err) {
 				directPurgeIDs = append(directPurgeIDs, asset.ID)
 				continue
 			}
@@ -185,19 +185,14 @@ func (s *Server) batchDelete(w http.ResponseWriter, r *http.Request) {
 		result.Failures = append(result.Failures, deleted.Failures...)
 	}
 	if len(directPurgeIDs) > 0 {
-		items, err := s.db.PurgeAssetIDs(r.Context(), directPurgeIDs)
+		purged, err := s.purgeAssetRecords(r.Context(), directPurgeIDs, false)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "batch_purge_failed", "永久删除数据库记录失败")
 			return
 		}
-		if len(items) > 0 {
-			s.removeDeletedAssetCaches(items)
-			s.publishAssetDeletedEvents(items)
-		}
-		for _, item := range items {
-			result.DeletedAssetIDs = append(result.DeletedAssetIDs, item.ID)
-			result.UpdatedAssetIDs = append(result.UpdatedAssetIDs, item.ID)
-		}
+		result.DeletedAssetIDs = append(result.DeletedAssetIDs, purged.DeletedAssetIDs...)
+		result.UpdatedAssetIDs = append(result.UpdatedAssetIDs, purged.DeletedAssetIDs...)
+		result.Failures = append(result.Failures, purged.Failures...)
 	}
 	result.DeletedAssetIDs = uniqueInt64s(result.DeletedAssetIDs)
 	result.UpdatedAssetIDs = uniqueInt64s(result.UpdatedAssetIDs)
@@ -207,6 +202,24 @@ func (s *Server) batchDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) batchDeleteRecords(w http.ResponseWriter, r *http.Request) {
+	var payload batchDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "请求内容无效")
+		return
+	}
+	purged, err := s.purgeAssetRecords(r.Context(), payload.AssetIDs, payload.RefreshCollectionCounts)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "batch_record_delete_failed", "批量删除媒体记录失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, BatchOperationResultDTO{
+		UpdatedAssetIDs: purged.DeletedAssetIDs,
+		DeletedAssetIDs: purged.DeletedAssetIDs,
+		Failures:        purged.Failures,
+	})
 }
 
 func (s *Server) addAlbumAssets(w http.ResponseWriter, r *http.Request) {

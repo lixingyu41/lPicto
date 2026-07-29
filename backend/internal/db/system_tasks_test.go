@@ -47,3 +47,31 @@ VALUES(NULL,'thumb','ready',now(),now())`); err != nil {
 		t.Fatalf("thumbnail task = %#v, %v", mediaTask, err)
 	}
 }
+
+func TestBackendTaskAverageUsesPersistedJobTimestamps(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, testDatabaseURL(t, ctx), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	assetID, _, _, err := database.UpsertAsset(ctx, testSearchAsset("timed.jpg", "image"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Conn().ExecContext(ctx, `
+INSERT INTO media_job(asset_id,job_type,status,started_at,finished_at)
+VALUES($1,'thumb','ready',now()-interval '12 seconds',now())
+ON CONFLICT(asset_id,job_type) DO UPDATE SET
+  status=excluded.status,started_at=excluded.started_at,finished_at=excluded.finished_at`, assetID); err != nil {
+		t.Fatal(err)
+	}
+	averages, err := database.MediaJobAverageSecondsPerItem(ctx, []string{"thumb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if averages["thumb"] < 11.5 || averages["thumb"] > 12.5 {
+		t.Fatalf("thumbnail average = %f, want about 12 seconds", averages["thumb"])
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"lpicto/backend/internal/db"
 	"lpicto/backend/internal/events"
@@ -83,6 +84,93 @@ func (s *Server) deleteAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	result := s.executeAssetDeletePlan(r.Context(), plan)
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) deleteAssetRecord(w http.ResponseWriter, r *http.Request) {
+	asset, ok := s.assetByParam(w, r)
+	if !ok {
+		return
+	}
+	result, err := s.purgeAssetRecords(r.Context(), []int64{asset.ID}, true)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "asset_record_delete_failed", "删除媒体记录失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) purgeAssetRecords(ctx context.Context, assetIDs []int64, refreshCounts bool) (AssetDeleteResultDTO, error) {
+	result := AssetDeleteResultDTO{
+		Deleted:         true,
+		DeletedAssetIDs: []int64{},
+		Failures:        []AssetDeleteFailureDTO{},
+	}
+	items, err := s.db.PurgeAssetIDs(ctx, uniqueInt64s(assetIDs))
+	if err != nil {
+		return result, err
+	}
+	if len(items) == 0 {
+		return result, nil
+	}
+	for _, item := range items {
+		s.stopAssetVideoWork(item.ID)
+	}
+	for _, item := range items {
+		result.DeletedAssetIDs = append(result.DeletedAssetIDs, item.ID)
+	}
+	s.removeDeletedAssetCaches(items)
+	s.publishAssetDeletedEvents(items)
+	s.invalidateProcessingProgress()
+	if refreshCounts {
+		if _, err := s.db.RefreshSystemCollectionCounts(ctx); err != nil && s.logger != nil {
+			s.logger.Warn("refresh system collection counts after record deletion failed", "error", err)
+		}
+		go func() {
+			if err := s.db.RefreshFolders(context.Background()); err != nil && s.logger != nil {
+				s.logger.Warn("refresh folders after record deletion failed", "error", err)
+			}
+		}()
+	}
+	return result, nil
+}
+
+func (s *Server) stopAssetVideoWork(assetID int64) {
+	var done []<-chan struct{}
+	s.videoProxyMu.Lock()
+	for key, state := range s.videoProxyStates {
+		if state == nil || state.AssetID != assetID {
+			continue
+		}
+		if state.Cancel != nil {
+			state.Cancel()
+		}
+		if state.Done != nil && (state.Queued || state.Transcoding) {
+			done = append(done, state.Done)
+		}
+		delete(s.videoProxyStates, key)
+	}
+	for key, state := range s.videoSegmentStates {
+		if state == nil || state.AssetID != assetID {
+			continue
+		}
+		if state.Cancel != nil {
+			state.Cancel(errVideoSegmentSessionStop)
+		}
+		if state.Done != nil && (state.Queued || state.Claiming || state.Transcoding) {
+			done = append(done, state.Done)
+		}
+		delete(s.videoSegmentStates, key)
+	}
+	s.videoProxyMu.Unlock()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for _, finished := range done {
+		select {
+		case <-finished:
+		case <-timer.C:
+			return
+		}
+	}
 }
 
 func (s *Server) writeAssetDeletePlanError(w http.ResponseWriter, err error) {

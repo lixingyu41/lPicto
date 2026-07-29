@@ -46,7 +46,9 @@ func (s *Server) runSystemTask(w http.ResponseWriter, r *http.Request) {
 	if libraryName != "" {
 		reason += ":" + libraryName
 	}
-	if systemTaskNeedsStorage(taskID) {
+	running := s.systemTaskRunning(r.Context(), taskID)
+	retryOnly := action == "retry_failed" || action == "reset_failed"
+	if systemTaskNeedsStorage(taskID) && !retryOnly {
 		for _, root := range roots {
 			if status := s.probeConfiguredLibraryRoot(r.Context(), libraryName, root); !status.Available {
 				writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "存储不可访问，任务没有启动")
@@ -54,31 +56,31 @@ func (s *Server) runSystemTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if action != "stop" && action != "check" && action != "restart" && s.systemTaskRunning(r.Context(), taskID) {
+	if action != "stop" && action != "check" && action != "restart" && !retryOnly && running {
 		writeJSON(w, http.StatusConflict, map[string]any{"accepted": false, "state": "running", "message": "任务正在运行，请先停止当前任务"})
 		return
 	}
 
 	switch taskID {
 	case "library_scan":
-		if action != "scan" {
+		if action != "reconcile" && action != "scan" {
 			systemTaskActionError(w)
 			return
 		}
-		result := s.scanner.RequestCountScanRoots(reason, roots)
+		result := s.scanner.RequestReconcileScanRoots(reason, roots)
 		writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 	case "metadata_extraction":
-		s.runMetadataTask(w, r, action, roots, reason)
+		s.runMetadataTask(w, r, action, roots, reason, running)
 	case "thumbnail_creation":
-		s.runThumbnailTask(w, r, action, roots, reason)
+		s.runThumbnailTask(w, r, action, roots, reason, running)
 	case "preview_creation", "video_poster_creation":
 		taskType := "preview"
 		if taskID == "video_poster_creation" {
 			taskType = "video_poster"
 		}
-		s.runQueuedMediaTask(w, r, taskType, action, roots)
+		s.runQueuedMediaTask(w, r, taskType, action, roots, running)
 	case "ai_analysis":
-		s.runAIAnalysisTask(w, r, action)
+		s.runAIAnalysisTask(w, r, action, running)
 	case taskStorageHealth:
 		if action != "check" {
 			systemTaskActionError(w)
@@ -190,8 +192,11 @@ func (s *Server) stopSystemTask(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) runMetadataTask(w http.ResponseWriter, r *http.Request, action string, roots []string, reason string) {
+func (s *Server) runMetadataTask(w http.ResponseWriter, r *http.Request, action string, roots []string, reason string, running bool) {
 	switch action {
+	case "start":
+		result := s.scanner.RequestMetadataScanRoots(reason, roots)
+		writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 	case "continue":
 		paths, err := s.db.MetadataWorkPathsForRoots(r.Context(), roots)
 		if err != nil {
@@ -202,8 +207,12 @@ func (s *Server) runMetadataTask(w http.ResponseWriter, r *http.Request, action 
 			writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "count": 0, "state": "complete"})
 			return
 		}
-		result := s.scanner.RequestMetadataScanPaths(reason, roots, paths)
-		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": result.Accepted, "count": len(paths), "state": result.State})
+		if running {
+			result := s.scanner.RequestMetadataScanPaths(reason, roots, paths)
+			writeJSON(w, http.StatusAccepted, map[string]any{"accepted": result.Accepted, "count": len(paths), "state": result.State})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": len(paths), "state": "pending"})
 	case "retry_failed":
 		paths, err := s.db.RetryFailedMetadataPathsForRoots(r.Context(), roots)
 		if err != nil {
@@ -229,11 +238,13 @@ func (s *Server) runMetadataTask(w http.ResponseWriter, r *http.Request, action 
 	}
 }
 
-func (s *Server) runThumbnailTask(w http.ResponseWriter, r *http.Request, action string, roots []string, reason string) {
-	_ = s.db.BeginSystemTask(context.Background(), "thumbnail_creation")
+func (s *Server) runThumbnailTask(w http.ResponseWriter, r *http.Request, action string, roots []string, reason string, running bool) {
+	if action != "retry_failed" {
+		_ = s.db.BeginSystemTask(context.Background(), "thumbnail_creation")
+	}
 	var result any
 	switch action {
-	case "continue":
+	case "start", "continue":
 		result = scanCommandResponse(s.scanner.RequestThumbnailContinueRoots(reason, roots))
 	case "retry_failed":
 		items, err := s.db.RetryFailedWorkForRoots(r.Context(), "thumb", roots)
@@ -241,10 +252,16 @@ func (s *Server) runThumbnailTask(w http.ResponseWriter, r *http.Request, action
 			writeError(w, http.StatusInternalServerError, "thumbnail_retry_failed", "重试缩略图失败任务失败")
 			return
 		}
-		for _, item := range items {
-			s.jobs.Enqueue(jobs.Task{Type: item.Type, AssetID: item.AssetID})
+		if running {
+			for _, item := range items {
+				s.jobs.Enqueue(jobs.Task{Type: item.Type, AssetID: item.AssetID})
+			}
 		}
-		result = map[string]any{"accepted": true, "count": len(items), "state": "queued"}
+		state := "pending"
+		if running {
+			state = "queued"
+		}
+		result = map[string]any{"accepted": true, "count": len(items), "state": state}
 	case "rebuild":
 		result = scanCommandResponse(s.scanner.RequestThumbnailRebuildRoots(reason, roots))
 	default:
@@ -254,8 +271,8 @@ func (s *Server) runThumbnailTask(w http.ResponseWriter, r *http.Request, action
 	writeJSON(w, http.StatusAccepted, result)
 }
 
-func (s *Server) runQueuedMediaTask(w http.ResponseWriter, r *http.Request, taskType string, action string, roots []string) {
-	if action != "continue" && action != "retry_failed" && action != "rebuild" {
+func (s *Server) runQueuedMediaTask(w http.ResponseWriter, r *http.Request, taskType string, action string, roots []string, running bool) {
+	if action != "start" && action != "continue" && action != "retry_failed" && action != "rebuild" {
 		systemTaskActionError(w)
 		return
 	}
@@ -263,7 +280,9 @@ func (s *Server) runQueuedMediaTask(w http.ResponseWriter, r *http.Request, task
 	if taskType == "video_poster" {
 		taskID = "video_poster_creation"
 	}
-	_ = s.db.BeginSystemTask(r.Context(), taskID)
+	if action != "retry_failed" {
+		_ = s.db.BeginSystemTask(r.Context(), taskID)
+	}
 	var items []db.WorkItem
 	var err error
 	if action == "rebuild" {
@@ -283,13 +302,19 @@ func (s *Server) runQueuedMediaTask(w http.ResponseWriter, r *http.Request, task
 		writeError(w, http.StatusInternalServerError, "task_work_failed", "读取待处理媒体失败")
 		return
 	}
-	for _, item := range items {
-		s.jobs.Enqueue(jobs.Task{Type: item.Type, AssetID: item.AssetID})
+	if action != "retry_failed" || running {
+		for _, item := range items {
+			s.jobs.Enqueue(jobs.Task{Type: item.Type, AssetID: item.AssetID})
+		}
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": len(items), "state": "queued"})
+	state := "pending"
+	if action != "retry_failed" || running {
+		state = "queued"
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": len(items), "state": state})
 }
 
-func (s *Server) runAIAnalysisTask(w http.ResponseWriter, r *http.Request, action string) {
+func (s *Server) runAIAnalysisTask(w http.ResponseWriter, r *http.Request, action string, running bool) {
 	switch action {
 	case "continue":
 		_ = s.db.BeginSystemTask(r.Context(), "ai_analysis")
@@ -310,9 +335,6 @@ func (s *Server) runAIAnalysisTask(w http.ResponseWriter, r *http.Request, actio
 		queued := make(map[int64]struct{}, len(failedItems)+1000)
 		for _, item := range failedItems {
 			queued[item.AssetID] = struct{}{}
-			if s.jobs != nil {
-				s.jobs.Enqueue(jobs.Task{Type: "ai_analyze", AssetID: item.AssetID, Priority: 1})
-			}
 		}
 		pendingItems, err := s.db.AIBackfillBatch(r.Context(), 1000)
 		if err != nil {
@@ -328,24 +350,22 @@ func (s *Server) runAIAnalysisTask(w http.ResponseWriter, r *http.Request, actio
 				continue
 			}
 			queued[item.AssetID] = struct{}{}
-			if s.jobs != nil {
-				s.jobs.Enqueue(jobs.Task{Type: "ai_analyze", AssetID: item.AssetID, Priority: 100})
-			}
 		}
-		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": len(queued), "settings": settings})
+		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": len(queued), "state": "preparing", "settings": settings})
 	case "retry_failed", "reset_failed":
 		items, err := s.db.RetryFailedAI(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "ai_retry_failed", "重置 AI 失败任务失败")
 			return
 		}
-		if len(items) > 0 {
+		if running && len(items) > 0 {
 			_ = s.db.EnsureSystemTaskRunning(r.Context(), "ai_analysis")
 		}
-		for _, item := range items {
-			s.jobs.Enqueue(jobs.Task{Type: "ai_analyze", AssetID: item.AssetID, Priority: 1})
+		state := "pending"
+		if running {
+			state = "queued"
 		}
-		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": len(items)})
+		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": len(items), "state": state})
 	case "rebuild":
 		count, err := s.db.ReindexAI(r.Context())
 		if err != nil {
@@ -354,12 +374,7 @@ func (s *Server) runAIAnalysisTask(w http.ResponseWriter, r *http.Request, actio
 		}
 		_ = s.db.BeginSystemTask(r.Context(), "ai_analysis")
 		_, _ = s.db.SetAIManualRun(r.Context(), true)
-		queued, err := s.enqueueAIBackfillNow(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "ai_enqueue_failed", "启动 AI 分析失败")
-			return
-		}
-		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": count, "queued": queued})
+		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": count, "queued": 0, "state": "preparing"})
 	default:
 		systemTaskActionError(w)
 	}
@@ -527,6 +542,10 @@ func (s *Server) runOrphanCacheCleanup(parent context.Context) {
 			}
 			base := strings.SplitN(entry.Name(), ".", 2)[0]
 			preserve := cacheFileReferenced(base, keys)
+			rel, _ := filepath.Rel(s.store.CacheRoot, path)
+			if strings.HasPrefix(filepath.ToSlash(rel), "ai-staging/") && time.Since(info.ModTime()) < 24*time.Hour {
+				preserve = true
+			}
 			if preserve || strings.Contains(entry.Name(), ".tmp") && time.Since(info.ModTime()) < 24*time.Hour {
 				return nil
 			}
@@ -587,11 +606,17 @@ func (s *Server) startCacheCleanupScheduler() {
 
 func (s *Server) startStorageHealthScheduler() {
 	go func() {
-		s.checkStorageHealth(context.Background())
-		ticker := time.NewTicker(30 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			s.checkStorageHealth(context.Background())
+		for {
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, now.Location())
+			if !next.After(now) {
+				next = next.Add(24 * time.Hour)
+			}
+			time.Sleep(time.Until(next))
+			_, failed, _ := s.checkStorageHealth(context.Background())
+			if failed == 0 {
+				s.scanner.RequestReconcileScan("daily_source_window")
+			}
 		}
 	}()
 }

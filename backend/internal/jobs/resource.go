@@ -156,20 +156,27 @@ func (l *ResourceLimiter) markStarted() {
 }
 
 func (l *ResourceLimiter) canStart() bool {
+	return l.blockedReason() == ""
+}
+
+func (l *ResourceLimiter) blockedReason() string {
+	if l == nil {
+		return ""
+	}
 	if ForegroundActive() {
-		return false
+		return "foreground"
 	}
 	if l.policy.LoadTarget > 0 {
 		if load, ok := readLoadAvg1(); ok && load > l.policy.LoadTarget {
-			return false
+			return "load"
 		}
 	}
 	if l.policy.MinFreeMemoryBytes > 0 {
 		if available, ok := readMemAvailable(); ok && available < l.policy.MinFreeMemoryBytes {
-			return false
+			return "memory"
 		}
 	}
-	return true
+	return ""
 }
 
 func readLoadAvg1() (float64, bool) {

@@ -94,7 +94,7 @@ func (s *Server) resetMediaLibrary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "media_library_cache_reset_failed", "媒体数据库已清空，但缓存文件清理失败")
 		return
 	}
-	for _, dir := range []string{"thumbs", "previews", "video-posters", "video-proxies"} {
+	for _, dir := range []string{"thumbs", "previews", "video-posters", "video-proxies", "originals", "video-chunks", "ai-staging"} {
 		if err := os.MkdirAll(filepath.Join(s.store.CacheRoot, dir), 0o755); err != nil {
 			writeError(w, http.StatusInternalServerError, "media_library_cache_prepare_failed", "重新创建缓存目录失败")
 			return

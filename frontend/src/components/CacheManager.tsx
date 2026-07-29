@@ -4,10 +4,11 @@ import { formatBytes } from '../utils/format';
 
 const resetConfirmation = '彻底重置';
 
-export function CacheManager({ cleanup, progress, onReset }: {
+export function CacheManager({ cleanup, progress, onReset, onCleanup }: {
   cleanup: CleanupStatus | null;
   progress: ProcessingProgress | null;
   onReset: (confirmation: string) => Promise<MediaLibraryResetResult>;
+  onCleanup?: () => Promise<void>;
 }) {
   const [resetOpen, setResetOpen] = useState(false);
   const [confirmation, setConfirmation] = useState('');
@@ -62,9 +63,28 @@ export function CacheManager({ cleanup, progress, onReset }: {
           <Metric label="媒体缓存" value={cachePending ? '统计中' : formatBytes(progress.cache.cacheBytes)} />
           <Metric label="数据库" value={cachePending ? '统计中' : formatBytes(progress.cache.databaseBytes)} />
           <Metric label="缓存文件" value={cachePending ? '统计中' : progress.cache.fileCount.toLocaleString()} />
+          <Metric label="缓存上限" value={cachePending ? '统计中' : formatBytes(progress.cache.maxBytes)} />
+          <Metric label="磁盘保留" value={cachePending ? '统计中' : formatBytes(progress.cache.minFreeBytes)} />
+          <Metric label="磁盘可用" value={cachePending ? '统计中' : formatBytes(progress.cache.freeBytes)} />
+          <Metric label="可回收" value={cachePending ? '统计中' : formatBytes(progress.cache.reclaimableBytes)} />
           <Metric label="后台状态" value={state} />
           <Metric label="队列" value={`${waiting.toLocaleString()} 等待 · ${working.toLocaleString()} 处理中`} />
         </div>
+        {!cachePending && (
+          <div className="cache-kind-usage" aria-label="缓存分类占用">
+            <Metric label="缩略图与封面" value={formatBytes((progress.cache.byKind.thumbs ?? 0) + (progress.cache.byKind['video-posters'] ?? 0))} />
+            <Metric label="图片与预览" value={formatBytes((progress.cache.byKind.originals ?? 0) + (progress.cache.byKind.previews ?? 0))} />
+            <Metric label="视频播放" value={formatBytes((progress.cache.byKind['video-chunks'] ?? 0) + (progress.cache.byKind['video-proxies'] ?? 0))} />
+            <Metric label="AI 暂存" value={formatBytes(progress.cache.byKind['ai-staging'] ?? 0)} />
+          </div>
+        )}
+        {onCleanup && (
+          <div className="cache-overview-actions">
+            <button type="button" disabled={cleanup?.running} onClick={() => void onCleanup()}>
+              {cleanup?.running ? '正在清理' : '清理无效缓存'}
+            </button>
+          </div>
+        )}
         <div className="cache-work-list">
           <CacheWorkRow counts={progress?.thumb} label="缩略图" note="用于瀑布流和媒体列表" />
           <CacheWorkRow counts={progress?.preview} label="高清预览" note="用于浏览器无法直接显示的图片" />

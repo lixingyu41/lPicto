@@ -89,6 +89,18 @@ func (c RemoteController) RequestScanRoots(reason string, roots []string) Comman
 	return c.RequestMetadataScanRoots(reason, roots)
 }
 
+func (c RemoteController) RequestReconcileScan(reason string) CommandResult {
+	c.setQueuedScanStatus(reason, scanTaskReconcile, nil)
+	c.Jobs.Enqueue(jobs.Task{Type: "scan_reconcile", Reason: reason, Priority: 10})
+	return CommandResult{Accepted: true, Started: false, State: "queued"}
+}
+
+func (c RemoteController) RequestReconcileScanRoots(reason string, roots []string) CommandResult {
+	c.setQueuedScanStatus(reason, scanTaskReconcile, roots)
+	c.Jobs.Enqueue(jobs.Task{Type: "scan_reconcile", Reason: reason, Roots: append([]string(nil), roots...), Priority: 10})
+	return CommandResult{Accepted: true, Started: false, State: "queued"}
+}
+
 func (c RemoteController) RequestRebuild(reason string) CommandResult {
 	return c.RequestThumbnailRebuild(reason)
 }

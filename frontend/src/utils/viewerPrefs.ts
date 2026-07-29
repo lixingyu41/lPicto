@@ -9,6 +9,7 @@ export interface ViewerPrefs {
   imageSlideshowSeconds: number;
   subtitlesEnabled: boolean;
   videoAutoplay: boolean;
+  videoPlaybackDelaySeconds: number;
   zoomMode: ViewerZoomMode;
   zoomScale: number;
   zoomPixelArea: number;
@@ -31,6 +32,7 @@ export const danmakuSpeedRange = { min: 0.5, max: 2, fallback: 1 } as const;
 export const zoomScaleRange = { min: 1.5, max: 8, fallback: 2.6 } as const;
 export const zoomPixelAreaRange = { min: 50, max: 2000, fallback: 300 } as const;
 export const imageSlideshowSecondsRange = { min: 1, max: 60, fallback: 3 } as const;
+export const videoPlaybackDelaySecondsRange = { min: 0, max: 5, fallback: 0 } as const;
 
 const danmakuDensityKey = 'lpicto.danmakuDensity';
 const danmakuFontScaleKey = 'lpicto.danmakuFontScale';
@@ -45,6 +47,7 @@ const zoomModeKey = 'lpicto.zoomMode';
 const zoomScaleKey = 'lpicto.zoomScale';
 const zoomPixelAreaKey = 'lpicto.zoomPixelArea';
 const videoAutoplayKey = 'lpicto.videoAutoplay';
+const videoPlaybackDelaySecondsKey = 'lpicto.videoPlaybackDelaySeconds';
 export const viewerPrefsChanged = 'lpicto-prefs-changed';
 
 export function loadViewerPrefs(): ViewerPrefs {
@@ -59,6 +62,12 @@ export function loadViewerPrefs(): ViewerPrefs {
     imageSlideshowSeconds: loadNumber(imageSlideshowSecondsKey, imageSlideshowSecondsRange.min, imageSlideshowSecondsRange.max, imageSlideshowSecondsRange.fallback),
     subtitlesEnabled: loadBoolean(subtitlesEnabledKey, true),
     videoAutoplay: localStorage.getItem(videoAutoplayKey) === 'true',
+    videoPlaybackDelaySeconds: loadNumber(
+      videoPlaybackDelaySecondsKey,
+      videoPlaybackDelaySecondsRange.min,
+      videoPlaybackDelaySecondsRange.max,
+      videoPlaybackDelaySecondsRange.fallback,
+    ),
     zoomMode: loadZoomMode(),
     zoomScale: loadNumber(zoomScaleKey, zoomScaleRange.min, zoomScaleRange.max, zoomScaleRange.fallback),
     zoomPixelArea: loadNumber(zoomPixelAreaKey, zoomPixelAreaRange.min, zoomPixelAreaRange.max, zoomPixelAreaRange.fallback),
@@ -79,6 +88,15 @@ export function saveViewerPrefs(prefs: ViewerPrefs) {
   localStorage.setItem(imageSlideshowSecondsKey, String(clampNumber(prefs.imageSlideshowSeconds, imageSlideshowSecondsRange.min, imageSlideshowSecondsRange.max, imageSlideshowSecondsRange.fallback)));
   localStorage.setItem(subtitlesEnabledKey, String(prefs.subtitlesEnabled));
   localStorage.setItem(videoAutoplayKey, String(prefs.videoAutoplay));
+  localStorage.setItem(
+    videoPlaybackDelaySecondsKey,
+    String(clampNumber(
+      prefs.videoPlaybackDelaySeconds,
+      videoPlaybackDelaySecondsRange.min,
+      videoPlaybackDelaySecondsRange.max,
+      videoPlaybackDelaySecondsRange.fallback,
+    )),
+  );
   localStorage.setItem(zoomModeKey, prefs.zoomMode);
   localStorage.setItem(zoomScaleKey, String(clampNumber(prefs.zoomScale, zoomScaleRange.min, zoomScaleRange.max, zoomScaleRange.fallback)));
   localStorage.setItem(

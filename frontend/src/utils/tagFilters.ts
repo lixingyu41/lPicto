@@ -10,7 +10,7 @@ export function parseTagFilters(value: string | null | undefined): string[] {
 }
 
 export function normalizeTagFilters(values: string[]): string[] {
-  return [...new Set(values.map((value) => value.trim()).filter((value) => value && [...value].length <= 80))].slice(0, 32);
+  return [...new Set(values.map((value) => value.trim()).filter((value) => value && [...value].length <= 160))].slice(0, 32);
 }
 
 export function serializeTagFilters(values: string[]) {

@@ -88,6 +88,7 @@ type AssetListOptions struct {
 	ManualTag       string
 	CombinedTag     string
 	CombinedTags    []string
+	TagNodes        []string
 	AIDescription   string
 	AITag           string
 	NFOTitle        string
@@ -128,6 +129,7 @@ type NeighborOptions struct {
 	ManualTag       string
 	CombinedTag     string
 	CombinedTags    []string
+	TagNodes        []string
 	AIDescription   string
 	AITag           string
 	NFOTitle        string
@@ -1244,7 +1246,7 @@ func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, er
 func assetListOptionsFromNeighbor(opts NeighborOptions) AssetListOptions {
 	return AssetListOptions{
 		Type: opts.Type, Sort: opts.Sort, Group: opts.Group, Query: opts.Query, CombinedQuery: opts.CombinedQuery, From: opts.From, To: opts.To, VisibleOnly: opts.VisibleOnly,
-		NFOQuery: opts.NFOQuery, NFOActor: opts.NFOActor, NFOID: opts.NFOID, NFOTag: opts.NFOTag, ManualTag: opts.ManualTag, CombinedTag: opts.CombinedTag, CombinedTags: opts.CombinedTags, AIDescription: opts.AIDescription, AITag: opts.AITag, NFOTitle: opts.NFOTitle, NFOYear: opts.NFOYear,
+		NFOQuery: opts.NFOQuery, NFOActor: opts.NFOActor, NFOID: opts.NFOID, NFOTag: opts.NFOTag, ManualTag: opts.ManualTag, CombinedTag: opts.CombinedTag, CombinedTags: opts.CombinedTags, TagNodes: opts.TagNodes, AIDescription: opts.AIDescription, AITag: opts.AITag, NFOTitle: opts.NFOTitle, NFOYear: opts.NFOYear,
 		MinWidth: opts.MinWidth, MaxWidth: opts.MaxWidth, MinHeight: opts.MinHeight, MaxHeight: opts.MaxHeight, MatchAnyAxis: opts.MatchAnyAxis,
 		MinDuration: opts.MinDuration, MaxDuration: opts.MaxDuration, MinSize: opts.MinSize, MaxSize: opts.MaxSize, Orientation: opts.Orientation,
 		Rating: opts.Rating, AlbumUnassigned: opts.AlbumUnassigned, AlbumIDs: opts.AlbumIDs, IncludeHidden: opts.IncludeHidden,
@@ -1511,6 +1513,33 @@ OR EXISTS (SELECT 1 FROM asset_ai_tag ait JOIN asset_ai_result air ON air.asset_
 		for _, tag := range tags {
 			args = append(args, tag)
 		}
+	}
+	for group, nodes := range groupTagNodes(opts.TagNodes) {
+		if group == "manual" {
+			names := make([]string, 0, len(nodes))
+			for _, node := range nodes {
+				names = append(names, strings.TrimPrefix(node, "manual:"))
+			}
+			where = append(where, `EXISTS (
+  SELECT 1 FROM asset_tag JOIN tag ON tag.id=asset_tag.tag_id
+  WHERE asset_tag.asset_id=assets.id AND tag.name IN (`+queryPlaceholders(len(names))+`)
+)`)
+			for _, name := range names {
+				args = append(args, name)
+			}
+			continue
+		}
+		parts := make([]string, 0, len(nodes))
+		for _, node := range nodes {
+			parts = append(parts, `?=ANY(f.node_ids)`)
+			args = append(args, node)
+		}
+		where = append(where, `EXISTS (
+  SELECT 1 FROM asset_ai_tag_facet f
+  JOIN asset_ai_result air ON air.asset_id=f.asset_id
+  WHERE f.asset_id=assets.id AND air.status='ready' AND air.input_cache_key=assets.cache_key
+    AND (`+strings.Join(parts, " OR ")+`)
+)`)
 	}
 	if text := strings.TrimSpace(opts.AIDescription); text != "" {
 		like := "%" + escapeLike(strings.ToLower(text)) + "%"
@@ -2061,6 +2090,35 @@ func normalizeCombinedTags(values []string) []string {
 		}
 	}
 	return out
+}
+
+func groupTagNodes(values []string) map[string][]string {
+	groups := map[string][]string{}
+	seen := map[string]struct{}{}
+	for _, raw := range values {
+		node := strings.TrimSpace(raw)
+		if node == "" || len([]rune(node)) > 160 || (!strings.HasPrefix(node, "ai:") && !strings.HasPrefix(node, "manual:")) {
+			continue
+		}
+		if _, exists := seen[node]; exists {
+			continue
+		}
+		seen[node] = struct{}{}
+		group := "manual"
+		if strings.HasPrefix(node, "ai:") {
+			base := strings.TrimPrefix(strings.SplitN(node, ":", 3)[1], "ai:")
+			segments := strings.Split(base, ".")
+			if len(segments) > 3 {
+				segments = segments[:3]
+			}
+			group = strings.Join(segments, ".")
+		}
+		groups[group] = append(groups[group], node)
+		if len(seen) == 32 {
+			break
+		}
+	}
+	return groups
 }
 
 func queryPlaceholders(count int) string {

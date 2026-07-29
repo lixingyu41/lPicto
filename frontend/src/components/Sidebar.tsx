@@ -2,11 +2,17 @@ import { type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode,
 import { FolderTree, Images, Layers, Library, Settings } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { useSidebarPanelValue, type SidebarPanelTarget } from './SidebarContext';
-import { isPrimarySidebarPanelTarget, primaryTargetForPath, type PrimarySidebarPanelTarget } from '../utils/sidebarPrefs';
+import {
+  isPrimarySidebarPanelTarget,
+  primaryTargetForPath,
+  type CollapsedSidebarContent,
+  type PrimarySidebarPanelTarget,
+} from '../utils/sidebarPrefs';
 import { loadSettingsSection, settingsSectionPath } from '../utils/settingsRoute';
 
 interface Props {
   collapsed: boolean;
+  collapsedContent: CollapsedSidebarContent;
   expanded: SidebarPanelTarget | null;
   secondaryWidth: number;
   routePathname?: string;
@@ -18,18 +24,20 @@ interface Props {
 const navItems: Array<{
   Icon: typeof Library;
   label: string;
+  compactLabel: string;
   target: PrimarySidebarPanelTarget;
   to: string;
 }> = [
-  { Icon: Library, label: '图库', target: 'library', to: '/library' },
-  { Icon: Images, label: '相册', target: 'albums', to: '/albums' },
-  { Icon: FolderTree, label: '文件夹', target: 'folders', to: '/folders' },
-  { Icon: Layers, label: '智能', target: 'collections', to: '/collections' },
-  { Icon: Settings, label: '设置', target: 'settings', to: '/settings' },
+  { Icon: Library, compactLabel: '库', label: '图库', target: 'library', to: '/library' },
+  { Icon: Images, compactLabel: '册', label: '相册', target: 'albums', to: '/albums' },
+  { Icon: FolderTree, compactLabel: '夹', label: '文件夹', target: 'folders', to: '/folders' },
+  { Icon: Layers, compactLabel: '智', label: '智能', target: 'collections', to: '/collections' },
+  { Icon: Settings, compactLabel: '设', label: '设置', target: 'settings', to: '/settings' },
 ];
 
 export default function Sidebar({
   collapsed,
+  collapsedContent,
   expanded,
   secondaryWidth,
   routePathname,
@@ -48,7 +56,6 @@ export default function Sidebar({
     }
   }, [expanded, onToggleExpanded, panels]);
 
-  const viewerPanel = panels.viewer ?? null;
   const activeRouteSecondaryTarget = routeTarget && expanded === routeTarget ? routeTarget : null;
   const activeSecondaryTarget = activeRouteSecondaryTarget;
   const secondaryPanel = activeRouteSecondaryTarget ? panels[activeRouteSecondaryTarget] : null;
@@ -106,8 +113,16 @@ export default function Sidebar({
           </button>
         </div>
         <div className="nav-main">
-          {navItems.map(({ Icon, label, target, to }) => (
-            <SidebarItem active={routeTarget === target} icon={<Icon size={18} />} key={target} label={label} to={target === 'settings' ? settingsSectionPath(loadSettingsSection()) : to} onActivate={() => toggleSecondaryForNav(target)} />
+          {navItems.map(({ Icon, compactLabel, label, target, to }) => (
+            <SidebarItem
+              active={routeTarget === target}
+              compactLabel={collapsedContent === 'character' ? compactLabel : ''}
+              icon={<Icon size={18} />}
+              key={target}
+              label={label}
+              to={target === 'settings' ? settingsSectionPath(loadSettingsSection()) : to}
+              onActivate={() => toggleSecondaryForNav(target)}
+            />
           ))}
         </div>
         <div className="nav-bottom">
@@ -115,7 +130,7 @@ export default function Sidebar({
         </div>
       </nav>
       {activeSecondaryTarget && (
-        <aside className={`sidebar-secondary sidebar-secondary-${activeSecondaryTarget}${viewerPanel ? ' has-viewer-panel' : ''}`}>
+        <aside className={`sidebar-secondary sidebar-secondary-${activeSecondaryTarget}`}>
           {activeRouteSecondaryTarget && (
             <div className="sidebar-secondary-main">
               <div
@@ -132,7 +147,6 @@ export default function Sidebar({
               {secondaryPanel}
             </div>
           )}
-          {viewerPanel && <div className="sidebar-secondary-viewer">{viewerPanel}</div>}
         </aside>
       )}
       <div aria-hidden="true" className="sidebar-resize-handle sidebar-resize-primary sidebar-resize-static" />
@@ -151,12 +165,14 @@ export default function Sidebar({
 
 function SidebarItem({
   active,
+  compactLabel,
   icon,
   label,
   onActivate,
   to,
 }: {
   active: boolean;
+  compactLabel: string;
   icon: ReactNode;
   label: string;
   onActivate: (event: MouseEvent<HTMLAnchorElement>) => void;
@@ -174,8 +190,9 @@ function SidebarItem({
         onActivate(event);
       }}
     >
-      {icon}
-      <span>{label}</span>
+      <span className="nav-link-icon">{icon}</span>
+      {compactLabel && <span className="nav-link-compact-label" aria-hidden="true">{compactLabel}</span>}
+      <span className="nav-link-label">{label}</span>
     </NavLink>
   );
 }

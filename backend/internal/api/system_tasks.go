@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -36,31 +37,33 @@ type SystemTaskFailureDTO struct {
 }
 
 type SystemTaskDTO struct {
-	ID              string                 `json:"id"`
-	Name            string                 `json:"name"`
-	Description     string                 `json:"description"`
-	Schedule        string                 `json:"schedule"`
-	Status          string                 `json:"status"`
-	Succeeded       *bool                  `json:"succeeded"`
-	LastStartedAt   *int64                 `json:"lastStartedAt"`
-	LastFinishedAt  *int64                 `json:"lastFinishedAt"`
-	NextRunAt       *int64                 `json:"nextRunAt"`
-	DurationSeconds *int64                 `json:"durationSeconds"`
-	Message         string                 `json:"message"`
-	LastError       string                 `json:"lastError"`
-	Processed       int                    `json:"processed"`
-	FailedCount     int64                  `json:"failedCount"`
-	CanRetry        bool                   `json:"canRetry"`
-	SupportsScope   bool                   `json:"supportsScope"`
-	Progress        *SystemTaskProgressDTO `json:"progress"`
-	Actions         []SystemTaskActionDTO  `json:"actions"`
-	Failures        []SystemTaskFailureDTO `json:"failures"`
+	ID                    string                 `json:"id"`
+	Name                  string                 `json:"name"`
+	Description           string                 `json:"description"`
+	Schedule              string                 `json:"schedule"`
+	Status                string                 `json:"status"`
+	Succeeded             *bool                  `json:"succeeded"`
+	LastStartedAt         *int64                 `json:"lastStartedAt"`
+	LastFinishedAt        *int64                 `json:"lastFinishedAt"`
+	NextRunAt             *int64                 `json:"nextRunAt"`
+	DurationSeconds       *int64                 `json:"durationSeconds"`
+	AverageSecondsPerItem *float64               `json:"averageSecondsPerItem"`
+	Message               string                 `json:"message"`
+	BlockedReason         string                 `json:"blockedReason,omitempty"`
+	LastError             string                 `json:"lastError"`
+	Processed             int                    `json:"processed"`
+	FailedCount           int64                  `json:"failedCount"`
+	CanRetry              bool                   `json:"canRetry"`
+	SupportsScope         bool                   `json:"supportsScope"`
+	Progress              *SystemTaskProgressDTO `json:"progress"`
+	Actions               []SystemTaskActionDTO  `json:"actions"`
+	Failures              []SystemTaskFailureDTO `json:"failures"`
 }
 
 func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
-	countRun, err := s.db.LastScanRunForTask(r.Context(), "count")
+	reconcileRun, err := s.db.LastScanRunForTask(r.Context(), "reconcile")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "tasks_failed", "读取图库扫描任务失败")
+		writeError(w, http.StatusInternalServerError, "tasks_failed", "读取图库对账任务失败")
 		return
 	}
 	metadataRun, err := s.db.LastScanRunForTask(r.Context(), "metadata")
@@ -84,6 +87,7 @@ func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
 	aiHealth, _ := s.db.SystemTaskState(r.Context(), db.SystemTaskAIHealth)
 	storageHealth, _ := s.db.SystemTaskState(r.Context(), taskStorageHealth)
 	cacheCleanup, _ := s.db.SystemTaskState(r.Context(), taskCacheCleanup)
+	sourceIO, _ := s.db.LatestSourceIOBatch(r.Context())
 	thumbnailControl, _ := s.db.SystemTaskState(r.Context(), "thumbnail_creation")
 	previewControl, _ := s.db.SystemTaskState(r.Context(), "preview_creation")
 	posterControl, _ := s.db.SystemTaskState(r.Context(), "video_poster_creation")
@@ -93,40 +97,60 @@ func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "tasks_failed", "读取 AI 分析任务失败")
 		return
 	}
+	aiSettings, _ := s.db.GetAISettings(r.Context())
 	aiActivity, _ := s.db.AIActivity(r.Context())
+	mediaAverages, _ := s.db.MediaJobAverageSecondsPerItem(r.Context(), []string{"metadata", "thumb", "preview", "video_poster"})
+	aiAverage, _ := s.db.AIAverageSecondsPerItem(r.Context())
 	queue := jobs.QueueStats{}
 	if s.jobs != nil {
 		queue = s.jobs.Stats()
 	}
 	scanStatus, _ := s.scanner.Status(r.Context())
 
-	thumbnailTask := aggregateMediaTask("thumbnail_creation", "缩略图创建", "为瀑布流和媒体列表创建缩略图", "媒体入库后自动运行", progress.Thumb, queue.ThumbQueued, queue.ActiveThumb)
+	thumbnailTask := thumbnailSystemTask(progress.Thumb, queue.ThumbQueued, queue.ActiveThumb)
 	previewTask := aggregateMediaTask("preview_creation", "高清预览创建", "为浏览器无法直接显示的图片创建高清预览", "媒体入库后自动运行", progress.Preview, queue.PreviewQueued, queue.ActivePreview)
 	posterTask := aggregateMediaTask("video_poster_creation", "视频封面创建", "创建视频播放前显示的首帧封面", "媒体入库后自动运行", progress.VideoPoster, queue.VideoPosterQueued, queue.ActiveVideoPoster)
 	metadataTask := metadataSystemTask(metadata, metadataRun, scanStatus)
+	metadataTask.AverageSecondsPerItem = float64MapValue(mediaAverages, "metadata")
+	thumbnailTask.AverageSecondsPerItem = float64MapValue(mediaAverages, "thumb")
+	previewTask.AverageSecondsPerItem = float64MapValue(mediaAverages, "preview")
+	posterTask.AverageSecondsPerItem = float64MapValue(mediaAverages, "video_poster")
 	applyMediaJobActivity(&thumbnailTask, thumbActivity)
 	applyMediaJobActivity(&previewTask, previewActivity)
 	applyMediaJobActivity(&posterTask, posterActivity)
 	applyStoppedState(&thumbnailTask, thumbnailControl)
 	applyStoppedState(&previewTask, previewControl)
 	applyStoppedState(&posterTask, posterControl)
-	aiTask := aiAnalysisSystemTask(aiStatus, aiActivity, queue.AIQueued, queue.ActiveAI)
+	thumbnailTask.Actions = manualStartTaskActions(thumbnailTask.Status == "running", progress.Thumb.Error, maxInt(0, progress.Thumb.Total-progress.Thumb.NotRequired))
+	posterTask.Actions = manualStartTaskActions(posterTask.Status == "running", progress.VideoPoster.Error, maxInt(0, progress.VideoPoster.Total-progress.VideoPoster.NotRequired))
+	aiTask := aiAnalysisSystemTask(aiStatus, aiActivity, queue.AIQueued, queue.ActiveAI, aiSettings.AutoAnalyze || aiSettings.ManualRun)
+	aiTask.AverageSecondsPerItem = aiAverage
 	applyStoppedState(&aiTask, aiControl)
+	aiStatus.Queued = queue.AIQueued
+	aiStatus.Active = queue.ActiveAI
+	aiStatus.Staged, aiStatus.StagedBytes, _ = s.db.AIStageStats(r.Context())
+	if sourceIO != nil && sourceIO.State == "running" {
+		aiStatus.SourceReading = true
+	}
+	aiTask.BlockedReason = s.aiPauseReason(r.Context(), aiStatus, aiSettings)
+	applyAIExecutionState(&aiTask, aiStatus, aiSettings, aiTask.BlockedReason)
 	applyRunningTaskDuration(&aiTask, aiControl, time.Now().Unix())
 	attachMediaFailures(r, s, &metadataTask, "metadata")
 	attachMediaFailures(r, s, &thumbnailTask, "thumb")
 	attachMediaFailures(r, s, &previewTask, "preview")
 	attachMediaFailures(r, s, &posterTask, "video_poster")
 	attachAIFailures(r, s, &aiTask)
-	scanTask := scanSystemTask("library_scan", "图库文件扫描", "检查图库中的新增、变更和缺失文件", countRun, scanStatus)
+	scanTask := scanSystemTask("library_scan", "图库文件对账", "仅检查数据库现有媒体对应的文件路径是否仍然存在", reconcileRun, scanStatus)
 	attachSummaryFailure(&scanTask)
-	storageTask := storedSystemTask(taskStorageHealth, "存储连接检查", "检查每个图库根目录及抽样媒体是否可访问", "每 30 分钟及扫描前", storageHealth, false)
+	storageTask := storedSystemTask(taskStorageHealth, "存储连接检查", "在集中读取窗口检查每个图库根目录及抽样媒体是否可访问", "每天 03:00 及手动任务前", storageHealth, false)
 	attachSummaryFailure(&storageTask)
 	aiHealthTask := aiHealthSystemTask(aiHealth)
 	attachSummaryFailure(&aiHealthTask)
 	cacheTask := storedSystemTask(taskCacheCleanup, "无效缓存清理", "删除失去数据库引用的缓存和过期临时文件", "每天 03:00", cacheCleanup, false)
 	attachSummaryFailure(&cacheTask)
+	sourceIOTask := sourceIOSystemTask(sourceIO)
 	items := []SystemTaskDTO{
+		sourceIOTask,
 		scanTask,
 		metadataTask,
 		thumbnailTask,
@@ -143,6 +167,69 @@ func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func sourceIOSystemTask(batch *db.SourceIOBatch) SystemTaskDTO {
+	item := SystemTaskDTO{
+		ID: "source_io_scheduler", Name: "存储读取调度",
+		Description: "集中安排所有 NAS 源文件读取；播放会抢占后台任务",
+		Schedule:    "每天 03:00、手动任务及媒体播放", Status: "never",
+		Actions: []SystemTaskActionDTO{}, Failures: []SystemTaskFailureDTO{},
+	}
+	if batch == nil {
+		item.Message = "尚未产生 NAS 读取"
+		return item
+	}
+	item.LastStartedAt = &batch.StartedAt
+	item.LastFinishedAt = batch.FinishedAt
+	item.Processed = batch.ItemCount
+	item.Message = fmt.Sprintf("%s · %d 项 · 读取 %d 字节", sourceIOReasonLabel(batch.Reason), batch.ItemCount, batch.BytesRead)
+	switch batch.State {
+	case "running":
+		item.Status = "running"
+	case "success":
+		item.Status = "success"
+		ok := true
+		item.Succeeded = &ok
+	case "preempted":
+		item.Status = "stopped"
+		item.Message = "已被当前媒体播放抢占；后台项目已恢复等待"
+	default:
+		item.Status = "failed"
+		ok := false
+		item.Succeeded = &ok
+		item.LastError = batch.Error
+	}
+	if batch.FinishedAt != nil {
+		duration := *batch.FinishedAt - batch.StartedAt
+		if duration < 0 {
+			duration = 0
+		}
+		item.DurationSeconds = &duration
+	}
+	now := time.Now()
+	next := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, now.Location())
+	if !next.After(now) {
+		next = next.Add(24 * time.Hour)
+	}
+	nextUnix := next.Unix()
+	item.NextRunAt = &nextUnix
+	return item
+}
+
+func sourceIOReasonLabel(reason string) string {
+	switch reason {
+	case "ai_stage_batch":
+		return "AI 批量准备"
+	case "video_playback":
+		return "当前视频播放"
+	case "viewer_image":
+		return "当前图片加载"
+	case "daily_source_window":
+		return "每日集中读取"
+	default:
+		return reason
+	}
 }
 
 func attachMediaFailures(r *http.Request, s *Server, item *SystemTaskDTO, jobType string) {
@@ -225,7 +312,21 @@ func standardMediaTaskActions(running bool, continuable, failed, total int) []Sy
 		{ID: "continue", Label: "继续", Kind: "primary", Enabled: !running && continuable > 0},
 	}
 	if failed > 0 {
-		actions = append(actions, SystemTaskActionDTO{ID: "retry_failed", Label: fmt.Sprintf("重试失败（%d）", failed), Kind: "secondary", Enabled: !running})
+		actions = append(actions, SystemTaskActionDTO{ID: "retry_failed", Label: fmt.Sprintf("重试失败（%d）", failed), Kind: "secondary", Enabled: true})
+	}
+	actions = append(actions,
+		SystemTaskActionDTO{ID: "rebuild", Label: "全部重建", Kind: "danger", Enabled: !running && total > 0, RequiresConfirmation: true},
+		SystemTaskActionDTO{ID: "stop", Label: "停止", Kind: "danger", Enabled: running},
+	)
+	return actions
+}
+
+func manualStartTaskActions(running bool, failed, total int) []SystemTaskActionDTO {
+	actions := []SystemTaskActionDTO{
+		{ID: "start", Label: "手动开始", Kind: "primary", Enabled: !running},
+	}
+	if failed > 0 {
+		actions = append(actions, SystemTaskActionDTO{ID: "retry_failed", Label: fmt.Sprintf("重试失败（%d）", failed), Kind: "secondary", Enabled: true})
 	}
 	actions = append(actions,
 		SystemTaskActionDTO{ID: "rebuild", Label: "全部重建", Kind: "danger", Enabled: !running && total > 0, RequiresConfirmation: true},
@@ -235,7 +336,9 @@ func standardMediaTaskActions(running bool, continuable, failed, total int) []Sy
 }
 
 func thumbnailSystemTask(counts db.WorkStatusCounts, queued, active int) SystemTaskDTO {
-	return aggregateMediaTask("thumbnail_creation", "缩略图创建", "为瀑布流和媒体列表创建缩略图", "媒体入库后自动运行", counts, queued, active)
+	item := aggregateMediaTask("thumbnail_creation", "缩略图创建", "为瀑布流和媒体列表创建缩略图", "媒体入库后自动运行", counts, queued, active)
+	item.Actions = manualStartTaskActions(item.Status == "running", counts.Error, maxInt(0, counts.Total-counts.NotRequired))
+	return item
 }
 
 func metadataSystemTask(counts db.WorkStatusCounts, run *model.ScanRun, scanStatus scanner.Status) SystemTaskDTO {
@@ -252,7 +355,7 @@ func metadataSystemTask(counts db.WorkStatusCounts, run *model.ScanRun, scanStat
 	if scanStatus.Running && scanStatus.Progress.Task == "metadata" {
 		item.Status = "running"
 	}
-	item.Actions = standardMediaTaskActions(item.Status == "running", counts.Pending+counts.Processing+counts.Error, counts.Error, counts.Total)
+	item.Actions = manualStartTaskActions(item.Status == "running", counts.Error, counts.Total)
 	return item
 }
 
@@ -279,26 +382,27 @@ func applyStoppedState(item *SystemTaskDTO, state *db.SystemTaskState) {
 }
 
 func scanSystemTask(id, name, description string, run *model.ScanRun, status scanner.Status) SystemTaskDTO {
-	item := SystemTaskDTO{ID: id, Name: name, Description: description, Schedule: "按需运行", Status: "never", SupportsScope: true}
+	item := SystemTaskDTO{ID: id, Name: name, Description: description, Schedule: "每天 03:00 及手动运行", Status: "never", SupportsScope: true}
 	if run != nil {
 		applyScanRun(&item, run)
 		item.Progress = &SystemTaskProgressDTO{Total: run.TotalSeen, Completed: run.TotalSeen, Failed: run.Errors}
+		item.Message = fmt.Sprintf("已核对 %d 项，缺失 %d", run.TotalSeen, run.AssetsDeleted)
 	}
-	if status.Running && status.Progress.Task == "count" {
+	if status.Running && status.Progress.Task == "reconcile" {
 		item.Status = "running"
 		total := maxInt(status.Progress.TotalFiles, status.Progress.DiscoveredFiles)
 		completed := maxInt(status.Progress.ScannedFiles, status.Progress.TotalSeen)
 		item.Progress = &SystemTaskProgressDTO{Total: total, Completed: completed, Pending: maxInt(0, total-completed), Failed: status.Progress.Errors}
-		item.Message = fmt.Sprintf("已检查 %d / %d，新增 %d，变更 %d，缺失 %d", completed, total, status.Progress.AssetsAdded, status.Progress.AssetsUpdated, status.Progress.AssetsDeleted)
+		item.Message = fmt.Sprintf("已核对 %d / %d，缺失 %d", completed, total, status.Progress.AssetsDeleted)
 	}
 	if item.Status == "running" {
 		item.Actions = []SystemTaskActionDTO{
-			{ID: "scan", Label: "扫描图库", Kind: "primary", Enabled: false},
+			{ID: "reconcile", Label: "开始对账", Kind: "primary", Enabled: false},
 			{ID: "stop", Label: "停止", Kind: "danger", Enabled: true},
 		}
 	} else {
 		item.Actions = []SystemTaskActionDTO{
-			{ID: "scan", Label: "扫描图库", Kind: "primary", Enabled: true},
+			{ID: "reconcile", Label: "开始对账", Kind: "primary", Enabled: true},
 			{ID: "stop", Label: "停止", Kind: "danger", Enabled: false},
 		}
 	}
@@ -318,7 +422,7 @@ func applyScanRun(item *SystemTaskDTO, run *model.ScanRun) {
 	setTaskDuration(item)
 }
 
-func aiAnalysisSystemTask(status db.AIStatus, activity db.AIActivity, queued, active int) SystemTaskDTO {
+func aiAnalysisSystemTask(status db.AIStatus, activity db.AIActivity, queued, active int, runRequested bool) SystemTaskDTO {
 	item := SystemTaskDTO{
 		ID: "ai_analysis", Name: "AI 媒体分析", Description: "为图片和视频生成描述与标签", Schedule: "自动或手动运行",
 		LastStartedAt: activity.LastStartedAt, LastFinishedAt: activity.LastFinishedAt, FailedCount: status.Failed, CanRetry: status.Failed > 0,
@@ -326,7 +430,7 @@ func aiAnalysisSystemTask(status db.AIStatus, activity db.AIActivity, queued, ac
 		Message: fmt.Sprintf("已完成 %d / %d，失败 %d，待分析 %d", status.Ready, status.Total, status.Failed, status.Pending+status.Stale),
 	}
 	switch {
-	case active > 0 || queued > 0 || status.Processing > 0:
+	case active > 0 || queued > 0 || status.Processing > 0 || runRequested && (status.Pending > 0 || status.Stale > 0):
 		item.Status = "running"
 	case status.Failed > 0:
 		item.Status, item.Succeeded = "failed", boolValue(false)
@@ -338,6 +442,23 @@ func aiAnalysisSystemTask(status db.AIStatus, activity db.AIActivity, queued, ac
 	item.Actions = standardMediaTaskActions(item.Status == "running", int(status.Pending+status.Stale+status.Processing+status.Failed), int(status.Failed), int(status.Total))
 	setTaskDuration(&item)
 	return item
+}
+
+func applyAIExecutionState(item *SystemTaskDTO, status db.AIStatus, settings db.AISettings, reason string) {
+	if item == nil || reason == "" {
+		return
+	}
+	runRequested := settings.AutoAnalyze || settings.ManualRun
+	continuable := int(status.Pending + status.Stale + status.Processing + status.Failed)
+	if !runRequested {
+		item.Status, item.Succeeded = "stopped", boolValue(false)
+		item.Actions = standardMediaTaskActions(false, continuable, int(status.Failed), int(status.Total))
+		return
+	}
+	if status.Active == 0 {
+		item.Status, item.Succeeded = "pending", nil
+		item.Actions = standardMediaTaskActions(true, continuable, int(status.Failed), int(status.Total))
+	}
 }
 
 func storedSystemTask(id, name, description, schedule string, state *db.SystemTaskState, supportsScope bool) SystemTaskDTO {
@@ -413,9 +534,14 @@ func readableMediaJobError(state *db.MediaJobTaskState) string {
 }
 
 func readableTaskError(reason string) string {
+	if detail, ok := modelOutputErrorDetail(reason); ok {
+		return detail
+	}
 	raw := strings.ToLower(reason)
 	message := "处理媒体时发生错误"
 	switch {
+	case strings.Contains(raw, "model_output_invalid"):
+		message = "AI 模型输出格式错误，已自动重新生成 1 次"
 	case strings.Contains(raw, "ai_transient:") && (strings.Contains(raw, "model response does not contain") || strings.Contains(raw, "description length")):
 		message = "AI 模型输出格式不正确，自动重试一次后仍失败"
 	case strings.Contains(raw, "ai_transient:") && (strings.Contains(raw, "server disconnected") || strings.Contains(raw, " eof")):
@@ -471,6 +597,68 @@ func readableTaskError(reason string) string {
 		return reason
 	}
 	return message
+}
+
+func modelOutputErrorDetail(reason string) (string, bool) {
+	start := strings.Index(reason, "{")
+	if start < 0 {
+		return "", false
+	}
+	var envelope struct {
+		Detail struct {
+			Code         string `json:"code"`
+			Message      string `json:"message"`
+			ParseError   string `json:"parseError"`
+			FinishReason string `json:"finishReason"`
+			Output       string `json:"output"`
+			Attempts     []struct {
+				Attempt      int    `json:"attempt"`
+				ParseError   string `json:"parseError"`
+				FinishReason string `json:"finishReason"`
+				Output       string `json:"output"`
+			} `json:"attempts"`
+		} `json:"detail"`
+	}
+	if err := json.Unmarshal([]byte(reason[start:]), &envelope); err != nil || envelope.Detail.Code != "model_output_invalid" {
+		return "", false
+	}
+	lines := []string{"AI 模型输出格式错误，已自动重新生成 1 次"}
+	for index, attempt := range envelope.Detail.Attempts {
+		number := attempt.Attempt
+		if number <= 0 {
+			number = index + 1
+		}
+		if value := strings.TrimSpace(attempt.ParseError); value != "" {
+			lines = append(lines, fmt.Sprintf("第 %d 次解析原因：%s", number, value))
+		}
+		if value := strings.TrimSpace(attempt.FinishReason); value != "" {
+			lines = append(lines, fmt.Sprintf("第 %d 次结束原因：%s", number, value))
+		}
+		if value := strings.TrimSpace(attempt.Output); value != "" {
+			lines = append(lines, fmt.Sprintf("第 %d 次模型原始输出：\n%s", number, value))
+		}
+	}
+	if len(envelope.Detail.Attempts) > 0 {
+		return strings.Join(lines, "\n"), true
+	}
+	if value := strings.TrimSpace(envelope.Detail.ParseError); value != "" {
+		lines = append(lines, "解析原因："+value)
+	}
+	if value := strings.TrimSpace(envelope.Detail.FinishReason); value != "" {
+		lines = append(lines, "结束原因："+value)
+	}
+	if value := strings.TrimSpace(envelope.Detail.Output); value != "" {
+		lines = append(lines, "模型原始输出：\n"+value)
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+func float64MapValue(values map[string]float64, key string) *float64 {
+	value, ok := values[key]
+	if !ok {
+		return nil
+	}
+	return &value
 }
 
 func setTaskDuration(item *SystemTaskDTO) {

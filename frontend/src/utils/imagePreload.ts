@@ -13,7 +13,10 @@ export function viewerImageUrl(asset: Asset) {
 
 export function preloadViewerAsset(asset: Asset | undefined, priority: FetchPriority = 'auto') {
   if (!asset || asset.mediaType !== 'image') return;
-  const url = viewerImageUrl(asset);
+  const baseUrl = viewerImageUrl(asset);
+  const url = asset.browserPlayable
+    ? `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}cacheOnly=1`
+    : baseUrl;
   if (!url || hoverPreloadedImages.has(url)) return;
   const image = new Image();
   image.decoding = 'async';

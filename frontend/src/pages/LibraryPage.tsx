@@ -52,6 +52,7 @@ const libraryURLKeys = [
 	'aiDescription',
 	'aiTag',
   'combinedTags',
+  'tagNodes',
   'nfo',
   'nfoActor',
   'nfoId',
@@ -206,7 +207,7 @@ export default function LibraryPage() {
 		visible: includeUnavailable ? 'all' : undefined,
 		aiDescription: aiDescriptionQuery.trim() || undefined,
 		aiTag: searchParams.get('aiTag')?.trim() || undefined,
-      combinedTags: serializeTagFilters(tagFilters),
+      tagNodes: serializeTagFilters(tagFilters),
       nfo: nfoQuery.trim() || undefined,
       nfoActor: nfoActorQuery.trim() || undefined,
       nfoId: nfoIDQuery.trim() || undefined,
@@ -440,7 +441,7 @@ export default function LibraryPage() {
         nfo: nfoQuery.trim(),
 		aiDescription: aiDescriptionQuery.trim(),
 		aiTag: searchRequest.aiTag,
-        combinedTags: searchRequest.combinedTags,
+        tagNodes: searchRequest.tagNodes,
         nfoActor: nfoActorQuery.trim(),
         nfoId: nfoIDQuery.trim(),
         nfoTag: nfoTagQuery.trim(),
@@ -867,7 +868,7 @@ function initialLibraryState(searchParams: URLSearchParams, persistedState: Libr
     sizeMaxMB: bytesParamToMB(searchParams.get('sizeMax')),
     dateFrom: unixParamToDatetimeLocal(searchParams.get('from')),
     dateTo: unixParamToDatetimeLocal(searchParams.get('to')),
-    tagFilters: parseTagFilters(searchParams.get('combinedTags')),
+    tagFilters: parseTagFilters(searchParams.get('tagNodes') ?? searchParams.get('combinedTags')),
   };
 }
 
@@ -878,6 +879,7 @@ function hasSearchStateParams(searchParams: URLSearchParams) {
 		'aiDescription',
 		'aiTag',
     'combinedTags',
+    'tagNodes',
     'nfo',
     'nfoActor',
     'nfoId',

@@ -8,7 +8,8 @@ export type AssetGridBatchCommand =
   | 'add-album'
   | 'rotate'
   | 'hide'
-  | 'delete';
+  | 'delete'
+  | 'delete-records';
 
 export interface AssetGridBatchState {
   available: boolean;

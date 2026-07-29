@@ -48,7 +48,7 @@ import { parseTagFilters, serializeTagFilters } from '../utils/tagFilters';
 
 const pageSize = waterfallPageSize;
 const albumsStateKey = 'albums';
-const albumsURLKeys = ['albumId', 'album', 'type', 'rating', 'orientation', 'sort', 'group', 'q', 'combinedTags'];
+const albumsURLKeys = ['albumId', 'album', 'type', 'rating', 'orientation', 'sort', 'group', 'q', 'combinedTags', 'tagNodes'];
 const pendingAlbumEditorKey = 'lpicto:pending-album-editor';
 const assetKinds: AssetKind[] = ['all', 'image', 'video'];
 
@@ -144,7 +144,7 @@ export default function AlbumsPage() {
       if (!selectedAlbum) {
         return Promise.resolve({ items: [], page, pageSize, hasMore: false });
       }
-      return api.albumAssets(selectedAlbum.id, page, pageSize, sort, query, serverGroup, rating, orientation, type, serializeTagFilters(tagFilters));
+      return api.albumAssets(selectedAlbum.id, page, pageSize, sort, query, serverGroup, rating, orientation, type, undefined, serializeTagFilters(tagFilters));
     },
     [orientation, query, rating, selectedAlbum, serverGroup, sort, tagFilters, type],
   );
@@ -213,7 +213,7 @@ export default function AlbumsPage() {
     let live = true;
     async function loadAnchors(albumId: number) {
       try {
-        const result = await api.albumAnchors(albumId, pageSize, sort, query, serverGroup, rating, orientation, type, serializeTagFilters(tagFilters));
+        const result = await api.albumAnchors(albumId, pageSize, sort, query, serverGroup, rating, orientation, type, undefined, serializeTagFilters(tagFilters));
         if (live) {
           setAnchors(result.items);
           setTotalCount(result.total);
@@ -271,7 +271,7 @@ export default function AlbumsPage() {
         q: query,
         rating,
         sort,
-        combinedTags: serializeTagFilters(tagFilters),
+        tagNodes: serializeTagFilters(tagFilters),
         type,
       },
       albumsURLKeys,
@@ -627,7 +627,7 @@ export default function AlbumsPage() {
             scrollTopTarget={scrollTopTarget}
             buildViewerUrl={(asset) =>
               appendViewerReturnParams(
-                `/viewer/${asset.id}?context=album&albumId=${selectedAlbum.id}&type=${type}&sort=${sort}&q=${encodeURIComponent(query)}${serializeTagFilters(tagFilters) ? `&combinedTags=${encodeURIComponent(serializeTagFilters(tagFilters)!)}` : ''}${ratingViewerParam(
+                `/viewer/${asset.id}?context=album&albumId=${selectedAlbum.id}&type=${type}&sort=${sort}&q=${encodeURIComponent(query)}${serializeTagFilters(tagFilters) ? `&tagNodes=${encodeURIComponent(serializeTagFilters(tagFilters)!)}` : ''}${ratingViewerParam(
                   rating,
                 )}${orientationViewerParam(orientation)}${serverGroup ? `&group=${serverGroup}` : ''}`,
                 currentPageReturnPath(),
@@ -718,7 +718,7 @@ function albumsStateFromSearchParams(params: URLSearchParams, fallback: AlbumsPa
     rating: params.has('rating') ? assetRatingParam(params.get('rating')) ?? base.rating : base.rating,
     selectedId: selectedId ?? base.selectedId,
     sort: isSortKey(sort) ? sort : base.sort,
-    tagFilters: params.has('combinedTags') ? parseTagFilters(params.get('combinedTags')) : base.tagFilters ?? [],
+    tagFilters: params.has('tagNodes') || params.has('combinedTags') ? parseTagFilters(params.get('tagNodes') ?? params.get('combinedTags')) : base.tagFilters ?? [],
     type: assetKinds.includes(type as AssetKind) ? (type as AssetKind) : base.type,
   };
 }

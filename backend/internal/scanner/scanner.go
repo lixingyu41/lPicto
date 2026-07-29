@@ -149,6 +149,7 @@ type scanTask string
 
 const (
 	scanTaskMetadata      scanTask = "metadata"
+	scanTaskReconcile     scanTask = "reconcile"
 	scanTaskCount         scanTask = "count"
 	scanTaskThumbContinue scanTask = "thumb_continue"
 	scanTaskThumbRebuild  scanTask = "thumb_rebuild"
@@ -192,6 +193,14 @@ func (s *Scanner) RequestScan(reason string) CommandResult {
 
 func (s *Scanner) RequestScanRoots(reason string, roots []string) CommandResult {
 	return s.RequestMetadataScanRoots(reason, roots)
+}
+
+func (s *Scanner) RequestReconcileScan(reason string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, task: scanTaskReconcile})
+}
+
+func (s *Scanner) RequestReconcileScanRoots(reason string, roots []string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: true, task: scanTaskReconcile})
 }
 
 func (s *Scanner) RequestRebuild(reason string) CommandResult {
@@ -543,6 +552,40 @@ func nextStatusRevision() int64 {
 
 func (s *Scanner) run(ctx context.Context, req scanRequest) {
 	logger := s.Logger.With("reason", req.reason)
+	priority := 100
+	if strings.HasPrefix(req.reason, "task:") {
+		priority = 50
+	}
+	sourceBatchID, _ := s.DB.BeginSourceIOBatch(context.Background(), req.reason, priority)
+	defer func() {
+		state, message := "success", ""
+		if ctx.Err() != nil {
+			state, message = "preempted", "当前媒体播放已抢占 NAS 读取"
+		}
+		_ = s.DB.FinishSourceIOBatch(context.Background(), sourceBatchID, state, 0, 0, message)
+	}()
+	stopMonitor := make(chan struct{})
+	defer close(stopMonitor)
+	if s.Jobs != nil {
+		go func() {
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				active, _ := s.Jobs.PlaybackPriorityActive(ctx)
+				if active {
+					s.RequestStop()
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-stopMonitor:
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
 	runID, err := s.DB.StartScanRun(ctx, string(req.task))
 	if err != nil {
 		logger.Error("start scan run failed", "error", err)
@@ -586,6 +629,9 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 	switch req.task {
 	case scanTaskCount:
 		s.runCount(ctx, runID, scanRoots, req.reason, logger)
+		return
+	case scanTaskReconcile:
+		s.runReconcile(ctx, runID, scanRoots, logger)
 		return
 	case scanTaskThumbRebuild:
 		s.runThumbnailRebuild(ctx, runID, scanRoots, logger)
@@ -695,6 +741,88 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 		logger.Error("finish scan run failed", "error", err)
 	}
 	logger.Info("scan finished", "seen", counts.totalSeen, "added", counts.assetsAdded, "updated", counts.assetsUpdated, "deleted", counts.assetsDeleted, "errors", counts.errors)
+}
+
+func (s *Scanner) runReconcile(ctx context.Context, runID int64, scanRoots []string, logger *slog.Logger) {
+	activePaths, err := s.DB.ActiveRelPathsForRoots(ctx, scanRoots)
+	if err != nil {
+		message := "读取现有媒体记录失败"
+		_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: "error", Errors: 1, LastError: &message})
+		logger.Error("load media records for reconciliation failed", "error", err)
+		return
+	}
+
+	s.updateProgressPhase("reconciling")
+	s.updateProgressTotalFiles(len(activePaths))
+	counts := counters{rootSeen: make(map[string]int, len(scanRoots))}
+	missingPaths := make([]string, 0)
+	for relPath := range activePaths {
+		if ctx.Err() != nil {
+			s.finishPaused(runID, counts)
+			return
+		}
+		sourcePath, pathErr := s.Store.PhotoPath(relPath)
+		if pathErr != nil {
+			counts.recordError("解析媒体路径失败", pathErr)
+			s.updateProgressCounts(counts, relPath)
+			continue
+		}
+		exists, statErr := sourceFileExists(sourcePath)
+		if statErr != nil {
+			if s.Sources != nil {
+				s.Sources.MarkUnavailableForRel(relPath, statErr)
+			}
+			message := "存储读取失败，对账已停止"
+			counts.recordError(message, statErr)
+			s.updateProgressCounts(counts, relPath)
+			_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{
+				Status: "error", TotalSeen: counts.totalSeen, Errors: counts.errors, LastError: counts.lastError,
+			})
+			logger.Warn("reconciliation stopped because source lookup failed", "relPath", relPath, "error", statErr)
+			return
+		}
+		counts.totalSeen++
+		if !exists {
+			missingPaths = append(missingPaths, relPath)
+		}
+		s.updateProgressCounts(counts, relPath)
+	}
+
+	if len(missingPaths) > 0 {
+		missing, markErr := s.DB.MarkMissingRelPaths(ctx, missingPaths)
+		if markErr != nil {
+			counts.recordError("标记缺失媒体失败", markErr)
+			logger.Warn("mark reconciled media missing failed", "count", len(missingPaths), "error", markErr)
+		} else {
+			counts.assetsDeleted = missing
+			s.updateProgressCounts(counts, "")
+		}
+	}
+	if err := s.DB.RefreshFolders(ctx); err != nil {
+		counts.recordError("更新文件夹统计失败", err)
+		logger.Warn("refresh folders after reconciliation failed", "error", err)
+	}
+	status := "finished"
+	if counts.errors > 0 {
+		status = "finished_with_errors"
+	}
+	s.updateProgressPhase("finished")
+	_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{
+		Status: status, TotalSeen: counts.totalSeen, AssetsDeleted: counts.assetsDeleted,
+		Errors: counts.errors, LastError: counts.lastError,
+	})
+	logger.Info("media reconciliation finished", "checked", counts.totalSeen, "missing", counts.assetsDeleted, "errors", counts.errors)
+}
+
+func sourceFileExists(path string) (bool, error) {
+	info, err := os.Stat(filepath.Clean(path))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !info.IsDir(), nil
 }
 
 func (s *Scanner) unavailableScanRoots(scanRoots []string) []string {

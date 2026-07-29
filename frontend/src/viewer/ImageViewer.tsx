@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Maximize2, Minimize2, RotateCw, Settings, Trash2 } from 'lucide-react';
+import { Database, Maximize2, Minimize2, RotateCw, Settings, Trash2 } from 'lucide-react';
 import type { Asset } from '../types/api';
 import {
   loadViewerPrefs,
@@ -20,15 +20,18 @@ interface Props {
   deleting: boolean;
   fullscreen: boolean;
   layerMode: ViewerMediaLayerMode;
+  mediaDetailsOpen: boolean;
   preloadEnabled: boolean;
   playbackMode: ViewerPlaybackMode;
   slideshowSeconds: number;
   onDelete: () => void;
+  onDeleteRecord: () => void;
   onMediaError: (assetId: number, cacheKey: string, message: string) => void;
   onMediaReady: (assetId: number, cacheKey: string) => void;
   onPlaybackEnded: () => void;
   onPlaybackModeChange: (value: ViewerPlaybackMode) => void;
   onRotate: () => void;
+  onToggleMediaDetails: () => void;
   onToggleFullscreen: () => void;
 }
 
@@ -40,7 +43,7 @@ interface ZoomState {
   backgroundY: number;
 }
 
-export default function ImageViewer({ asset, deleting, fullscreen, layerMode, preloadEnabled, playbackMode, slideshowSeconds, onDelete, onMediaError, onMediaReady, onPlaybackEnded, onPlaybackModeChange, onRotate, onToggleFullscreen }: Props) {
+export default function ImageViewer({ asset, deleting, fullscreen, layerMode, mediaDetailsOpen, preloadEnabled, playbackMode, slideshowSeconds, onDelete, onDeleteRecord, onMediaError, onMediaReady, onPlaybackEnded, onPlaybackModeChange, onRotate, onToggleMediaDetails, onToggleFullscreen }: Props) {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const settingsRef = useRef<HTMLDivElement | null>(null);
@@ -269,7 +272,12 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
               title="图片设置"
               aria-label="图片设置"
               aria-expanded={settingsOpen}
-              onClick={() => setSettingsOpen((value) => !value)}
+              onPointerDown={(event) => {
+                if (event.button === 0) setSettingsOpen((open) => !open);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') setSettingsOpen((open) => !open);
+              }}
             >
               <Settings size={18} />
             </button>
@@ -291,6 +299,18 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
                   <span>图片旋转</span>
                   <span><output>{asset.rotation || 0}°</output><RotateCw size={16} /></span>
                 </button>
+                <label className="video-settings-row video-settings-toggle-row">
+                  <span>媒体详情</span>
+                  <span className="video-settings-switch">
+                    <input
+                      aria-label="媒体详情"
+                      type="checkbox"
+                      checked={mediaDetailsOpen}
+                      onChange={onToggleMediaDetails}
+                    />
+                    <span aria-hidden="true" />
+                  </span>
+                </label>
                 <button
                   className="video-settings-action danger"
                   type="button"
@@ -302,6 +322,18 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
                 >
                   <span>删除媒体</span>
                   <Trash2 size={16} />
+                </button>
+                <button
+                  className="video-settings-action danger"
+                  type="button"
+                  disabled={deleting}
+                  onClick={() => {
+                    setSettingsOpen(false);
+                    onDeleteRecord();
+                  }}
+                >
+                  <span>删除记录</span>
+                  <Database size={16} />
                 </button>
               </div>
             )}

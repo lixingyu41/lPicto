@@ -1,5 +1,7 @@
 import base64
 import io
+import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -17,15 +19,16 @@ from transformers import ChineseCLIPProcessor
 
 from taxonomy import LABELS, TAXONOMY_VERSION
 from media_sampling import sample_ratios
-from tag_logic import augment_candidates_from_description, parse_model_analysis, reconcile_required_defaults, select_validated_tags
+from tag_hierarchy import attach_tag_hierarchy
+from tag_logic import limit_closeup_candidates, parse_structured_model_analysis, reconcile_closeups_from_description, select_validated_tags
 
 MODEL_DIR = Path("/models/chinese-clip")
 MEDIA_ROOT = Path("/Media").resolve()
 CACHE_ROOT = Path("/cache").resolve()
 TAG_MODEL = "Qwen3-VL-candidates+Chinese-CLIP-validation"
-TAG_MODEL_VERSION = "Qwen-52d6c8ff+Xenova-f2690486-compound-v4"
-DESCRIPTION_MODEL = "Qwen3-VL-2B-Instruct-Q4_K_M"
-DESCRIPTION_MODEL_VERSION = "Qwen-52d6c8ffea26cc873ac5ad116f8631268d7eb503"
+TAG_MODEL_VERSION = "Qwen-f982a075+Xenova-f2690486-ai-classified-v6"
+DESCRIPTION_MODEL = "Qwen3-VL-8B-Instruct-Q4_K_M"
+DESCRIPTION_MODEL_VERSION = "Qwen-f982a07559d4a2f6c8744d840bf6fccab30eea96"
 LOCK = threading.Lock()
 CONTROL_LOCK = threading.Lock()
 PAUSED = threading.Event()
@@ -33,11 +36,38 @@ LLAMA_PROCESS = None
 LLAMA_LOG = None
 ACTIVE_MEDIA_PROCESSES = set()
 ANALYSIS_EPOCH = 0
+LOGGER = logging.getLogger("lpicto.ai")
+
+ANALYSIS_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["description", "tags"],
+    "properties": {
+        "description": {"type": "string"},
+        "tags": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["label", "category", "subject", "type", "color", "style"],
+                "properties": {
+                    "label": {"type": "string"},
+                    "category": {"type": "string", "enum": ["people", "action", "clothing", "closeup"]},
+                    "subject": {"type": "string", "enum": ["count", "posture", "activity", "shoes", "socks", "top", "outerwear", "dress", "pants", "sportswear", "swimwear", "hat", "accessories", "part"]},
+                    "type": {"type": "string"},
+                    "color": {"type": "string", "enum": ["", "黑", "白", "灰", "红", "橙", "黄", "绿", "青", "蓝", "紫", "粉", "棕"]},
+                    "style": {"type": "string"}
+                }
+            }
+        },
+    },
+}
 
 LLAMA_COMMAND = [
-    "llama-server", "-m", "/models/Qwen3VL-2B-Instruct-Q4_K_M.gguf",
-    "--mmproj", "/models/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
-    "--host", "127.0.0.1", "--port", "8091", "-c", "4096", "-t", "6",
+    "llama-server", "-m", "/models/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+    "--mmproj", "/models/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf",
+    "--host", "127.0.0.1", "--port", "8091", "-c", "8192", "-t", "8",
     "-ngl", "0", "--parallel", "1", "--image-min-tokens", "256", "--image-max-tokens", "512",
 ]
 
@@ -48,6 +78,22 @@ class AnalyzeRequest(BaseModel):
     cacheKey: str
     duration: float | None = None
     focus: str = ""
+    stagedPath: str = ""
+
+
+class ModelOutputInvalidError(ValueError):
+    def __init__(self, attempts):
+        super().__init__("模型输出格式错误，已自动重新生成 1 次")
+        self.attempts = attempts
+
+
+def _retry_analysis_prompt(prompt):
+    return (
+        "这些画面请重新独立分析，识别范围、判断标准和输出含义保持不变。"
+        "这一次先逐项确定结构化标签的字段和值，最后再填写 description；仍只输出符合 schema 的 JSON。\n"
+        + prompt.replace("请分析", "请再次分析", 1)
+    )
+
 
 app = FastAPI(title="lPicto local AI", docs_url=None, redoc_url=None)
 processor = ChineseCLIPProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
@@ -124,6 +170,13 @@ def _safe_media_path(rel_path):
         raise ValueError("media path escapes root")
     return target
 
+def _safe_stage_path(rel_path):
+    target = (CACHE_ROOT / rel_path.replace("\\", "/")).resolve()
+    stage_root = (CACHE_ROOT / "ai-staging").resolve()
+    if target != stage_root and stage_root not in target.parents:
+        raise ValueError("stage path escapes cache root")
+    return target
+
 def _video_frames(path, duration):
     ratios = sample_ratios(duration)
     frames = []
@@ -154,6 +207,22 @@ def _video_frames(path, duration):
     return frames
 
 def _load_frames(request):
+    if request.stagedPath:
+        stage_path = _safe_stage_path(request.stagedPath)
+        meta_path = stage_path / "meta.json"
+        if not stage_path.is_dir() or not meta_path.is_file():
+            raise FileNotFoundError(stage_path)
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        ratios = meta.get("ratios") or [0.0]
+        frame_paths = sorted(stage_path.glob("*.jpg"))
+        if not frame_paths:
+            raise FileNotFoundError(f"no staged frames in {stage_path}")
+        frames = []
+        for index, frame_path in enumerate(frame_paths):
+            with Image.open(frame_path) as image:
+                ratio = float(ratios[index]) if index < len(ratios) else 0.0
+                frames.append((ratio, image.convert("RGB").copy()))
+        return frames
     media_path = _safe_media_path(request.relPath)
     if not media_path.is_file():
         raise FileNotFoundError(media_path)
@@ -185,47 +254,75 @@ def _data_url(image):
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 def _analysis(frames, media_type, epoch, focus=""):
-    structured_focus = "必须输出以下7类标签" in focus
     focus_instruction = ""
     if focus.strip():
         focus_instruction = f"\n重点识别：{focus.strip()}。画面中可见时，优先写入描述并选择对应标签。"
-    prompt = f"""请分析图片中可见的主体、场景和动作，并严格输出一个 JSON 对象：
-{{"description":"40到120个简体中文字符的客观描述","tags":["标签1","标签2"]}}
-输出 3 到 10 个能直接用于分类的具体中文短语，每个 2 到 12 个字符。标签应优先表达“属性＋具体对象”和具体动作，例如“紫色紧身衣”“牛仔裤”“跳舞”。
-颜色修饰物体时必须与物体组成一个标签，不要单独输出“紫色”；能够识别具体服装时不要输出“衣服”“裤子”“人物”等泛化标签；使用“牛仔裤”而不是“裤子”，使用“跳舞”而不是“舞蹈”。
-禁止推测人物身份、精确地点或画面外事件，不要输出 JSON 之外的文字。{focus_instruction}"""
-    if media_type == "video":
-        prompt = f"""以下图片按视频时间顺序抽取。请概括多帧共同可见的主体、场景和动作变化，并严格输出一个 JSON 对象：
-{{"description":"40到120个简体中文字符的客观描述","tags":["标签1","标签2"]}}
-输出 3 到 10 个至少在两帧中共同出现、能直接用于分类的具体中文短语，每个 2 到 12 个字符。标签应优先表达“属性＋具体对象”和具体动作，例如“紫色紧身衣”“牛仔裤”“跳舞”。
-颜色修饰物体时必须与物体组成一个标签，不要单独输出“紫色”；能够识别具体服装时不要输出“衣服”“裤子”“人物”等泛化标签；使用“牛仔裤”而不是“裤子”，使用“跳舞”而不是“舞蹈”。
-禁止推测人物身份、精确地点或未显示事件，不要输出 JSON 之外的文字。{focus_instruction}"""
-    if structured_focus:
-        prompt = f"""请分析{"按时间顺序抽取的视频画面" if media_type == "video" else "图片"}，严格输出以下 JSON，不要省略 requiredTags 的任何字段：
-{{"description":"40到120个简体中文字符的客观描述","requiredTags":{{"shoes":"鞋类标签","socks":"袜子标签","closeup":"特写标签","clothing":["服装标签"],"scenes":["场景标签"],"actions":["动作标签"],"people":"人数标签"}},"tags":[]}}
-标签规则：
-1. shoes：清楚未穿鞋写“未穿鞋”；穿鞋写具体类型，能看清颜色时写成“白色运动鞋”；脚部不可见写“鞋子无法判断”。
-2. socks：清楚未穿袜写“未穿袜”；穿袜必须把颜色和类型合成一个词，如“白色短袜”“黑色丝袜”；不可见写“袜子无法判断”。
-3. closeup：写具体部位加“特写”，如“脸部特写”“腿部特写”“脚部特写”；没有明显特写写“无明显特写”。
-4. clothing：逐件列出全部清晰可见的衣物，上衣、内搭、外套、裙装、裤装、鞋帽等识别到几件就写几件，不得只保留其中一件；每件都将主要颜色和具体类型合成一个词，如“紫色上衣”“黑色外套”“蓝色牛仔裤”；颜色或类型看不清时写“服装无法判断”。
-5. scenes：每个明确场景各写一个词，如“室内”“舞台”“海边”；无法辨认写“场景无法判断”。
-6. actions：写可见姿态或动作，如“坐着”“躺着”“站立”“跳舞”“做操”；多个明确动作可分别写，无法辨认写“动作无法判断”。
-7. people：写主要画面中的可见人数：“一个人”“两个人”“3个人”“4个人”，依此类推；无法数清写“人数无法判断”。
-description 必须写清人数、全部可见衣物、鞋袜、特写部位、动作、场景和有助于搜索的背景细节，使用完整自然语句，不得只重复标签。
-“未穿鞋”“未穿袜”只能在脚部清楚可见时使用；禁止用“人物”“衣服”“鞋子”“裤子”这类泛词代替具体标签。标签总数最多 10 个；视频以多数抽帧共同可见的状态为准。{focus_instruction}"""
+    prompt = f"""请分析{"按时间顺序抽取的视频画面" if media_type == "video" else "图片"}，只识别人物、动作、鞋子、袜子、衣服和特写，输出描述和最多 10 个结构化标签。不要识别或描述背景、场景、地点、物体、自然、交通、食物、天气和媒体形式。每个标签必须由你直接判断 category 与 subject，禁止依赖标签文字推断分类。
+category/subject 允许组合：
+people→count；action→posture/activity；
+clothing→shoes/socks/top/outerwear/dress/pants/sportswear/swimwear/hat/accessories；
+closeup→part。
+label 是用于浏览的完整中文标签；type 是具体类型或地点，color 只能从黑、白、灰、红、橙、黄、绿、青、蓝、紫、粉、棕中选择一个单字，style 是款式或图案，不适用的属性写空字符串。例如：
+白色波点纱裙={{label:"白色波点纱裙",category:"clothing",subject:"dress",type:"纱裙",color:"白",style:"波点"}}
+红色手绳={{label:"红色手绳",category:"clothing",subject:"accessories",type:"手绳",color:"红",style:""}}
+勾脚={{label:"勾脚",category:"action",subject:"activity",type:"勾脚",color:"",style:""}}
+固定标准：人数的 label 和 type 必须使用阿拉伯数字“N人”，例如 1人、2人、3人，禁止“一人、一个人、两个人”；姿态统一使用坐姿、躺姿、站立、蹲姿、跪姿、俯卧、仰卧；走路统一为行走、舞蹈统一为跳舞、体操统一为做操。特写只允许脸部、头部、眼部、鼻部、嘴部、嘴唇、舌部、牙齿、耳部、颈部、肩部、锁骨、胸部、腹部、肚脐、腰部、背部、手部、手掌、手指、手臂、肘部、手腕、臀部、腿部、大腿、膝部、小腿、脚踝、脚部、脚底、脚趾、全身，并输出“部位＋特写”；命中具体部位时禁止再输出范围更大的重复特写，图片只输出最主要的一个特写，视频最多输出两个不同特写。裤袜、连裤袜、紧身裤袜、丝袜及其他带“袜”的穿着必须使用 clothing→socks，禁止归入 pants；紧身裤仍使用 pants。圆点图案统一写波点，格子统一写格纹。
+颜色忽略深浅：米白、乳白、米色归白，银归灰，金归黄，褐色和卡其色归棕；“浅色、深色、亮色、暗色”没有明确色相时 color 留空。label 中可写“白色连裤袜”等完整名称，但 color 必须只写单字。标签优先覆盖鞋袜、全部可见衣物、明确特写、动作和人数。people 只允许人数，不生成“女子、女孩、男性”等人物类型；身体部位只有构成明显特写时才生成特写标签。颜色必须绑定具体对象，禁止单独输出颜色；无法确认的项目不生成标签，任何包含“无法判断”的内容只能写入 description。description 使用 40 到 120 个简体中文字符，只描述人物数量、动作、鞋袜、衣服和特写，不写背景及其他内容；视频标签以抽帧中清晰可见的内容为准。{focus_instruction}"""
     content = [{"type": "text", "text": prompt}] + [{"type": "image_url", "image_url": {"url": _data_url(image)}} for _, image in frames]
-    payload = {"model": DESCRIPTION_MODEL, "messages": [{"role": "user", "content": content}], "temperature": 0.1, "max_tokens": 360, "stream": False}
-    _check_analysis(epoch)
-    response = httpx.post("http://127.0.0.1:8091/v1/chat/completions", json=payload, timeout=600)
-    response.raise_for_status()
-    _check_analysis(epoch)
-    raw = response.json()["choices"][0]["message"]["content"]
-    description, candidates, required_tags = parse_model_analysis(raw, LABELS, require_categories=structured_focus)
+    payload = {
+        "model": DESCRIPTION_MODEL,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0.1,
+        "max_tokens": 768,
+        "stream": False,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "media_analysis", "strict": True, "schema": ANALYSIS_JSON_SCHEMA},
+        },
+    }
+    parsed = None
+    failed_attempts = []
+    for attempt in range(2):
+        _check_analysis(epoch)
+        if attempt:
+            payload["temperature"] = 0.0
+            payload["messages"][0]["content"][0]["text"] = _retry_analysis_prompt(prompt)
+        response = httpx.post("http://127.0.0.1:8091/v1/chat/completions", json=payload, timeout=600)
+        response.raise_for_status()
+        _check_analysis(epoch)
+        body = response.json()
+        choice = body["choices"][0]
+        raw = choice["message"]["content"]
+        try:
+            parsed = parse_structured_model_analysis(raw)
+            break
+        except (ValueError, json.JSONDecodeError) as exc:
+            diagnostic_output = raw[:2048] + ("…" if len(raw) > 2048 else "")
+            failed_attempts.append(
+                {
+                    "attempt": attempt + 1,
+                    "parseError": str(exc),
+                    "finishReason": choice.get("finish_reason", ""),
+                    "output": diagnostic_output,
+                }
+            )
+            LOGGER.warning(
+                "invalid model JSON attempt=%d finish_reason=%s response_length=%d error=%s response=%r",
+                attempt + 1,
+                choice.get("finish_reason", ""),
+                len(raw),
+                exc,
+                diagnostic_output,
+            )
+    if parsed is None:
+        raise ModelOutputInvalidError(failed_attempts)
+    description, candidates, required_tags, model_metadata = parsed
+    candidates, model_metadata = reconcile_closeups_from_description(description, candidates, model_metadata)
+    candidates, model_metadata = limit_closeup_candidates(candidates, model_metadata, media_type)
+    required_tags = set(candidates)
     description = "".join(description.splitlines()).strip()
     if len(description) < 40:
-        description = description.rstrip("。") + "，并记录画面中可见的人物穿着、姿态、场景与背景细节。"
-    candidates = augment_candidates_from_description(description, candidates, LABELS)
-    candidates, required_tags = reconcile_required_defaults(candidates, required_tags)
+        description = description.rstrip("。") + "，并记录画面中可见的人物数量、穿着、动作与特写细节。"
     if not candidates:
         return description[:120], []
     label_index = {label: index for index, label in enumerate(candidates)}
@@ -238,7 +335,7 @@ description 必须写清人数、全部可见衣物、鞋袜、特写部位、�
         max_tags=10,
         required_tags=required_tags,
     )
-    return description[:120], tags
+    return description[:120], attach_tag_hierarchy(tags, model_metadata)
 
 def _palette(frames):
     samples = []
@@ -321,6 +418,15 @@ def analyze(request: AnalyzeRequest):
         return {"description": description, "tags": tags, "palette": palette, "tagModel": TAG_MODEL, "tagModelVersion": TAG_MODEL_VERSION, "descriptionModel": DESCRIPTION_MODEL, "descriptionModelVersion": DESCRIPTION_MODEL_VERSION, "taxonomyVersion": TAXONOMY_VERSION, "sampledFrames": [{"ratio": ratio} for ratio, _ in frames]}
     except HTTPException:
         raise
+    except ModelOutputInvalidError as exc:
+        raise HTTPException(
+            500,
+            {
+                "code": "model_output_invalid",
+                "message": str(exc),
+                "attempts": exc.attempts,
+            },
+        ) from exc
     except Exception as exc:
         if PAUSED.is_set() or epoch != ANALYSIS_EPOCH:
             raise HTTPException(409, "AI analysis paused for media playback") from exc

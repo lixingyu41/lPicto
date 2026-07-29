@@ -1,13 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import Hls, { type Fragment } from 'hls.js';
-import { ChevronDown, Maximize2, Minimize2, Pause, Play, RotateCw, Settings, Trash2, Volume2, VolumeX } from 'lucide-react';
+import { ChevronDown, Database, Maximize2, Minimize2, Pause, Play, RotateCw, Settings, Trash2, Volume2, VolumeX } from 'lucide-react';
 import type { Asset, SubtitleInfo, VideoProxyHeartbeat, VideoProxyRuntime, VideoSegmentStatus } from '../types/api';
 import {
   api,
   assetPreviewUrl,
   assetSubtitleUrl,
   assetVideoHlsPlaylistUrl,
-  assetVideoHlsSegmentUrl,
   assetVideoUrl,
 } from '../api/client';
 import { formatDuration } from '../utils/format';
@@ -63,9 +62,11 @@ interface Props {
   subtitlesEnabled: boolean;
   deleting: boolean;
   layerMode: ViewerMediaLayerMode;
+  mediaDetailsOpen: boolean;
   preloadEnabled: boolean;
   onDanmakuPrefChange: (key: DanmakuPrefKey, value: number) => void;
   onDelete: () => void;
+  onDeleteRecord: () => void;
   onMediaError: (assetId: number, cacheKey: string, message: string) => void;
   onMediaReady: (assetId: number, cacheKey: string) => void;
   onPriorityPreloadComplete: (assetId: number, cacheKey: string) => void;
@@ -76,13 +77,13 @@ interface Props {
   onRotate: () => void;
   onSelectedSubtitleChange: (value: string) => void;
   onSubtitlesEnabledChange: (value: boolean) => void;
+  onToggleMediaDetails: () => void;
   onToggleFullscreen: () => void;
   onProxyRuntimeChange?: (runtime: VideoSegmentStatus | null) => void;
 }
 
 type DanmakuPrefKey = 'danmakuDensity' | 'danmakuFontScale' | 'danmakuOpacity' | 'danmakuSpeed';
 
-const autoplayDelayMs = 800;
 const proxyPollMs = 3000;
 const proxyKeepaliveMs = 15000;
 const hlsSegmentSeconds = 10;
@@ -124,9 +125,11 @@ export default function VideoViewer({
   subtitlesEnabled,
   deleting,
   layerMode,
+  mediaDetailsOpen,
   preloadEnabled,
   onDanmakuPrefChange,
   onDelete,
+  onDeleteRecord,
   onMediaError,
   onMediaReady,
   onPriorityPreloadComplete,
@@ -137,6 +140,7 @@ export default function VideoViewer({
   onRotate,
   onSelectedSubtitleChange,
   onSubtitlesEnabledChange,
+  onToggleMediaDetails,
   onToggleFullscreen,
   onProxyRuntimeChange,
 }: Props) {
@@ -158,6 +162,14 @@ export default function VideoViewer({
   const skipNextAudioPreferenceSave = useRef(false);
   const wantsPlaying = useRef(false);
   const resumeAttempts = useRef(0);
+  const directRecoveryAttempts = useRef(0);
+  const directRecoveryLastErrorAt = useRef(0);
+  const pendingDirectRecovery = useRef<{
+    assetId: number;
+    cacheKey: string;
+    resumeAt: number;
+    shouldResume: boolean;
+  } | null>(null);
   const currentTimeRef = useRef(0);
   const networkResourceBytes = useRef(new Map<string, number>());
   const networkIdleTimer = useRef<number | null>(null);
@@ -189,6 +201,7 @@ export default function VideoViewer({
   const [proxySessionId] = useState(() => createVideoProxySessionId());
   const [proxyStartTime, setProxyStartTime] = useState(0);
   const [proxyRuntime, setProxyRuntime] = useState<VideoSegmentStatus | null>(null);
+  const [directReloadNonce, setDirectReloadNonce] = useState(0);
   const [duration, setDuration] = useState(asset.duration ?? 0);
   const [currentTime, setCurrentTime] = useState(0);
   const [scrubTime, setScrubTime] = useState<number | null>(null);
@@ -212,20 +225,34 @@ export default function VideoViewer({
   const playbackAsset = liveAsset.id === asset.id && liveAsset.cacheKey === asset.cacheKey ? liveAsset : asset;
   const browserFirst = viewerPrefs.videoProcessingMode === 'browser';
   const usesProxy = !playbackAsset.browserPlayable && (!browserFirst || browserDirectFailed) && !proxyFailed;
-  const mediaLoadEnabled = layerMode === 'active' || (preloadEnabled && !usesProxy);
+  // Keep the real player attached for prepared neighbours as well.  A completed
+  // standalone fetch is not enough: hls.js would otherwise create a new media
+  // pipeline after navigation and request the first segment again.
+  const mediaLoadEnabled = layerMode === 'active' || preloadEnabled;
   const source = useMemo(() => {
     if (!mediaLoadEnabled) return '';
     if (usesProxy) {
       return assetVideoHlsPlaylistUrl(playbackAsset, { clientId: proxyClientId.current, sessionId: proxySessionId });
     }
-    return assetVideoUrl(playbackAsset);
-  }, [mediaLoadEnabled, playbackAsset, proxySessionId, usesProxy]);
+    const directSource = assetVideoUrl(playbackAsset);
+    if (directReloadNonce <= 0) return directSource;
+    const fragmentIndex = directSource.indexOf('#');
+    const requestSource = fragmentIndex >= 0 ? directSource.slice(0, fragmentIndex) : directSource;
+    const fragment = fragmentIndex >= 0 ? directSource.slice(fragmentIndex) : '';
+    return `${requestSource}&reload=${directReloadNonce}${fragment}`;
+  }, [directReloadNonce, mediaLoadEnabled, playbackAsset, proxySessionId, usesProxy]);
 
   const subtitleSource = subtitlesEnabled && selectedSubtitleId ? assetSubtitleUrl(asset, selectedSubtitleId) : '';
   const canPlay = !sourceFailed && Boolean(source);
   const posterSource = asset.thumbStatus === 'ready' ? assetPreviewUrl(asset) : '';
   const showPosterLayer = Boolean(posterSource) && (!canPlay || !firstFrameReady);
   const statusLabel = videoStatusLabel(playbackAsset, sourceFailed, proxyRuntime);
+  const directPrewarmStart = Math.floor(Math.max(0, currentTime) / 20) * 20;
+
+  useEffect(() => {
+    if (layerMode !== 'active' || usesProxy || !playbackAsset.browserPlayable) return;
+    void api.prewarmDirectVideo(playbackAsset.id, directPrewarmStart).catch(() => undefined);
+  }, [directPrewarmStart, layerMode, playbackAsset.browserPlayable, playbackAsset.id, source, usesProxy]);
   const displayedTime = scrubTime ?? currentTime;
   const selectedSubtitle = useMemo(
     () => subtitles.find((subtitle) => subtitle.id === selectedSubtitleId),
@@ -247,8 +274,8 @@ export default function VideoViewer({
     if (!usesProxy) onPriorityPreloadComplete(asset.id, asset.cacheKey);
   }
 
-  function updateDirectPreloadProgress(video: HTMLVideoElement) {
-    if (layerModeRef.current === 'active' || usesProxy || preloadSegmentReadyRef.current) return;
+  function updateBackgroundPreloadProgress(video: HTMLVideoElement) {
+    if (layerModeRef.current === 'active' || preloadSegmentReadyRef.current) return;
     const mediaDuration = video.duration || asset.duration || 0;
     const target = Math.min(10, mediaDuration > 0 ? mediaDuration : 10);
     let bufferedThrough = 0;
@@ -256,6 +283,7 @@ export default function VideoViewer({
       if (video.buffered.start(index) <= 0.25) bufferedThrough = Math.max(bufferedThrough, video.buffered.end(index));
     }
     if (bufferedThrough + 0.25 < target) {
+      if (usesProxy) return;
       const probeTime = Math.min(Math.max(0, target - 0.05), Math.max(0, bufferedThrough - 0.05));
       if (!video.seeking && probeTime > 0 && Math.abs(video.currentTime - probeTime) > 0.2) video.currentTime = probeTime;
       return;
@@ -328,6 +356,16 @@ export default function VideoViewer({
     setSettingsOpen(false);
     setPlaybackOptionsOpen(false);
     setDanmakuOptionsOpen(false);
+  };
+
+  const toggleSettings = () => {
+    if (settingsOpen) {
+      closeSettings();
+      return;
+    }
+    setPlaybackOptionsOpen(false);
+    setDanmakuOptionsOpen(false);
+    setSettingsOpen(true);
   };
 
   const mediaStyle = useMemo(() => {
@@ -484,6 +522,35 @@ export default function VideoViewer({
     }
   }
 
+  function recoverDirectPlayback(video: HTMLVideoElement) {
+    if (usesProxy || layerModeRef.current !== 'active') return false;
+    const now = Date.now();
+    if (now-directRecoveryLastErrorAt.current > 30_000) directRecoveryAttempts.current = 0;
+    if (directRecoveryAttempts.current >= 2) return false;
+    directRecoveryAttempts.current += 1;
+    directRecoveryLastErrorAt.current = now;
+    pendingDirectRecovery.current = {
+      assetId: asset.id,
+      cacheKey: asset.cacheKey,
+      resumeAt: clampTime(video.currentTime || currentTimeRef.current, duration || asset.duration || 0),
+      shouldResume: wantsPlaying.current || !video.paused || hasPlaybackStarted,
+    };
+    setHlsPhase('direct');
+    setSourceFailed(false);
+    setBuffering(true);
+    setWaitingTrigger('network');
+    setPlayError('');
+    setDirectReloadNonce((current) => current + 1);
+    return true;
+  }
+
+  function resumeRecoveredDirectPlayback(video: HTMLVideoElement) {
+    const pending = pendingDirectRecovery.current;
+    if (!pending || pending.assetId !== asset.id || pending.cacheKey !== asset.cacheKey) return;
+    pendingDirectRecovery.current = null;
+    if (pending.shouldResume) void startPlayback(video);
+  }
+
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       if (layerMode !== 'active') return;
@@ -555,29 +622,6 @@ export default function VideoViewer({
   }, [currentTime]);
 
   useEffect(() => {
-    if (layerMode === 'active' || !preloadEnabled || !usesProxy || preloadSegmentReadyRef.current) return undefined;
-    const controller = new AbortController();
-    const segmentUrl = assetVideoHlsSegmentUrl(playbackAsset, 0, {
-      clientId: proxyClientId.current,
-      sessionId: proxySessionId,
-    });
-    void fetch(segmentUrl, { cache: 'default', signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        await response.arrayBuffer();
-        if (controller.signal.aborted) return;
-        preloadSegmentReadyRef.current = true;
-        setPreloadSegmentReady(true);
-        notifyPreparedMedia();
-      })
-      .catch((err: unknown) => {
-        if (controller.signal.aborted) return;
-        onMediaError(asset.id, asset.cacheKey, err instanceof Error ? `视频首个分片预加载失败：${err.message}` : '视频首个分片预加载失败');
-      });
-    return () => controller.abort();
-  }, [asset.cacheKey, asset.id, layerMode, onMediaError, playbackAsset, preloadEnabled, proxySessionId, usesProxy]);
-
-  useEffect(() => {
     const video = ref.current;
     if (!video || !source) return undefined;
     hlsRef.current?.destroy();
@@ -623,7 +667,7 @@ export default function VideoViewer({
       lowLatencyMode: false,
       maxBufferLength: hlsSegmentSeconds * hlsCriticalPreloadSegments,
       maxMaxBufferLength: hlsSegmentSeconds * hlsCriticalPreloadSegments,
-      startFragPrefetch: false,
+      startFragPrefetch: layerModeRef.current !== 'active',
     });
     hlsRef.current = hls;
     hls.on(Hls.Events.MEDIA_ATTACHED, () => {
@@ -650,6 +694,10 @@ export default function VideoViewer({
       recordNetworkProgress(data.frag.url, loaded, Math.max(stats.total, loaded), stats.loading.start, stats.loaded);
       stopFragmentNetworkProgress();
       void pollVideoSegmentStatus(asset.id, proxySessionId);
+    });
+    hls.on(Hls.Events.FRAG_BUFFERED, () => {
+      updateBufferedRange(video);
+      updateBackgroundPreloadProgress(video);
     });
     hls.on(Hls.Events.ERROR, (_event, data) => {
       if (!data.fatal) return;
@@ -703,6 +751,7 @@ export default function VideoViewer({
   const playbackDiagnosis = useMemo(
     () => diagnoseVideoPlayback({
       autoplayEnabled: viewerPrefs.videoAutoplay,
+      autoplayDelaySeconds: viewerPrefs.videoPlaybackDelaySeconds,
       autoplayPending,
       bufferedEnd,
       buffering,
@@ -726,7 +775,8 @@ export default function VideoViewer({
     [
       autoplayPending, bufferedEnd, buffering, canPlay, currentTime, ended, hasPlaybackStarted, hlsPhase,
       paused, playError, playRequested, proxyRuntime, proxyStreamEnabled, seeking, sourceFailed, usesProxy,
-      videoMetrics.networkState, videoMetrics.readyState, viewerPrefs.videoAutoplay, waitingTrigger,
+      videoMetrics.networkState, videoMetrics.readyState, viewerPrefs.videoAutoplay,
+      viewerPrefs.videoPlaybackDelaySeconds, waitingTrigger,
     ],
   );
 
@@ -793,9 +843,18 @@ export default function VideoViewer({
         void ref.current.play().catch(() => undefined);
       }
       autoplayTimer.current = null;
-    }, autoplayDelayMs);
+    }, viewerPrefs.videoPlaybackDelaySeconds * 1000);
     return clearAutoplayTimer;
-  }, [asset.id, canPlay, layerMode, playbackRate, source, viewerPrefs.playbackMode, viewerPrefs.videoAutoplay]);
+  }, [
+    asset.id,
+    canPlay,
+    layerMode,
+    playbackRate,
+    source,
+    viewerPrefs.playbackMode,
+    viewerPrefs.videoAutoplay,
+    viewerPrefs.videoPlaybackDelaySeconds,
+  ]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -864,9 +923,13 @@ export default function VideoViewer({
     setProxyStreamEnabled(false);
     setProxyStartTime(0);
     setProxyRuntime(null);
+    setDirectReloadNonce(0);
     proxyPlayPending.current = false;
     wantsPlaying.current = false;
     resumeAttempts.current = 0;
+    directRecoveryAttempts.current = 0;
+    directRecoveryLastErrorAt.current = 0;
+    pendingDirectRecovery.current = null;
     clearResumeTimer();
   }, [asset.id, viewerPrefs.videoProcessingMode]);
 
@@ -1070,14 +1133,14 @@ export default function VideoViewer({
             onClick={togglePlay}
             onDurationChange={(event) => {
               setDuration(event.currentTarget.duration || asset.duration || 0);
-              updateDirectPreloadProgress(event.currentTarget);
+              updateBackgroundPreloadProgress(event.currentTarget);
             }}
             onLoadedData={(event) => {
               setFirstFrameReady(true);
               if (layerModeRef.current === 'active') notifyPreparedMedia();
-              else updateDirectPreloadProgress(event.currentTarget);
+              else updateBackgroundPreloadProgress(event.currentTarget);
             }}
-            onError={() => {
+            onError={(event) => {
               if (!usesProxy && browserFirst && !playbackAsset.browserPlayable && !browserDirectFailed) {
                 setBrowserDirectFailed(true);
                 setHlsPhase('idle');
@@ -1086,6 +1149,7 @@ export default function VideoViewer({
                 setPlayError('');
                 return;
               }
+              if (recoverDirectPlayback(event.currentTarget)) return;
               setHlsPhase('error');
               setSourceFailed(true);
               setBuffering(false);
@@ -1099,9 +1163,14 @@ export default function VideoViewer({
               setDuration(event.currentTarget.duration || asset.duration || 0);
               setPaused(event.currentTarget.paused);
               event.currentTarget.playbackRate = playbackRate;
+              const pending = pendingDirectRecovery.current;
+              if (pending && pending.assetId === asset.id && pending.cacheKey === asset.cacheKey) {
+                const maxTime = Math.max(0, (event.currentTarget.duration || asset.duration || 0) - 0.05);
+                event.currentTarget.currentTime = Math.min(pending.resumeAt, maxTime);
+              }
               updateBufferedRange(event.currentTarget);
               updateVideoMetrics(event.currentTarget);
-              updateDirectPreloadProgress(event.currentTarget);
+              updateBackgroundPreloadProgress(event.currentTarget);
             }}
             onPause={(event) => {
               setPaused(true);
@@ -1126,7 +1195,7 @@ export default function VideoViewer({
             }}
             onProgress={(event) => {
               updateBufferedRange(event.currentTarget);
-              updateDirectPreloadProgress(event.currentTarget);
+              updateBackgroundPreloadProgress(event.currentTarget);
             }}
             onStalled={() => {
               setBuffering(true);
@@ -1140,15 +1209,17 @@ export default function VideoViewer({
               setBuffering(false);
               setWaitingTrigger('none');
               updateBufferedRange(event.currentTarget);
+              if (!event.currentTarget.seeking) resumeRecoveredDirectPlayback(event.currentTarget);
               if (layerModeRef.current === 'active') notifyMediaReady();
-              else updateDirectPreloadProgress(event.currentTarget);
+              else updateBackgroundPreloadProgress(event.currentTarget);
             }}
             onSeeked={(event) => {
               setBuffering(false);
               setSeeking(false);
               setWaitingTrigger('none');
               updateBufferedRange(event.currentTarget);
-              updateDirectPreloadProgress(event.currentTarget);
+              updateBackgroundPreloadProgress(event.currentTarget);
+              resumeRecoveredDirectPlayback(event.currentTarget);
             }}
             onSeeking={() => {
               setSeeking(true);
@@ -1306,14 +1377,11 @@ export default function VideoViewer({
               aria-label="视频设置"
               aria-expanded={settingsOpen}
               aria-haspopup="dialog"
-              onClick={() => {
-                if (settingsOpen) {
-                  closeSettings();
-                } else {
-                  setPlaybackOptionsOpen(false);
-                  setDanmakuOptionsOpen(false);
-                  setSettingsOpen(true);
-                }
+              onPointerDown={(event) => {
+                if (event.button === 0) toggleSettings();
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') toggleSettings();
               }}
             >
               <Settings size={18} />
@@ -1428,6 +1496,18 @@ export default function VideoViewer({
                   <span>视频旋转</span>
                   <span><output>{asset.rotation || 0}°</output><RotateCw size={16} /></span>
                 </button>
+                <label className="video-settings-row video-settings-toggle-row">
+                  <span>媒体详情</span>
+                  <span className="video-settings-switch">
+                    <input
+                      aria-label="媒体详情"
+                      type="checkbox"
+                      checked={mediaDetailsOpen}
+                      onChange={onToggleMediaDetails}
+                    />
+                    <span aria-hidden="true" />
+                  </span>
+                </label>
                 <button
                   className="video-settings-action danger"
                   type="button"
@@ -1439,6 +1519,18 @@ export default function VideoViewer({
                 >
                   <span>删除媒体</span>
                   <Trash2 size={16} />
+                </button>
+                <button
+                  className="video-settings-action danger"
+                  type="button"
+                  disabled={deleting}
+                  onClick={() => {
+                    closeSettings();
+                    onDeleteRecord();
+                  }}
+                >
+                  <span>删除记录</span>
+                  <Database size={16} />
                 </button>
               </div>
             )}
@@ -1549,6 +1641,7 @@ function videoMetricsEqual(
 
 interface PlaybackDiagnosisInput {
   autoplayEnabled: boolean;
+  autoplayDelaySeconds: number;
   autoplayPending: boolean;
   bufferedEnd: number;
   buffering: boolean;
@@ -1615,7 +1708,11 @@ function diagnoseVideoPlayback(input: PlaybackDiagnosisInput): { detail: string 
   }
   if (!input.hasPlaybackStarted) {
     if (input.autoplayPending) {
-      return { label: '等待播放', reason: '等待自动播放计时', detail: `自动播放将在 ${autoplayDelayMs} 毫秒延迟后尝试` };
+      return {
+        label: '等待播放',
+        reason: '等待自动播放计时',
+        detail: `自动播放将在 ${input.autoplayDelaySeconds.toFixed(1)} 秒延迟后尝试`,
+      };
     }
     if (!input.playRequested) {
       return {

@@ -24,6 +24,10 @@ func (s *Server) updateVideoProxySettings(w http.ResponseWriter, r *http.Request
 		TTLSeconds: int64(config.NormalizeVideoProxyCacheTTL(time.Duration(payload.CacheTTLSeconds) * time.Second).Seconds()),
 		MaxBytes:   config.NormalizeVideoProxyCacheMaxBytes(payload.MaxCacheBytes),
 	}
+	const unifiedVideoSoftLimit int64 = 12 << 30
+	if normalized.MaxBytes <= 0 || normalized.MaxBytes > unifiedVideoSoftLimit {
+		normalized.MaxBytes = unifiedVideoSoftLimit
+	}
 	if err := s.db.SetVideoProxyCacheSettings(r.Context(), normalized); err != nil {
 		writeError(w, http.StatusInternalServerError, "video_proxy_settings_failed", "保存转码缓存设置失败")
 		return

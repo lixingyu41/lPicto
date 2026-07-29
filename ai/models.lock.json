@@ -1,8 +1,8 @@
 {
   "version": 1,
   "files": [
-    {"path":"Qwen3VL-2B-Instruct-Q4_K_M.gguf","size":1107409952,"sha256":"089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae","url":"https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/52d6c8ffea26cc873ac5ad116f8631268d7eb503/Qwen3VL-2B-Instruct-Q4_K_M.gguf"},
-    {"path":"mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf","size":445053216,"sha256":"f9a68fabba69c3b81e153367b2c7521030b0fa8bb0de400c9599c8e6725f9c82","url":"https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/52d6c8ffea26cc873ac5ad116f8631268d7eb503/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf"},
+    {"path":"Qwen3VL-8B-Instruct-Q4_K_M.gguf","size":5027784800,"sha256":"67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2","url":"https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/Qwen3VL-8B-Instruct-Q4_K_M.gguf"},
+    {"path":"mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf","size":752289728,"sha256":"c6ba85508d82f42590e6eb77d5340369ab6fecf107a7561d809523d8aa5f3bfd","url":"https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf"},
     {"path":"chinese-clip/onnx/model.onnx","size":753665706,"sha256":"d4e282affd5f09e196856cc63fbd0e77c576f598fdf6f6bb78ee61f1ef7cd770","url":"https://huggingface.co/Xenova/chinese-clip-vit-base-patch16/resolve/f26904860903e70e050b8f48255e5f48401816e9/onnx/model.onnx"}
   ]
 }

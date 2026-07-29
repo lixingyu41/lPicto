@@ -320,7 +320,7 @@ func (s Store) CacheFilePath(kind, cacheKey, ext string) (string, error) {
 		return "", errors.New("empty cache extension")
 	}
 	switch kind {
-	case "thumbs", "previews", "video-posters", "video-proxies":
+	case "thumbs", "previews", "video-posters", "video-proxies", "originals", "video-chunks", "ai-staging":
 	default:
 		return "", errors.New("invalid cache kind")
 	}
@@ -354,6 +354,38 @@ func (s Store) RemoveCache(cacheKey string) error {
 		shardDir := filepath.Dir(s.cacheFilePath(variant.kind, cacheKey, variant.ext))
 		_ = os.Remove(shardDir)
 	}
+	for _, kind := range []string{"originals", "video-chunks", "ai-staging"} {
+		if err := s.removeCachePrefixAnyExt(kind, cacheKey); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (s Store) removeCachePrefixAnyExt(kind, cacheKey string) error {
+	shard := cacheKey
+	if len(shard) > 2 {
+		shard = shard[:2]
+	}
+	shardDir := filepath.Join(s.CacheRoot, kind, shard)
+	entries, err := os.ReadDir(shardDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), cacheKey) {
+			continue
+		}
+		target := filepath.Join(shardDir, entry.Name())
+		if err := os.RemoveAll(target); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	_ = os.Remove(shardDir)
 	return firstErr
 }
 
@@ -362,7 +394,7 @@ func (s Store) RemoveCacheVariant(cacheKey string, kind string, ext string) erro
 		return errors.New("invalid cache key")
 	}
 	switch kind {
-	case "thumbs", "previews", "video-posters", "video-proxies":
+	case "thumbs", "previews", "video-posters", "video-proxies", "originals", "video-chunks", "ai-staging":
 	default:
 		return errors.New("invalid cache kind")
 	}
@@ -381,7 +413,7 @@ func (s Store) RemoveCachePrefix(cacheKeyPrefix string, kind string, ext string)
 		return errors.New("invalid cache key prefix")
 	}
 	switch kind {
-	case "thumbs", "previews", "video-posters", "video-proxies":
+	case "thumbs", "previews", "video-posters", "video-proxies", "originals", "video-chunks", "ai-staging":
 	default:
 		return errors.New("invalid cache kind")
 	}

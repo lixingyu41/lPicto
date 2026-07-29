@@ -1,38 +1,39 @@
-import { ArrowDown, ArrowDownAZ, ArrowUp, ArrowUpAZ, CalendarClock, CaseSensitive, Clock3, HardDrive, type LucideIcon } from 'lucide-react';
+import {
+  Activity,
+  ArrowDown,
+  ArrowDownAZ,
+  ArrowUp,
+  ArrowUpAZ,
+  CalendarDays,
+  Database,
+  FileClock,
+  FileText,
+  FolderInput,
+  Gauge,
+  ScanLine,
+  Star,
+  Timer,
+  type LucideIcon,
+} from 'lucide-react';
 import type { SortField, SortKey } from '../types/api';
 import { CompactSidebarMenu } from './CompactSidebarMenu';
 
 export type SortDirection = 'asc' | 'desc';
 
-const sortFields: Array<{ value: SortField; label: string }> = [
-  { value: 'timeline', label: '时间' },
-  { value: 'imported', label: '导入时间' },
-  { value: 'modified', label: '修改时间' },
-  { value: 'size', label: '大小' },
-  { value: 'filename', label: '文件名' },
-  { value: 'path', label: '路径' },
-  { value: 'media_type', label: '媒体类型' },
-  { value: 'resolution', label: '分辨率' },
-  { value: 'duration', label: '时长' },
-  { value: 'rating', label: '评分' },
-  { value: 'container', label: '容器' },
-  { value: 'video_codec', label: '视频编码' },
-  { value: 'audio_codec', label: '音频编码' },
-  { value: 'fps', label: '帧率' },
-  { value: 'bitrate', label: '码率' },
-  { value: 'subtitle', label: '字幕' },
-  { value: 'danmaku', label: '弹幕' },
-  { value: 'ai_description', label: 'AI 描述' },
-  { value: 'ai_tag', label: 'AI 标签' },
+const sortFields: Array<{ value: SortField; label: string; icon: LucideIcon }> = [
+  { value: 'timeline', label: '时间', icon: CalendarDays },
+  { value: 'imported', label: '导入时间', icon: FolderInput },
+  { value: 'modified', label: '修改时间', icon: FileClock },
+  { value: 'size', label: '大小', icon: Database },
+  { value: 'filename', label: '文件名', icon: FileText },
+  { value: 'resolution', label: '分辨率', icon: ScanLine },
+  { value: 'duration', label: '时长', icon: Timer },
+  { value: 'rating', label: '评分', icon: Star },
+  { value: 'fps', label: '帧率', icon: Gauge },
+  { value: 'bitrate', label: '码率', icon: Activity },
 ];
 
-const compactSortFields: Array<{ value: SortField; label: string; icon: LucideIcon }> = sortFields.map((field) => ({
-  ...field,
-  icon: field.value === 'timeline' ? Clock3
-    : field.value === 'imported' || field.value === 'modified' ? CalendarClock
-      : field.value === 'size' || field.value === 'bitrate' ? HardDrive
-        : CaseSensitive,
-}));
+const compactSortFields = sortFields;
 const sortFieldValues = new Set(sortFields.map((field) => field.value));
 
 export default function SortControls({ sort, onChange }: { sort: SortKey; onChange: (sort: SortKey) => void }) {

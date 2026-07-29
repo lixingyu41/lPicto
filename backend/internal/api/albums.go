@@ -213,7 +213,7 @@ func (s *Server) albumAssets(w http.ResponseWriter, r *http.Request) {
 	opts := db.AssetListOptions{
 		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-		Orientation: searchOrientation(r), CombinedTags: combinedTagsQuery(r),
+		Orientation: searchOrientation(r), CombinedTags: combinedTagsQuery(r), TagNodes: tagNodesQuery(r),
 	}
 	assets, err := s.db.ListAlbumAssets(r.Context(), id, opts)
 	s.recordFilterTiming(w, r, started)
@@ -245,15 +245,15 @@ func (s *Server) albumAnchors(w http.ResponseWriter, r *http.Request) {
 		typeFilter = ""
 	}
 	anchorResult, err := s.db.AlbumAnchors(r.Context(), id, db.AssetListOptions{
-		PageSize:    pageSize,
-		Type:        typeFilter,
-		Sort:        safeSort(r.URL.Query().Get("sort")),
-		Group:       safeGroup(r.URL.Query().Get("group")),
-		Query:       strings.TrimSpace(r.URL.Query().Get("q")),
-		VisibleOnly: visibleOnly(r),
-		Rating:      ratingQueryPtr(r, "rating"),
-		Orientation: searchOrientation(r),
-		CombinedTags: combinedTagsQuery(r),
+		PageSize:     pageSize,
+		Type:         typeFilter,
+		Sort:         safeSort(r.URL.Query().Get("sort")),
+		Group:        safeGroup(r.URL.Query().Get("group")),
+		Query:        strings.TrimSpace(r.URL.Query().Get("q")),
+		VisibleOnly:  visibleOnly(r),
+		Rating:       ratingQueryPtr(r, "rating"),
+		Orientation:  searchOrientation(r),
+		CombinedTags: combinedTagsQuery(r), TagNodes: tagNodesQuery(r),
 	})
 	s.recordFilterTiming(w, r, started)
 	if errors.Is(err, sql.ErrNoRows) {

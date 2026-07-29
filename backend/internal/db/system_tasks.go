@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"strings"
 
 	"lpicto/backend/internal/util"
 )
@@ -31,6 +32,41 @@ type TaskFailure struct {
 	AssetID int64
 	RelPath string
 	Reason  string
+}
+
+func (d *DB) MediaJobAverageSecondsPerItem(ctx context.Context, jobTypes []string) (map[string]float64, error) {
+	result := make(map[string]float64, len(jobTypes))
+	if len(jobTypes) == 0 {
+		return result, nil
+	}
+	placeholders := make([]string, len(jobTypes))
+	args := make([]any, len(jobTypes))
+	for index, jobType := range jobTypes {
+		placeholders[index] = "?"
+		args[index] = jobType
+	}
+	rows, err := d.conn.QueryContext(ctx, `
+SELECT mj.job_type,
+  AVG(GREATEST(EXTRACT(EPOCH FROM (COALESCE(mj.finished_at,now())-mj.started_at)),0))
+FROM media_job mj
+JOIN media_asset ma ON ma.id=mj.asset_id AND ma.deleted_at IS NULL
+WHERE mj.job_type IN (`+strings.Join(placeholders, ",")+`)
+  AND mj.started_at IS NOT NULL
+  AND (mj.finished_at IS NOT NULL OR mj.status='processing')
+GROUP BY mj.job_type`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var jobType string
+		var average float64
+		if err := rows.Scan(&jobType, &average); err != nil {
+			return nil, err
+		}
+		result[jobType] = average
+	}
+	return result, rows.Err()
 }
 
 func (d *DB) BeginSystemTask(ctx context.Context, taskKey string) error {

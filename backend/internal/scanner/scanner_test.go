@@ -17,6 +17,26 @@ import (
 	"lpicto/backend/internal/storage"
 )
 
+func TestSourceFileExistsOnlyChecksPathPresence(t *testing.T) {
+	root := t.TempDir()
+	filePath := filepath.Join(root, "media.mp4")
+	if err := os.WriteFile(filePath, []byte("not valid media"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exists, err := sourceFileExists(filePath)
+	if err != nil || !exists {
+		t.Fatalf("plain file exists = %v, err = %v", exists, err)
+	}
+	exists, err = sourceFileExists(filepath.Join(root, "missing.mp4"))
+	if err != nil || exists {
+		t.Fatalf("missing file exists = %v, err = %v", exists, err)
+	}
+	exists, err = sourceFileExists(root)
+	if err != nil || exists {
+		t.Fatalf("directory exists as media = %v, err = %v", exists, err)
+	}
+}
+
 func TestLibraryScansDoNotDeleteOtherRoots(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

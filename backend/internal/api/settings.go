@@ -137,6 +137,17 @@ func (s *Server) refreshCacheStats() {
 		s.logger.Warn("database size refresh failed", "error", err)
 	}
 	stats := computeCacheStatsWithDatabase(s.store.CacheRoot, databaseBytes)
+	usage := s.cachePolicy.Usage()
+	stats.MaxBytes = s.cachePolicy.MaxBytes()
+	stats.MinFreeBytes = s.cachePolicy.MinFreeBytes()
+	stats.FreeBytes = usage.FreeBytes
+	stats.ByKind = usage.ByKind
+	for kind, size := range usage.ByKind {
+		switch kind {
+		case "ai-staging", "video-chunks", "video-proxies", "originals", "previews":
+			stats.ReclaimableBytes += size
+		}
+	}
 	stats.UpdatedAt = time.Now().Unix()
 	s.cacheMu.Lock()
 	s.cacheStats = stats
@@ -369,6 +380,9 @@ func (s *Server) removeDeletedAssetCaches(items []db.DeletedAsset) {
 		seen[item.CacheKey] = struct{}{}
 		if err := s.removeVideoSegmentCaches(item.CacheKey); err != nil {
 			s.logger.Warn("remove video segment cache after asset deletion failed", "relPath", item.RelPath, "cacheKey", item.CacheKey, "error", err)
+		}
+		if err := s.store.RemoveCachePrefix(item.CacheKey, "video-proxies", "mp4"); err != nil {
+			s.logger.Warn("remove video proxy cache prefix after asset deletion failed", "relPath", item.RelPath, "cacheKey", item.CacheKey, "error", err)
 		}
 		if err := s.store.RemoveCache(item.CacheKey); err != nil {
 			s.logger.Warn("remove cache after asset deletion failed", "relPath", item.RelPath, "cacheKey", item.CacheKey, "error", err)

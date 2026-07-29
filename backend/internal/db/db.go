@@ -71,6 +71,12 @@ func Open(ctx context.Context, databaseURL string, migrationsDir string) (*DB, e
 		_ = raw.Close()
 		return nil, err
 	}
+	if _, err := database.Conn().ExecContext(ctx, `
+UPDATE source_io_batch SET state='interrupted',finished_at=now(),
+error_message=COALESCE(error_message,'服务重启，读取窗口已关闭') WHERE state='running'`); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
 	return database, nil
 }
 

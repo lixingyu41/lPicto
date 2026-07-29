@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { ChevronDown, ChevronRight, Trash2 } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, Plus, Search, Trash2 } from 'lucide-react';
 import { api } from '../api/client';
 import AssetGrid from '../components/AssetGrid';
 import { CompactAssetGroupingControls, normalizeAssetGroupModeForSort } from '../components/AssetGroupingControls';
 import AssetInfoPanel from '../components/AssetInfoPanel';
 import EmptyState from '../components/EmptyState';
+import HierarchicalTagPicker from '../components/HierarchicalTagPicker';
 import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
 import { SidebarFilterIconRow, SidebarMediaTypeList, SidebarOrientationFilter, SidebarRatingFilter } from '../components/SidebarControls';
@@ -66,9 +67,10 @@ export default function CollectionsPage() {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [collectionsError, setCollectionsError] = useState<string | null>(null);
 	const [aiTags, setAITags] = useState<AITagSummary[]>([]);
-	const [aiTagQuery, setAITagQuery] = useState('');
 	const [aiTagCardCollapsed, setAITagCardCollapsed] = useState(false);
+  const [aiTagSearchOpen, setAITagSearchOpen] = useState(false);
   const [systemCollectionsCollapsed, setSystemCollectionsCollapsed] = useState(false);
+  const [smartCollectionsCollapsed, setSmartCollectionsCollapsed] = useState(false);
   const [selectedCollectionId, setSelectedCollectionId] = useState(initialStateRef.current.selectedCollectionId);
   const [selectedTags, setSelectedTags] = useState(initialStateRef.current.selectedTags);
   const previousCollectionIdRef = useRef(initialStateRef.current.selectedCollectionId === 'tags' ? 'unclassified' : initialStateRef.current.selectedCollectionId);
@@ -83,7 +85,9 @@ export default function CollectionsPage() {
   const [refreshRevision, setRefreshRevision] = useState(0);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const [newCollectionName, setNewCollectionName] = useState('');
+  const [newCollectionOpen, setNewCollectionOpen] = useState(false);
   const [creatingCollection, setCreatingCollection] = useState(false);
+  const newCollectionInputRef = useRef<HTMLInputElement | null>(null);
   const sidebarState = useSidebarReturnState();
   const serverGroup = serverGroupForMode(groupMode);
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
@@ -118,16 +122,16 @@ export default function CollectionsPage() {
 
 	useEffect(() => {
 		let live = true;
-		const timer = window.setTimeout(() => void api.aiTags(aiTagQuery).then((result) => { if (live) setAITags(result.items ?? []); }).catch(() => { if (live) setAITags([]); }), 150);
+		const timer = window.setTimeout(() => void api.aiTags().then((result) => { if (live) setAITags(result.items ?? []); }).catch(() => { if (live) setAITags([]); }), 150);
 		return () => { live = false; window.clearTimeout(timer); };
-	}, [aiTagQuery, refreshRevision]);
+	}, [refreshRevision]);
 
   const loadAssets = useCallback(
     (page: number) => {
       if (!selectedCollectionId) {
         return Promise.resolve({ items: [], page, pageSize, hasMore: false });
       }
-      return api.collectionAssets(selectedCollectionId, page, pageSize, sort, query, serverGroup, rating, orientation, type, selectedTags);
+      return api.collectionAssets(selectedCollectionId, page, pageSize, sort, query, serverGroup, rating, orientation, type, [], selectedTags);
     },
     [orientation, query, rating, selectedCollectionId, selectedTags, serverGroup, sort, type],
   );
@@ -219,7 +223,7 @@ export default function CollectionsPage() {
         return;
       }
       try {
-        const result = await api.collectionAnchors(selectedCollectionId, pageSize, sort, query, serverGroup, rating, orientation, type, selectedTags);
+        const result = await api.collectionAnchors(selectedCollectionId, pageSize, sort, query, serverGroup, rating, orientation, type, [], selectedTags);
         if (!live) return;
         setAnchors(result.items);
         setTotalCount(result.total);
@@ -280,7 +284,7 @@ export default function CollectionsPage() {
       group: serverGroup,
       orientation,
       combinedQuery: query.trim() || undefined,
-      combinedTags: selectedTags.length > 0 ? JSON.stringify(selectedTags) : undefined,
+      tagNodes: selectedTags.length > 0 ? JSON.stringify(selectedTags) : undefined,
       rating,
       sort,
       type,
@@ -292,12 +296,17 @@ export default function CollectionsPage() {
       setCollections((current) => [...current.filter((item) => item.id !== created.id), created]);
       setSelectedCollectionId(created.id);
       setNewCollectionName('');
+      setNewCollectionOpen(false);
     } catch (err) {
       setCollectionsError(err instanceof Error ? err.message : '创建智能集合失败');
     } finally {
       setCreatingCollection(false);
     }
   }, [creatingCollection, newCollectionName, orientation, query, rating, selectedTags, serverGroup, sort, type]);
+
+  useEffect(() => {
+    if (newCollectionOpen) newCollectionInputRef.current?.focus();
+  }, [newCollectionOpen]);
 
   const selectCollection = useCallback((id: string) => {
     if (id !== 'tags') {
@@ -306,17 +315,6 @@ export default function CollectionsPage() {
     }
     setSelectedCollectionId(id);
   }, []);
-
-  const toggleTag = useCallback((tag: string) => {
-    const next = selectedTags.includes(tag) ? selectedTags.filter((item) => item !== tag) : [...selectedTags, tag];
-    if (next.length > 0) {
-      if (selectedCollectionId !== 'tags') previousCollectionIdRef.current = selectedCollectionId;
-      setSelectedCollectionId('tags');
-    } else {
-      setSelectedCollectionId(previousCollectionIdRef.current);
-    }
-    setSelectedTags(next);
-  }, [selectedCollectionId, selectedTags]);
 
   const deleteManualTag = useCallback(async (item: AITagSummary) => {
     if (!item.manualTagId || !window.confirm(`删除标签“${item.tag}”？媒体上的这个手工标签也会被移除。`)) return;
@@ -361,66 +359,116 @@ export default function CollectionsPage() {
         onToggle={() => setSystemCollectionsCollapsed((collapsed) => !collapsed)}
         onSelect={selectCollection}
       />
-	  <section className="sidebar-filter-card sidebar-ai-tag-card" aria-labelledby="collections-tags-title">
-		<button
-		  aria-expanded={!aiTagCardCollapsed}
-		  className="sidebar-filter-card-toggle"
-		  type="button"
-		  onClick={() => setAITagCardCollapsed((collapsed) => !collapsed)}
-		>
-		  {aiTagCardCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
-		  <span className="sidebar-control-title" id="collections-tags-title">标签</span>
-		</button>
-		{!aiTagCardCollapsed && (
-		  <>
-			<input value={aiTagQuery} onChange={(event) => setAITagQuery(event.target.value)} placeholder="搜索标签" />
-			<div className="sidebar-tag-cloud">
-			  {aiTags.map((item) => {
-				const selected = selectedTags.includes(item.tag);
-				const className = ['sidebar-tag-chip', item.aiCount > 0 ? 'ai-source' : '', selected ? 'active' : ''].filter(Boolean).join(' ');
-				const title = item.aiCount > 0 ? (item.manualAdded ? `AI 标签；手动添加：${item.tag}` : `AI 标签：${item.tag}`) : `手动添加：${item.tag}`;
-				return (
-				  <div className={className} key={item.tag} title={title}>
-					<button aria-pressed={selected} className="sidebar-tag-select" type="button" onClick={() => toggleTag(item.tag)}>
-					  <span>{item.tag}</span><small>{item.count}</small>
-					</button>
-					{item.manualTagId && <button aria-label={`删除标签 ${item.tag}`} className="sidebar-tag-delete" title={`删除标签 ${item.tag}`} type="button" onClick={() => void deleteManualTag(item)}><Trash2 size={12} /></button>}
-				  </div>
-				);
-			  })}
-			</div>
-		  </>
-		)}
-	  </section>
-      <CollectionSidebarGroup
-        collections={smartCollections}
-        emptyLabel="暂无智能集合"
-        label="智能集合"
-        selectedId={selectedCollectionId}
-        onSelect={selectCollection}
-      />
-      <label className="sidebar-field">
-        <span>新建智能集合</span>
-        <input value={newCollectionName} onChange={(event) => setNewCollectionName(event.target.value)} placeholder="名称" />
-      </label>
-      {newCollectionName.trim() && (
-        <button className="sidebar-command" disabled={creatingCollection} type="button" onClick={() => void createSmartCollection()}>
-          <span>{creatingCollection ? '创建中' : '保存当前规则'}</span>
-        </button>
-      )}
+      <section className="sidebar-collection-section" aria-labelledby="smart-collections-title">
+        <div className="sidebar-section-title-row">
+          <button
+            aria-expanded={!smartCollectionsCollapsed}
+            className="sidebar-section-title-toggle"
+            type="button"
+            onClick={() => setSmartCollectionsCollapsed((collapsed) => !collapsed)}
+          >
+            {smartCollectionsCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+            <span className="sidebar-control-title" id="smart-collections-title">智能集合</span>
+          </button>
+          <button
+            aria-expanded={newCollectionOpen}
+            className={newCollectionOpen ? 'sidebar-section-icon-button active' : 'sidebar-section-icon-button'}
+            type="button"
+            title={newCollectionOpen ? '取消新建智能集合' : '新建智能集合'}
+            onClick={() => {
+              setNewCollectionOpen((open) => !open);
+              if (smartCollectionsCollapsed) setSmartCollectionsCollapsed(false);
+              if (newCollectionOpen) setNewCollectionName('');
+            }}
+          >
+            <Plus size={15} />
+          </button>
+        </div>
+        {!smartCollectionsCollapsed && <CollectionSidebarRows collections={smartCollections} emptyLabel="暂无智能集合" onSelect={selectCollection} selectedId={selectedCollectionId} />}
+        {!smartCollectionsCollapsed && newCollectionOpen && (
+          <div className="sidebar-inline-create">
+            <input
+              ref={newCollectionInputRef}
+              value={newCollectionName}
+              placeholder="智能集合名称"
+              onChange={(event) => setNewCollectionName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void createSmartCollection();
+                if (event.key === 'Escape') {
+                  setNewCollectionName('');
+                  setNewCollectionOpen(false);
+                }
+              }}
+            />
+            <button
+              aria-label="保存智能集合"
+              disabled={!newCollectionName.trim() || creatingCollection}
+              type="button"
+              title="保存当前规则"
+              onClick={() => void createSmartCollection()}
+            >
+              <Check size={15} />
+            </button>
+          </div>
+        )}
+      </section>
+      <section className="sidebar-collection-section sidebar-ai-tag-card" aria-labelledby="collections-tags-title">
+        <div className="sidebar-section-title-row">
+          <button
+            aria-expanded={!aiTagCardCollapsed}
+            className="sidebar-section-title-toggle"
+            type="button"
+            onClick={() => setAITagCardCollapsed((collapsed) => !collapsed)}
+          >
+            {aiTagCardCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+            <span className="sidebar-control-title" id="collections-tags-title">标签</span>
+          </button>
+          <button
+            aria-expanded={aiTagSearchOpen}
+            className={aiTagSearchOpen ? 'sidebar-section-icon-button active' : 'sidebar-section-icon-button'}
+            type="button"
+            title={aiTagSearchOpen ? '关闭标签搜索' : '搜索标签'}
+            onClick={() => {
+              setAITagSearchOpen((open) => !open);
+              if (aiTagCardCollapsed) setAITagCardCollapsed(false);
+            }}
+          >
+            <Search size={14} />
+          </button>
+        </div>
+        {!aiTagCardCollapsed && (
+          <>
+            <HierarchicalTagPicker inline searchVisible={aiTagSearchOpen} selected={selectedTags} onChange={(nodes) => {
+              if (nodes.length > 0 && selectedCollectionId !== 'tags') previousCollectionIdRef.current = selectedCollectionId;
+              setSelectedCollectionId(nodes.length > 0 ? 'tags' : previousCollectionIdRef.current);
+              setSelectedTags(nodes);
+            }} />
+            {aiTags.some((item) => item.manualTagId) && (
+              <div className="sidebar-manual-tag-actions">
+                {aiTags.filter((item) => item.manualTagId).map((item) => (
+                  <button key={item.tag} type="button" title={`删除手工标签 ${item.tag}`} onClick={() => void deleteManualTag(item)}>
+                    <span>{item.tag}</span><Trash2 size={12} />
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </section>
       {collectionsError && <div className="error-line">{collectionsError}</div>}
     </div>,
     [
       collectionsError,
 		aiTags,
-		aiTagQuery,
 		aiTagCardCollapsed,
+      aiTagSearchOpen,
       deleteManualTag,
       createSmartCollection,
       creatingCollection,
       groupMode,
       handleSortChange,
       newCollectionName,
+      newCollectionOpen,
       orientation,
       query,
       rating,
@@ -428,11 +476,11 @@ export default function CollectionsPage() {
       selectedTags,
       selectCollection,
       smartCollections,
+      smartCollectionsCollapsed,
       sort,
       systemCollections,
       systemCollectionsCollapsed,
       type,
-      toggleTag,
     ],
   );
 
@@ -520,11 +568,13 @@ function CollectionSidebarGroup({
 }) {
   if (collapsible) {
     return (
-      <section className="sidebar-filter-card">
-        <button aria-expanded={!collapsed} className="sidebar-filter-card-toggle" type="button" onClick={onToggle}>
-          {collapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
-          <span className="sidebar-control-title">{label}</span>
-        </button>
+      <section className="sidebar-collection-section">
+        <div className="sidebar-section-title-row">
+          <button aria-expanded={!collapsed} className="sidebar-section-title-toggle" type="button" onClick={onToggle}>
+            {collapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+            <span className="sidebar-control-title">{label}</span>
+          </button>
+        </div>
         {!collapsed && <CollectionSidebarRows collections={collections} emptyLabel={emptyLabel} onSelect={onSelect} selectedId={selectedId} />}
       </section>
     );
@@ -583,7 +633,7 @@ function buildViewerUrl(
 ) {
   const params = new URLSearchParams({ collectionId, context: 'collection', sort });
 	if (query.trim()) params.set('combinedQuery', query.trim());
-	if (selectedTags.length > 0) params.set('combinedTags', JSON.stringify(selectedTags));
+	if (selectedTags.length > 0) params.set('tagNodes', JSON.stringify(selectedTags));
 	if (collectionId.startsWith('tag:')) params.set('combinedTag', collectionId.slice(4));
 	if (collectionId.startsWith('ai-tag:')) params.set('aiTag', collectionId.slice(7));
   if (group) params.set('group', group);
@@ -598,7 +648,7 @@ function isDynamicTagCollection(id: string) {
 }
 
 function dynamicTagCollection(id: string, selectedTags: string[]): Collection | null {
-  if (id === 'tags') return { id, name: selectedTags.length > 0 ? selectedTags.join('、') : '标签', kind: 'smart' };
+  if (id === 'tags') return { id, name: selectedTags.length > 0 ? `标签筛选（${selectedTags.length}）` : '标签', kind: 'smart' };
   if (id.startsWith('tag:')) return { id, name: id.slice(4), kind: 'smart' };
   if (id.startsWith('ai-tag:')) return { id, name: id.slice(7), kind: 'smart' };
   return null;
@@ -606,9 +656,9 @@ function dynamicTagCollection(id: string, selectedTags: string[]): Collection | 
 
 function normalizeTagSelection(state: CollectionsPageState, explicitTags?: string | null): CollectionsPageState {
   let selectedTags = explicitTags !== undefined ? parseSelectedTags(explicitTags) : parseSelectedTags(JSON.stringify(Array.isArray(state.selectedTags) ? state.selectedTags : []));
+  selectedTags = selectedTags.filter((tag) => tag.startsWith('ai:') || tag.startsWith('manual:'));
   let selectedCollectionId = state.selectedCollectionId;
-  if (selectedCollectionId.startsWith('tag:')) selectedTags = [selectedCollectionId.slice(4)];
-  if (selectedCollectionId.startsWith('ai-tag:')) selectedTags = [selectedCollectionId.slice(7)];
+  if (selectedCollectionId.startsWith('tag:')) selectedTags = [`manual:${selectedCollectionId.slice(4)}`];
   if (selectedTags.length > 0) selectedCollectionId = 'tags';
   if (selectedCollectionId === 'tags' && selectedTags.length === 0) selectedCollectionId = defaultCollectionsState.selectedCollectionId;
   return { ...state, selectedCollectionId, selectedTags };

@@ -89,7 +89,12 @@ func (s *Server) videoProxyCacheSettings(ctx context.Context) videoProxyCacheSet
 		}
 		return settings
 	}
-	return normalizeVideoProxyCacheSettings(dbSettings)
+	result := normalizeVideoProxyCacheSettings(dbSettings)
+	const unifiedVideoSoftLimit int64 = 12 << 30
+	if result.MaxBytes <= 0 || result.MaxBytes > unifiedVideoSoftLimit {
+		result.MaxBytes = unifiedVideoSoftLimit
+	}
+	return result
 }
 
 func videoProxyCacheSettingsFromConfig(cfg config.Config) videoProxyCacheSettings {

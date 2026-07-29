@@ -2,7 +2,6 @@ import {
   createContext,
   useCallback,
   useContext,
-  useEffect,
   useId,
   useRef,
   useState,
@@ -25,62 +24,40 @@ export interface CompactSidebarMenuOption {
 interface CompactSidebarMenuGroupValue {
   activeId: string | null;
   closeMenu: (restoreFocus?: boolean) => void;
-  openMenu: (id: string, trigger: HTMLButtonElement | null, persistent?: boolean) => void;
+  openMenu: (id: string, trigger: HTMLButtonElement | null) => void;
   panelHostRef: React.RefObject<HTMLDivElement>;
-  toggleMenu: (id: string, trigger: HTMLButtonElement | null, persistent?: boolean) => void;
+  toggleMenu: (id: string, trigger: HTMLButtonElement | null) => void;
 }
 
 const CompactSidebarMenuGroupContext = createContext<CompactSidebarMenuGroupValue | null>(null);
 
 export function CompactSidebarMenuGroup({ children }: { children: ReactNode }) {
-  const groupRef = useRef<HTMLDivElement>(null);
   const panelHostRef = useRef<HTMLDivElement>(null);
   const activeTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const persistentMenuRef = useRef(false);
   const [activeId, setActiveId] = useState<string | null>(null);
 
   const closeMenu = useCallback((restoreFocus = false) => {
-    if (persistentMenuRef.current) return;
     setActiveId(null);
     if (restoreFocus && activeTriggerRef.current) {
       window.requestAnimationFrame(() => activeTriggerRef.current?.focus());
     }
   }, []);
 
-  const openMenu = useCallback((id: string, trigger: HTMLButtonElement | null, persistent = false) => {
-    setActiveId((current) => {
-      if (current && current !== id && persistentMenuRef.current) return current;
-      activeTriggerRef.current = trigger;
-      persistentMenuRef.current = persistent;
-      return id;
-    });
+  const openMenu = useCallback((id: string, trigger: HTMLButtonElement | null) => {
+    activeTriggerRef.current = trigger;
+    setActiveId(id);
   }, []);
 
-  const toggleMenu = useCallback((id: string, trigger: HTMLButtonElement | null, persistent = false) => {
+  const toggleMenu = useCallback((id: string, trigger: HTMLButtonElement | null) => {
     setActiveId((current) => {
-      if (current === id) {
-        persistentMenuRef.current = false;
-        return null;
-      }
-      if (current && persistentMenuRef.current) return current;
       activeTriggerRef.current = trigger;
-      persistentMenuRef.current = persistent;
-      return id;
+      return current === id ? null : id;
     });
   }, []);
-
-  useEffect(() => {
-    if (!activeId) return undefined;
-    const closeFromOutside = (event: PointerEvent) => {
-      if (!groupRef.current?.contains(event.target as Node)) closeMenu();
-    };
-    document.addEventListener('pointerdown', closeFromOutside, true);
-    return () => document.removeEventListener('pointerdown', closeFromOutside, true);
-  }, [activeId, closeMenu]);
 
   return (
     <CompactSidebarMenuGroupContext.Provider value={{ activeId, closeMenu, openMenu, panelHostRef, toggleMenu }}>
-      <div className="sidebar-filter-icon-group" ref={groupRef}>
+      <div className="sidebar-filter-icon-group">
         {children}
         <div className="sidebar-compact-menu-panel-host" ref={panelHostRef} />
       </div>
@@ -92,14 +69,12 @@ export function CompactSidebarMenu({
   ariaLabel,
   footer,
   options,
-  persistent = false,
   title,
   trigger,
 }: {
   ariaLabel: string;
   footer?: ReactNode;
   options: CompactSidebarMenuOption[];
-  persistent?: boolean;
   title: string;
   trigger: ReactNode;
 }) {
@@ -118,19 +93,19 @@ export function CompactSidebarMenu({
   const handleTriggerKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
     if (event.key === 'Escape') {
       event.preventDefault();
-      if (!persistent) group?.closeMenu(true);
+      group?.closeMenu(true);
       return;
     }
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
     event.preventDefault();
-    group?.openMenu(menuId, triggerRef.current, persistent);
+    group?.openMenu(menuId, triggerRef.current);
     window.requestAnimationFrame(() => focusOption(event.key === 'ArrowDown' ? 0 : -1));
   };
 
   const handlePanelKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key === 'Escape') {
       event.preventDefault();
-      if (!persistent) group?.closeMenu(true);
+      group?.closeMenu(true);
       return;
     }
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
@@ -161,7 +136,7 @@ export function CompactSidebarMenu({
           type="button"
           onClick={() => {
             option.onSelect();
-            if (!persistent && option.closeOnSelect === true) group.closeMenu();
+            if (option.closeOnSelect === true) group.closeMenu();
           }}
         >
           {option.icon}
@@ -185,7 +160,7 @@ export function CompactSidebarMenu({
         ref={triggerRef}
         title={title}
         type="button"
-        onClick={() => group?.toggleMenu(menuId, triggerRef.current, persistent)}
+        onClick={() => group?.toggleMenu(menuId, triggerRef.current)}
         onKeyDown={handleTriggerKeyDown}
       >
         {trigger}

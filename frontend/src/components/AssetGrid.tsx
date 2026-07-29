@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Check, ListFilter, Play, Plus, Square, X } from 'lucide-react';
+import { Check, Play, Plus, Square, X } from 'lucide-react';
 import type { Asset, SortField, SortKey } from '../types/api';
 import { api, assetThumbUrl } from '../api/client';
 import { effectiveAspect, rotatedCoverStyle } from '../utils/rotation';
@@ -31,6 +31,7 @@ import {
   type MediaColumnId,
   type MediaViewPreferences,
 } from '../utils/mediaViewPrefs';
+import HierarchicalTagPicker from './HierarchicalTagPicker';
 
 interface Props {
   assets: Asset[];
@@ -158,6 +159,7 @@ export default function AssetGrid({
   autoSelectAssetIds,
 }: Props) {
   const parentRef = useRef<HTMLDivElement | null>(null);
+  const forwardPageSentinelRef = useRef<HTMLDivElement | null>(null);
   const assetsByID = useRef<Map<number, Asset>>(new Map());
   const pressState = useRef({
     active: false,
@@ -444,6 +446,27 @@ export default function AssetGrid({
   const totalHeight = virtualizer.getTotalSize();
 
   useEffect(() => {
+    const element = parentRef.current;
+    const sentinel = forwardPageSentinelRef.current;
+    if (!element || !sentinel || !hasMore) return undefined;
+    const lead = Math.max(1, Math.ceil(element.clientHeight * waterfallPrefetchScreens(scrollSample.current.velocity)));
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          requestWaterfallPages(element, scrollSample.current.velocity);
+        }
+      },
+      {
+        root: element,
+        rootMargin: `0px 0px ${lead}px 0px`,
+        threshold: 0,
+      },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMore, loading, totalHeight, viewport.height]);
+
+  useEffect(() => {
     if (!parentRef.current || !focusAssetId || appliedFocusAssetId.current === focusAssetId) return;
     const element = parentRef.current;
     const targetTop = scrollTopForAsset(element, gridRowsRef.current, focusAssetId);
@@ -596,6 +619,11 @@ export default function AssetGrid({
             </div>
           );
         })}
+        <div
+          aria-hidden="true"
+          ref={forwardPageSentinelRef}
+          style={{ bottom: 0, height: 1, left: 0, pointerEvents: 'none', position: 'absolute', width: 1 }}
+        />
       </div>
       {loading && <div className="grid-loading-dot" aria-label="加载中" />}
       </div>
@@ -684,6 +712,7 @@ export default function AssetGrid({
       case 'rotate': void batchRotate(); break;
       case 'hide': void batchHide(); break;
       case 'delete': void batchDelete(); break;
+      case 'delete-records': void batchDeleteRecords(); break;
     }
   }
 
@@ -826,6 +855,43 @@ export default function AssetGrid({
         await onBatchDeleteComplete?.();
       }
       setBatchMessage(err instanceof Error ? `删除中断：${err.message}` : '删除中断');
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  async function batchDeleteRecords() {
+    if (!window.confirm(`删除 ${selectedIds.length} 个媒体的全部数据库记录和缓存？源文件不会删除，重新扫描后可恢复。`)) return;
+    const ids = [...selectedIds];
+    const chunkSize = 100;
+    let processed = 0;
+    let deleted = 0;
+    setBatchBusy(true);
+    setBatchProgress({ current: 0, total: ids.length });
+    setBatchMessage(`删除记录中 0/${ids.length}`);
+    try {
+      for (let offset = 0; offset < ids.length; offset += chunkSize) {
+        const chunk = ids.slice(offset, offset + chunkSize);
+        const finalChunk = offset + chunkSize >= ids.length;
+        const result = await api.batchDeleteRecords(chunk, finalChunk);
+        const deletedIds = result.deletedAssetIds ?? result.updatedAssetIds ?? [];
+        deleted += deletedIds.length;
+        processed += chunk.length;
+        onBatchRemoveAssets?.(deletedIds);
+        setSelectedAssetIds((current) => {
+          const next = new Set(current);
+          deletedIds.forEach((id) => next.delete(id));
+          return next;
+        });
+        setBatchProgress({ current: processed, total: ids.length });
+        setBatchMessage(`删除记录中 ${processed}/${ids.length}`);
+      }
+      setSelectedAssetIds(new Set());
+      await onBatchDeleteComplete?.();
+      setBatchMessage(`已删除 ${deleted} 条记录`);
+    } catch (err) {
+      if (deleted > 0) await onBatchDeleteComplete?.();
+      setBatchMessage(err instanceof Error ? `删除记录中断：${err.message}` : '删除记录中断');
     } finally {
       setBatchBusy(false);
     }
@@ -1066,67 +1132,9 @@ function AssetListHeader({
         {active && <span aria-hidden="true">{direction === 'asc' ? '↑' : '↓'}</span>}
       </button>
       {column === 'aiTags' && onTagFilterChange && (
-        <AssetTagFilter selected={selectedTags} onChange={onTagFilterChange} />
+        <HierarchicalTagPicker compact selected={selectedTags} onChange={onTagFilterChange} />
       )}
       <span className="asset-list-resize" role="separator" aria-orientation="vertical" onPointerDown={beginResize} />
-    </div>
-  );
-}
-
-function AssetTagFilter({ selected, onChange }: { selected: string[]; onChange: (tags: string[]) => void }) {
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const [options, setOptions] = useState<import('../types/api').AITagSummary[]>([]);
-  const [draft, setDraft] = useState<string[]>(selected);
-
-  useEffect(() => {
-    if (!open) return;
-    setDraft(selected);
-    void api.aiTags().then((result) => setOptions(result.items ?? [])).catch(() => setOptions([]));
-    const close = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
-    };
-    document.addEventListener('pointerdown', close);
-    return () => document.removeEventListener('pointerdown', close);
-  }, [open, selected]);
-
-  const visible = options.filter((item) => item.tag.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
-  const toggle = (tag: string) => setDraft((current) => current.includes(tag) ? current.filter((item) => item !== tag) : [...current, tag]);
-  return (
-    <div className="asset-tag-filter" ref={rootRef}>
-      <button
-        aria-expanded={open}
-        className={selected.length > 0 ? 'asset-tag-filter-trigger active' : 'asset-tag-filter-trigger'}
-        type="button"
-        title={selected.length > 0 ? `已筛选 ${selected.length} 个标签` : '筛选标签'}
-        onClick={(event) => { event.stopPropagation(); setOpen((value) => !value); }}
-      >
-        <ListFilter size={13} />
-        {selected.length > 0 && <span>{selected.length}</span>}
-      </button>
-      {open && (
-        <div className="asset-tag-filter-menu" onClick={(event) => event.stopPropagation()}>
-          <input autoFocus value={query} placeholder="搜索标签" onChange={(event) => setQuery(event.target.value)} />
-          <div className="asset-tag-filter-options">
-            {visible.map((item) => {
-              const checked = draft.includes(item.tag);
-              return (
-                <button className={checked ? 'selected' : ''} key={item.tag} type="button" onClick={() => toggle(item.tag)}>
-                  <span className="asset-tag-filter-check">{checked && <Check size={11} />}</span>
-                  <span className="asset-tag-filter-name">{item.tag}</span>
-                  <small>{item.aiCount > 0 ? 'AI' : ''}{item.aiCount > 0 && item.manualAdded ? ' · ' : ''}{item.manualAdded ? '自标' : ''}</small>
-                </button>
-              );
-            })}
-            {visible.length === 0 && <span className="asset-tag-filter-empty">没有匹配标签</span>}
-          </div>
-          <div className="asset-tag-filter-actions">
-            <button type="button" onClick={() => setDraft([])}>清除</button>
-            <button className="primary" type="button" onClick={() => { onChange(draft); setOpen(false); }}>应用</button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -1239,16 +1247,31 @@ function AssetListTags({ asset }: { asset: Asset }) {
       setSaving(false);
     }
   };
+  const aiGroups = [...(asset.aiTags ?? []).reduce((groups, item) => {
+    const key = item.categoryLabel || '其他';
+    groups.set(key, [...(groups.get(key) ?? []), item]);
+    return groups;
+  }, new Map<string, NonNullable<Asset['aiTags']>>())];
 
   return (
     <div className="asset-list-tags" title={error || undefined} onClick={stop}>
-      <div className="asset-list-tag-group">
-        <span className="asset-list-tag-kind">AI</span>
-        {(asset.aiTags ?? []).map((item) => (
-          <span className="asset-list-tag ai" key={item.tag} title={`AI 匹配度 ${item.confidence.toFixed(3)}`}>{item.tag}</span>
-        ))}
-        {(asset.aiTags ?? []).length === 0 && <span className="asset-list-tag-empty">—</span>}
-      </div>
+      {aiGroups.map(([category, items]) => (
+        <div className="asset-list-tag-group hierarchical" key={category}>
+          <span className="asset-list-tag-kind">{category}</span>
+          <div className="asset-list-tag-children">
+            {items.map((item) => (
+              <span
+                className="asset-list-tag ai"
+                key={item.tag}
+                title={`${(item.facets ?? []).map((facet) => facet.labels.join(' / ')).join('\n')}\nAI 匹配度 ${item.confidence.toFixed(3)}`}
+              >
+                <small>{item.subjectLabel || category}</small><span>{item.tag}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      ))}
+      {aiGroups.length === 0 && <div className="asset-list-tag-group"><span className="asset-list-tag-kind">AI</span><span className="asset-list-tag-empty">—</span></div>}
       <div className="asset-list-tag-group">
         <span className="asset-list-tag-kind">自标</span>
         {manualTags.map((item) => (

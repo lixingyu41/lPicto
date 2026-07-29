@@ -25,15 +25,17 @@ type Processor struct {
 	Sources             *storage.SourceHealth
 	HealthWaitTimeout   time.Duration
 	HealthRetryInterval time.Duration
+	Stager              *Stager
 }
 
 type analyzeRequest struct {
-	AssetID   int64    `json:"assetId"`
-	RelPath   string   `json:"relPath"`
-	MediaType string   `json:"mediaType"`
-	CacheKey  string   `json:"cacheKey"`
-	Duration  *float64 `json:"duration,omitempty"`
-	Focus     string   `json:"focus,omitempty"`
+	AssetID    int64    `json:"assetId"`
+	RelPath    string   `json:"relPath"`
+	MediaType  string   `json:"mediaType"`
+	CacheKey   string   `json:"cacheKey"`
+	Duration   *float64 `json:"duration,omitempty"`
+	Focus      string   `json:"focus,omitempty"`
+	StagedPath string   `json:"stagedPath,omitempty"`
 }
 
 type analyzeResponse struct {
@@ -66,7 +68,7 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 		return err
 	}
 	if p.Sources != nil {
-		if available, _ := p.Sources.AvailableForRel(asset.RelPath); !available {
+		if available, _ := p.Sources.CachedAvailableForRel(asset.RelPath); !available {
 			if p.Logger != nil {
 				p.Logger.Info("skip AI analysis because storage is unavailable", "assetID", asset.ID, "relPath", asset.RelPath)
 			}
@@ -100,7 +102,21 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 	if err != nil {
 		return p.fail(ctx, asset.ID, asset.CacheKey, err, true)
 	}
-	payload, _ := json.Marshal(analyzeRequest{AssetID: asset.ID, RelPath: asset.RelPath, MediaType: asset.MediaType, CacheKey: asset.CacheKey, Duration: asset.Duration, Focus: focus})
+	var stage *db.AIStage
+	if p.Stager != nil {
+		stage, err = p.Stager.Prepare(ctx, asset)
+		if err != nil {
+			if ctx.Err() != nil {
+				return p.interrupt(asset.ID, asset.CacheKey, context.Cause(ctx))
+			}
+			return p.fail(ctx, asset.ID, asset.CacheKey, err, true)
+		}
+	}
+	stagedPath := ""
+	if stage != nil {
+		stagedPath = stage.StagePath
+	}
+	payload, _ := json.Marshal(analyzeRequest{AssetID: asset.ID, RelPath: asset.RelPath, MediaType: asset.MediaType, CacheKey: asset.CacheKey, Duration: asset.Duration, Focus: focus, StagedPath: stagedPath})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(p.BaseURL, "/")+"/analyze", bytes.NewReader(payload))
 	if err != nil {
 		return p.fail(ctx, asset.ID, asset.CacheKey, err, true)
@@ -119,7 +135,7 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 		if isPlaybackInterruptionResponse(resp.StatusCode, body) {
 			return p.interrupt(asset.ID, asset.CacheKey, jobs.ErrPlaybackPriority)
 		}
@@ -131,7 +147,8 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 			}
 			return p.interrupt(asset.ID, asset.CacheKey, cause)
 		}
-		return p.fail(ctx, asset.ID, asset.CacheKey, cause, !isMediaAnalysisError(cause))
+		retryable := !isMediaAnalysisError(cause) && !strings.Contains(strings.ToLower(cause.Error()), "model_output_invalid")
+		return p.fail(ctx, asset.ID, asset.CacheKey, cause, retryable)
 	}
 	var result analyzeResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&result); err != nil {
@@ -148,6 +165,9 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 		result.SampledFrames = json.RawMessage("[]")
 	}
 	err = p.DB.SaveAIResult(ctx, asset.ID, asset.CacheKey, description, result.TagModel, result.TagModelVersion, result.DescriptionModel, result.DescriptionModelVersion, result.TaxonomyVersion, result.SampledFrames, result.Tags, result.Palette)
+	if err == nil && p.Stager != nil {
+		p.Stager.Remove(context.Background(), stage)
+	}
 	if err != nil && ctx.Err() != nil {
 		return p.interrupt(asset.ID, asset.CacheKey, context.Cause(ctx))
 	}

@@ -21,6 +21,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"lpicto/backend/internal/cachepolicy"
 	"lpicto/backend/internal/config"
 	"lpicto/backend/internal/db"
 	"lpicto/backend/internal/events"
@@ -40,6 +41,8 @@ type Server struct {
 	events       *events.Bus
 	logger       *slog.Logger
 	sourceHealth *storage.SourceHealth
+	cachePolicy  *cachepolicy.Manager
+	cacheCopyMu  sync.Mutex
 
 	cacheMu         sync.Mutex
 	cacheStats      CacheStatsDTO
@@ -81,6 +84,8 @@ type Server struct {
 type ScanController interface {
 	RequestScan(reason string) scanner.CommandResult
 	RequestScanRoots(reason string, roots []string) scanner.CommandResult
+	RequestReconcileScan(reason string) scanner.CommandResult
+	RequestReconcileScanRoots(reason string, roots []string) scanner.CommandResult
 	RequestRebuild(reason string) scanner.CommandResult
 	RequestCountScan(reason string) scanner.CommandResult
 	RequestCountScanRoots(reason string, roots []string) scanner.CommandResult
@@ -109,6 +114,7 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 		events:                     bus,
 		logger:                     logger,
 		sourceHealth:               storage.NewSourceHealth(store, 15*time.Second, cfg.RedisURL),
+		cachePolicy:                cachepolicy.New(store.CacheRoot, database),
 		videoProxyStates:           map[string]*videoProxyRuntime{},
 		videoSegmentStates:         map[string]*videoSegmentRuntime{},
 		videoSegmentIgnoreEditList: map[string]bool{},
@@ -126,6 +132,7 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 		}
 	}
 	s.startVideoProxySweeper()
+	s.startUnifiedCacheSweeper()
 	s.startCacheCleanupScheduler()
 	s.startStorageHealthScheduler()
 	r := chi.NewRouter()
@@ -187,6 +194,8 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Post("/api/ai/reindex", s.reindexAI)
 	r.Post("/api/ai/retry-failed", s.retryFailedAI)
 	r.Get("/api/ai/tags", s.aiTags)
+	r.Put("/api/assets/{id}/ai/tags", s.replaceAssetAITag)
+	r.Delete("/api/assets/{id}/ai/tags", s.deleteAssetAITag)
 	r.Get("/api/duplicates", s.duplicateGroups)
 	r.Get("/api/duplicates/selection", s.duplicateSelection)
 	r.Get("/api/album-groups", s.albumGroups)
@@ -221,8 +230,10 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Post("/api/assets/batch/hide", s.batchHide)
 	r.Post("/api/assets/batch/unhide", s.batchUnhide)
 	r.Post("/api/assets/batch/delete", s.batchDelete)
+	r.Post("/api/assets/batch/delete-records", s.batchDeleteRecords)
 	r.Get("/api/assets/{id}/delete-plan", s.assetDeletePlan)
 	r.Post("/api/assets/{id}/delete", s.deleteAsset)
+	r.Delete("/api/assets/{id}/record", s.deleteAssetRecord)
 	r.Get("/api/assets/{id}/tags", s.assetTags)
 	r.Post("/api/assets/{id}/tags", s.addAssetTag)
 	r.Delete("/api/assets/{id}/tags", s.removeAssetTag)
@@ -238,6 +249,7 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Head("/api/assets/{id}/original", s.original)
 	r.Get("/api/assets/{id}/video", s.video)
 	r.Head("/api/assets/{id}/video", s.video)
+	r.Post("/api/assets/{id}/video/cache/prewarm", s.prewarmDirectVideo)
 	r.Get("/api/assets/{id}/video-poster", s.videoPoster)
 	r.Get("/api/assets/{id}/hls/playlist.m3u8", s.videoHLSPlaylist)
 	r.Get("/api/assets/{id}/hls/status", s.videoHLSStatus)
@@ -268,6 +280,10 @@ func isForegroundRequest(path string) bool {
 	if isStreamingAssetRequest(path) {
 		return false
 	}
+	// Status polling must not pause the background work it is observing.
+	if path == "/api/ai/status" {
+		return false
+	}
 	return strings.HasPrefix(path, "/api/library/") ||
 		strings.HasPrefix(path, "/api/albums") ||
 		strings.HasPrefix(path, "/api/collections") ||
@@ -288,13 +304,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) storageStatus(w http.ResponseWriter, r *http.Request) {
-	statuses := s.sourceHealth.Statuses()
-	for _, status := range statuses {
-		if relPath, err := s.db.SourceHealthSample(r.Context(), status.RootID); err == nil {
-			s.sourceHealth.ProbeAsset(relPath)
-		}
-	}
-	statuses = s.sourceHealth.Statuses()
+	statuses := s.sourceHealth.CachedStatuses()
 	available := true
 	for _, status := range statuses {
 		if !status.Available {
@@ -617,9 +627,9 @@ func (s *Server) folderAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	page, pageSize := s.page(r, s.cfg.PageSizeDefault)
 	opts := db.AssetListOptions{
-		Page: page, PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
+		Page: page, PageSize: pageSize, Type: safeType(r.URL.Query().Get("type")), Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-		Orientation: searchOrientation(r), CombinedTags: combinedTagsQuery(r),
+		Orientation: searchOrientation(r), CombinedTags: combinedTagsQuery(r), TagNodes: tagNodesQuery(r),
 	}
 	assets, err := s.db.ListFolderAssets(r.Context(), id, opts)
 	s.recordFilterTiming(w, r, started)
@@ -666,9 +676,9 @@ func (s *Server) folderAnchors(w http.ResponseWriter, r *http.Request) {
 	}
 	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
 	opts := db.AssetListOptions{
-		PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
+		PageSize: pageSize, Type: safeType(r.URL.Query().Get("type")), Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-		Orientation: searchOrientation(r), CombinedTags: combinedTagsQuery(r),
+		Orientation: searchOrientation(r), CombinedTags: combinedTagsQuery(r), TagNodes: tagNodesQuery(r),
 	}
 	anchorResult, err := s.db.FolderAnchors(r.Context(), id, opts)
 	s.recordFilterTiming(w, r, started)
@@ -721,6 +731,7 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		ManualTag:     strings.TrimSpace(r.URL.Query().Get("manualTag")),
 		CombinedTag:   strings.TrimSpace(r.URL.Query().Get("combinedTag")),
 		CombinedTags:  combinedTagsQuery(r),
+		TagNodes:      tagNodesQuery(r),
 		AIDescription: strings.TrimSpace(r.URL.Query().Get("aiDescription")),
 		AITag:         strings.TrimSpace(r.URL.Query().Get("aiTag")),
 		NFOTitle:      strings.TrimSpace(r.URL.Query().Get("nfoTitle")),
@@ -792,7 +803,7 @@ func (s *Server) assetPosition(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		result, err = s.db.FolderAssetPosition(r.Context(), *folderID, id, db.AssetListOptions{
-			PageSize: pageSize, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
+			PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 			Query: strings.TrimSpace(r.URL.Query().Get("q")), Recursive: boolQuery(r, "recursive", false), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
 			ManualTag: strings.TrimSpace(r.URL.Query().Get("manualTag")), Orientation: searchOrientation(r),
 		})
@@ -981,6 +992,24 @@ func (s *Server) serveVideoAsset(w http.ResponseWriter, r *http.Request, asset m
 }
 
 func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, asset model.Asset, _ bool) {
+	if asset.MediaType == model.MediaTypeImage {
+		if s.serveCachedOriginalImage(w, r, asset) {
+			return
+		}
+		if r.URL.Query().Get("cacheOnly") == "1" {
+			writeError(w, http.StatusNotFound, "local_cache_miss", "本地原图缓存尚未生成")
+			return
+		}
+		s.markPlaybackPriority(r.Context())
+	}
+	if asset.MediaType == model.MediaTypeVideo {
+		done := jobs.EnterForeground()
+		defer done()
+		s.markPlaybackPriority(r.Context())
+		if s.serveChunkCachedVideo(w, r, asset) {
+			return
+		}
+	}
 	if available, _ := s.sourceHealth.AvailableForRel(asset.RelPath); !available {
 		writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
 		return
@@ -1130,6 +1159,7 @@ func (s *Server) libraryAssetOptions(r *http.Request, page int, pageSize int) db
 		ManualTag:     strings.TrimSpace(r.URL.Query().Get("manualTag")),
 		CombinedTag:   strings.TrimSpace(r.URL.Query().Get("combinedTag")),
 		CombinedTags:  combinedTagsQuery(r),
+		TagNodes:      tagNodesQuery(r),
 		AIDescription: strings.TrimSpace(r.URL.Query().Get("aiDescription")),
 		AITag:         strings.TrimSpace(r.URL.Query().Get("aiTag")),
 		NFOTitle:      strings.TrimSpace(r.URL.Query().Get("nfoTitle")),
