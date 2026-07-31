@@ -140,6 +140,7 @@ type Page[T any] struct {
 const (
 	MediaTypeImage = "image"
 	MediaTypeVideo = "video"
+	MediaTypeAudio = "audio"
 
 	StatusPending     = "pending"
 	StatusProcessing  = "processing"

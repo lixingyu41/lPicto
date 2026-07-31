@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Check, Play, Plus, Square, X } from 'lucide-react';
+import { Check, Music, Play, Plus, Square, X } from 'lucide-react';
 import type { Asset, SortField, SortKey } from '../types/api';
 import { api, assetThumbUrl } from '../api/client';
 import { effectiveAspect, rotatedCoverStyle } from '../utils/rotation';
@@ -608,6 +608,11 @@ export default function AssetGrid({
                         <Play size={12} fill="currentColor" />
                       </span>
                     )}
+                    {asset.mediaType === 'audio' && (
+                      <span className="asset-video-chip asset-audio-chip" title="音频">
+                        <Music size={12} />
+                      </span>
+                    )}
                     {selectionMode && (
                       <span className={selectedAssetIds.has(asset.id) ? 'asset-select-box selected' : 'asset-select-box'}>
                         <Square size={14} />
@@ -1161,6 +1166,7 @@ function AssetListCell({
         <div className="asset-list-thumb" style={{ width: thumbWidth, height: thumbHeight }}>
           <AssetTileMedia asset={asset} rowHeight={thumbHeight} tileWidth={thumbWidth} />
           {asset.mediaType === 'video' && <span className="asset-list-video"><Play size={12} fill="currentColor" /></span>}
+          {asset.mediaType === 'audio' && <span className="asset-list-video asset-list-audio"><Music size={12} /></span>}
         </div>
         <ListText value={asset.filename} expandable maxLines={textLines} />
       </div>
@@ -1343,7 +1349,7 @@ function listTextLines(availableHeight: number) {
 function listColumnValue(asset: Asset, column: MediaColumnId) {
   switch (column) {
     case 'path': return asset.relPath;
-    case 'mediaType': return asset.mediaType === 'video' ? '视频' : '图片';
+    case 'mediaType': return asset.mediaType === 'video' ? '视频' : asset.mediaType === 'audio' ? '音频' : '图片';
     case 'resolution': return asset.width && asset.height ? `${asset.width} × ${asset.height}` : '';
     case 'duration': return formatDuration(asset.duration);
     case 'timeline': return formatListDate(asset.takenAt ?? asset.timelineAt);
@@ -1708,5 +1714,5 @@ function assetAspect(asset: Asset): number {
 }
 
 function assetReadyForThumb(asset: Asset): boolean {
-  return asset.thumbStatus === 'ready';
+  return asset.mediaType === 'audio' || asset.thumbStatus === 'ready';
 }

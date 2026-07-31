@@ -501,7 +501,7 @@ func (d *DB) NFOOptions(ctx context.Context, opts NFOOptionOptions) ([]string, e
 	where := []string{"assets.is_live = true", "anv.field = ?"}
 	args := []any{opts.Field}
 	if opts.VisibleOnly {
-		where = append(where, "assets.thumb_status = 'ready'")
+		where = append(where, "(assets.thumb_status = 'ready' OR assets.media_type = 'audio')")
 	}
 	if query := strings.TrimSpace(opts.Query); query != "" {
 		where = append(where, "anv.normalized_value LIKE ? ESCAPE '\\'")
@@ -1371,7 +1371,7 @@ func fastMediaNeighborEligible(opts AssetListOptions, contextName string) bool {
 	if opts.Group == assetGroupFolder {
 		return false
 	}
-	if opts.Type != model.MediaTypeImage && opts.Type != model.MediaTypeVideo {
+	if opts.Type != model.MediaTypeImage && opts.Type != model.MediaTypeVideo && opts.Type != model.MediaTypeAudio {
 		return false
 	}
 	switch opts.Sort {
@@ -1399,7 +1399,7 @@ func (d *DB) fastMediaNeighborSide(ctx context.Context, current model.Asset, opt
 	where := []string{
 		"ma.deleted_at IS NULL",
 		fmt.Sprintf("ma.media_type = %d", mediaTypeCode(opts.Type)),
-		"ma.thumb_status = 'ready'",
+		"(ma.thumb_status = 'ready' OR ma.media_type = 3)",
 		"EXISTS (SELECT 1 FROM file_instance fi WHERE fi.asset_id = ma.id AND fi.missing = false)",
 	}
 	var args []any
@@ -1434,10 +1434,10 @@ func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 		where = append(where, "hidden = false")
 	}
 	if opts.VisibleOnly {
-		where = append(where, "thumb_status = 'ready'")
+		where = append(where, "(thumb_status = 'ready' OR media_type = 'audio')")
 	}
 	switch opts.Type {
-	case model.MediaTypeImage, model.MediaTypeVideo:
+	case model.MediaTypeImage, model.MediaTypeVideo, model.MediaTypeAudio:
 		where = append(where, "id IN (SELECT id FROM media_asset WHERE media_type = ?)")
 		args = append(args, mediaTypeCode(opts.Type))
 	}
@@ -2155,6 +2155,8 @@ func mediaTypeCode(value string) int {
 	switch value {
 	case model.MediaTypeVideo:
 		return 2
+	case model.MediaTypeAudio:
+		return 3
 	default:
 		return 1
 	}
@@ -2304,6 +2306,38 @@ func AssetStatuses(mediaType string, browserPlayable bool, proxyEnabled bool) (t
 		return model.StatusPending, model.StatusNotRequired, model.StatusPending, model.StatusNotRequired
 	}
 	return model.StatusNotRequired, model.StatusNotRequired, model.StatusNotRequired, model.StatusNotRequired
+}
+
+func (d *DB) ReclassifyAssetAsAudio(ctx context.Context, assetID int64, mimeType string, browserPlayable bool) error {
+	now := util.UnixNow()
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `
+UPDATE media_asset
+SET media_type = ?, mime_type = ?, browser_playable = ?,
+    width = NULL, height = NULL, aspect_ratio = NULL, fps = NULL,
+    video_codec = NULL, video_bitrate = NULL,
+    thumb_status = ?, preview_status = ?, video_poster_status = ?, video_proxy_status = ?,
+    thumb_ready = false, preview_ready = false, proxy_ready = false,
+    error_text = NULL, updated_at = ?
+WHERE id = ? AND media_type = ?`,
+		mediaTypeCode(model.MediaTypeAudio), mimeType, browserPlayable,
+		model.StatusNotRequired, model.StatusNotRequired, model.StatusNotRequired, model.StatusNotRequired,
+		unixTime(now), assetID, mediaTypeCode(model.MediaTypeVideo)); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `
+UPDATE media_job
+SET status = ?, error_text = NULL, finished_at = ?
+WHERE asset_id = ? AND job_type IN ('thumb', 'video_poster')`,
+		model.StatusNotRequired, unixTime(now), assetID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func BuildAssetUpsert(rel string, mediaType string) (AssetUpsert, error) {

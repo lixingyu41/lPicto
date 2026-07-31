@@ -27,6 +27,7 @@ import {
   savePageState,
   saveViewerReturnPath,
   type GridReturnState,
+  useViewerAwareMediaState,
 } from '../utils/pageState';
 import { assetRatingParam, currentURLHasParam, currentURLLocation, currentURLPath, orientationParam, replaceURLState } from '../utils/urlState';
 import { waterfallPageSize } from '../utils/waterfallPaging';
@@ -71,15 +72,18 @@ export default function CollectionsPage() {
   const [aiTagSearchOpen, setAITagSearchOpen] = useState(false);
   const [systemCollectionsCollapsed, setSystemCollectionsCollapsed] = useState(false);
   const [smartCollectionsCollapsed, setSmartCollectionsCollapsed] = useState(false);
-  const [selectedCollectionId, setSelectedCollectionId] = useState(initialStateRef.current.selectedCollectionId);
-  const [selectedTags, setSelectedTags] = useState(initialStateRef.current.selectedTags);
+  const [selectedCollectionId, setSelectedCollectionId] = useViewerAwareMediaState(initialStateRef.current.selectedCollectionId);
+  const [selectedTags, setSelectedTags] = useViewerAwareMediaState(initialStateRef.current.selectedTags);
   const previousCollectionIdRef = useRef(initialStateRef.current.selectedCollectionId === 'tags' ? 'unclassified' : initialStateRef.current.selectedCollectionId);
-  const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
-  const [query, setQuery] = useState(initialStateRef.current.query);
-  const [groupMode, setGroupMode] = useState<AssetGroupMode>(initialStateRef.current.groupMode);
-  const [type, setType] = useState<AssetKind>(initialStateRef.current.type);
-  const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
-  const [rating, setRating] = useState<AssetRating>(initialStateRef.current.rating);
+  const [sort, setSort] = useViewerAwareMediaState<SortKey>(initialStateRef.current.sort);
+  const [query, setQuery] = useViewerAwareMediaState(initialStateRef.current.query);
+  const [groupMode, setGroupMode] = useViewerAwareMediaState<AssetGroupMode>(initialStateRef.current.groupMode);
+  const [type, setType] = useViewerAwareMediaState<AssetKind>(initialStateRef.current.type);
+  const [orientation, setOrientation] = useViewerAwareMediaState<OrientationFilter>(initialStateRef.current.orientation);
+  useEffect(() => {
+    if (type === 'audio') setOrientation('all');
+  }, [type]);
+  const [rating, setRating] = useViewerAwareMediaState<AssetRating>(initialStateRef.current.rating);
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [refreshRevision, setRefreshRevision] = useState(0);
@@ -676,5 +680,5 @@ function parseSelectedTags(raw: string | null): string[] {
 }
 
 function assetKindParam(value: string | null): AssetKind {
-  return value === 'image' || value === 'video' ? value : 'all';
+  return value === 'image' || value === 'video' || value === 'audio' ? value : 'all';
 }

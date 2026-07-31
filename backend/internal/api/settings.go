@@ -384,6 +384,12 @@ func (s *Server) removeDeletedAssetCaches(items []db.DeletedAsset) {
 		if err := s.store.RemoveCachePrefix(item.CacheKey, "video-proxies", "mp4"); err != nil {
 			s.logger.Warn("remove video proxy cache prefix after asset deletion failed", "relPath", item.RelPath, "cacheKey", item.CacheKey, "error", err)
 		}
+		if err := s.store.RemoveCachePrefix(item.CacheKey, "audio-proxies", "flac"); err != nil {
+			s.logger.Warn("remove audio proxy cache prefix after asset deletion failed", "relPath", item.RelPath, "cacheKey", item.CacheKey, "error", err)
+		}
+		if err := s.store.RemoveCachePrefix(item.CacheKey, "audio-chunks", "bin"); err != nil {
+			s.logger.Warn("remove audio chunk cache prefix after asset deletion failed", "relPath", item.RelPath, "cacheKey", item.CacheKey, "error", err)
+		}
 		if err := s.store.RemoveCache(item.CacheKey); err != nil {
 			s.logger.Warn("remove cache after asset deletion failed", "relPath", item.RelPath, "cacheKey", item.CacheKey, "error", err)
 		}

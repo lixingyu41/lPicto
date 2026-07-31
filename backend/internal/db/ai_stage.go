@@ -61,6 +61,7 @@ JOIN media_asset asset ON asset.id=stage.asset_id AND asset.cache_key=stage.cach
 LEFT JOIN asset_ai_result result ON result.asset_id=asset.id
 WHERE stage.state='ready'
   AND asset.deleted_at IS NULL
+  AND asset.media_type IN (1,2)
   AND EXISTS (
     SELECT 1 FROM file_instance file
     WHERE file.asset_id=asset.id AND file.missing=false

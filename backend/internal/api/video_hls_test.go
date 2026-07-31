@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"errors"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,19 +15,19 @@ import (
 	"lpicto/backend/internal/storage"
 )
 
-func TestPlaybackSegmentPreemptsBalancedAndNewViewerSupersedesOldViewer(t *testing.T) {
+func TestPlaybackSegmentPreemptsBalancedAndKeepsPeerPlaybackRunning(t *testing.T) {
 	warmupCtx, cancelWarmup := context.WithCancelCause(context.Background())
 	oldViewerCtx, cancelOldViewer := context.WithCancelCause(context.Background())
 	server := &Server{videoSegmentStates: map[string]*videoSegmentRuntime{
 		"warmup": {CacheKey: "warmup", SessionID: "same", Priority: videoSegmentPriorityBalanced, Transcoding: true, Cancel: cancelWarmup},
 		"old":    {CacheKey: "old", SessionID: "old", Priority: videoSegmentPriorityPlayback, Transcoding: true, Cancel: cancelOldViewer},
 	}}
-	server.preemptVideoSegmentsLocked("playing", "same", videoSegmentPriorityPlayback)
+	server.preemptVideoSegmentsLocked("playing", videoSegmentPriorityPlayback)
 	if !errors.Is(context.Cause(warmupCtx), errVideoSegmentPreempted) {
 		t.Fatalf("warmup cause = %v", context.Cause(warmupCtx))
 	}
-	if !errors.Is(context.Cause(oldViewerCtx), errVideoSegmentSuperseded) {
-		t.Fatalf("old viewer cause = %v", context.Cause(oldViewerCtx))
+	if context.Cause(oldViewerCtx) != nil {
+		t.Fatalf("peer playback was cancelled: %v", context.Cause(oldViewerCtx))
 	}
 }
 
@@ -41,6 +43,11 @@ func TestVideoSegmentQueueUsesPriorityThenFIFO(t *testing.T) {
 	server.videoSegmentStates["critical"].Queued = false
 	if got := server.videoSegmentQueueHeadLocked(); got == nil || got.CacheKey != "neighbor" {
 		t.Fatalf("balanced queue head = %#v, want oldest neighbor", got)
+	}
+	server.videoSegmentStates["playing-2"] = &videoSegmentRuntime{CacheKey: "playing-2", Priority: videoSegmentPriorityPlayback, QueueOrder: 5, Queued: true, Cancel: func(error) {}}
+	server.videoSegmentStates["playing-1"] = &videoSegmentRuntime{CacheKey: "playing-1", Priority: videoSegmentPriorityPlayback, QueueOrder: 4, Queued: true, Cancel: func(error) {}}
+	if got := server.videoSegmentQueueHeadLocked(); got == nil || got.CacheKey != "playing-1" {
+		t.Fatalf("playback queue head = %#v, want oldest playback request", got)
 	}
 }
 
@@ -63,6 +70,45 @@ func TestStopVideoSegmentSessionCancelsOnlyMatchingTasksAndKeepsCache(t *testing
 	}
 	if _, ok := server.videoSegmentStates["cached"]; ok {
 		t.Fatal("completed runtime should be removed when session closes")
+	}
+}
+
+func TestSharedVideoSegmentSurvivesUntilLastSessionStops(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	server := &Server{videoSegmentStates: map[string]*videoSegmentRuntime{
+		"shared": {
+			AssetID: 7, SessionID: "viewer-a", SessionIDs: map[string]struct{}{"viewer-a": {}, "viewer-b": {}},
+			Queued: true, Cancel: cancel,
+		},
+	}}
+	if got := server.stopVideoSegmentSession(7, "viewer-a"); got != 0 {
+		t.Fatalf("first stop cancelled %d tasks, want 0", got)
+	}
+	if context.Cause(ctx) != nil {
+		t.Fatalf("shared task was cancelled while another viewer still needed it: %v", context.Cause(ctx))
+	}
+	if got := server.stopVideoSegmentSession(7, "viewer-b"); got != 1 {
+		t.Fatalf("last stop cancelled %d tasks, want 1", got)
+	}
+	if !errors.Is(context.Cause(ctx), errVideoSegmentSessionStop) {
+		t.Fatalf("last stop cause = %v", context.Cause(ctx))
+	}
+}
+
+func TestVideoSegmentPriorityHeaderOverridesPlaylistQuery(t *testing.T) {
+	request := httptest.NewRequest("GET", "/segment.ts?priority=preload", nil)
+	request.Header.Set(videoSegmentPriorityHeader, "playback")
+	if got := videoSegmentPriorityFromRequest(request, videoSegmentPriorityBalanced); got != videoSegmentPriorityPlayback {
+		t.Fatalf("priority = %d, want playback", got)
+	}
+}
+
+func TestVideoSegmentQueryPreservesPreloadPriority(t *testing.T) {
+	query := videoSegmentQuery(model.Asset{CacheKey: "asset"}, VideoProxyHeartbeatRequest{
+		ClientID: "browser", SessionID: "viewer",
+	}, "preload")
+	if !strings.Contains(query, "priority=preload") {
+		t.Fatalf("query = %q, want preload priority", query)
 	}
 }
 

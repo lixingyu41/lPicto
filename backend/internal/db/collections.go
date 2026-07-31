@@ -384,11 +384,11 @@ func (d *DB) systemCollectionFilter(kind string, opts AssetListOptions) (string,
 	case SystemCollectionHidden:
 		where += " AND hidden = true"
 	case SystemCollectionAIPending:
-		where += ` AND (NOT EXISTS (SELECT 1 FROM asset_ai_result air WHERE air.asset_id=assets.id) OR EXISTS (SELECT 1 FROM asset_ai_result air WHERE air.asset_id=assets.id AND (air.status IN ('pending','processing') OR air.input_cache_key<>assets.cache_key)))`
+		where += ` AND media_type IN ('image','video') AND (NOT EXISTS (SELECT 1 FROM asset_ai_result air WHERE air.asset_id=assets.id) OR EXISTS (SELECT 1 FROM asset_ai_result air WHERE air.asset_id=assets.id AND (air.status IN ('pending','processing') OR air.input_cache_key<>assets.cache_key)))`
 	case SystemCollectionAIReady:
-		where += ` AND EXISTS (SELECT 1 FROM asset_ai_result air WHERE air.asset_id=assets.id AND air.status='ready' AND air.input_cache_key=assets.cache_key)`
+		where += ` AND media_type IN ('image','video') AND EXISTS (SELECT 1 FROM asset_ai_result air WHERE air.asset_id=assets.id AND air.status='ready' AND air.input_cache_key=assets.cache_key)`
 	case SystemCollectionAIFailed:
-		where += ` AND EXISTS (SELECT 1 FROM asset_ai_result air WHERE air.asset_id=assets.id AND air.status='failed' AND air.input_cache_key=assets.cache_key)`
+		where += ` AND media_type IN ('image','video') AND EXISTS (SELECT 1 FROM asset_ai_result air WHERE air.asset_id=assets.id AND air.status='failed' AND air.input_cache_key=assets.cache_key)`
 	case SystemCollectionMissing:
 		source = "asset_records"
 		parts := []string{"missing = true", "is_live = true"}
@@ -396,7 +396,7 @@ func (d *DB) systemCollectionFilter(kind string, opts AssetListOptions) (string,
 		if !opts.IncludeHidden {
 			parts = append(parts, "hidden = false")
 		}
-		if opts.Type == model.MediaTypeImage || opts.Type == model.MediaTypeVideo {
+		if opts.Type == model.MediaTypeImage || opts.Type == model.MediaTypeVideo || opts.Type == model.MediaTypeAudio {
 			parts = append(parts, "media_type = ?")
 			args = append(args, opts.Type)
 		}

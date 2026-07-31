@@ -46,6 +46,35 @@ func TestBrowserVideoPlayable(t *testing.T) {
 	}
 }
 
+func TestDetectAudioFormats(t *testing.T) {
+	for _, name := range []string{"song.mp3", "track.m4a", "lossless.flac", "voice.opus", "archive.ape", "master.dsf"} {
+		detection := DetectByPath(name)
+		if !detection.OK || detection.MediaType != "audio" {
+			t.Fatalf("DetectByPath(%q) = %#v, want audio", name, detection)
+		}
+	}
+}
+
+func TestBrowserAudioPlayable(t *testing.T) {
+	if !BrowserAudioPlayable("mp3", "mp3") || !BrowserAudioPlayable("flac", "flac") || !BrowserAudioPlayable("mp4", "aac") {
+		t.Fatal("expected directly playable audio")
+	}
+	if BrowserAudioPlayable("ape", "ape") || BrowserAudioPlayable("dsf", "dsd_lsbf") {
+		t.Fatal("expected compatibility conversion for APE and DSD")
+	}
+}
+
+func TestStreamKindsFromMetadataJSON(t *testing.T) {
+	raw := `{"streams":[{"codec_type":"audio","codec_name":"aac"}],"format":{"format_name":"mov,mp4"}}`
+	hasVideo, hasAudio, codec := StreamKindsFromMetadataJSON(raw)
+	if hasVideo || !hasAudio || codec != "aac" {
+		t.Fatalf("stream kinds = video:%v audio:%v codec:%q", hasVideo, hasAudio, codec)
+	}
+	if got := AudioMimeType("mp4"); got != "audio/mp4" {
+		t.Fatalf("AudioMimeType(mp4) = %q", got)
+	}
+}
+
 func TestUnixTimeParsesNoZoneInLocalLocation(t *testing.T) {
 	previousLocal := time.Local
 	local := time.FixedZone("TEST", 8*60*60)

@@ -14,6 +14,8 @@ import (
 
 type Metadata struct {
 	MimeType        string
+	HasVideo        bool
+	HasAudio        bool
 	Width           *int
 	Height          *int
 	Duration        *float64
@@ -41,7 +43,7 @@ func NewExtractor() Extractor {
 }
 
 func (e Extractor) Extract(ctx context.Context, path string, detection Detection, mtime, importedAt int64) Metadata {
-	if detection.MediaType == "video" {
+	if detection.MediaType == "video" || detection.MediaType == "audio" {
 		return e.extractVideo(ctx, path, detection, mtime, importedAt)
 	}
 	return e.extractImage(ctx, path, detection, mtime, importedAt)
@@ -107,6 +109,7 @@ func (e Extractor) extractVideo(ctx context.Context, path string, detection Dete
 	for _, stream := range probe.Streams {
 		switch stream.CodecType {
 		case "video":
+			meta.HasVideo = true
 			if meta.Width == nil && stream.Width > 0 {
 				meta.Width = &stream.Width
 			}
@@ -126,6 +129,7 @@ func (e Extractor) extractVideo(ctx context.Context, path string, detection Dete
 				meta.VideoCreatedAt = created
 			}
 		case "audio":
+			meta.HasAudio = true
 			if audioCodec == "" {
 				audioCodec = strings.ToLower(stream.CodecName)
 				meta.AudioCodec = stringPtrValue(codecDisplayName(stream.CodecName, stream.Profile))
@@ -143,9 +147,35 @@ func (e Extractor) extractVideo(ctx context.Context, path string, detection Dete
 	if created := tagUnixTime(probe.Format.Tags); created != nil {
 		meta.VideoCreatedAt = created
 	}
-	meta.BrowserPlayable = BrowserVideoPlayable(detection.Ext, videoCodec, audioCodec)
+	if detection.MediaType == "audio" || (!meta.HasVideo && meta.HasAudio) {
+		meta.BrowserPlayable = BrowserAudioPlayable(detection.Ext, audioCodec)
+	} else {
+		meta.BrowserPlayable = BrowserVideoPlayable(detection.Ext, videoCodec, audioCodec)
+	}
 	meta.TimelineAt = TimelineAt(nil, meta.VideoCreatedAt, mtime, importedAt)
 	return meta
+}
+
+func StreamKindsFromMetadataJSON(raw string) (hasVideo bool, hasAudio bool, audioCodec string) {
+	if strings.TrimSpace(raw) == "" {
+		return false, false, ""
+	}
+	var probe ffprobeResult
+	if err := json.Unmarshal([]byte(raw), &probe); err != nil {
+		return false, false, ""
+	}
+	for _, stream := range probe.Streams {
+		switch stream.CodecType {
+		case "video":
+			hasVideo = true
+		case "audio":
+			hasAudio = true
+			if audioCodec == "" {
+				audioCodec = strings.ToLower(strings.TrimSpace(stream.CodecName))
+			}
+		}
+	}
+	return hasVideo, hasAudio, audioCodec
 }
 
 func BrowserVideoPlayable(ext, videoCodec, audioCodec string) bool {

@@ -83,6 +83,35 @@ func TestMarkDeletedWithCacheReturnsCacheKey(t *testing.T) {
 	}
 }
 
+func TestReclassifyAssetAsAudioClearsVisualWork(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	assetID, _, _, err := database.UpsertAsset(ctx, AssetUpsert{
+		RelPath: "audio-only.mp4", Filename: "audio-only.mp4", Ext: "mp4", MediaType: model.MediaTypeVideo,
+		Size: 10, Mtime: 10, ImportedAt: 10, TimelineAt: 10, CacheKey: "audio-only",
+		ThumbStatus: model.StatusError, PreviewStatus: model.StatusNotRequired,
+		VideoPosterStatus: model.StatusError, VideoProxyStatus: model.StatusNotRequired,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ReclassifyAssetAsAudio(ctx, assetID, "audio/mp4", true); err != nil {
+		t.Fatal(err)
+	}
+	asset, err := database.GetAsset(ctx, assetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asset.MediaType != model.MediaTypeAudio || asset.ThumbStatus != model.StatusNotRequired || asset.VideoPosterStatus != model.StatusNotRequired || !asset.BrowserPlayable {
+		t.Fatalf("reclassified asset = %#v", asset)
+	}
+}
+
 func TestMarkDeletedUnderReturnsNestedAssets(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
@@ -172,6 +201,10 @@ func TestAssetStatusesSkipsPreviewForBrowserPlayableImages(t *testing.T) {
 	_, _, _, proxy = AssetStatuses(model.MediaTypeVideo, true, false)
 	if proxy != model.StatusNotRequired {
 		t.Fatalf("disabled video proxy status = %q, want not_required", proxy)
+	}
+	thumb, preview, poster, proxy = AssetStatuses(model.MediaTypeAudio, false, true)
+	if thumb != model.StatusNotRequired || preview != model.StatusNotRequired || poster != model.StatusNotRequired || proxy != model.StatusNotRequired {
+		t.Fatalf("audio statuses = %q %q %q %q, want all not_required", thumb, preview, poster, proxy)
 	}
 }
 

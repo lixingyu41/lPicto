@@ -37,6 +37,7 @@ import {
   savePageState,
   saveViewerReturnPath,
   type GridReturnState,
+  useViewerAwareMediaState,
 } from '../utils/pageState';
 import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import { removeAssetById } from '../utils/assetSort';
@@ -157,41 +158,47 @@ export default function LibraryPage() {
   );
   const initialResolution = initialResolutionRanges(initialStateRef.current);
   const initialDuration = initialDurationMinuteRanges(initialStateRef.current);
-  const [query, setQuery] = useState(initialStateRef.current.query);
-	const [aiDescriptionQuery, setAIDescriptionQuery] = useState(initialStateRef.current.aiDescriptionQuery ?? '');
-  const [nfoQuery, setNFOQuery] = useState(initialStateRef.current.nfoQuery);
-  const [nfoActorQuery, setNFOActorQuery] = useState(initialStateRef.current.nfoActorQuery ?? '');
-  const [nfoIDQuery, setNFOIDQuery] = useState(initialStateRef.current.nfoIDQuery ?? '');
-  const [nfoTagQuery, setNFOTagQuery] = useState(initialStateRef.current.nfoTagQuery ?? '');
-  const [nfoTitleQuery, setNFOTitleQuery] = useState(initialStateRef.current.nfoTitleQuery ?? '');
-  const [nfoYearQuery, setNFOYearQuery] = useState(initialStateRef.current.nfoYearQuery ?? '');
-  const [type, setType] = useState<AssetKind>(initialStateRef.current.type);
-  const [rating, setRating] = useState<AssetRating>(initialStateRef.current.rating ?? 0);
-  const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
-  const [resolutionXRange, setResolutionXRange] = useState(initialResolution.x);
-  const [resolutionYRange, setResolutionYRange] = useState(initialResolution.y);
-  const [dateFrom, setDateFrom] = useState(initialStateRef.current.dateFrom);
-  const [dateTo, setDateTo] = useState(initialStateRef.current.dateTo);
-  const [durationMinMinutes, setDurationMinMinutes] = useState(initialDuration.min);
-  const [durationMaxMinutes, setDurationMaxMinutes] = useState(initialDuration.max);
-  const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
-  const [albumFilterMode, setAlbumFilterMode] = useState<SearchAlbumFilterMode>(initialStateRef.current.albumFilterMode);
+  const [query, setQuery] = useViewerAwareMediaState(initialStateRef.current.query);
+	const [aiDescriptionQuery, setAIDescriptionQuery] = useViewerAwareMediaState(initialStateRef.current.aiDescriptionQuery ?? '');
+  const [nfoQuery, setNFOQuery] = useViewerAwareMediaState(initialStateRef.current.nfoQuery);
+  const [nfoActorQuery, setNFOActorQuery] = useViewerAwareMediaState(initialStateRef.current.nfoActorQuery ?? '');
+  const [nfoIDQuery, setNFOIDQuery] = useViewerAwareMediaState(initialStateRef.current.nfoIDQuery ?? '');
+  const [nfoTagQuery, setNFOTagQuery] = useViewerAwareMediaState(initialStateRef.current.nfoTagQuery ?? '');
+  const [nfoTitleQuery, setNFOTitleQuery] = useViewerAwareMediaState(initialStateRef.current.nfoTitleQuery ?? '');
+  const [nfoYearQuery, setNFOYearQuery] = useViewerAwareMediaState(initialStateRef.current.nfoYearQuery ?? '');
+  const [type, setType] = useViewerAwareMediaState<AssetKind>(initialStateRef.current.type);
+  const [rating, setRating] = useViewerAwareMediaState<AssetRating>(initialStateRef.current.rating ?? 0);
+  const [sort, setSort] = useViewerAwareMediaState<SortKey>(initialStateRef.current.sort);
+  const [resolutionXRange, setResolutionXRange] = useViewerAwareMediaState(initialResolution.x);
+  const [resolutionYRange, setResolutionYRange] = useViewerAwareMediaState(initialResolution.y);
+  const [dateFrom, setDateFrom] = useViewerAwareMediaState(initialStateRef.current.dateFrom);
+  const [dateTo, setDateTo] = useViewerAwareMediaState(initialStateRef.current.dateTo);
+  const [durationMinMinutes, setDurationMinMinutes] = useViewerAwareMediaState(initialDuration.min);
+  const [durationMaxMinutes, setDurationMaxMinutes] = useViewerAwareMediaState(initialDuration.max);
+  const [orientation, setOrientation] = useViewerAwareMediaState<OrientationFilter>(initialStateRef.current.orientation);
+  const [albumFilterMode, setAlbumFilterMode] = useViewerAwareMediaState<SearchAlbumFilterMode>(initialStateRef.current.albumFilterMode);
   const [albumFilterCardCollapsed, setAlbumFilterCardCollapsed] = useState(initialStateRef.current.albumFilterCardCollapsed ?? false);
-  const [albumIds, setAlbumIds] = useState<number[]>(initialStateRef.current.albumIds);
+  const [albumIds, setAlbumIds] = useViewerAwareMediaState<number[]>(initialStateRef.current.albumIds);
   const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Set<string>>(() => new Set(initialStateRef.current.collapsedGroupKeys));
   const [albums, setAlbums] = useState<Album[]>([]);
   const [groups, setGroups] = useState<AlbumGroup[]>([]);
-  const [groupMode, setGroupMode] = useState<AssetGroupMode>(initialStateRef.current.groupMode);
-  const [sizeMinMB, setSizeMinMB] = useState(initialStateRef.current.sizeMinMB);
-  const [sizeMaxMB, setSizeMaxMB] = useState(initialStateRef.current.sizeMaxMB);
+  const [groupMode, setGroupMode] = useViewerAwareMediaState<AssetGroupMode>(initialStateRef.current.groupMode);
+  const [sizeMinMB, setSizeMinMB] = useViewerAwareMediaState(initialStateRef.current.sizeMinMB);
+  const [sizeMaxMB, setSizeMaxMB] = useViewerAwareMediaState(initialStateRef.current.sizeMaxMB);
   const [searchCardCollapsed, setSearchCardCollapsed] = useState(initialStateRef.current.searchCardCollapsed ?? false);
-  const [tagFilters, setTagFilters] = useState(initialStateRef.current.tagFilters ?? []);
+  const [tagFilters, setTagFilters] = useViewerAwareMediaState(initialStateRef.current.tagFilters ?? []);
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const [smartCollectionName, setSmartCollectionName] = useState('');
   const [savingSmartCollection, setSavingSmartCollection] = useState(false);
   const [smartCollectionError, setSmartCollectionError] = useState<string | null>(null);
+  useEffect(() => {
+    if (type !== 'audio') return;
+    setOrientation('all');
+    setResolutionXRange('');
+    setResolutionYRange('');
+  }, [type]);
   const sidebarState = useSidebarReturnState();
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const serverGroup = serverGroupForMode(groupMode);
@@ -943,7 +950,7 @@ function positiveIntParam(value: string | null) {
 }
 
 function parseAssetKindParam(value: string | null): AssetKind {
-  return value === 'image' || value === 'video' ? value : 'all';
+  return value === 'image' || value === 'video' || value === 'audio' ? value : 'all';
 }
 
 function parseOrientationParam(value: string | null): OrientationFilter {

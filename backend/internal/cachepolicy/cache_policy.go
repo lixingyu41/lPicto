@@ -178,7 +178,7 @@ func (p *Manager) EnsureCapacity(ctx context.Context, reserve int64) (CacheUsage
 	}
 	var candidates []candidate
 	evictionRank := map[string]int{
-		"ai-staging": 0, "video-chunks": 1, "video-proxies": 1, "originals": 2, "previews": 2,
+		"ai-staging": 0, "video-chunks": 1, "video-proxies": 1, "audio-chunks": 1, "audio-proxies": 1, "originals": 2, "previews": 2,
 		"thumbs": 10, "video-posters": 10,
 	}
 	_ = filepath.WalkDir(p.root, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -195,7 +195,7 @@ func (p *Manager) EnsureCapacity(ctx context.Context, reserve int64) (CacheUsage
 		if kind == "ai-staging" && age < 24*time.Hour {
 			return nil
 		}
-		if (kind == "video-chunks" || kind == "video-proxies" || kind == "originals" || kind == "previews") && age < 10*time.Minute {
+		if (kind == "video-chunks" || kind == "video-proxies" || kind == "audio-chunks" || kind == "audio-proxies" || kind == "originals" || kind == "previews") && age < 10*time.Minute {
 			return nil
 		}
 		if evictionRank[kind] >= 10 && !strings.Contains(entry.Name(), ".tmp") {

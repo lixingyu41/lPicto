@@ -2,7 +2,6 @@ import type { Album, AlbumSource, Asset, AssetKind, AssetRating, OrientationFilt
 
 export function assetMatchesLibrary(asset: Asset, type: AssetKind, query: string, rating?: AssetRating, orientation?: OrientationFilter) {
   return (
-    asset.thumbStatus === 'ready' &&
     matchesType(asset, type) &&
     matchesQuery(asset, query) &&
     matchesRating(asset, rating) &&
@@ -23,7 +22,7 @@ export function assetMatchesFolder(
   orientation?: OrientationFilter,
   type: AssetKind = 'all',
 ) {
-  if (asset.thumbStatus !== 'ready' || !matchesType(asset, type) || !matchesQuery(asset, query) || !matchesRating(asset, rating) || !matchesOrientationFilter(asset, orientation)) return false;
+  if (!matchesType(asset, type) || !matchesQuery(asset, query) || !matchesRating(asset, rating) || !matchesOrientationFilter(asset, orientation)) return false;
   if (recursive) {
     return folderRelPath === '' || asset.parentRelPath === folderRelPath || asset.parentRelPath.startsWith(`${folderRelPath}/`);
   }
@@ -33,7 +32,6 @@ export function assetMatchesFolder(
 export function assetMatchesAlbum(asset: Asset, album: Album | null, query: string, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind) {
   if (
     !album ||
-    asset.thumbStatus !== 'ready' ||
     !matchesType(asset, type ?? 'all') ||
     !matchesQuery(asset, query) ||
     !matchesRating(asset, rating) ||

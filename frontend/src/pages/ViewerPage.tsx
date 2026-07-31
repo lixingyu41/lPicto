@@ -32,6 +32,8 @@ import RatingStars, { normalizeAssetRating } from '../components/RatingStars';
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format';
 import ImageViewer from '../viewer/ImageViewer';
 import VideoViewer, { type VideoPlaybackInfo } from '../viewer/VideoViewer';
+import AudioViewer from '../viewer/AudioViewer';
+import { viewerAudioOutputBridge } from '../viewer/audioOutputBridge';
 import type { ViewerMediaLayerMode } from '../viewer/mediaLayer';
 import { useKeyboard } from '../hooks/useKeyboard';
 import { useRestoreSidebarState, type SidebarReturnState } from '../components/SidebarContext';
@@ -202,6 +204,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   useEffect(
     () => () => {
       viewerPanelResizeCleanupRef.current?.();
+      viewerAudioOutputBridge.dispose();
     },
     [],
   );
@@ -277,7 +280,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
         : [5, 3, 6, 2, 7, 1];
     for (const index of order) {
       const asset = indicatorAssets[index];
-      if (!asset || asset.mediaType !== 'video') continue;
+      if (!asset || (asset.mediaType !== 'video' && asset.mediaType !== 'audio')) continue;
       const key = mediaReadyKey(asset.id, asset.cacheKey);
       if (!mediaWindowKeys.has(key) || key === currentMediaKey) continue;
       if (preparedMediaStatus[key] === undefined) return key;
@@ -375,7 +378,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
 			}
 		}
 		setAssetAI(null); setAssetAIError(null); setAITagError(null);
-		if (current) void loadAI(current);
+		if (current && current.mediaType !== 'audio') void loadAI(current);
 		return () => { live = false; window.clearTimeout(timer); };
 	}, [current?.id]);
 
@@ -551,6 +554,17 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const goAsset = useCallback(
     (asset: Asset | undefined, direction: -1 | 0 | 1 = 0) => {
       if (!asset) return;
+      const source = currentAssetRef.current;
+      if (
+        source
+        && (source.mediaType === 'video' || source.mediaType === 'audio')
+        && (asset.mediaType === 'video' || asset.mediaType === 'audio')
+      ) {
+        viewerAudioOutputBridge.beginTransition(
+          mediaReadyKey(source.id, source.cacheKey),
+          mediaReadyKey(asset.id, asset.cacheKey),
+        );
+      }
       if (direction !== 0) lastNavigationDirection.current = direction;
       navigate(
         { pathname: `/viewer/${asset.id}`, search: searchParams.toString() },
@@ -996,7 +1010,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onToggleMediaDetails={() => setMediaDetailsOpen((open) => !open)}
           onToggleFullscreen={toggleFullscreen}
         />
-        ) : (
+        ) : asset.mediaType === 'video' ? (
         <VideoViewer
           asset={asset}
           fullscreen={fullscreen}
@@ -1026,6 +1040,26 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onToggleFullscreen={toggleFullscreen}
           onProxyRuntimeChange={handleCurrentProxyRuntimeChange}
         />
+        ) : (
+        <AudioViewer
+          asset={asset}
+          deleting={deleteLoading || deleteSubmitting || recordDeleteSubmitting}
+          fullscreen={fullscreen}
+          layerMode={layerMode}
+          mediaDetailsOpen={mediaDetailsOpen}
+          playbackRate={playbackRate}
+          preloadEnabled={preloadEnabled}
+          viewerPrefs={viewerPrefs}
+          onDelete={openDeleteDialog}
+          onDeleteRecord={openRecordDeleteDialog}
+          onMediaError={handleMediaError}
+          onMediaReady={handleMediaReady}
+          onPlaybackEnded={playNextAsset}
+          onPlaybackModeChange={updatePlaybackMode}
+          onPlaybackRateChange={updatePlaybackRate}
+          onToggleMediaDetails={() => setMediaDetailsOpen((open) => !open)}
+          onToggleFullscreen={toggleFullscreen}
+        />
         )}
       </div>
     );
@@ -1046,7 +1080,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           ref={viewerBodyRef}
           className="viewer-body"
           onContextMenu={(event) => {
-            if (!(event.target instanceof Element) || !event.target.closest('.image-stage, .video-stage')) return;
+            if (!(event.target instanceof Element) || !event.target.closest('.image-stage, .video-stage, .audio-stage')) return;
             if (event.target.closest('[data-viewer-wheel-control]')) return;
             event.preventDefault();
             leave();
@@ -1300,7 +1334,7 @@ function ViewerSidebarPanel({
             onDraftChange={onTagDraftChange}
             onRemove={onRemoveTag}
           />
-		  <div className="sidebar-asset-tags sidebar-ai-result">
+		  {asset.mediaType !== 'audio' && <div className="sidebar-asset-tags sidebar-ai-result">
 			<div className="sidebar-control-title">AI 描述</div>
 			{aiError && <div className="sidebar-error">{aiError}</div>}
 			{!aiResult && !aiError && <div className="sidebar-empty-line">读取中</div>}
@@ -1317,7 +1351,7 @@ function ViewerSidebarPanel({
                 onSave={onSaveAITag}
               />
             )}
-		  </div>
+		  </div>}
           <div className="sidebar-control-title">星级</div>
           <RatingStars value={normalizeAssetRating(asset.rating)} onChange={onRatingChange} />
         </>
@@ -1766,12 +1800,26 @@ function mediaDetailRows(
   runtime: VideoSegmentStatus | null,
 ) {
   const rows = [
-    { label: '媒体类型', value: asset.mediaType === 'video' ? '视频' : '图片' },
-    { label: asset.mediaType === 'video' ? '视频分辨率' : '图片分辨率', value: formatDimensions(asset.width, asset.height) },
+    { label: '媒体类型', value: asset.mediaType === 'video' ? '视频' : asset.mediaType === 'audio' ? '音频' : '图片' },
+    { label: asset.mediaType === 'video' ? '视频分辨率' : asset.mediaType === 'audio' ? '全局封面尺寸' : '图片分辨率', value: asset.mediaType === 'audio' ? '1024 x 1024 px' : formatDimensions(asset.width, asset.height) },
     { label: '当前显示尺寸', value: formatDimensions(layout.mediaWidth, layout.mediaHeight) },
     { label: '播放器区域', value: formatDimensions(layout.playerWidth, layout.playerHeight) },
     { label: '播放器窗口', value: `${formatDimensions(layout.windowWidth, layout.windowHeight)} · 宽 ${layout.windowWidth}px` },
   ];
+  if (asset.mediaType === 'audio') {
+    rows.splice(1, 0,
+      { label: '播放来源', value: asset.browserPlayable ? '原文件按需读取' : 'FLAC 无损兼容缓存' },
+      { label: '播放位置', value: `0:00 / ${formatDuration(asset.duration || 0)}` },
+    );
+    rows.push(
+      { label: '音频码率', value: formatBitrate(asset.audioBitrate) },
+      { label: '总码率', value: formatBitrate(asset.overallBitrate) },
+      { label: '音频编码', value: asset.audioCodec || '未知' },
+      { label: '封装格式', value: asset.container || '未知' },
+      { label: '源文件总大小', value: formatBytes(asset.size) },
+    );
+    return rows;
+  }
   if (asset.mediaType !== 'video') return rows;
   const bufferedPercent = info?.duration ? Math.round(Math.min(1, Math.max(0, info.bufferedEnd / info.duration)) * 100) : 0;
   const droppedPercent = info?.totalFrames ? (info.droppedFrames / info.totalFrames) * 100 : 0;
@@ -1887,14 +1935,14 @@ function formatDecimal(value: number) {
 
 function assetInfoRows(asset: Asset, tags: AssetTag[]) {
   const rows = [
-    { label: '类型', value: asset.mediaType === 'image' ? '照片' : '视频' },
+    { label: '类型', value: asset.mediaType === 'image' ? '照片' : asset.mediaType === 'audio' ? '音频' : '视频' },
     { label: '大小', value: formatBytes(asset.size) },
     { label: '时间', value: formatDateTime(asset.timelineAt) },
     { label: '星级', value: asset.rating === 0 ? '未评级' : `${asset.rating} 星` },
   ];
   if (asset.width && asset.height) rows.push({ label: '尺寸', value: `${asset.width} x ${asset.height}` });
-  if (asset.mediaType === 'video' && asset.duration !== null) rows.push({ label: '时长', value: formatDuration(asset.duration) });
-  rows.push({ label: '旋转', value: `${asset.rotation || 0}°` });
+  if ((asset.mediaType === 'video' || asset.mediaType === 'audio') && asset.duration !== null) rows.push({ label: '时长', value: formatDuration(asset.duration) });
+  if (asset.mediaType !== 'audio') rows.push({ label: '旋转', value: `${asset.rotation || 0}°` });
   rows.push({ label: '标签', value: tags.length > 0 ? tags.map((item) => item.tag).join('、') : '无标签' });
   return rows;
 }

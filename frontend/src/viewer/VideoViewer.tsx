@@ -18,6 +18,7 @@ import {
   type ViewerPrefs,
 } from '../utils/viewerPrefs';
 import DanmakuLayer from './DanmakuLayer';
+import { viewerAudioOutputBridge } from './audioOutputBridge';
 import type { ViewerMediaLayerMode } from './mediaLayer';
 
 export interface VideoPlaybackInfo {
@@ -232,7 +233,11 @@ export default function VideoViewer({
   const source = useMemo(() => {
     if (!mediaLoadEnabled) return '';
     if (usesProxy) {
-      return assetVideoHlsPlaylistUrl(playbackAsset, { clientId: proxyClientId.current, sessionId: proxySessionId });
+      return assetVideoHlsPlaylistUrl(playbackAsset, {
+        clientId: proxyClientId.current,
+        sessionId: proxySessionId,
+        priority: 'preload',
+      });
     }
     const directSource = assetVideoUrl(playbackAsset);
     if (directReloadNonce <= 0) return directSource;
@@ -384,6 +389,18 @@ export default function VideoViewer({
     setProxyStreamEnabled(true);
   };
 
+  const promoteCurrentPlaybackSegment = (time = currentTimeRef.current) => {
+    if (!usesProxy) return;
+    const segmentIndex = Math.max(0, Math.floor(time / hlsSegmentSeconds));
+    void api.prewarmVideoSegments(
+      asset.id,
+      segmentIndex,
+      1,
+      'playback',
+      { clientId: proxyClientId.current, sessionId: proxySessionId },
+    ).catch(() => undefined);
+  };
+
   const proxyHeartbeat = (state: VideoProxyHeartbeat['state'], wantsStream: boolean): VideoProxyHeartbeat => ({
     clientId: proxyClientId.current,
     sessionId: proxySessionId,
@@ -418,6 +435,7 @@ export default function VideoViewer({
     const video = ref.current;
     if (!video) return;
     if (video.paused) {
+      viewerAudioOutputBridge.prime();
       wantsPlaying.current = true;
       setPlayRequested(true);
       setEnded(false);
@@ -498,6 +516,7 @@ export default function VideoViewer({
     setPlayRequested(true);
     setEnded(false);
     setPlayError('');
+    promoteCurrentPlaybackSegment(video.currentTime);
     try {
       await video.play();
       resumeAttempts.current = 0;
@@ -668,6 +687,11 @@ export default function VideoViewer({
       maxBufferLength: hlsSegmentSeconds * hlsCriticalPreloadSegments,
       maxMaxBufferLength: hlsSegmentSeconds * hlsCriticalPreloadSegments,
       startFragPrefetch: layerModeRef.current !== 'active',
+      xhrSetup: (xhr, url) => {
+        if (!url.includes('/hls/segments/')) return;
+        const priority = layerModeRef.current === 'active' && wantsPlaying.current ? 'playback' : 'preload';
+        xhr.setRequestHeader('X-LPicto-Segment-Priority', priority);
+      },
     });
     hlsRef.current = hls;
     hls.on(Hls.Events.MEDIA_ATTACHED, () => {
@@ -837,10 +861,8 @@ export default function VideoViewer({
     autoplayTimer.current = window.setTimeout(() => {
       setAutoplayPending(false);
       if (ref.current) {
-        wantsPlaying.current = true;
-        setPlayRequested(true);
         ref.current.playbackRate = playbackRate;
-        void ref.current.play().catch(() => undefined);
+        void startPlayback(ref.current);
       }
       autoplayTimer.current = null;
     }, viewerPrefs.videoPlaybackDelaySeconds * 1000);
@@ -1175,6 +1197,7 @@ export default function VideoViewer({
             onPause={(event) => {
               setPaused(true);
               setEnded(event.currentTarget.ended);
+              if (layerMode === 'active') viewerAudioOutputBridge.mediaStopped(`${asset.id}:${asset.cacheKey}`);
               scheduleResumeAfterUnexpectedPause(event.currentTarget);
             }}
             onPlaying={(event) => {
@@ -1182,6 +1205,7 @@ export default function VideoViewer({
               setSeeking(false);
               setEnded(false);
               setWaitingTrigger('none');
+              if (layerMode === 'active') viewerAudioOutputBridge.mediaStarted(`${asset.id}:${asset.cacheKey}`);
               updateBufferedRange(event.currentTarget);
             }}
             onPlay={() => {
@@ -1235,6 +1259,7 @@ export default function VideoViewer({
               setEnded(true);
               setWaitingTrigger('none');
               if (layerMode === 'active' && viewerPrefs.playbackMode === 'continuous') onPlaybackEnded();
+              viewerAudioOutputBridge.mediaStopped(`${asset.id}:${asset.cacheKey}`);
             }}
             onTimeUpdate={(event) => {
               const next = clampTime(event.currentTarget.currentTime, duration || asset.duration || 0);

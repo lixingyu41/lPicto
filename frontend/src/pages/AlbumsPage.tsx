@@ -37,6 +37,7 @@ import {
   savePageState,
   saveViewerReturnPath,
   type GridReturnState,
+  useViewerAwareMediaState,
   viewerOverlayCloseCompleted,
 } from '../utils/pageState';
 import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
@@ -50,7 +51,7 @@ const pageSize = waterfallPageSize;
 const albumsStateKey = 'albums';
 const albumsURLKeys = ['albumId', 'album', 'type', 'rating', 'orientation', 'sort', 'group', 'q', 'combinedTags', 'tagNodes'];
 const pendingAlbumEditorKey = 'lpicto:pending-album-editor';
-const assetKinds: AssetKind[] = ['all', 'image', 'video'];
+const assetKinds: AssetKind[] = ['all', 'image', 'video', 'audio'];
 
 type PendingAlbumEditor = { mode: 'add' } | { mode: 'edit'; albumId: number };
 
@@ -91,14 +92,17 @@ export default function AlbumsPage() {
   const initialAlbumNameRef = useRef(searchParams.get('album') ?? '');
   const [albums, setAlbums] = useState<Album[]>([]);
   const [groups, setGroups] = useState<AlbumGroup[]>([]);
-  const [type, setType] = useState<AssetKind>(initialStateRef.current.type);
-  const [selectedId, setSelectedId] = useState<number | null>(initialStateRef.current.selectedId);
-  const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
-  const [groupMode, setGroupMode] = useState<AssetGroupMode>(initialStateRef.current.groupMode);
-  const [query, setQuery] = useState(initialStateRef.current.query);
-  const [rating, setRating] = useState<AssetRating>(initialStateRef.current.rating ?? 0);
-  const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
-  const [tagFilters, setTagFilters] = useState(initialStateRef.current.tagFilters ?? []);
+  const [type, setType] = useViewerAwareMediaState<AssetKind>(initialStateRef.current.type);
+  const [selectedId, setSelectedId] = useViewerAwareMediaState<number | null>(initialStateRef.current.selectedId);
+  const [sort, setSort] = useViewerAwareMediaState<SortKey>(initialStateRef.current.sort);
+  const [groupMode, setGroupMode] = useViewerAwareMediaState<AssetGroupMode>(initialStateRef.current.groupMode);
+  const [query, setQuery] = useViewerAwareMediaState(initialStateRef.current.query);
+  const [rating, setRating] = useViewerAwareMediaState<AssetRating>(initialStateRef.current.rating ?? 0);
+  const [orientation, setOrientation] = useViewerAwareMediaState<OrientationFilter>(initialStateRef.current.orientation);
+  useEffect(() => {
+    if (type === 'audio') setOrientation('all');
+  }, [type]);
+  const [tagFilters, setTagFilters] = useViewerAwareMediaState(initialStateRef.current.tagFilters ?? []);
   const [addOpen, setAddOpen] = useState(false);
   const [editingAlbum, setEditingAlbum] = useState<Album | null>(null);
   const [groupDraftOpen, setGroupDraftOpen] = useState(false);

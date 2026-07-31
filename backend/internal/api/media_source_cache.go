@@ -15,7 +15,8 @@ import (
 	"lpicto/backend/internal/model"
 )
 
-const directVideoChunkBytes int64 = 8 << 20
+const directMediaChunkBytes int64 = 8 << 20
+const directVideoChunkBytes int64 = directMediaChunkBytes
 const directVideoSourceOpenTimeout = 10 * time.Second
 
 func (s *Server) serveCachedOriginalImage(w http.ResponseWriter, r *http.Request, asset model.Asset) bool {
@@ -105,11 +106,20 @@ func (s *Server) serveCachedMediaFile(w http.ResponseWriter, r *http.Request, as
 }
 
 func (s *Server) serveChunkCachedVideo(w http.ResponseWriter, r *http.Request, asset model.Asset) bool {
+	return s.serveChunkCachedMedia(w, r, asset, "video-chunks", "video_playback")
+}
+
+func (s *Server) serveChunkCachedAudio(w http.ResponseWriter, r *http.Request, asset model.Asset) bool {
+	return s.serveChunkCachedMedia(w, r, asset, "audio-chunks", "audio_playback")
+}
+
+func (s *Server) serveChunkCachedMedia(w http.ResponseWriter, r *http.Request, asset model.Asset, cacheKind, sourceReason string) bool {
 	if asset.Size <= 0 {
 		return false
 	}
 	reader := &chunkedVideoReader{
 		server: s, ctx: r.Context(), asset: asset, size: asset.Size,
+		cacheKind: cacheKind, sourceReason: sourceReason,
 	}
 	defer reader.Close()
 	if asset.MimeType != nil && *asset.MimeType != "" {
@@ -146,7 +156,7 @@ func serveBoundedVideoContent(w http.ResponseWriter, r *http.Request, reader io.
 	start, end, err := boundedByteRange(rangeHeader, size, 0)
 	if err != nil {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
-		writeError(w, http.StatusRequestedRangeNotSatisfiable, "invalid_range", "请求的视频范围无效")
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "invalid_range", "请求的媒体范围无效")
 		return nil
 	}
 	length := end - start + 1
@@ -232,8 +242,8 @@ func (s *Server) prewarmDirectVideo(w http.ResponseWriter, r *http.Request) {
 	if endByte > asset.Size {
 		endByte = asset.Size
 	}
-	first := startByte / directVideoChunkBytes
-	last := endByte / directVideoChunkBytes
+	first := startByte / directMediaChunkBytes
+	last := endByte / directMediaChunkBytes
 	if last > first+15 {
 		last = first + 15
 	}
@@ -243,7 +253,7 @@ func (s *Server) prewarmDirectVideo(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		stopPriority := s.holdPlaybackPriority(ctx)
 		defer stopPriority()
-		reader := &chunkedVideoReader{server: s, ctx: ctx, asset: asset, size: asset.Size}
+		reader := &chunkedVideoReader{server: s, ctx: ctx, asset: asset, size: asset.Size, cacheKind: "video-chunks", sourceReason: "video_playback"}
 		defer reader.Close()
 		for index := first; index <= last; index++ {
 			if _, err := reader.ensureChunk(index); err != nil {
@@ -258,15 +268,17 @@ func (s *Server) prewarmDirectVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 type chunkedVideoReader struct {
-	server    *Server
-	ctx       context.Context
-	asset     model.Asset
-	size      int64
-	offset    int64
-	source    *os.File
-	batchID   int64
-	bytesRead int64
-	readErr   error
+	server       *Server
+	ctx          context.Context
+	asset        model.Asset
+	size         int64
+	offset       int64
+	source       *os.File
+	batchID      int64
+	bytesRead    int64
+	readErr      error
+	cacheKind    string
+	sourceReason string
 }
 
 func (r *chunkedVideoReader) Seek(offset int64, whence int) (int64, error) {
@@ -294,8 +306,8 @@ func (r *chunkedVideoReader) Read(target []byte) (int, error) {
 	}
 	total := 0
 	for len(target) > 0 && r.offset < r.size {
-		index := r.offset / directVideoChunkBytes
-		chunkOffset := r.offset % directVideoChunkBytes
+		index := r.offset / directMediaChunkBytes
+		chunkOffset := r.offset % directMediaChunkBytes
 		path, err := r.ensureChunk(index)
 		if err != nil {
 			r.readErr = err
@@ -327,13 +339,19 @@ func (r *chunkedVideoReader) Read(target []byte) (int, error) {
 
 func (r *chunkedVideoReader) ensureChunk(index int64) (string, error) {
 	key := r.asset.CacheKey + "-c" + strconv.FormatInt(index, 10)
-	path, err := r.server.store.CachePath("video-chunks", key, "bin")
+	if r.cacheKind == "" {
+		r.cacheKind = "video-chunks"
+	}
+	if r.sourceReason == "" {
+		r.sourceReason = "video_playback"
+	}
+	path, err := r.server.store.CachePath(r.cacheKind, key, "bin")
 	if err != nil {
 		return "", err
 	}
 	length := expectedVideoChunkBytes(r.size, index)
 	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Size() == length {
-		r.server.cachePolicy.Touch(r.ctx, "video-chunks", key, path)
+		r.server.cachePolicy.Touch(r.ctx, r.cacheKind, key, path)
 		return path, nil
 	}
 	r.server.cacheCopyMu.Lock()
@@ -355,10 +373,10 @@ func (r *chunkedVideoReader) ensureChunk(index int64) (string, error) {
 			return "", err
 		}
 		r.source = source
-		r.batchID, _ = r.server.db.BeginSourceIOBatch(context.Background(), "video_playback", 0)
+		r.batchID, _ = r.server.db.BeginSourceIOBatch(context.Background(), r.sourceReason, 0)
 	}
 	data := make([]byte, length)
-	count, err := r.source.ReadAt(data, index*directVideoChunkBytes)
+	count, err := r.source.ReadAt(data, index*directMediaChunkBytes)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
@@ -372,19 +390,19 @@ func (r *chunkedVideoReader) ensureChunk(index int64) (string, error) {
 		return "", err
 	}
 	assetID := r.asset.ID
-	r.server.cachePolicy.Register(context.Background(), "video-chunks", key, path, &assetID, 10*time.Minute)
+	r.server.cachePolicy.Register(context.Background(), r.cacheKind, key, path, &assetID, 10*time.Minute)
 	return path, nil
 }
 
 func expectedVideoChunkBytes(size, index int64) int64 {
-	remaining := size - index*directVideoChunkBytes
+	remaining := size - index*directMediaChunkBytes
 	if remaining <= 0 {
 		return 0
 	}
-	if remaining < directVideoChunkBytes {
+	if remaining < directMediaChunkBytes {
 		return remaining
 	}
-	return directVideoChunkBytes
+	return directMediaChunkBytes
 }
 
 func (r *chunkedVideoReader) Close() {

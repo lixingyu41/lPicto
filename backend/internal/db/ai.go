@@ -463,7 +463,7 @@ LEFT JOIN asset_ai_result r ON r.asset_id=ma.id WHERE ma.deleted_at IS NULL AND 
 	rows, err := d.conn.QueryContext(ctx, `SELECT ma.id,ma.cache_key,fi.rel_path FROM media_asset ma
 JOIN LATERAL (SELECT rel_path FROM file_instance WHERE asset_id=ma.id AND missing=false ORDER BY last_seen_at DESC,id DESC LIMIT 1) fi ON true
 LEFT JOIN asset_ai_result r ON r.asset_id=ma.id
-WHERE ma.deleted_at IS NULL AND (r.asset_id IS NULL OR r.input_cache_key<>ma.cache_key OR r.status='pending')
+WHERE ma.deleted_at IS NULL AND ma.media_type IN (1,2) AND (r.asset_id IS NULL OR r.input_cache_key<>ma.cache_key OR r.status='pending')
 ORDER BY ma.sort_time DESC,ma.id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -495,7 +495,7 @@ func (d *DB) ReindexAI(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO asset_ai_result(asset_id,input_cache_key,status,description,tag_model,tag_model_version,description_model,description_model_version,taxonomy_version,sampled_frames,palette,attempts,error_text,started_at,finished_at,updated_at)
-SELECT id,cache_key,'pending',NULL,'','','','','','[]'::jsonb,'[]'::jsonb,0,NULL,NULL,NULL,now() FROM media_asset WHERE deleted_at IS NULL
+SELECT id,cache_key,'pending',NULL,'','','','','','[]'::jsonb,'[]'::jsonb,0,NULL,NULL,NULL,now() FROM media_asset WHERE deleted_at IS NULL AND media_type IN (1,2)
 ON CONFLICT(asset_id) DO UPDATE SET input_cache_key=excluded.input_cache_key,status='pending',description=NULL,tag_model='',tag_model_version='',description_model='',description_model_version='',taxonomy_version='',sampled_frames='[]'::jsonb,palette='[]'::jsonb,attempts=0,error_text=NULL,started_at=NULL,finished_at=NULL,updated_at=now()`)
 	if err != nil {
 		return 0, err
@@ -526,7 +526,7 @@ func (d *DB) ReindexAIForLibrary(ctx context.Context, library ScanLibrary) ([]AI
   SELECT DISTINCT ma.id,ma.cache_key,ma.sort_time
   FROM media_asset ma
   JOIN file_instance fi ON fi.asset_id=ma.id AND fi.missing=false
-  WHERE ma.deleted_at IS NULL AND (` + strings.Join(conditions, " OR ") + `)
+  WHERE ma.deleted_at IS NULL AND ma.media_type IN (1,2) AND (` + strings.Join(conditions, " OR ") + `)
 ), deleted_tags AS (
   DELETE FROM asset_ai_tag t USING selected WHERE t.asset_id=selected.id RETURNING t.asset_id
 ), reset AS (
@@ -557,7 +557,7 @@ func (d *DB) RetryFailedAI(ctx context.Context) ([]AIBackfillItem, error) {
   UPDATE asset_ai_result r
   SET status='pending',attempts=0,error_text=NULL,started_at=NULL,finished_at=NULL,updated_at=now()
   FROM media_asset ma
-  WHERE ma.id=r.asset_id AND ma.deleted_at IS NULL AND r.input_cache_key=ma.cache_key AND r.status='failed'
+  WHERE ma.id=r.asset_id AND ma.deleted_at IS NULL AND ma.media_type IN (1,2) AND r.input_cache_key=ma.cache_key AND r.status='failed'
   RETURNING r.asset_id,ma.cache_key,ma.sort_time
 )
 SELECT asset_id,cache_key FROM reset ORDER BY sort_time DESC,asset_id DESC`)
@@ -690,6 +690,6 @@ ORDER BY depth,label,id`, args...)
 func (d *DB) AIStatus(ctx context.Context) (AIStatus, error) {
 	var out AIStatus
 	err := d.conn.QueryRowContext(ctx, `SELECT COUNT(*),COUNT(*) FILTER(WHERE r.status='pending' OR r.asset_id IS NULL),COUNT(*) FILTER(WHERE r.status='processing'),COUNT(*) FILTER(WHERE r.status='ready' AND r.input_cache_key=ma.cache_key),COUNT(*) FILTER(WHERE r.status='failed' AND r.input_cache_key=ma.cache_key),COUNT(*) FILTER(WHERE r.asset_id IS NOT NULL AND r.input_cache_key<>ma.cache_key),COALESCE((COUNT(*) FILTER(WHERE r.status='ready' AND r.finished_at>now()-interval '1 hour'))/GREATEST(EXTRACT(EPOCH FROM (now()-MIN(r.finished_at) FILTER(WHERE r.status='ready' AND r.finished_at>now()-interval '1 hour')))/60.0,1.0/60.0),0)
-FROM media_asset ma LEFT JOIN asset_ai_result r ON r.asset_id=ma.id WHERE ma.deleted_at IS NULL`).Scan(&out.Total, &out.Pending, &out.Processing, &out.Ready, &out.Failed, &out.Stale, &out.PerMinute)
+FROM media_asset ma LEFT JOIN asset_ai_result r ON r.asset_id=ma.id WHERE ma.deleted_at IS NULL AND ma.media_type IN (1,2)`).Scan(&out.Total, &out.Pending, &out.Processing, &out.Ready, &out.Failed, &out.Stale, &out.PerMinute)
 	return out, err
 }

@@ -1,4 +1,4 @@
-export type MediaType = 'image' | 'video';
+export type MediaType = 'image' | 'video' | 'audio';
 export type AssetKind = 'all' | MediaType;
 export type OrientationFilter = 'all' | 'landscape' | 'portrait';
 export type NFOFilterField = 'actor' | 'id' | 'tag' | 'title' | 'year';
@@ -96,6 +96,19 @@ export interface VideoProxyRuntime {
   command: string;
   message: string;
   serverTime: number;
+}
+
+export interface AudioProxyRuntime {
+  assetId: number;
+  required: boolean;
+  cached: boolean;
+  transcoding: boolean;
+  queued: boolean;
+  status: 'idle' | 'queued' | 'processing' | 'ready' | 'error';
+  progress: number;
+  bytes: number;
+  error: string;
+  updatedAt: number;
 }
 
 export interface VideoSegmentStatus {
@@ -444,6 +457,7 @@ export interface ProcessingProgress {
   assetTotal: number;
   imageTotal: number;
   videoTotal: number;
+  audioTotal: number;
   thumb: WorkStatusCounts;
   transcode: WorkStatusCounts;
   preview: WorkStatusCounts;

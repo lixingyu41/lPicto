@@ -670,13 +670,13 @@ func albumAssetFilterSQL(album model.Album, opts AssetListOptions) (string, []an
 		where = append(where, "hidden = false")
 	}
 	if opts.VisibleOnly {
-		where = append(where, "thumb_status = 'ready'")
+		where = append(where, "(thumb_status = 'ready' OR media_type = 'audio')")
 	}
 	mediaFilter := normalizeAlbumMediaFilter(album.MediaTypeFilter)
-	if opts.Type == model.MediaTypeImage || opts.Type == model.MediaTypeVideo {
+	if opts.Type == model.MediaTypeImage || opts.Type == model.MediaTypeVideo || opts.Type == model.MediaTypeAudio {
 		mediaFilter = opts.Type
 	}
-	if mediaFilter == model.MediaTypeImage || mediaFilter == model.MediaTypeVideo {
+	if mediaFilter == model.MediaTypeImage || mediaFilter == model.MediaTypeVideo || mediaFilter == model.MediaTypeAudio {
 		where = append(where, "assets.id IN (SELECT id FROM media_asset WHERE media_type = ?)")
 		args = append(args, mediaTypeCode(mediaFilter))
 	}
@@ -731,7 +731,7 @@ WHERE f.rel_path = ?
 			args = append(args, source.RelPath)
 		}
 		switch normalizeAlbumMediaFilter(source.MediaTypeFilter) {
-		case model.MediaTypeImage, model.MediaTypeVideo:
+		case model.MediaTypeImage, model.MediaTypeVideo, model.MediaTypeAudio:
 			parts = append(parts, `assets.id IN (SELECT id FROM media_asset WHERE media_type = ?)`)
 			args = append(args, mediaTypeCode(normalizeAlbumMediaFilter(source.MediaTypeFilter)))
 		}
@@ -800,7 +800,7 @@ func effectiveHeightSQL() string {
 
 func normalizeAlbumMediaFilter(value string) string {
 	switch value {
-	case model.MediaTypeImage, model.MediaTypeVideo:
+	case model.MediaTypeImage, model.MediaTypeVideo, model.MediaTypeAudio:
 		return value
 	default:
 		return AlbumMediaAll

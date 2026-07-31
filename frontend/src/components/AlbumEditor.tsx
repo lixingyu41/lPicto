@@ -141,6 +141,7 @@ export default function AlbumEditor({
               <option value="all">全部</option>
               <option value="image">照片</option>
               <option value="video">视频</option>
+              <option value="audio">音频</option>
             </select>
           </label>
           <label className="settings-field">
@@ -287,7 +288,7 @@ function AlbumFolderTreeNode({
 }
 
 function sourceFilterLabel(source: Pick<AlbumSource, 'mediaTypeFilter' | 'orientationFilter' | 'recursive'>) {
-  const type = source.mediaTypeFilter === 'image' ? '照片' : source.mediaTypeFilter === 'video' ? '视频' : '全部';
+  const type = source.mediaTypeFilter === 'image' ? '照片' : source.mediaTypeFilter === 'video' ? '视频' : source.mediaTypeFilter === 'audio' ? '音频' : '全部';
   const orientation =
     source.orientationFilter === 'portrait' ? '竖屏' : source.orientationFilter === 'landscape' ? '横屏' : '全部方向';
   return `${type} · ${orientation} · ${source.recursive ? '含子文件夹' : '仅本层'}`;

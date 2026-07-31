@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
-import { ChevronRight, Database, EyeOff, Image as ImageIcon, Images, ListChecks, MonitorSmartphone, RectangleHorizontal, RectangleVertical, RotateCw, Sparkles, Square, Star, StarOff, Tags, Trash2, Video } from 'lucide-react';
+import { ChevronRight, Database, EyeOff, Image as ImageIcon, Images, ListChecks, MonitorSmartphone, Music, RectangleHorizontal, RectangleVertical, RotateCw, Sparkles, Square, Star, StarOff, Tags, Trash2, Video } from 'lucide-react';
 import type { Album, AlbumGroup, AssetKind, AssetRating, OrientationFilter } from '../types/api';
 import { CompactSidebarMenu, CompactSidebarMenuGroup } from './CompactSidebarMenu';
 import {
@@ -371,6 +371,7 @@ const assetKindOptions: Array<SidebarIconMenuOption<AssetKind>> = [
   { value: 'all', label: '全部', renderIcon: () => <Images size={18} /> },
   { value: 'video', label: '视频', renderIcon: () => <Video size={18} /> },
   { value: 'image', label: '图片', renderIcon: () => <ImageIcon size={18} /> },
+  { value: 'audio', label: '音频', renderIcon: () => <Music size={18} /> },
 ];
 
 const orientationFilterOptions: Array<SidebarIconMenuOption<OrientationFilter>> = [
@@ -427,6 +428,8 @@ export function assetKindLabel(value: AssetKind) {
       return '图片';
     case 'video':
       return '视频';
+    case 'audio':
+      return '音频';
     default:
       return '全部';
   }

@@ -314,6 +314,7 @@ type ProcessingProgressDTO struct {
 	AssetTotal  int                 `json:"assetTotal"`
 	ImageTotal  int                 `json:"imageTotal"`
 	VideoTotal  int                 `json:"videoTotal"`
+	AudioTotal  int                 `json:"audioTotal"`
 	Thumb       WorkStatusCountsDTO `json:"thumb"`
 	Transcode   WorkStatusCountsDTO `json:"transcode"`
 	Preview     WorkStatusCountsDTO `json:"preview"`
@@ -722,6 +723,7 @@ func processingProgressDTO(progress db.ProcessingProgress, queue jobs.QueueStats
 		AssetTotal:  progress.AssetTotal,
 		ImageTotal:  progress.ImageTotal,
 		VideoTotal:  progress.VideoTotal,
+		AudioTotal:  progress.AudioTotal,
 		Thumb:       workStatusCountsDTO(progress.Thumb),
 		Transcode:   workStatusCountsDTO(progress.Transcode),
 		Preview:     workStatusCountsDTO(progress.Preview),

@@ -49,8 +49,10 @@ import type {
   VideoProxyRuntime,
   VideoProxySettings,
   VideoSegmentStatus,
+  AudioProxyRuntime,
 } from '../types/api';
 import { loadMediaViewPreferences } from '../utils/mediaViewPrefs';
+import audioCoverUrl from '../assets/audio-cover.png';
 
 interface APIErrorBody {
   error?: {
@@ -64,6 +66,7 @@ const requestTimeoutMs = 30_000;
 export interface VideoProxySessionContext {
   clientId?: string;
   sessionId?: string;
+  priority?: 'playback' | 'preload';
 }
 
 async function request<T>(url: string, init?: RequestInit, timeoutMs = requestTimeoutMs): Promise<T> {
@@ -464,7 +467,7 @@ export const api = {
     }),
   videoSegmentStatus: (id: number, session?: VideoProxySessionContext) =>
     request<VideoSegmentStatus>(`/api/assets/${id}/hls/status${videoSessionQuery(session)}`),
-  prewarmVideoSegments: (id: number, from: number, count: number, priority: 'critical' | 'balanced', session?: VideoProxySessionContext, signal?: AbortSignal) =>
+  prewarmVideoSegments: (id: number, from: number, count: number, priority: 'playback' | 'critical' | 'balanced', session?: VideoProxySessionContext, signal?: AbortSignal) =>
     request<{ cachedSegments: number; required: boolean }>(`/api/assets/${id}/hls/prewarm${qs({
       from: Math.max(0, Math.floor(from)),
       count: Math.max(1, Math.floor(count)),
@@ -476,6 +479,10 @@ export const api = {
     request<{ cancelled: number }>(`/api/assets/${id}/hls/session/stop${videoSessionQuery(session)}`, { method: 'POST' }),
   prewarmDirectVideo: (id: number, startSeconds = 0) =>
     request<{ accepted: boolean; chunks: number }>(`/api/assets/${id}/video/cache/prewarm?start=${Math.max(0, startSeconds)}`, { method: 'POST' }),
+  startAudioProxy: (id: number, priority: 'current' | 'preload', signal?: AbortSignal) =>
+    request<AudioProxyRuntime>(`/api/assets/${id}/audio-proxy?priority=${priority}`, { method: 'POST', signal }),
+  audioProxyStatus: (id: number, signal?: AbortSignal) =>
+    request<AudioProxyRuntime>(`/api/assets/${id}/audio-proxy/status`, { signal }),
   neighbors: (id: number, params: Record<string, string | number | undefined | null>, signal?: AbortSignal) =>
     request<Neighbors>(`/api/assets/${id}/neighbors${qs(params)}`, { signal }),
   assetPosition: (id: number, params: Record<string, string | number | undefined | null>) =>
@@ -483,10 +490,12 @@ export const api = {
 };
 
 export function assetThumbUrl(asset: Asset): string {
+  if (asset.mediaType === 'audio') return audioCoverUrl;
   return `/api/cache/thumbs/${asset.cacheKey}.webp`;
 }
 
 export function assetPreviewUrl(asset: Asset): string {
+  if (asset.mediaType === 'audio') return audioCoverUrl;
   if (asset.mediaType === 'video') {
     return assetThumbUrl(asset);
   }
@@ -494,6 +503,14 @@ export function assetPreviewUrl(asset: Asset): string {
     return assetOriginalUrl(asset);
   }
   return `/api/assets/${asset.id}/preview?v=${asset.cacheKey}`;
+}
+
+export function assetAudioCoverUrl(): string {
+  return audioCoverUrl;
+}
+
+export function assetAudioUrl(asset: Asset): string {
+  return `/api/assets/${asset.id}/audio?v=${asset.cacheKey}`;
 }
 
 export function assetOriginalUrl(asset: Asset): string {
@@ -526,6 +543,7 @@ export function assetVideoHlsPlaylistUrl(asset: Asset, session?: VideoProxySessi
   if (session?.sessionId) {
     query.set('sessionId', session.sessionId);
   }
+  query.set('priority', session?.priority ?? 'preload');
   return `/api/assets/${asset.id}/hls/playlist.m3u8?${query.toString()}`;
 }
 

@@ -21,6 +21,7 @@ type ProcessingProgress struct {
 	AssetTotal  int
 	ImageTotal  int
 	VideoTotal  int
+	AudioTotal  int
 	Thumb       WorkStatusCounts
 	Transcode   WorkStatusCounts
 	Preview     WorkStatusCounts
@@ -78,9 +79,10 @@ func (d *DB) processingProgress(ctx context.Context, where string, args []any) (
 SELECT
   COUNT(*),
   COALESCE(SUM(CASE WHEN media_type = 'image' THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0)
+  COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN media_type = 'audio' THEN 1 ELSE 0 END), 0)
 FROM assets
-WHERE `+where, args...).Scan(&progress.AssetTotal, &progress.ImageTotal, &progress.VideoTotal); err != nil {
+WHERE `+where, args...).Scan(&progress.AssetTotal, &progress.ImageTotal, &progress.VideoTotal, &progress.AudioTotal); err != nil {
 		return ProcessingProgress{}, err
 	}
 

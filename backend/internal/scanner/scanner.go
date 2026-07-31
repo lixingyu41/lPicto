@@ -1518,6 +1518,10 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 	importedAt := util.UnixNow()
 	mtime := info.ModTime().Unix()
 	meta := s.Extractor.Extract(ctx, absPath, detection, mtime, importedAt)
+	if detection.MediaType == model.MediaTypeVideo && !meta.HasVideo && meta.HasAudio {
+		detection.MediaType = model.MediaTypeAudio
+		detection.MimeType = media.AudioMimeType(detection.Ext)
+	}
 	mimeType := detection.MimeType
 	if meta.MimeType != "" {
 		mimeType = meta.MimeType
@@ -1913,8 +1917,10 @@ func (s *Scanner) enqueueWork(assetID int64, mediaType string, previewStatus str
 	if s.Jobs == nil {
 		return
 	}
-	if enabled, err := s.DB.AIExecutionEnabled(context.Background()); err == nil && enabled {
-		s.Jobs.Enqueue(jobs.Task{Type: "ai_analyze", AssetID: assetID, Priority: 10})
+	if mediaType == model.MediaTypeImage || mediaType == model.MediaTypeVideo {
+		if enabled, err := s.DB.AIExecutionEnabled(context.Background()); err == nil && enabled {
+			s.Jobs.Enqueue(jobs.Task{Type: "ai_analyze", AssetID: assetID, Priority: 10})
+		}
 	}
 	if mediaType == model.MediaTypeImage {
 		s.Jobs.Enqueue(jobs.Task{Type: "thumb", AssetID: assetID})

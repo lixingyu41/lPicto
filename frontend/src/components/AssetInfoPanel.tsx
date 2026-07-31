@@ -16,7 +16,7 @@ export default function AssetInfoPanel({ asset, title }: Props) {
         <dl>
           <div>
             <dt>类型</dt>
-            <dd>{asset.mediaType === 'image' ? '照片' : '视频'}</dd>
+            <dd>{asset.mediaType === 'image' ? '照片' : asset.mediaType === 'audio' ? '音频' : '视频'}</dd>
           </div>
           <div>
             <dt>大小</dt>

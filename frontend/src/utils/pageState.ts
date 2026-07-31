@@ -1,3 +1,4 @@
+import { useCallback, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import type { SidebarPanelTarget } from '../components/SidebarContext';
 
 export interface GridReturnState {
@@ -101,6 +102,35 @@ export function requestViewerOverlayClose() {
   const detail = { handled: false };
   window.dispatchEvent(new CustomEvent(viewerOverlayCloseRequested, { detail }));
   return detail.handled;
+}
+
+export function useViewerAwareMediaState<State>(
+  initialState: State | (() => State),
+  equals: (current: State, next: State) => boolean = mediaStateEquals,
+): [State, Dispatch<SetStateAction<State>>] {
+  const [state, setState] = useState(initialState);
+  const stateRef = useRef(state);
+  const equalsRef = useRef(equals);
+  equalsRef.current = equals;
+
+  const setViewerAwareState = useCallback<Dispatch<SetStateAction<State>>>((action) => {
+    const current = stateRef.current;
+    const next = typeof action === 'function'
+      ? (action as (previous: State) => State)(current)
+      : action;
+    if (equalsRef.current(current, next)) return;
+    requestViewerOverlayClose();
+    stateRef.current = next;
+    setState(next);
+  }, []);
+
+  return [state, setViewerAwareState];
+}
+
+function mediaStateEquals<State>(current: State, next: State) {
+  if (Object.is(current, next)) return true;
+  if (!Array.isArray(current) || !Array.isArray(next) || current.length !== next.length) return false;
+  return current.every((value, index) => Object.is(value, next[index]));
 }
 
 export function emitViewerOverlayCloseCompleted() {

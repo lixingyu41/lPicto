@@ -7,7 +7,7 @@ import FoldersPage from './pages/FoldersPage';
 import LibraryPage from './pages/LibraryPage';
 import SettingsPage from './pages/SettingsPage';
 import ViewerPage from './pages/ViewerPage';
-import { emitViewerOverlayCloseCompleted, requestViewerOverlayClose, viewerOverlayCloseRequested } from './utils/pageState';
+import { emitViewerOverlayCloseCompleted, viewerOverlayCloseRequested } from './utils/pageState';
 
 interface ViewerOverlayState {
   backgroundLocation?: Location;
@@ -40,17 +40,6 @@ export default function App() {
     window.addEventListener(viewerOverlayCloseRequested, handleViewerOverlayClose);
     return () => window.removeEventListener(viewerOverlayCloseRequested, handleViewerOverlayClose);
   }, [backgroundLocation, navigate, showingViewerOverlay]);
-
-  useEffect(() => {
-    if (!showingViewerOverlay) return undefined;
-    const closeViewerBeforeBackgroundAction = (event: PointerEvent) => {
-      if (!(event.target instanceof Element)) return;
-      if (event.target.closest('.viewer-page, .modal-backdrop')) return;
-      requestViewerOverlayClose();
-    };
-    document.addEventListener('pointerdown', closeViewerBeforeBackgroundAction, true);
-    return () => document.removeEventListener('pointerdown', closeViewerBeforeBackgroundAction, true);
-  }, [showingViewerOverlay]);
 
   return (
     <Layout routeLocation={routeLocation} overlay={showingViewerOverlay ? <ViewerPage overlay /> : null}>

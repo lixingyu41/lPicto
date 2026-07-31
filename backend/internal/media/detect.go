@@ -35,6 +35,27 @@ var videoExts = map[string]string{
 	".m4v":  "video/x-m4v",
 }
 
+var audioExts = map[string]string{
+	".mp3":  "audio/mpeg",
+	".aac":  "audio/aac",
+	".m4a":  "audio/mp4",
+	".flac": "audio/flac",
+	".wav":  "audio/wav",
+	".ogg":  "audio/ogg",
+	".oga":  "audio/ogg",
+	".opus": "audio/ogg",
+	".wma":  "audio/x-ms-wma",
+	".ape":  "audio/x-ape",
+	".alac": "audio/mp4",
+	".aif":  "audio/aiff",
+	".aiff": "audio/aiff",
+	".amr":  "audio/amr",
+	".ac3":  "audio/ac3",
+	".mka":  "audio/x-matroska",
+	".dsf":  "audio/x-dsf",
+	".dff":  "audio/x-dff",
+}
+
 func DetectByPath(filename string) Detection {
 	ext := strings.ToLower(filepath.Ext(filename))
 	if mt, ok := imageExts[ext]; ok {
@@ -43,10 +64,48 @@ func DetectByPath(filename string) Detection {
 	if mt, ok := videoExts[ext]; ok {
 		return Detection{MediaType: "video", MimeType: mt, Ext: strings.TrimPrefix(ext, "."), OK: true}
 	}
+	if mt, ok := audioExts[ext]; ok {
+		return Detection{MediaType: "audio", MimeType: mt, Ext: strings.TrimPrefix(ext, "."), OK: true}
+	}
 	if mt := mime.TypeByExtension(ext); mt != "" {
 		return Detection{MimeType: mt, Ext: strings.TrimPrefix(ext, ".")}
 	}
 	return Detection{Ext: strings.TrimPrefix(ext, ".")}
+}
+
+func BrowserAudioPlayable(ext, codec string) bool {
+	ext = strings.ToLower(strings.TrimPrefix(ext, "."))
+	codec = strings.ToLower(strings.TrimSpace(codec))
+	switch ext {
+	case "mp3":
+		return codec == "" || codec == "mp3"
+	case "mp4", "m4a", "m4v", "aac":
+		return codec == "" || codec == "aac"
+	case "flac":
+		return codec == "" || codec == "flac"
+	case "wav":
+		return codec == "" || strings.HasPrefix(codec, "pcm_")
+	case "ogg", "oga":
+		return codec == "" || codec == "vorbis" || codec == "opus" || codec == "flac"
+	case "opus":
+		return codec == "" || codec == "opus"
+	default:
+		return false
+	}
+}
+
+func AudioMimeType(ext string) string {
+	switch strings.ToLower(strings.TrimPrefix(ext, ".")) {
+	case "mp4", "m4a", "m4v", "aac", "alac":
+		return "audio/mp4"
+	case "mov":
+		return "audio/quicktime"
+	default:
+		if detected := DetectByPath("audio." + strings.TrimPrefix(ext, ".")); detected.MimeType != "" {
+			return detected.MimeType
+		}
+		return "audio/*"
+	}
 }
 
 func BrowserImageDisplayable(mimeType string) bool {

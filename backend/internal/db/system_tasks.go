@@ -207,7 +207,7 @@ SELECT r.asset_id,
   COALESCE((SELECT fi.rel_path FROM file_instance fi WHERE fi.asset_id=r.asset_id ORDER BY fi.missing,fi.id LIMIT 1), ''),
   COALESCE(r.error_text, '')
 FROM asset_ai_result r
-JOIN media_asset ma ON ma.id=r.asset_id AND ma.deleted_at IS NULL
+JOIN media_asset ma ON ma.id=r.asset_id AND ma.deleted_at IS NULL AND ma.media_type IN (1,2)
 WHERE r.status='failed'
 ORDER BY r.updated_at DESC,r.asset_id DESC
 LIMIT ?`, limit)

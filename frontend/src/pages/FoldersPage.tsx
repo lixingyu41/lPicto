@@ -24,6 +24,7 @@ import {
   savePageState,
   saveViewerReturnPath,
   type GridReturnState,
+  useViewerAwareMediaState,
 } from '../utils/pageState';
 import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import { assetMatchesFolder } from '../utils/assetFilters';
@@ -86,16 +87,19 @@ export default function FoldersPage() {
   const [tree, setTree] = useState<Folder[]>(() => folderTreeCache ?? []);
   const [treeLoading, setTreeLoading] = useState(folderTreeCache === null);
   const [treeError, setTreeError] = useState('');
-  const [currentId, setCurrentId] = useState(initialStateRef.current.currentId);
+  const [currentId, setCurrentId] = useViewerAwareMediaState(initialStateRef.current.currentId);
   const [current, setCurrent] = useState<Folder | null>(null);
-  const [sort, setSort] = useState<SortKey>(initialStateRef.current.sort);
-  const [query, setQuery] = useState(initialStateRef.current.query);
-  const [groupMode, setGroupMode] = useState<AssetGroupMode>(initialStateRef.current.groupMode);
-  const [includeSubfolders, setIncludeSubfolders] = useState(initialStateRef.current.includeSubfolders);
-  const [rating, setRating] = useState<AssetRating>(initialStateRef.current.rating ?? 0);
-  const [orientation, setOrientation] = useState<OrientationFilter>(initialStateRef.current.orientation);
-  const [type, setType] = useState<AssetKind>(initialStateRef.current.type);
-  const [tagFilters, setTagFilters] = useState(initialStateRef.current.tagFilters ?? []);
+  const [sort, setSort] = useViewerAwareMediaState<SortKey>(initialStateRef.current.sort);
+  const [query, setQuery] = useViewerAwareMediaState(initialStateRef.current.query);
+  const [groupMode, setGroupMode] = useViewerAwareMediaState<AssetGroupMode>(initialStateRef.current.groupMode);
+  const [includeSubfolders, setIncludeSubfolders] = useViewerAwareMediaState(initialStateRef.current.includeSubfolders);
+  const [rating, setRating] = useViewerAwareMediaState<AssetRating>(initialStateRef.current.rating ?? 0);
+  const [orientation, setOrientation] = useViewerAwareMediaState<OrientationFilter>(initialStateRef.current.orientation);
+  const [type, setType] = useViewerAwareMediaState<AssetKind>(initialStateRef.current.type);
+  useEffect(() => {
+    if (type === 'audio') setOrientation('all');
+  }, [type]);
+  const [tagFilters, setTagFilters] = useViewerAwareMediaState(initialStateRef.current.tagFilters ?? []);
   const [collapsedFolderKeys, setCollapsedFolderKeys] = useState<Set<string>>(() => {
     if (initialStateRef.current.collapsedFolderKeys.length > 0 || !folderTreeCache) {
       return new Set(initialStateRef.current.collapsedFolderKeys);
@@ -581,7 +585,7 @@ function foldersStateFromSearchParams(params: URLSearchParams, fallback: Folders
 }
 
 function parseAssetKind(value: string | null): AssetKind {
-  return value === 'image' || value === 'video' ? value : 'all';
+  return value === 'image' || value === 'video' || value === 'audio' ? value : 'all';
 }
 
 function typeViewerParam(type: AssetKind) {

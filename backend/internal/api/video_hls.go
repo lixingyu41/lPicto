@@ -30,6 +30,7 @@ type videoSegmentRuntime struct {
 	AssetID      int64
 	CacheKey     string
 	SessionID    string
+	SessionIDs   map[string]struct{}
 	SegmentIndex int
 	StartSeconds float64
 	Duration     float64
@@ -63,6 +64,7 @@ type videoSegmentPlan struct {
 }
 
 const videoPrioritySegmentCount = 5
+const videoSegmentPriorityHeader = "X-LPicto-Segment-Priority"
 
 const (
 	videoSegmentPriorityStale    = 10
@@ -108,10 +110,11 @@ func (s *Server) videoHLSPlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session := videoProxySessionFromRequest(r)
+	priority := videoSegmentPriorityName(videoSegmentPriorityFromRequest(r, videoSegmentPriorityBalanced))
 	segmentSeconds := s.videoSegmentSeconds()
 	segmentCount := videoSegmentCount(duration, segmentSeconds)
 	targetDuration := int(math.Ceil(float64(segmentSeconds)))
-	query := videoSegmentQuery(asset, session)
+	query := videoSegmentQuery(asset, session, priority)
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
@@ -180,7 +183,7 @@ func (s *Server) videoHLSSegment(w http.ResponseWriter, r *http.Request) {
 	}
 	session := videoProxySessionFromRequest(r)
 	cacheSettings := s.videoProxyCacheSettings(r.Context())
-	priority := parseVideoSegmentPriority(r.URL.Query().Get("priority"), videoSegmentPriorityBalanced)
+	priority := videoSegmentPriorityFromRequest(r, videoSegmentPriorityBalanced)
 	var state *videoSegmentRuntime
 	for {
 		var cached bool
@@ -233,7 +236,7 @@ func (s *Server) videoHLSPrewarm(w http.ResponseWriter, r *http.Request) {
 	}
 	session := videoProxySessionFromRequest(r)
 	cacheSettings := s.videoProxyCacheSettings(r.Context())
-	priority := parseVideoSegmentPriority(r.URL.Query().Get("priority"), videoSegmentPriorityCritical)
+	priority := videoSegmentPriorityFromRequest(r, videoSegmentPriorityCritical)
 	completed := 0
 	for index := start; index < start+count; index++ {
 		plan, err := s.videoSegmentPlan(asset, index)
@@ -324,6 +327,7 @@ func (s *Server) ensureVideoSegmentRuntime(asset model.Asset, plan videoSegmentP
 			AssetID:      asset.ID,
 			CacheKey:     plan.CacheKey,
 			SessionID:    sessionID,
+			SessionIDs:   map[string]struct{}{sessionID: {}},
 			SegmentIndex: plan.SegmentIndex,
 			StartSeconds: plan.StartSeconds,
 			Duration:     plan.Duration,
@@ -334,9 +338,9 @@ func (s *Server) ensureVideoSegmentRuntime(asset model.Asset, plan videoSegmentP
 		}
 		s.videoSegmentStates[plan.CacheKey] = state
 	}
+	videoSegmentAddSessionLocked(state, sessionID)
 	state.AssetID = asset.ID
 	state.CacheKey = plan.CacheKey
-	state.SessionID = sessionID
 	state.SegmentIndex = plan.SegmentIndex
 	state.StartSeconds = plan.StartSeconds
 	state.Duration = plan.Duration
@@ -355,11 +359,13 @@ func (s *Server) ensureVideoSegmentRuntime(asset model.Asset, plan videoSegmentP
 		_ = touchFile(dest, now)
 		return state, true, nil
 	}
-	s.preemptVideoSegmentsLocked(plan.CacheKey, sessionID, priority)
+	s.preemptVideoSegmentsLocked(plan.CacheKey, priority)
 	if state.Queued || state.Transcoding {
 		if priority > state.Priority {
 			state.Priority = priority
 			state.SessionID = sessionID
+			s.videoSegmentSequence++
+			state.QueueOrder = s.videoSegmentSequence
 		}
 		s.videoProxyMu.Unlock()
 		return state, false, nil
@@ -368,6 +374,7 @@ func (s *Server) ensureVideoSegmentRuntime(asset model.Asset, plan videoSegmentP
 		AssetID:      asset.ID,
 		CacheKey:     plan.CacheKey,
 		SessionID:    sessionID,
+		SessionIDs:   map[string]struct{}{sessionID: {}},
 		SegmentIndex: plan.SegmentIndex,
 		StartSeconds: plan.StartSeconds,
 		Duration:     plan.Duration,
@@ -394,15 +401,13 @@ func (s *Server) ensureVideoSegmentRuntime(asset model.Asset, plan videoSegmentP
 	return state, false, nil
 }
 
-func (s *Server) preemptVideoSegmentsLocked(cacheKey string, sessionID string, priority int) {
+func (s *Server) preemptVideoSegmentsLocked(cacheKey string, priority int) {
 	for key, running := range s.videoSegmentStates {
 		if key == cacheKey || running == nil || (!running.Queued && !running.Transcoding) || running.Cancel == nil {
 			continue
 		}
 		if running.Priority < priority && (running.Claiming || running.Transcoding) {
 			running.Cancel(errVideoSegmentPreempted)
-		} else if priority == videoSegmentPriorityPlayback && running.Priority == priority && running.SessionID != sessionID {
-			running.Cancel(errVideoSegmentSuperseded)
 		}
 	}
 }
@@ -412,7 +417,11 @@ func (s *Server) stopVideoSegmentSession(assetID int64, sessionID string) int {
 	cancelled := 0
 	s.videoProxyMu.Lock()
 	for key, state := range s.videoSegmentStates {
-		if state == nil || state.AssetID != assetID || state.SessionID != sessionID {
+		if state == nil || state.AssetID != assetID || !videoSegmentHasSessionLocked(state, sessionID) {
+			continue
+		}
+		videoSegmentRemoveSessionLocked(state, sessionID)
+		if videoSegmentSessionCountLocked(state) > 0 {
 			continue
 		}
 		if state.Queued || state.Claiming || state.Transcoding {
@@ -427,6 +436,69 @@ func (s *Server) stopVideoSegmentSession(assetID int64, sessionID string) int {
 	}
 	s.videoProxyMu.Unlock()
 	return cancelled
+}
+
+func videoSegmentAddSessionLocked(state *videoSegmentRuntime, sessionID string) {
+	if state == nil {
+		return
+	}
+	sessionID = sanitizeVideoProxyID(sessionID, "legacy")
+	if state.SessionIDs == nil {
+		state.SessionIDs = map[string]struct{}{}
+		if state.SessionID != "" {
+			state.SessionIDs[sanitizeVideoProxyID(state.SessionID, "legacy")] = struct{}{}
+		}
+	}
+	state.SessionIDs[sessionID] = struct{}{}
+	if state.SessionID == "" {
+		state.SessionID = sessionID
+	}
+}
+
+func videoSegmentHasSessionLocked(state *videoSegmentRuntime, sessionID string) bool {
+	if state == nil {
+		return false
+	}
+	sessionID = sanitizeVideoProxyID(sessionID, "legacy")
+	if state.SessionIDs != nil {
+		_, ok := state.SessionIDs[sessionID]
+		return ok
+	}
+	return sanitizeVideoProxyID(state.SessionID, "legacy") == sessionID
+}
+
+func videoSegmentRemoveSessionLocked(state *videoSegmentRuntime, sessionID string) {
+	if state == nil {
+		return
+	}
+	sessionID = sanitizeVideoProxyID(sessionID, "legacy")
+	if state.SessionIDs == nil {
+		if sanitizeVideoProxyID(state.SessionID, "legacy") == sessionID {
+			state.SessionID = ""
+		}
+		return
+	}
+	delete(state.SessionIDs, sessionID)
+	if state.SessionID == sessionID {
+		state.SessionID = ""
+		for remaining := range state.SessionIDs {
+			state.SessionID = remaining
+			break
+		}
+	}
+}
+
+func videoSegmentSessionCountLocked(state *videoSegmentRuntime) int {
+	if state == nil {
+		return 0
+	}
+	if state.SessionIDs != nil {
+		return len(state.SessionIDs)
+	}
+	if state.SessionID != "" {
+		return 1
+	}
+	return 0
 }
 
 func (s *Server) removeVideoSegmentCaches(assetCacheKey string) error {
@@ -835,12 +907,35 @@ func parseVideoSegmentPriority(value string, fallback int) int {
 		return videoSegmentPriorityPlayback
 	case "critical":
 		return videoSegmentPriorityCritical
-	case "balanced", "neighbor", "tail":
+	case "balanced", "neighbor", "preload", "tail":
 		return videoSegmentPriorityBalanced
 	case "stale":
 		return videoSegmentPriorityStale
 	default:
 		return fallback
+	}
+}
+
+func videoSegmentPriorityFromRequest(r *http.Request, fallback int) int {
+	if r == nil {
+		return fallback
+	}
+	if value := strings.TrimSpace(r.Header.Get(videoSegmentPriorityHeader)); value != "" {
+		return parseVideoSegmentPriority(value, fallback)
+	}
+	return parseVideoSegmentPriority(r.URL.Query().Get("priority"), fallback)
+}
+
+func videoSegmentPriorityName(priority int) string {
+	switch {
+	case priority >= videoSegmentPriorityPlayback:
+		return "playback"
+	case priority >= videoSegmentPriorityCritical:
+		return "critical"
+	case priority >= videoSegmentPriorityBalanced:
+		return "preload"
+	default:
+		return "stale"
 	}
 }
 
@@ -906,7 +1001,7 @@ func (s *Server) videoSegmentStatus(asset model.Asset, sessionID string) VideoSe
 	defer s.videoProxyMu.Unlock()
 	var selected *videoSegmentRuntime
 	for _, state := range s.videoSegmentStates {
-		if state == nil || state.AssetID != asset.ID || state.SessionID != sessionID {
+		if state == nil || state.AssetID != asset.ID || !videoSegmentHasSessionLocked(state, sessionID) {
 			continue
 		}
 		if selected == nil || state.Priority > selected.Priority ||
@@ -999,10 +1094,10 @@ func (s *Server) videoSegmentCacheSummary(asset model.Asset) videoSegmentCacheSu
 	return summary
 }
 
-func videoSegmentQuery(asset model.Asset, session VideoProxyHeartbeatRequest) string {
+func videoSegmentQuery(asset model.Asset, session VideoProxyHeartbeatRequest, priority string) string {
 	query := url.Values{}
 	query.Set("v", asset.CacheKey)
-	query.Set("priority", "playback")
+	query.Set("priority", videoSegmentPriorityName(parseVideoSegmentPriority(priority, videoSegmentPriorityBalanced)))
 	if session.ClientID != "" {
 		query.Set("clientId", session.ClientID)
 	}

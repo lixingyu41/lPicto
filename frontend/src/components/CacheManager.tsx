@@ -75,6 +75,7 @@ export function CacheManager({ cleanup, progress, onReset, onCleanup }: {
             <Metric label="缩略图与封面" value={formatBytes((progress.cache.byKind.thumbs ?? 0) + (progress.cache.byKind['video-posters'] ?? 0))} />
             <Metric label="图片与预览" value={formatBytes((progress.cache.byKind.originals ?? 0) + (progress.cache.byKind.previews ?? 0))} />
             <Metric label="视频播放" value={formatBytes((progress.cache.byKind['video-chunks'] ?? 0) + (progress.cache.byKind['video-proxies'] ?? 0))} />
+            <Metric label="音频播放" value={formatBytes((progress.cache.byKind['audio-chunks'] ?? 0) + (progress.cache.byKind['audio-proxies'] ?? 0))} />
             <Metric label="AI 暂存" value={formatBytes(progress.cache.byKind['ai-staging'] ?? 0)} />
           </div>
         )}

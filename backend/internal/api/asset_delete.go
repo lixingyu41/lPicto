@@ -162,6 +162,19 @@ func (s *Server) stopAssetVideoWork(assetID int64) {
 		delete(s.videoSegmentStates, key)
 	}
 	s.videoProxyMu.Unlock()
+	s.audioProxyMu.Lock()
+	for key, state := range s.audioProxyStates {
+		if state == nil || state.AssetID != assetID {
+			continue
+		}
+		state.mu.Lock()
+		if state.cancel != nil {
+			state.cancel()
+		}
+		state.mu.Unlock()
+		delete(s.audioProxyStates, key)
+	}
+	s.audioProxyMu.Unlock()
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	for _, finished := range done {

@@ -11,6 +11,7 @@ import (
 
 	"lpicto/backend/internal/db"
 	"lpicto/backend/internal/jobs"
+	"lpicto/backend/internal/model"
 )
 
 type aiSettingsRequest struct {
@@ -55,6 +56,10 @@ func (s *Server) assetAI(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if asset.MediaType == model.MediaTypeAudio {
+		writeJSON(w, http.StatusOK, map[string]any{"assetId": asset.ID, "inputCacheKey": asset.CacheKey, "status": "not_required", "description": "", "tags": []any{}, "palette": []any{}, "attempts": 0, "sampledFrames": []any{}})
+		return
+	}
 	result, err := s.db.GetAIResult(r.Context(), asset.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeJSON(w, http.StatusOK, map[string]any{"assetId": asset.ID, "inputCacheKey": asset.CacheKey, "status": "pending", "description": "", "tags": []any{}, "palette": []any{}, "attempts": 0, "sampledFrames": []any{}})
@@ -77,6 +82,10 @@ func (s *Server) assetAI(w http.ResponseWriter, r *http.Request) {
 func (s *Server) reanalyzeAssetAI(w http.ResponseWriter, r *http.Request) {
 	asset, ok := s.assetByParam(w, r)
 	if !ok {
+		return
+	}
+	if asset.MediaType == model.MediaTypeAudio {
+		writeError(w, http.StatusBadRequest, "audio_ai_not_supported", "音频不参与媒体 AI 分析")
 		return
 	}
 	if err := s.db.EnsureAIQueued(r.Context(), asset.ID, asset.CacheKey, true); err != nil {

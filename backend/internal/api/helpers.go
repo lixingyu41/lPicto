@@ -149,7 +149,7 @@ func safeGroup(value string) string {
 
 func safeType(value string) string {
 	switch value {
-	case "image", "video":
+	case "image", "video", "audio":
 		return value
 	default:
 		return "all"

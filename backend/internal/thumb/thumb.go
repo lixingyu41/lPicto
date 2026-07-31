@@ -13,6 +13,7 @@ import (
 	"lpicto/backend/internal/db"
 	"lpicto/backend/internal/events"
 	"lpicto/backend/internal/jobs"
+	"lpicto/backend/internal/media"
 	"lpicto/backend/internal/model"
 	"lpicto/backend/internal/storage"
 	"lpicto/backend/internal/util"
@@ -71,6 +72,13 @@ func (p Processor) processVideoPoster(ctx context.Context, assetID int64) error 
 		_ = p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusError, &message)
 		return err
 	}
+	refreshed, err := p.DB.GetAsset(ctx, assetID)
+	if err != nil {
+		return err
+	}
+	if refreshed.MediaType != model.MediaTypeVideo {
+		return p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusNotRequired, nil)
+	}
 	return p.DB.SetAssetWorkStatus(ctx, assetID, "video_poster_status", model.StatusReady, nil)
 }
 
@@ -111,6 +119,12 @@ func (p Processor) process(ctx context.Context, assetID int64, kind string, stat
 }
 
 func (p Processor) processVideoThumb(ctx context.Context, asset model.Asset, source string) error {
+	if hasVideo, hasAudio, audioCodec := media.StreamKindsFromMetadataJSON(valueOrEmpty(asset.MetadataJSON)); !hasVideo && hasAudio {
+		if p.Logger != nil {
+			p.Logger.Info("reclassifying audio-only container", "assetID", asset.ID, "relPath", asset.RelPath, "ext", asset.Ext)
+		}
+		return p.DB.ReclassifyAssetAsAudio(ctx, asset.ID, media.AudioMimeType(asset.Ext), media.BrowserAudioPlayable(asset.Ext, audioCodec))
+	}
 	dest, err := p.Store.CachePath("thumbs", asset.CacheKey, "webp")
 	if err != nil {
 		return err
@@ -183,6 +197,13 @@ func (p Processor) processVideoThumb(ctx context.Context, asset model.Asset, sou
 		p.CachePolicy.Register(context.Background(), "thumbs", asset.CacheKey, dest, &assetID, 0)
 	}
 	return p.DB.SetAssetWorkStatus(ctx, asset.ID, "video_poster_status", model.StatusReady, nil)
+}
+
+func valueOrEmpty(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func (p Processor) processAsset(ctx context.Context, asset model.Asset, kind string, statusField string, longEdge int, quality int, source string) error {

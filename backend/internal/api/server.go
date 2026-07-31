@@ -75,6 +75,9 @@ type Server struct {
 	videoSegmentIgnoreEditList map[string]bool
 	videoSegmentSequence       uint64
 	videoProxySlots            chan struct{}
+	audioProxyMu               sync.Mutex
+	audioProxyStates           map[string]*audioProxyRuntime
+	audioProxySlot             chan struct{}
 
 	folderRefreshSem chan struct{}
 
@@ -119,6 +122,8 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 		videoSegmentStates:         map[string]*videoSegmentRuntime{},
 		videoSegmentIgnoreEditList: map[string]bool{},
 		videoProxySlots:            make(chan struct{}, liveVideoProxyMaxActive),
+		audioProxyStates:           map[string]*audioProxyRuntime{},
+		audioProxySlot:             make(chan struct{}, 1),
 		folderRefreshSem:           make(chan struct{}, 4),
 		staticDir:                  findStaticDir(cfg.StaticDir),
 	}
@@ -249,6 +254,10 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Head("/api/assets/{id}/original", s.original)
 	r.Get("/api/assets/{id}/video", s.video)
 	r.Head("/api/assets/{id}/video", s.video)
+	r.Get("/api/assets/{id}/audio", s.audio)
+	r.Head("/api/assets/{id}/audio", s.audio)
+	r.Post("/api/assets/{id}/audio-proxy", s.startAudioProxy)
+	r.Get("/api/assets/{id}/audio-proxy/status", s.audioProxyStatus)
 	r.Post("/api/assets/{id}/video/cache/prewarm", s.prewarmDirectVideo)
 	r.Get("/api/assets/{id}/video-poster", s.videoPoster)
 	r.Get("/api/assets/{id}/hls/playlist.m3u8", s.videoHLSPlaylist)
@@ -296,7 +305,7 @@ func isForegroundRequest(path string) bool {
 }
 
 func isStreamingAssetRequest(path string) bool {
-	return strings.HasSuffix(path, "/video") || strings.HasSuffix(path, "/video-proxy") || strings.Contains(path, "/hls/")
+	return strings.HasSuffix(path, "/video") || strings.HasSuffix(path, "/video-proxy") || strings.HasSuffix(path, "/audio") || strings.Contains(path, "/hls/")
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -945,6 +954,18 @@ func (s *Server) video(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.serveVideoAsset(w, r, asset)
+}
+
+func (s *Server) audio(w http.ResponseWriter, r *http.Request) {
+	asset, ok := s.assetByParam(w, r)
+	if !ok {
+		return
+	}
+	if asset.MediaType != model.MediaTypeAudio {
+		writeError(w, http.StatusBadRequest, "not_audio", "资源不是音频")
+		return
+	}
+	s.serveAudioAsset(w, r, asset)
 }
 
 func (s *Server) serveCache(w http.ResponseWriter, r *http.Request, kind string, ext string, contentType string, taskType string) {
