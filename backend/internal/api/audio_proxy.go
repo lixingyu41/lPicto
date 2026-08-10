@@ -56,6 +56,8 @@ func (s *Server) serveAudioAsset(w http.ResponseWriter, r *http.Request, asset m
 		writeError(w, http.StatusInternalServerError, "audio_proxy_path_failed", "读取音频兼容缓存失败")
 		return
 	}
+	releaseCache := s.cachePolicy.Pin(path)
+	defer releaseCache()
 	file, err := os.Open(path)
 	if err != nil {
 		writeError(w, http.StatusConflict, "audio_proxy_not_ready", "音频兼容缓存尚未生成")
@@ -208,6 +210,10 @@ func (s *Server) runAudioProxy(ctx context.Context, asset model.Asset, state *au
 		return
 	}
 	tmp := dest + ".tmp"
+	releaseDest := s.cachePolicy.Pin(dest)
+	defer releaseDest()
+	releaseTemp := s.cachePolicy.Pin(tmp)
+	defer releaseTemp()
 	_ = os.Remove(tmp)
 	args := []string{"-y", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-i", source, "-map", "0:a:0", "-vn", "-c:a", "flac", "-compression_level", "5", "-f", "flac", tmp}
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)

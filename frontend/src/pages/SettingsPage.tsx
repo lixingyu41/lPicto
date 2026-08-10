@@ -17,11 +17,6 @@ import {
   type ViewerPrefs,
 } from '../utils/viewerPrefs';
 import {
-  loadCollapsedSidebarContent,
-  saveCollapsedSidebarContent,
-  type CollapsedSidebarContent,
-} from '../utils/sidebarPrefs';
-import {
   mediaLayoutDefinition,
   mediaLayoutDefinitions,
   loadMediaViewPreferences,
@@ -48,7 +43,6 @@ export default function SettingsPage() {
   const [error, setError] = useState<string | null>(null);
   const [rowHeightLevel, setRowHeightLevel] = useState<GridRowHeightLevel>(() => loadGridRowHeightLevel());
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => loadThemeMode());
-  const [collapsedSidebarContent, setCollapsedSidebarContent] = useState<CollapsedSidebarContent>(() => loadCollapsedSidebarContent());
   const [viewerPrefs, setViewerPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
   const [mediaViewPrefs, setMediaViewPrefs] = useState<MediaViewPreferences>(() => loadMediaViewPreferences());
   const [draggedMediaColumn, setDraggedMediaColumn] = useState<MediaColumnId | null>(null);
@@ -102,8 +96,9 @@ export default function SettingsPage() {
   }, [draggedMediaColumn, mediaViewPrefs.columnOrder]);
 
   useEffect(() => {
-    if (sectionSlug?.trim().toLowerCase() === 'video-proxy') {
-      navigate(settingsSectionPath('cache'), { replace: true });
+    const normalizedSection = sectionSlug?.trim().toLowerCase();
+    if (normalizedSection === 'video-proxy' || normalizedSection === 'appearance') {
+      navigate(settingsSectionPath(normalizedSection === 'appearance' ? 'viewer' : 'cache'), { replace: true });
       return;
     }
     if (!routeSection) {
@@ -263,7 +258,7 @@ export default function SettingsPage() {
         if (!live) return;
         setSystemTasks(result.items);
         setStoppingTaskIds((current) => {
-          const next = new Set(Array.from(current).filter((id) => result.items.some((task) => task.id === id && task.status === 'running')));
+          const next = new Set(Array.from(current).filter((id) => systemTaskIsStillRunning(result.items, id)));
           return next.size === current.size ? current : next;
         });
         const activelyChanging = result.items.some((task) =>
@@ -396,7 +391,7 @@ export default function SettingsPage() {
       ]);
       setSystemTasks(tasksResult.items);
       setStoppingTaskIds((current) => {
-        if (!current.has(task.id) || tasksResult.items.some((item) => item.id === task.id && item.status === 'running')) return current;
+        if (!current.has(task.id) || systemTaskIsStillRunning(tasksResult.items, task.id)) return current;
         const next = new Set(current);
         next.delete(task.id);
         return next;
@@ -472,11 +467,6 @@ export default function SettingsPage() {
   function updateRowHeightLevel(next: GridRowHeightLevel) {
     setRowHeightLevel(next);
     saveGridRowHeightLevel(next);
-  }
-
-  function updateCollapsedSidebarContent(next: CollapsedSidebarContent) {
-    setCollapsedSidebarContent(next);
-    saveCollapsedSidebarContent(next);
   }
 
   async function saveVideoProxySettings() {
@@ -669,74 +659,52 @@ export default function SettingsPage() {
               </section>
             )}
 
-            {activeSettingsSection === 'appearance' && (
-              <section className="settings-panel settings-section">
-                <div className="settings-panel-title">外观</div>
-                <div className="settings-field settings-field-wide">
-                  <span>主题</span>
-                  <div className="settings-segmented three-options">
-                    <button
-                      className={themeMode === 'system' ? 'active' : ''}
-                      type="button"
-                      onClick={() => updateThemeMode('system')}
-                    >
-                      跟随系统
-                    </button>
-                    <button
-                      className={themeMode === 'light' ? 'active' : ''}
-                      type="button"
-                      onClick={() => updateThemeMode('light')}
-                    >
-                      浅色
-                    </button>
-                    <button
-                      className={themeMode === 'dark' ? 'active' : ''}
-                      type="button"
-                      onClick={() => updateThemeMode('dark')}
-                    >
-                      深色
-                    </button>
-                  </div>
-                </div>
-                <div className="settings-field settings-field-wide settings-field-spaced">
-                  <span>图库单行高度</span>
-                  <div className="settings-segmented five-options">
-                    {rowHeightOptions.map((option) => (
-                      <button
-                        className={rowHeightLevel === option.value ? 'active' : ''}
-                        key={option.value}
-                        type="button"
-                        onClick={() => updateRowHeightLevel(option.value)}
-                      >
-                        {option.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div className="settings-field settings-field-wide settings-field-spaced">
-                  <span>一级菜单折叠样式</span>
-                  <div className="settings-segmented">
-                    <button
-                      className={collapsedSidebarContent === 'icon' ? 'active' : ''}
-                      type="button"
-                      onClick={() => updateCollapsedSidebarContent('icon')}
-                    >
-                      图标
-                    </button>
-                    <button
-                      className={collapsedSidebarContent === 'character' ? 'active' : ''}
-                      type="button"
-                      onClick={() => updateCollapsedSidebarContent('character')}
-                    >
-                      单字
-                    </button>
-                  </div>
-                </div>
-              </section>
-            )}
-
             {activeSettingsSection === 'viewer' && (
               <section className="settings-section viewer-settings-section">
+                <section className="settings-panel">
+                  <div className="settings-panel-title">外观</div>
+                  <div className="settings-field settings-field-wide">
+                    <span>主题</span>
+                    <div className="settings-segmented three-options">
+                      <button
+                        className={themeMode === 'system' ? 'active' : ''}
+                        type="button"
+                        onClick={() => updateThemeMode('system')}
+                      >
+                        跟随系统
+                      </button>
+                      <button
+                        className={themeMode === 'light' ? 'active' : ''}
+                        type="button"
+                        onClick={() => updateThemeMode('light')}
+                      >
+                        浅色
+                      </button>
+                      <button
+                        className={themeMode === 'dark' ? 'active' : ''}
+                        type="button"
+                        onClick={() => updateThemeMode('dark')}
+                      >
+                        深色
+                      </button>
+                    </div>
+                  </div>
+                  <div className="settings-field settings-field-wide settings-field-spaced">
+                    <span>媒体显示尺寸</span>
+                    <div className="settings-segmented five-options">
+                      {rowHeightOptions.map((option) => (
+                        <button
+                          className={rowHeightLevel === option.value ? 'active' : ''}
+                          key={option.value}
+                          type="button"
+                          onClick={() => updateRowHeightLevel(option.value)}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </section>
                 <section className="settings-panel">
                   <div className="settings-panel-title">视频播放</div>
                   <div className="viewer-settings-grid">
@@ -758,7 +726,7 @@ export default function SettingsPage() {
                   </label>
                   <div className="settings-field settings-field-wide">
                     <span>播放完毕后</span>
-                    <div className="settings-segmented three-options">
+                    <div className="settings-segmented">
                       {playbackModeOptions.map((option) => (
                         <button
                           className={viewerPrefs.playbackMode === option.value ? 'active' : ''}
@@ -869,7 +837,7 @@ export default function SettingsPage() {
                   <div className="settings-panel-title">媒体布局</div>
                   <div className="settings-field settings-field-wide">
                     <span>全局布局</span>
-                    <div className="settings-segmented">
+                    <div className="settings-segmented three-options">
                       {mediaLayoutDefinitions.map((layout) => (
                         <button
                           className={mediaViewPrefs.mode === layout.id ? 'active' : ''}
@@ -883,6 +851,17 @@ export default function SettingsPage() {
                       ))}
                     </div>
                   </div>
+                  <label className="settings-check-row settings-field-wide">
+                    <input
+                      type="checkbox"
+                      checked={mediaViewPrefs.videoHoverPreview}
+                      onChange={(event) => updateMediaViewPrefs({
+                        ...mediaViewPrefs,
+                        videoHoverPreview: event.target.checked,
+                      })}
+                    />
+                    <span>视频缩略图悬停预览</span>
+                  </label>
                   {mediaLayoutDefinition(mediaViewPrefs.mode).configurableColumns && (
                   <div className="media-column-settings" aria-label="列表显示列">
                     <div className="muted-line">勾选显示字段，拖动调整顺序；列宽在列表表头中调节。</div>
@@ -1187,6 +1166,62 @@ function taskScopeLabel(scope: string, libraries: ScanLibrary[]) {
   return libraries.find((library) => library.id === scope)?.name ?? '所选图库';
 }
 
+const systemTaskGroups = [
+  {
+    id: 'background',
+    name: '后台任务',
+    taskIds: ['cache_cleanup', 'ai_health_check', 'storage_health_check', 'library_scan', 'source_io_scheduler'],
+  },
+  {
+    id: 'intelligence',
+    name: '智能任务',
+    taskIds: ['ai_analysis', 'duplicate_scan'],
+  },
+  {
+    id: 'library',
+    name: '媒体库',
+    taskIds: ['media_scan'],
+  },
+] as const;
+
+interface SystemTaskNode {
+  task: SystemTask;
+  children: SystemTask[];
+}
+
+const mediaScanChildIDs = ['metadata_extraction', 'thumbnail_creation', 'video_poster_creation', 'preview_creation', 'storyboard_creation'] as const;
+
+function systemTaskIsStillRunning(tasks: SystemTask[], taskId: string) {
+  return tasks.some((task) => task.id === taskId && task.status === 'running');
+}
+
+function systemTaskNodes(tasks: SystemTask[]): SystemTaskNode[] {
+  const byID = new Map(tasks.map((task) => [task.id, task]));
+  const childIDs = new Set<string>(mediaScanChildIDs);
+  const nodes: SystemTaskNode[] = [];
+  const mediaScan = byID.get('media_scan');
+  const mediaChildren = mediaScanChildIDs.map((id) => byID.get(id)).filter((task): task is SystemTask => Boolean(task));
+  if (mediaScan) nodes.push({ task: mediaScan, children: mediaChildren });
+  for (const task of tasks) {
+    if (task.id === 'media_scan' || childIDs.has(task.id)) continue;
+    nodes.push({ task, children: [] });
+  }
+  return nodes;
+}
+
+function groupedSystemTasks(tasks: SystemTask[]) {
+  const nodes = systemTaskNodes(tasks);
+  const byID = new Map(nodes.map((node) => [node.task.id, node]));
+  const assigned = new Set<string>(systemTaskGroups.flatMap((group) => [...group.taskIds]));
+  const groups = systemTaskGroups.map((group) => ({
+    ...group,
+    tasks: group.taskIds.map((taskID) => byID.get(taskID)).filter((node): node is SystemTaskNode => Boolean(node)),
+  }));
+  const remaining = nodes.filter((node) => !assigned.has(node.task.id));
+  if (remaining.length > 0) groups[0].tasks.push(...remaining);
+  return groups.filter((group) => group.tasks.length > 0);
+}
+
 function TaskSettingsPanel({ actionBusy, libraries, scopes, stoppingTaskIds, tasks, onAction, onScopeChange }: {
   actionBusy: string | null;
   libraries: ScanLibrary[];
@@ -1198,6 +1233,8 @@ function TaskSettingsPanel({ actionBusy, libraries, scopes, stoppingTaskIds, tas
 }) {
   const navigate = useNavigate();
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set(['intelligence', 'library']));
+  const [expandedTasks, setExpandedTasks] = useState<Set<string>>(() => new Set());
   useEffect(() => {
     if (!tasks.some((task) => task.status === 'running')) return;
     setNowSeconds(Math.floor(Date.now() / 1000));
@@ -1205,97 +1242,164 @@ function TaskSettingsPanel({ actionBusy, libraries, scopes, stoppingTaskIds, tas
     return () => window.clearInterval(timer);
   }, [tasks]);
   const openFailureInLibrary = useCallback((path: string) => {
-    const filename = path.replace(/\\/g, '/').split('/').pop()?.trim() || path.trim();
+    const normalizedPath = path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    const parts = normalizedPath.split('/').filter(Boolean);
+    const filename = parts.pop()?.trim() || path.trim();
     if (!filename) return;
-    navigate({ pathname: '/library', search: new URLSearchParams({ q: filename, visible: 'all' }).toString() });
+    const folder = parts.join('/');
+    navigate({
+      pathname: '/folders',
+      search: new URLSearchParams({
+        folder,
+        group: 'none',
+        orientation: 'all',
+        q: filename,
+        rating: 'all',
+        recursive: '0',
+        type: 'all',
+      }).toString(),
+    });
   }, [navigate]);
+  const taskGroups = groupedSystemTasks(tasks);
+  const renderTask = (task: SystemTask, children: SystemTask[] = [], nested = false) => {
+    const stopping = stoppingTaskIds.has(task.id);
+    const expanded = expandedTasks.has(task.id);
+    const finishedAt = task.status === 'running' ? null : task.lastFinishedAt;
+    const durationSeconds = task.status === 'running' && task.lastStartedAt != null
+      ? Math.max(0, nowSeconds - task.lastStartedAt)
+      : task.durationSeconds;
+    const hasTimeline = task.lastStartedAt != null || finishedAt != null || durationSeconds != null || task.nextRunAt != null;
+    const hasFailures = (task.failures?.length ?? 0) > 0;
+    const hasDetails = hasTimeline || !task.progress || hasFailures;
+    return (
+      <article
+        aria-label={`${task.name}，${stopping ? '正在停止' : systemTaskStatusLabel(task.status)}`}
+        className={`system-task-card status-${stopping ? 'stopping' : task.status}${children.length > 0 ? ' has-children' : ''}${nested ? ' is-nested' : ''}`}
+        key={task.id}
+      >
+        <div className="system-task-heading">
+          <div className="system-task-title">
+            {children.length > 0 && (
+              <button
+                aria-expanded={expanded}
+                className="system-task-children-toggle"
+                type="button"
+                title={expanded ? '收起子任务' : '展开子任务'}
+                onClick={() => setExpandedTasks((current) => {
+                  const next = new Set(current);
+                  if (next.has(task.id)) next.delete(task.id);
+                  else next.add(task.id);
+                  return next;
+                })}
+              >
+                <span aria-hidden="true">›</span>
+              </button>
+            )}
+            <span
+              aria-describedby={`task-description-${task.id}`}
+              className="system-task-name-wrap"
+              tabIndex={0}
+            >
+              <span className="system-task-name">{task.name}</span>
+              <span className="system-task-description-tooltip" id={`task-description-${task.id}`} role="tooltip">
+                {task.description}
+              </span>
+            </span>
+          </div>
+          <div className="system-task-actions">
+            {task.supportsScope && (
+              <select
+                aria-label={`${task.name}执行范围`}
+                disabled={task.status === 'running' || actionBusy !== null}
+                value={scopes[task.id] ?? 'all'}
+                onChange={(event) => onScopeChange(task.id, event.target.value)}
+              >
+                <option value="all">全部图库</option>
+                {libraries.map((library) => <option key={library.id} value={library.id}>{library.name}</option>)}
+              </select>
+            )}
+            {task.actions.map((action) => {
+              const key = `${task.id}:${action.id}`;
+              return (
+                <button
+                  className={`settings-save-button system-task-run-button ${action.kind}`}
+                  disabled={!action.enabled || actionBusy !== null || stopping}
+                  key={action.id}
+                  type="button"
+                  onClick={() => onAction(task, action)}
+                >
+                  {(actionBusy === key || (stopping && action.id === 'stop')) && <span aria-hidden="true" className="button-progress-spinner" />}
+                  {stopping && action.id === 'stop' ? '正在停止' : actionBusy === key ? taskActionBusyLabel(action.id) : action.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        {task.progress && (
+          <SystemTaskProgress
+            averageSecondsPerItem={task.averageSecondsPerItem}
+            task={task}
+          />
+        )}
+        {task.blockedReason && (
+          <div className="system-task-blocked-reason" role="status">
+            <span aria-hidden="true" className="system-task-blocked-indicator" />
+            {task.blockedReason}
+          </div>
+        )}
+        {hasDetails && <div className="system-task-details">
+          {hasTimeline && (
+            <div className="system-task-timeline">
+              {task.lastStartedAt != null && <span>开始 {formatSystemTaskTime(task.lastStartedAt)}</span>}
+              {finishedAt != null && <span>完成 {formatSystemTaskTime(finishedAt)}</span>}
+              {durationSeconds != null && <span>{task.status === 'running' ? '运行时长' : '耗时'} {formatTaskDuration(durationSeconds)}</span>}
+              {task.nextRunAt != null && <span>下次 {formatSystemTaskTime(task.nextRunAt)}</span>}
+            </div>
+          )}
+          {!task.progress && <div className="system-task-message">{task.message || '尚未运行'}</div>}
+          {hasFailures && <SystemTaskFailures task={task} onOpen={openFailureInLibrary} />}
+        </div>}
+        {children.length > 0 && expanded && (
+          <div className="system-task-children">
+            {children.map((child) => renderTask(child, [], true))}
+          </div>
+        )}
+      </article>
+    );
+  };
   return (
     <section className="settings-panel settings-section system-tasks-panel">
       <div className="settings-panel-title">系统任务</div>
-      <div className="system-task-list">
+      <div className="system-task-groups">
         {tasks.length === 0 && <div className="muted-line">读取中</div>}
-        {tasks.map((task) => {
-          const stopping = stoppingTaskIds.has(task.id);
-          const finishedAt = task.status === 'running' ? null : task.lastFinishedAt;
-          const durationSeconds = task.status === 'running' && task.lastStartedAt != null
-            ? Math.max(0, nowSeconds - task.lastStartedAt)
-            : task.durationSeconds;
-          const hasTimeline = task.lastStartedAt != null || finishedAt != null || durationSeconds != null || task.nextRunAt != null;
-          const hasFailures = (task.failures?.length ?? 0) > 0;
-          const hasDetails = hasTimeline || !task.progress || hasFailures;
+        {taskGroups.map((group) => {
+          const expanded = expandedGroups.has(group.id);
+          const groupedTasks = group.tasks.flatMap((node) => [node.task, ...node.children]);
+          const runningCount = groupedTasks.filter((task) => task.status === 'running').length;
+          const failedCount = groupedTasks.filter((task) => task.failedCount > 0).length;
           return (
-            <article
-              aria-label={`${task.name}，${stopping ? '正在停止' : systemTaskStatusLabel(task.status)}`}
-              className={`system-task-card status-${stopping ? 'stopping' : task.status}`}
-              key={task.id}
-            >
-              <div className="system-task-heading">
-                <div className="system-task-title">
-                  <span
-                    aria-describedby={`task-description-${task.id}`}
-                    className="system-task-name-wrap"
-                    tabIndex={0}
-                  >
-                    <span className="system-task-name">{task.name}</span>
-                    <span className="system-task-description-tooltip" id={`task-description-${task.id}`} role="tooltip">
-                      {task.description}
-                    </span>
-                  </span>
-                </div>
-                <div className="system-task-actions">
-                  {task.supportsScope && (
-                    <select
-                      aria-label={`${task.name}执行范围`}
-                      disabled={task.status === 'running' || actionBusy !== null}
-                      value={scopes[task.id] ?? 'all'}
-                      onChange={(event) => onScopeChange(task.id, event.target.value)}
-                    >
-                      <option value="all">全部图库</option>
-                      {libraries.map((library) => <option key={library.id} value={library.id}>{library.name}</option>)}
-                    </select>
-                  )}
-                  {task.actions.map((action) => {
-                    const key = `${task.id}:${action.id}`;
-                    return (
-                      <button
-                        className={`settings-save-button system-task-run-button ${action.kind}`}
-                        disabled={!action.enabled || actionBusy !== null || stopping}
-                        key={action.id}
-                        type="button"
-                        onClick={() => onAction(task, action)}
-                      >
-                        {(actionBusy === key || (stopping && action.id === 'stop')) && <span aria-hidden="true" className="button-progress-spinner" />}
-                        {stopping && action.id === 'stop' ? '正在停止' : actionBusy === key ? taskActionBusyLabel(action.id) : action.label}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-              {task.progress && (
-                <SystemTaskProgress
-                  averageSecondsPerItem={task.averageSecondsPerItem}
-                  task={task}
-                />
-              )}
-              {task.blockedReason && (
-                <div className="system-task-blocked-reason" role="status">
-                  <span aria-hidden="true" className="system-task-blocked-indicator" />
-                  {task.blockedReason}
-                </div>
-              )}
-              {hasDetails && <div className="system-task-details">
-                {hasTimeline && (
-                  <div className="system-task-timeline">
-                    {task.lastStartedAt != null && <span>开始 {formatSystemTaskTime(task.lastStartedAt)}</span>}
-                    {finishedAt != null && <span>完成 {formatSystemTaskTime(finishedAt)}</span>}
-                    {durationSeconds != null && <span>{task.status === 'running' ? '运行时长' : '耗时'} {formatTaskDuration(durationSeconds)}</span>}
-                    {task.nextRunAt != null && <span>下次 {formatSystemTaskTime(task.nextRunAt)}</span>}
-                  </div>
-                )}
-                {!task.progress && <div className="system-task-message">{task.message || '尚未运行'}</div>}
-                {hasFailures && <SystemTaskFailures task={task} onOpen={openFailureInLibrary} />}
-              </div>}
-            </article>
+            <section className={`system-task-group${expanded ? ' expanded' : ''}`} key={group.id}>
+              <button
+                aria-expanded={expanded}
+                className="system-task-group-toggle"
+                type="button"
+                onClick={() => setExpandedGroups((current) => {
+                  const next = new Set(current);
+                  if (next.has(group.id)) next.delete(group.id);
+                  else next.add(group.id);
+                  return next;
+                })}
+              >
+                <span className="system-task-group-chevron" aria-hidden="true">›</span>
+                <span>{group.name}</span>
+                <span className="system-task-group-summary">
+                  {runningCount > 0 && <small className="running">运行 {runningCount}</small>}
+                  {failedCount > 0 && <small className="failed">异常 {failedCount}</small>}
+                  <small>{group.tasks.length} 项</small>
+                </span>
+              </button>
+              {expanded && <div className="system-task-list">{group.tasks.map((node) => renderTask(node.task, node.children))}</div>}
+            </section>
           );
         })}
       </div>

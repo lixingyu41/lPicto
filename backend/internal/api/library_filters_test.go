@@ -66,6 +66,54 @@ func TestLegacySearchAPIRouteIsRemoved(t *testing.T) {
 	}
 }
 
+func TestAllCollectionAndSmartRuleSupportFilenameOnlySearch(t *testing.T) {
+	server, database, _ := testMissingSourceServer(t)
+	matchingID := testInsertAsset(t, database, "角色a 001.jpg", "filenamecollection01", model.MediaTypeImage)
+	testInsertAsset(t, database, "其他内容.jpg", "filenamecollection02", model.MediaTypeImage)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/collections/all/assets?page=1&pageSize=20&q=角色a", nil)
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("all collection status = %d, want 200; body = %s", recorder.Code, recorder.Body.String())
+	}
+	var page struct {
+		Items []AssetDTO `json:"items"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != matchingID {
+		t.Fatalf("all collection items = %#v, want asset %d", page.Items, matchingID)
+	}
+
+	collection, err := database.CreateSmartCollection(context.Background(), db.CollectionCreate{Name: "角色a", RuleJSON: `{"q":"角色a"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/api/collections/"+collection.ID+"/assets?page=1&pageSize=20", nil)
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("smart collection status = %d, want 200; body = %s", recorder.Code, recorder.Body.String())
+	}
+	page.Items = nil
+	if err := json.NewDecoder(recorder.Body).Decode(&page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != matchingID {
+		t.Fatalf("smart collection items = %#v, want asset %d", page.Items, matchingID)
+	}
+}
+
+func TestCollectionRuleKeepsFilenameAndCombinedSearchSeparate(t *testing.T) {
+	rule := `{"q":"文件名条件","combinedQuery":"描述条件"}`
+	opts := optionsFromCollectionRule(&rule, 1, 100)
+	if opts.Query != "文件名条件" || opts.CombinedQuery != "描述条件" {
+		t.Fatalf("collection search options = query %q combined %q", opts.Query, opts.CombinedQuery)
+	}
+}
+
 func TestCollectionNeighborAPIUsesSavedSmartRule(t *testing.T) {
 	server, database, _ := testMissingSourceServer(t)
 	firstVideo := testInsertAsset(t, database, "a-video.mp4", "neighborfiltervid001", model.MediaTypeVideo)

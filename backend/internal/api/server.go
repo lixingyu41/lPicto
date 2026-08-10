@@ -21,6 +21,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	aiworker "lpicto/backend/internal/ai"
 	"lpicto/backend/internal/cachepolicy"
 	"lpicto/backend/internal/config"
 	"lpicto/backend/internal/db"
@@ -42,6 +43,7 @@ type Server struct {
 	logger       *slog.Logger
 	sourceHealth *storage.SourceHealth
 	cachePolicy  *cachepolicy.Manager
+	aiStager     *aiworker.Stager
 	cacheCopyMu  sync.Mutex
 
 	cacheMu         sync.Mutex
@@ -54,11 +56,14 @@ type Server struct {
 	progressStatsAt    time.Time
 	progressRefreshing bool
 
-	cleanupMu      sync.Mutex
-	cleanupStatus  CleanupStatusDTO
-	cleanupCancel  context.CancelFunc
-	mediaResetMu   sync.Mutex
-	mediaResetting bool
+	cleanupMu           sync.Mutex
+	cleanupStatus       CleanupStatusDTO
+	cleanupCancel       context.CancelFunc
+	duplicateScanMu     sync.Mutex
+	duplicateScanCancel context.CancelFunc
+	duplicateScanFailed int
+	mediaResetMu        sync.Mutex
+	mediaResetting      bool
 
 	sourceDirMu    sync.Mutex
 	sourceDirCache map[string]sourceDirCacheEntry
@@ -108,6 +113,7 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	if liveVideoProxyMaxActive < 1 {
 		liveVideoProxyMaxActive = 1
 	}
+	cachePolicy := cachepolicy.New(store.CacheRoot, database)
 	s := &Server{
 		cfg:                        cfg,
 		db:                         database,
@@ -117,7 +123,8 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 		events:                     bus,
 		logger:                     logger,
 		sourceHealth:               storage.NewSourceHealth(store, 15*time.Second, cfg.RedisURL),
-		cachePolicy:                cachepolicy.New(store.CacheRoot, database),
+		cachePolicy:                cachePolicy,
+		aiStager:                   &aiworker.Stager{DB: database, Store: store, Policy: cachePolicy},
 		videoProxyStates:           map[string]*videoProxyRuntime{},
 		videoSegmentStates:         map[string]*videoSegmentRuntime{},
 		videoSegmentIgnoreEditList: map[string]bool{},
@@ -248,6 +255,7 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Get("/api/assets/{id}/subtitles/{subtitleID}", s.assetSubtitle)
 	r.Get("/api/assets/{id}/neighbors", s.neighbors)
 	r.Get("/api/assets/{id}/position", s.assetPosition)
+	r.Post("/api/assets/{id}/played", s.markAssetPlayed)
 	r.Get("/api/assets/{id}/thumb", s.thumb)
 	r.Get("/api/assets/{id}/preview", s.preview)
 	r.Get("/api/assets/{id}/original", s.original)
@@ -260,6 +268,9 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Get("/api/assets/{id}/audio-proxy/status", s.audioProxyStatus)
 	r.Post("/api/assets/{id}/video/cache/prewarm", s.prewarmDirectVideo)
 	r.Get("/api/assets/{id}/video-poster", s.videoPoster)
+	r.Get("/api/assets/{id}/storyboard", s.assetStoryboard)
+	r.Post("/api/assets/{id}/storyboard/generate", s.generateAssetStoryboard)
+	r.Get("/api/assets/{id}/storyboard/{sheet}", s.assetStoryboardSheet)
 	r.Get("/api/assets/{id}/hls/playlist.m3u8", s.videoHLSPlaylist)
 	r.Get("/api/assets/{id}/hls/status", s.videoHLSStatus)
 	r.Post("/api/assets/{id}/hls/prewarm", s.videoHLSPrewarm)
@@ -716,7 +727,7 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contextName := r.URL.Query().Get("context")
-	if contextName != "folder" && contextName != "album" && contextName != "collection" {
+	if contextName != "folder" && contextName != "album" && contextName != "collection" && contextName != "recent" {
 		contextName = "library"
 	}
 	typeFilter := safeType(r.URL.Query().Get("type"))
@@ -755,6 +766,7 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		AlbumUnassigned: albumUnassignedQuery(r),
 		AlbumIDs:        int64ListQuery(r, "albumIds"),
 		VisibleOnly:     visibleOnly(r),
+		PlayedOnly:      boolQuery(r, "playedOnly", false),
 	}
 	var result db.Neighbors
 	var err error
@@ -793,7 +805,7 @@ func (s *Server) assetPosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contextName := r.URL.Query().Get("context")
-	if contextName != "folder" && contextName != "album" && contextName != "collection" {
+	if contextName != "folder" && contextName != "album" && contextName != "collection" && contextName != "recent" {
 		contextName = "library"
 	}
 	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
@@ -982,6 +994,8 @@ func (s *Server) serveCacheAsset(w http.ResponseWriter, r *http.Request, asset m
 		writeError(w, http.StatusInternalServerError, "cache_path_failed", "读取缓存失败")
 		return
 	}
+	releaseCache := s.cachePolicy.Pin(path)
+	defer releaseCache()
 	file, err := os.Open(path)
 	if err != nil {
 		_ = taskType
@@ -1001,6 +1015,7 @@ func (s *Server) serveCacheAsset(w http.ResponseWriter, r *http.Request, asset m
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("X-Accel-Buffering", "no")
 	}
+	s.cachePolicy.Touch(r.Context(), kind, asset.CacheKey, path)
 	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
 }
 
@@ -1195,6 +1210,7 @@ func (s *Server) libraryAssetOptions(r *http.Request, page int, pageSize int) db
 		Rating:          ratingQueryPtr(r, "rating"),
 		AlbumUnassigned: albumUnassignedQuery(r),
 		AlbumIDs:        int64ListQuery(r, "albumIds"),
+		PlayedOnly:      boolQuery(r, "playedOnly", false),
 	}
 }
 

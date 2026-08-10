@@ -23,7 +23,7 @@ import type {
   Asset,
   AssetDeletedEvent,
   AssetKind,
-  AssetRating,
+  AssetRatingFilter,
   LibraryAnchor,
   OrientationFilter,
   SortKey,
@@ -60,7 +60,7 @@ interface AlbumsPageState extends GridReturnState {
   groupMode: AssetGroupMode;
   orientation: OrientationFilter;
   query: string;
-  rating: AssetRating;
+  rating: AssetRatingFilter;
   selectedId: number | null;
   sort: SortKey;
   tagFilters: string[];
@@ -73,7 +73,7 @@ const defaultAlbumsState: AlbumsPageState = {
   groupMode: 'none',
   orientation: 'all',
   query: '',
-  rating: 0,
+  rating: 'all',
   selectedId: null,
   sort: 'timeline_desc',
   tagFilters: [],
@@ -97,7 +97,7 @@ export default function AlbumsPage() {
   const [sort, setSort] = useViewerAwareMediaState<SortKey>(initialStateRef.current.sort);
   const [groupMode, setGroupMode] = useViewerAwareMediaState<AssetGroupMode>(initialStateRef.current.groupMode);
   const [query, setQuery] = useViewerAwareMediaState(initialStateRef.current.query);
-  const [rating, setRating] = useViewerAwareMediaState<AssetRating>(initialStateRef.current.rating ?? 0);
+  const [rating, setRating] = useViewerAwareMediaState<AssetRatingFilter>(initialStateRef.current.rating ?? 'all');
   const [orientation, setOrientation] = useViewerAwareMediaState<OrientationFilter>(initialStateRef.current.orientation);
   useEffect(() => {
     if (type === 'audio') setOrientation('all');
@@ -117,6 +117,7 @@ export default function AlbumsPage() {
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const [pressPreviewAsset, setPressPreviewAsset] = useState<Asset | null>(null);
   const serverGroup = serverGroupForMode(groupMode);
+  const activeRating = rating === 'all' ? undefined : rating;
 
   const selectedAlbum = useMemo(
     () => albums.find((album) => album.id === selectedId) ?? albums[0] ?? null,
@@ -148,9 +149,9 @@ export default function AlbumsPage() {
       if (!selectedAlbum) {
         return Promise.resolve({ items: [], page, pageSize, hasMore: false });
       }
-      return api.albumAssets(selectedAlbum.id, page, pageSize, sort, query, serverGroup, rating, orientation, type, undefined, serializeTagFilters(tagFilters));
+      return api.albumAssets(selectedAlbum.id, page, pageSize, sort, query, serverGroup, activeRating, orientation, type, undefined, serializeTagFilters(tagFilters));
     },
-    [orientation, query, rating, selectedAlbum, serverGroup, sort, tagFilters, type],
+    [activeRating, orientation, query, selectedAlbum, serverGroup, sort, tagFilters, type],
   );
 
   const { items, hasMore, hasPrevious, loading, error: loadError, loadMore, loadPrevious, reset, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
@@ -191,11 +192,11 @@ export default function AlbumsPage() {
 
   const mergeReadyAssets = useCallback(
     (incoming: Asset[]) => {
-      const filtered = incoming.filter((asset) => assetMatchesAlbum(asset, selectedAlbum, query, rating, orientation, type));
+      const filtered = incoming.filter((asset) => assetMatchesAlbum(asset, selectedAlbum, query, activeRating, orientation, type));
       if (filtered.length === 0) return;
       mutateItems((current) => mergeSortedAssets(current, filtered, sort, { hasMore, loadedStartIndex, groupMode }));
     },
-    [groupMode, hasMore, loadedStartIndex, mutateItems, orientation, query, rating, selectedAlbum, sort, type],
+    [activeRating, groupMode, hasMore, loadedStartIndex, mutateItems, orientation, query, selectedAlbum, sort, type],
   );
 
   const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
@@ -206,18 +207,18 @@ export default function AlbumsPage() {
     if (eventsConnected || !selectedAlbum) return undefined;
     const timer = window.setInterval(() => {
       void api
-        .albumAssets(selectedAlbum.id, 1, pageSize, sort, query, serverGroup, rating, orientation, type)
+        .albumAssets(selectedAlbum.id, 1, pageSize, sort, query, serverGroup, activeRating, orientation, type)
         .then((result) => mergeReadyAssets(result.items))
         .catch(() => undefined);
     }, 30000);
     return () => window.clearInterval(timer);
-  }, [eventsConnected, mergeReadyAssets, orientation, query, rating, selectedAlbum, serverGroup, sort, type]);
+  }, [activeRating, eventsConnected, mergeReadyAssets, orientation, query, selectedAlbum, serverGroup, sort, type]);
 
   useEffect(() => {
     let live = true;
     async function loadAnchors(albumId: number) {
       try {
-        const result = await api.albumAnchors(albumId, pageSize, sort, query, serverGroup, rating, orientation, type, undefined, serializeTagFilters(tagFilters));
+        const result = await api.albumAnchors(albumId, pageSize, sort, query, serverGroup, activeRating, orientation, type, undefined, serializeTagFilters(tagFilters));
         if (live) {
           setAnchors(result.items);
           setTotalCount(result.total);
@@ -238,7 +239,7 @@ export default function AlbumsPage() {
     return () => {
       live = false;
     };
-  }, [orientation, query, rating, selectedAlbum?.id, serverGroup, sort, tagFilters, type]);
+  }, [activeRating, orientation, query, selectedAlbum?.id, serverGroup, sort, tagFilters, type]);
 
   const currentPageState = useCallback(
     (): AlbumsPageState => ({
@@ -273,7 +274,7 @@ export default function AlbumsPage() {
         group: groupMode,
         orientation: orientation === 'all' ? undefined : orientation,
         q: query,
-        rating,
+        rating: activeRating,
         sort,
         tagNodes: serializeTagFilters(tagFilters),
         type,
@@ -301,7 +302,7 @@ export default function AlbumsPage() {
     [location, navigate],
   );
 
-  const handleRatingChange = useCallback((nextRating: AssetRating) => {
+  const handleRatingChange = useCallback((nextRating: AssetRatingFilter) => {
     setRating(nextRating);
   }, []);
 
@@ -639,16 +640,14 @@ export default function AlbumsPage() {
               )
             }
           />
-          {groupMode !== 'folder' && (
-            <LibraryIndexRail
-              anchors={anchors}
-              sort={sort}
-              scrollRatio={scrollRatio}
-              totalCount={totalCount}
-              pageSize={pageSize}
-              onSeek={seekIndex}
-            />
-          )}
+          <LibraryIndexRail
+            anchors={anchors}
+            hideLabels={groupMode === 'folder'}
+            scrollRatio={scrollRatio}
+            totalCount={totalCount}
+            pageSize={pageSize}
+            onSeek={seekIndex}
+          />
           <PressPreviewOverlay asset={pressPreviewAsset} />
         </div>
       )}
@@ -727,8 +726,8 @@ function albumsStateFromSearchParams(params: URLSearchParams, fallback: AlbumsPa
   };
 }
 
-function ratingViewerParam(rating: AssetRating) {
-  return `&rating=${rating}`;
+function ratingViewerParam(rating: AssetRatingFilter) {
+  return rating === 'all' ? '' : `&rating=${rating}`;
 }
 
 function orientationViewerParam(orientation: OrientationFilter) {

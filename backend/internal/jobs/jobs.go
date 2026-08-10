@@ -28,6 +28,7 @@ type Handler func(ctx context.Context, task Task) error
 const (
 	imageQueueCapacity       = 131072
 	videoPosterQueueCapacity = 65536
+	storyboardQueueCapacity  = 65536
 	redisQueuePrefix         = "lpicto:jobs:v2"
 	legacyRedisQueue         = "lpicto:jobs"
 	redisDedupSet            = redisQueuePrefix + ":queued"
@@ -38,15 +39,17 @@ const (
 var (
 	ErrPlaybackPriority = errors.New("playback requires CPU priority")
 	ErrRetryable        = errors.New("task should be retried")
+	ErrTaskStopped      = errors.New("task stopped by user")
 )
 
 var (
 	redisControlTaskTypes  = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild"}
 	redisImageTaskTypes    = []string{"thumb", "preview"}
 	redisPosterTaskTypes   = []string{"video_poster"}
+	redisStoryboardTypes   = []string{"storyboard"}
 	redisAITaskTypes       = []string{"ai_analyze"}
-	redisMediaTaskTypes    = []string{"thumb", "preview", "video_poster", "video_proxy", "ai_analyze"}
-	redisAllTaskTypes      = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "thumb", "preview", "video_poster", "ai_analyze"}
+	redisMediaTaskTypes    = []string{"thumb", "preview", "video_poster", "storyboard", "video_proxy", "ai_analyze"}
+	redisAllTaskTypes      = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "thumb", "preview", "video_poster", "storyboard", "ai_analyze"}
 	redisPromoteTaskScript = redis.NewScript(`
 local items = redis.call('LRANGE', KEYS[1], 0, -1)
 for _, member in ipairs(items) do
@@ -58,6 +61,22 @@ for _, member in ipairs(items) do
   end
 end
 return 0
+`)
+	redisPriorityEnqueueScript = redis.NewScript(`
+local items = redis.call('LRANGE', KEYS[1], 0, -1)
+for _, member in ipairs(items) do
+  local ok, decoded = pcall(cjson.decode, member)
+  local priority = 0
+  if ok and decoded.task then
+    priority = tonumber(decoded.task.priority or 0) or 0
+  end
+  if priority <= 0 or priority >= 100 then
+    redis.call('LINSERT', KEYS[1], 'BEFORE', member, ARGV[1])
+    return 1
+  end
+end
+redis.call('RPUSH', KEYS[1], ARGV[1])
+return 1
 `)
 )
 
@@ -77,6 +96,8 @@ type QueueStats struct {
 	ActiveThumb       int `json:"activeThumb"`
 	ActivePreview     int `json:"activePreview"`
 	ActiveVideoPoster int `json:"activeVideoPoster"`
+	StoryboardQueued  int `json:"storyboardQueued"`
+	ActiveStoryboard  int `json:"activeStoryboard"`
 	ActiveTranscode   int `json:"activeTranscode"`
 	AIQueued          int `json:"aiQueued"`
 	ActiveAI          int `json:"activeAi"`
@@ -91,6 +112,7 @@ type WorkerConfig struct {
 type Manager struct {
 	imageQueue       chan Task
 	videoPosterQueue chan Task
+	storyboardQueue  chan Task
 	thumb            Handler
 	scan             Handler
 	ai               Handler
@@ -101,6 +123,8 @@ type Manager struct {
 	mu               sync.Mutex
 	queued           map[string]int
 	active           map[string]int
+	activeCancels    map[string]map[uint64]context.CancelCauseFunc
+	activeCancelID   uint64
 	wg               sync.WaitGroup
 }
 
@@ -117,11 +141,59 @@ func New(logger *slog.Logger, thumb Handler, policies ...ResourcePolicy) *Manage
 	return &Manager{
 		imageQueue:       make(chan Task, imageQueueCapacity),
 		videoPosterQueue: make(chan Task, videoPosterQueueCapacity),
+		storyboardQueue:  make(chan Task, storyboardQueueCapacity),
 		thumb:            thumb,
 		resources:        resources,
 		logger:           logger,
 		queued:           map[string]int{},
 		active:           map[string]int{},
+		activeCancels:    map[string]map[uint64]context.CancelCauseFunc{},
+	}
+}
+
+// CancelActive stops work that has already left the queue. The handler keeps
+// the item pending, so a later manual continue can process it again.
+func (m *Manager) CancelActive(taskTypes ...string) int {
+	if m == nil || len(taskTypes) == 0 {
+		return 0
+	}
+	allowed := make(map[string]struct{}, len(taskTypes))
+	for _, taskType := range taskTypes {
+		allowed[taskType] = struct{}{}
+	}
+	m.mu.Lock()
+	cancels := make([]context.CancelCauseFunc, 0)
+	for taskType, active := range m.activeCancels {
+		if _, ok := allowed[taskType]; !ok {
+			continue
+		}
+		for _, cancel := range active {
+			cancels = append(cancels, cancel)
+		}
+	}
+	m.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel(ErrTaskStopped)
+	}
+	return len(cancels)
+}
+
+func (m *Manager) registerActiveCancel(taskType string, cancel context.CancelCauseFunc) func() {
+	m.mu.Lock()
+	m.activeCancelID++
+	id := m.activeCancelID
+	if m.activeCancels[taskType] == nil {
+		m.activeCancels[taskType] = make(map[uint64]context.CancelCauseFunc)
+	}
+	m.activeCancels[taskType][id] = cancel
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		delete(m.activeCancels[taskType], id)
+		if len(m.activeCancels[taskType]) == 0 {
+			delete(m.activeCancels, taskType)
+		}
+		m.mu.Unlock()
 	}
 }
 
@@ -152,6 +224,10 @@ func (m *Manager) Start(ctx context.Context, cfg WorkerConfig) {
 		m.startRedisWorkers(ctx, "control", 1, redisControlTaskTypes, nil)
 		m.startRedisWorkers(ctx, "image", cfg.Image, redisImageTaskTypes, nil)
 		m.startRedisWorkers(ctx, "video_poster", cfg.VideoPoster, redisPosterTaskTypes, redisImageTaskTypes)
+		// Storyboards have their own serial worker. Viewer-triggered work must be
+		// able to start immediately instead of waiting behind bulk thumbnails or
+		// posters, and an active storyboard is deliberately allowed to finish.
+		m.startRedisWorkers(ctx, "storyboard", 1, redisStoryboardTypes, nil)
 		m.startRedisWorkers(ctx, "ai", cfg.AI, redisAITaskTypes, nil)
 		return
 	}
@@ -163,6 +239,8 @@ func (m *Manager) Start(ctx context.Context, cfg WorkerConfig) {
 		m.wg.Add(1)
 		go m.worker(ctx, "video_poster", m.videoPosterQueue, m.thumb)
 	}
+	m.wg.Add(1)
+	go m.worker(ctx, "storyboard", m.storyboardQueue, m.thumb)
 }
 
 func (m *Manager) ResetRuntimeState(ctx context.Context) {
@@ -267,6 +345,9 @@ func (m *Manager) BackgroundBlocker(ctx context.Context) string {
 	if active, err := m.PlaybackPriorityActive(ctx); err == nil && active {
 		return "playback"
 	}
+	if active, err := m.StoryboardPriorityActive(ctx); err == nil && active {
+		return "storyboard"
+	}
 	if m.resources != nil {
 		return m.resources.blockedReason()
 	}
@@ -274,6 +355,27 @@ func (m *Manager) BackgroundBlocker(ctx context.Context) string {
 		return "foreground"
 	}
 	return ""
+}
+
+// StoryboardPriorityActive reports whether progress-preview generation is
+// queued or running. AI yields while this NAS-reading task is active.
+func (m *Manager) StoryboardPriorityActive(ctx context.Context) (bool, error) {
+	if m == nil {
+		return false, nil
+	}
+	if m.redis == nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.queued["storyboard"]+m.active["storyboard"] > 0, nil
+	}
+	pipe := m.redis.Pipeline()
+	queued := pipe.LLen(ctx, m.redisQueueKey("storyboard"))
+	active := pipe.HGet(ctx, redisActiveHash, "storyboard")
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return false, err
+	}
+	activeCount, _ := strconv.Atoi(active.Val())
+	return queued.Val() > 0 || activeCount > 0, nil
 }
 
 func (m *Manager) Stop() {
@@ -330,6 +432,7 @@ func (m *Manager) Stats() QueueStats {
 			ThumbQueued:       redisQueued["thumb"],
 			PreviewQueued:     redisQueued["preview"],
 			VideoPosterQueued: redisQueued["video_poster"],
+			StoryboardQueued:  redisQueued["storyboard"],
 			VideoProxyQueued:  0,
 			VideoProxyCap:     0,
 			VideoQueued:       0,
@@ -337,6 +440,7 @@ func (m *Manager) Stats() QueueStats {
 			ActiveThumb:       redisActive["thumb"],
 			ActivePreview:     redisActive["preview"],
 			ActiveVideoPoster: redisActive["video_poster"],
+			ActiveStoryboard:  redisActive["storyboard"],
 			ActiveTranscode:   redisActive["preview"],
 			AIQueued:          redisQueued["ai_analyze"],
 			ActiveAI:          redisActive["ai_analyze"],
@@ -350,6 +454,7 @@ func (m *Manager) Stats() QueueStats {
 		PreviewQueued:     queued["preview"],
 		PreviewCap:        cap(m.imageQueue),
 		VideoPosterQueued: queued["video_poster"],
+		StoryboardQueued:  queued["storyboard"],
 		VideoPosterCap:    cap(m.videoPosterQueue),
 		VideoProxyQueued:  0,
 		VideoProxyCap:     0,
@@ -358,6 +463,7 @@ func (m *Manager) Stats() QueueStats {
 		ActiveThumb:       active["thumb"],
 		ActivePreview:     active["preview"],
 		ActiveVideoPoster: active["video_poster"],
+		ActiveStoryboard:  active["storyboard"],
 		ActiveTranscode:   active["preview"],
 	}
 }
@@ -380,6 +486,8 @@ func (m *Manager) Enqueue(task Task) {
 		queue = m.imageQueue
 	case "video_poster":
 		queue = m.videoPosterQueue
+	case "storyboard":
+		queue = m.storyboardQueue
 	case "ai_analyze":
 		if m.ai != nil {
 			go func() {
@@ -400,7 +508,7 @@ func (m *Manager) Enqueue(task Task) {
 
 func knownQueueTask(taskType string) bool {
 	switch taskType {
-	case "thumb", "preview", "video_poster", "ai_analyze", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "scan_stop":
+	case "thumb", "preview", "video_poster", "storyboard", "ai_analyze", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "scan_stop":
 		return true
 	default:
 		return false
@@ -422,7 +530,7 @@ func (m *Manager) enqueueRedis(task Task) {
 	}
 	var pushErr error
 	if task.Priority > 0 && task.Priority < 100 {
-		pushErr = m.redis.LPush(context.Background(), m.redisQueueKey(task.Type), string(data)).Err()
+		pushErr = redisPriorityEnqueueScript.Run(context.Background(), m.redis, []string{m.redisQueueKey(task.Type)}, string(data)).Err()
 	} else {
 		pushErr = m.redis.RPush(context.Background(), m.redisQueueKey(task.Type), string(data)).Err()
 	}
@@ -463,6 +571,18 @@ func (m *Manager) redisWorker(ctx context.Context, name string, keys []string, b
 				}
 				continue
 			}
+			storyboardActive, storyboardErr := m.StoryboardPriorityActive(ctx)
+			if storyboardErr != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				m.logger.Warn("storyboard priority check failed", "worker", name, "error", storyboardErr)
+			} else if storyboardActive {
+				if err := sleepContext(ctx, 250*time.Millisecond); err != nil {
+					return
+				}
+				continue
+			}
 		}
 		if len(blockedBy) > 0 {
 			blocked, err := m.redisQueuesHaveBacklog(ctx, blockedBy)
@@ -479,7 +599,7 @@ func (m *Manager) redisWorker(ctx context.Context, name string, keys []string, b
 				continue
 			}
 		}
-		if resourceManaged && m.resources != nil {
+		if resourceManaged && name != "storyboard" && m.resources != nil {
 			if err := m.resources.Wait(ctx); err != nil {
 				return
 			}
@@ -519,10 +639,18 @@ func (m *Manager) runTask(ctx context.Context, worker string, task Task) error {
 		return nil
 	}
 	taskCtx := ctx
+	cancelTask := context.CancelCauseFunc(func(error) {})
+	unregisterCancel := func() {}
+	if resourceManagedTask(task.Type) {
+		taskCtx, cancelTask = context.WithCancelCause(ctx)
+		unregisterCancel = m.registerActiveCancel(task.Type, cancelTask)
+		defer func() {
+			unregisterCancel()
+			cancelTask(nil)
+		}()
+	}
 	stopPriorityMonitor := func() {}
-	if resourceManagedTask(task.Type) && m.redis != nil {
-		var cancel context.CancelCauseFunc
-		taskCtx, cancel = context.WithCancelCause(ctx)
+	if resourceManagedTask(task.Type) && task.Type != "storyboard" && m.redis != nil {
 		done := make(chan struct{})
 		stopPriorityMonitor = func() {
 			select {
@@ -531,11 +659,11 @@ func (m *Manager) runTask(ctx context.Context, worker string, task Task) error {
 				close(done)
 			}
 		}
-		go m.cancelForPlaybackPriority(taskCtx, cancel, done)
+		go m.cancelForHigherPriorityWork(taskCtx, task.Type, cancelTask, done)
 		defer stopPriorityMonitor()
 	}
 	release := func() {}
-	if resourceManagedTask(task.Type) && m.resources != nil {
+	if resourceManagedTask(task.Type) && task.Type != "storyboard" && m.resources != nil {
 		var err error
 		release, err = m.resources.Acquire(taskCtx)
 		if err != nil {
@@ -544,7 +672,7 @@ func (m *Manager) runTask(ctx context.Context, worker string, task Task) error {
 	}
 	m.markStarted(task.Type)
 	err := handler(taskCtx, task)
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrPlaybackPriority) {
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrPlaybackPriority) && !errors.Is(err, ErrTaskStopped) {
 		m.logger.Warn("job failed", "worker", worker, "type", task.Type, "assetID", task.AssetID, "error", err)
 	}
 	release()
@@ -552,7 +680,7 @@ func (m *Manager) runTask(ctx context.Context, worker string, task Task) error {
 	return err
 }
 
-func (m *Manager) cancelForPlaybackPriority(ctx context.Context, cancel context.CancelCauseFunc, done <-chan struct{}) {
+func (m *Manager) cancelForHigherPriorityWork(ctx context.Context, taskType string, cancel context.CancelCauseFunc, done <-chan struct{}) {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -560,6 +688,13 @@ func (m *Manager) cancelForPlaybackPriority(ctx context.Context, cancel context.
 		if err == nil && active {
 			cancel(ErrPlaybackPriority)
 			return
+		}
+		if taskType == "ai_analyze" {
+			storyboardActive, storyboardErr := m.StoryboardPriorityActive(ctx)
+			if storyboardErr == nil && storyboardActive {
+				cancel(ErrPlaybackPriority)
+				return
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -679,7 +814,7 @@ func resourceManagedTypes(taskTypes []string) bool {
 
 func resourceManagedTask(taskType string) bool {
 	switch taskType {
-	case "thumb", "preview", "video_poster", "ai_analyze":
+	case "thumb", "preview", "video_poster", "storyboard", "ai_analyze":
 		return true
 	default:
 		return false
@@ -688,7 +823,7 @@ func resourceManagedTask(taskType string) bool {
 
 func (m *Manager) handlerFor(taskType string) Handler {
 	switch taskType {
-	case "thumb", "preview", "video_poster":
+	case "thumb", "preview", "video_poster", "storyboard":
 		return m.thumb
 	case "ai_analyze":
 		return m.ai

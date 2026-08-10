@@ -28,6 +28,22 @@ func TestMissingCollectionExcludesDeletedAssets(t *testing.T) {
 	}
 }
 
+func TestAllCollectionUsesBaseLiveAssetFilter(t *testing.T) {
+	database := &DB{}
+	source, where, _, ok := database.systemCollectionFilter(SystemCollectionAll, AssetListOptions{})
+	if !ok {
+		t.Fatal("all collection filter should exist")
+	}
+	if source != "assets" {
+		t.Fatalf("source = %q, want assets", source)
+	}
+	for _, condition := range []string{"is_live = true", "hidden = false"} {
+		if !strings.Contains(where, condition) {
+			t.Fatalf("where = %q, missing %q", where, condition)
+		}
+	}
+}
+
 func TestAIReadyCollectionRequiresCurrentCompletedResult(t *testing.T) {
 	database := &DB{}
 	source, where, _, ok := database.systemCollectionFilter(SystemCollectionAIReady, AssetListOptions{})
@@ -38,6 +54,22 @@ func TestAIReadyCollectionRequiresCurrentCompletedResult(t *testing.T) {
 		t.Fatalf("source = %q, want assets", source)
 	}
 	for _, condition := range []string{"air.status='ready'", "air.input_cache_key=assets.cache_key"} {
+		if !strings.Contains(where, condition) {
+			t.Fatalf("where = %q, missing %q", where, condition)
+		}
+	}
+}
+
+func TestStoryboardReadyCollectionRequiresCompletedVideoStoryboard(t *testing.T) {
+	database := &DB{}
+	source, where, _, ok := database.systemCollectionFilter(SystemCollectionStoryboardReady, AssetListOptions{})
+	if !ok {
+		t.Fatal("storyboard ready collection filter should exist")
+	}
+	if source != "assets" {
+		t.Fatalf("source = %q, want assets", source)
+	}
+	for _, condition := range []string{"media_type='video'", "mj.job_type='storyboard'", "mj.status='ready'"} {
 		if !strings.Contains(where, condition) {
 			t.Fatalf("where = %q, missing %q", where, condition)
 		}

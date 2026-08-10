@@ -15,21 +15,24 @@ const (
 	CollectionKindSystem = "system"
 	CollectionKindSmart  = "smart"
 
-	SystemCollectionUnclassified   = "unclassified"
-	SystemCollectionUnrated        = "unrated"
-	SystemCollectionUntagged       = "untagged"
-	SystemCollectionWithDanmaku    = "with_danmaku"
-	SystemCollectionWithSubtitles  = "with_subtitles"
-	SystemCollectionNeedsTranscode = "needs_transcode"
-	SystemCollectionDuplicates     = "duplicates"
-	SystemCollectionMissing        = "missing"
-	SystemCollectionHidden         = "hidden"
-	SystemCollectionAIPending      = "ai_pending"
-	SystemCollectionAIReady        = "ai_ready"
-	SystemCollectionAIFailed       = "ai_failed"
+	SystemCollectionAll             = "all"
+	SystemCollectionUnclassified    = "unclassified"
+	SystemCollectionUnrated         = "unrated"
+	SystemCollectionUntagged        = "untagged"
+	SystemCollectionWithDanmaku     = "with_danmaku"
+	SystemCollectionWithSubtitles   = "with_subtitles"
+	SystemCollectionNeedsTranscode  = "needs_transcode"
+	SystemCollectionDuplicates      = "duplicates"
+	SystemCollectionMissing         = "missing"
+	SystemCollectionHidden          = "hidden"
+	SystemCollectionAIPending       = "ai_pending"
+	SystemCollectionAIReady         = "ai_ready"
+	SystemCollectionAIFailed        = "ai_failed"
+	SystemCollectionStoryboardReady = "storyboard_ready"
 )
 
 var systemCollections = []model.Collection{
+	{ID: SystemCollectionAll, Name: "全部", Kind: CollectionKindSystem, SystemKind: SystemCollectionAll},
 	{ID: SystemCollectionUnclassified, Name: "未分类", Kind: CollectionKindSystem, SystemKind: SystemCollectionUnclassified},
 	{ID: SystemCollectionUnrated, Name: "未评分", Kind: CollectionKindSystem, SystemKind: SystemCollectionUnrated},
 	{ID: SystemCollectionUntagged, Name: "无标签", Kind: CollectionKindSystem, SystemKind: SystemCollectionUntagged},
@@ -42,6 +45,7 @@ var systemCollections = []model.Collection{
 	{ID: SystemCollectionAIPending, Name: "AI 待分析", Kind: CollectionKindSystem, SystemKind: SystemCollectionAIPending},
 	{ID: SystemCollectionAIReady, Name: "AI 已分析", Kind: CollectionKindSystem, SystemKind: SystemCollectionAIReady},
 	{ID: SystemCollectionAIFailed, Name: "AI 分析失败", Kind: CollectionKindSystem, SystemKind: SystemCollectionAIFailed},
+	{ID: SystemCollectionStoryboardReady, Name: "进度预览已生成", Kind: CollectionKindSystem, SystemKind: SystemCollectionStoryboardReady},
 }
 
 type CollectionCreate struct {
@@ -202,7 +206,7 @@ func duplicateGroupedRankedSQL(where string, sort string) string {
     FIRST_VALUE(timeline_at) OVER duplicate_window AS duplicate_timeline_at,
     FIRST_VALUE(imported_at) OVER duplicate_window AS duplicate_imported_at,
     FIRST_VALUE(size) OVER duplicate_window AS duplicate_size,
-		FIRST_VALUE(filename_sort_key) OVER duplicate_window AS duplicate_filename_sort_key,
+		FIRST_VALUE(filename_sort_key COLLATE "lpicto_natural_numeric") OVER duplicate_window AS duplicate_filename_sort_key,
 		FIRST_VALUE(lower(filename)) OVER duplicate_window AS duplicate_filename,
 		FIRST_VALUE(parent_rel_path) OVER duplicate_window AS duplicate_parent_rel_path,
 		FIRST_VALUE(id) OVER duplicate_window AS duplicate_id
@@ -217,9 +221,9 @@ func duplicateGroupSortSQL(sort string, group string) string {
 	case "timeline_asc":
 		groupOrder = "duplicate_timeline_at ASC, duplicate_id ASC"
 	case "filename", "filename_asc":
-		groupOrder = "duplicate_filename_sort_key ASC, duplicate_filename ASC, duplicate_id ASC"
+		groupOrder = naturalFilenameOrderSQL("duplicate_filename_sort_key", "duplicate_filename", "ASC", "duplicate_id")
 	case "filename_desc":
-		groupOrder = "duplicate_filename_sort_key DESC, duplicate_filename DESC, duplicate_id DESC"
+		groupOrder = naturalFilenameOrderSQL("duplicate_filename_sort_key", "duplicate_filename", "DESC", "duplicate_id")
 	case "size", "size_desc":
 		groupOrder = "duplicate_size DESC, duplicate_id DESC"
 	case "size_asc":
@@ -359,6 +363,7 @@ func (d *DB) systemCollectionFilter(kind string, opts AssetListOptions) (string,
 	baseOpts.IncludeHidden = kind == SystemCollectionHidden
 	where, args := assetFilterSQL(baseOpts, false)
 	switch kind {
+	case SystemCollectionAll:
 	case SystemCollectionUnclassified:
 		where += " AND NOT " + albumMembershipExistsSQL()
 	case SystemCollectionUnrated:
@@ -389,6 +394,8 @@ func (d *DB) systemCollectionFilter(kind string, opts AssetListOptions) (string,
 		where += ` AND media_type IN ('image','video') AND EXISTS (SELECT 1 FROM asset_ai_result air WHERE air.asset_id=assets.id AND air.status='ready' AND air.input_cache_key=assets.cache_key)`
 	case SystemCollectionAIFailed:
 		where += ` AND media_type IN ('image','video') AND EXISTS (SELECT 1 FROM asset_ai_result air WHERE air.asset_id=assets.id AND air.status='failed' AND air.input_cache_key=assets.cache_key)`
+	case SystemCollectionStoryboardReady:
+		where += ` AND media_type='video' AND EXISTS (SELECT 1 FROM media_job mj WHERE mj.asset_id=assets.id AND mj.job_type='storyboard' AND mj.status='ready')`
 	case SystemCollectionMissing:
 		source = "asset_records"
 		parts := []string{"missing = true", "is_live = true"}
@@ -431,6 +438,49 @@ LIMIT ?`, limit)
 	}
 	defer rows.Close()
 	return scanAssetRows(rows)
+}
+
+func (d *DB) DuplicateHashCandidatesAfterID(ctx context.Context, afterID int64, limit int) ([]model.Asset, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := d.conn.QueryContext(ctx, assetSelectSQL()+`
+WHERE deleted_at IS NULL
+  AND hidden = false
+  AND sha256 IS NULL
+  AND id > ?
+  AND size IN (
+    SELECT size
+    FROM assets
+    WHERE deleted_at IS NULL AND hidden = false
+    GROUP BY size
+    HAVING COUNT(*) > 1
+  )
+ORDER BY id ASC
+LIMIT ?`, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAssetRows(rows)
+}
+
+func (d *DB) DuplicateHashProgress(ctx context.Context) (total int, completed int, err error) {
+	err = d.conn.QueryRowContext(ctx, `
+WITH duplicate_sizes AS (
+  SELECT size
+  FROM assets
+  WHERE deleted_at IS NULL AND hidden = false
+  GROUP BY size
+  HAVING COUNT(*) > 1
+)
+SELECT COUNT(*)::INT,
+  COUNT(*) FILTER (WHERE sha256 IS NOT NULL AND sha256 <> '')::INT
+FROM assets
+WHERE deleted_at IS NULL
+  AND hidden = false
+  AND size IN (SELECT size FROM duplicate_sizes)`).Scan(&total, &completed)
+	return total, completed, err
 }
 
 func (d *DB) SetAssetSHA256Hex(ctx context.Context, assetID int64, hashHex string) error {

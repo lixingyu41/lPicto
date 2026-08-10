@@ -111,6 +111,15 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 			}
 			return p.fail(ctx, asset.ID, asset.CacheKey, err, true)
 		}
+		if stage != nil {
+			if err := p.DB.MarkAIStageProcessing(ctx, asset.ID, asset.CacheKey); err != nil {
+				p.Stager.Remove(context.Background(), stage)
+				return p.fail(ctx, asset.ID, asset.CacheKey, err, true)
+			}
+			releaseStage := p.Stager.Pin(stage)
+			defer releaseStage()
+			defer p.Stager.Remove(context.Background(), stage)
+		}
 	}
 	stagedPath := ""
 	if stage != nil {
@@ -165,9 +174,6 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 		result.SampledFrames = json.RawMessage("[]")
 	}
 	err = p.DB.SaveAIResult(ctx, asset.ID, asset.CacheKey, description, result.TagModel, result.TagModelVersion, result.DescriptionModel, result.DescriptionModelVersion, result.TaxonomyVersion, result.SampledFrames, result.Tags, result.Palette)
-	if err == nil && p.Stager != nil {
-		p.Stager.Remove(context.Background(), stage)
-	}
 	if err != nil && ctx.Err() != nil {
 		return p.interrupt(asset.ID, asset.CacheKey, context.Cause(ctx))
 	}

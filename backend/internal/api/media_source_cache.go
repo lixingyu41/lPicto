@@ -88,6 +88,8 @@ func (s *Server) serveCachedOriginalImage(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) serveCachedMediaFile(w http.ResponseWriter, r *http.Request, asset model.Asset, path string, info os.FileInfo) {
+	releaseCache := s.cachePolicy.Pin(path)
+	defer releaseCache()
 	file, err := os.Open(path)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "cache_not_ready", "缓存尚未生成")
@@ -313,13 +315,16 @@ func (r *chunkedVideoReader) Read(target []byte) (int, error) {
 			r.readErr = err
 			return total, err
 		}
+		releaseCache := r.server.cachePolicy.Pin(path)
 		file, err := os.Open(path)
 		if err != nil {
+			releaseCache()
 			r.readErr = err
 			return total, err
 		}
 		count, readErr := file.ReadAt(target, chunkOffset)
 		_ = file.Close()
+		releaseCache()
 		total += count
 		r.offset += int64(count)
 		target = target[count:]
@@ -349,6 +354,8 @@ func (r *chunkedVideoReader) ensureChunk(index int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	releaseCache := r.server.cachePolicy.Pin(path)
+	defer releaseCache()
 	length := expectedVideoChunkBytes(r.size, index)
 	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Size() == length {
 		r.server.cachePolicy.Touch(r.ctx, r.cacheKind, key, path)

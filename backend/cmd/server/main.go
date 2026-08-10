@@ -131,6 +131,11 @@ func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *j
 	}
 	scan.StartPeriodicCount(ctx, cfg.FileCountScanInterval)
 	queue.ResetRuntimeState(ctx)
+	if aiStager != nil {
+		if err := aiStager.CleanupInterrupted(ctx); err != nil {
+			logger.Warn("cleanup interrupted AI staging failed", "error", err)
+		}
+	}
 	if err := queue.ClearAIQueue(ctx); err != nil {
 		logger.Warn("clear stale AI queue before staged backfill failed", "error", err)
 	}
@@ -230,6 +235,14 @@ func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager
 				}
 				for _, stagedItem := range stagedItems {
 					item, stage := stagedItem.item, stagedItem.stage
+					enabled, enabledErr := database.AIExecutionEnabled(ctx)
+					if enabledErr != nil {
+						stageBatchErr = enabledErr
+						break
+					}
+					if !enabled {
+						break
+					}
 					if (stage == nil || stage.State != "ready") && stager != nil && prepareBudget > 0 && preparedBytes < aiworker.StageBatchMaxBytes {
 						if sources != nil {
 							if available, _ := sources.CachedAvailableForRel(item.RelPath); !available {
@@ -261,6 +274,14 @@ func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager
 								_, _ = database.MarkAIFailed(ctx, item.AssetID, item.CacheKey, "AI 输入准备失败："+stageErr.Error())
 								prepareBudget--
 								continue
+							}
+							enabled, enabledErr = database.AIExecutionEnabled(ctx)
+							if enabledErr != nil || !enabled {
+								stager.Remove(context.Background(), stage)
+								if enabledErr != nil {
+									stageBatchErr = enabledErr
+								}
+								break
 							}
 							preparedBytes += stage.SizeBytes
 							preparedCount++

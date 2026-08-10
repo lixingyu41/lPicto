@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,6 +22,7 @@ import (
 const (
 	taskStorageHealth = "storage_health_check"
 	taskCacheCleanup  = "cache_cleanup"
+	taskDuplicateScan = "duplicate_scan"
 )
 
 type systemTaskRunRequest struct {
@@ -62,6 +62,13 @@ func (s *Server) runSystemTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch taskID {
+	case "media_scan":
+		if action != "continue" && action != "start" && action != "retry_failed" && action != "rebuild" {
+			systemTaskActionError(w)
+			return
+		}
+		result := s.scanner.RequestCountScanRoots(reason, roots)
+		writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 	case "library_scan":
 		if action != "reconcile" && action != "scan" {
 			systemTaskActionError(w)
@@ -73,14 +80,26 @@ func (s *Server) runSystemTask(w http.ResponseWriter, r *http.Request) {
 		s.runMetadataTask(w, r, action, roots, reason, running)
 	case "thumbnail_creation":
 		s.runThumbnailTask(w, r, action, roots, reason, running)
-	case "preview_creation", "video_poster_creation":
+	case "preview_creation", "video_poster_creation", "storyboard_creation":
 		taskType := "preview"
 		if taskID == "video_poster_creation" {
 			taskType = "video_poster"
+		} else if taskID == "storyboard_creation" {
+			taskType = "storyboard"
 		}
 		s.runQueuedMediaTask(w, r, taskType, action, roots, running)
 	case "ai_analysis":
 		s.runAIAnalysisTask(w, r, action, running)
+	case taskDuplicateScan:
+		if action != "scan" && action != "continue" {
+			systemTaskActionError(w)
+			return
+		}
+		if !s.startDuplicateScan() {
+			writeJSON(w, http.StatusConflict, map[string]any{"accepted": false, "state": "running", "message": "重复文件扫描正在运行"})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "state": "running"})
 	case taskStorageHealth:
 		if action != "check" {
 			systemTaskActionError(w)
@@ -111,11 +130,14 @@ func (s *Server) systemTaskRunning(ctx context.Context, taskID string) bool {
 		s.cleanupMu.Unlock()
 		return running
 	}
-	if taskID == "library_scan" || taskID == "metadata_extraction" || taskID == "thumbnail_creation" {
+	if taskID == "media_scan" || taskID == "library_scan" || taskID == "metadata_extraction" || taskID == "thumbnail_creation" {
 		status, _ := s.scanner.Status(ctx)
-		if status.Running {
+		if status.Running && (taskID != "media_scan" || status.Progress.Task == "count") {
 			return true
 		}
+	}
+	if taskID == taskDuplicateScan {
+		return s.duplicateScanIsRunning()
 	}
 	if s.jobs == nil {
 		return false
@@ -128,6 +150,8 @@ func (s *Server) systemTaskRunning(ctx context.Context, taskID string) bool {
 		return stats.PreviewQueued+stats.ActivePreview > 0
 	case "video_poster_creation":
 		return stats.VideoPosterQueued+stats.ActiveVideoPoster > 0
+	case "storyboard_creation":
+		return stats.StoryboardQueued+stats.ActiveStoryboard > 0
 	case "ai_analysis":
 		return stats.AIQueued+stats.ActiveAI > 0
 	default:
@@ -137,7 +161,7 @@ func (s *Server) systemTaskRunning(ctx context.Context, taskID string) bool {
 
 func systemTaskNeedsStorage(taskID string) bool {
 	switch taskID {
-	case "library_scan", "metadata_extraction", "thumbnail_creation", "preview_creation", "video_poster_creation", "ai_analysis":
+	case "media_scan", "library_scan", "metadata_extraction", "thumbnail_creation", "preview_creation", "video_poster_creation", "storyboard_creation", "ai_analysis", taskDuplicateScan:
 		return true
 	default:
 		return false
@@ -148,11 +172,12 @@ func (s *Server) stopSystemTask(w http.ResponseWriter, r *http.Request) {
 	taskID := strings.TrimSpace(chi.URLParam(r, "id"))
 	ctx := r.Context()
 	switch taskID {
-	case "library_scan", "metadata_extraction":
+	case "media_scan", "library_scan", "metadata_extraction":
 		result := s.scanner.RequestStop()
 		writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 	case "thumbnail_creation":
 		_ = s.jobs.ClearQueues(ctx, "thumb", "video_poster")
+		s.jobs.CancelActive("thumb", "video_poster")
 		_ = s.db.RequeueProcessingWork(ctx, "thumb")
 		_ = s.db.RequeueProcessingWork(ctx, "video_poster")
 		result := s.scanner.RequestStop()
@@ -160,12 +185,20 @@ func (s *Server) stopSystemTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 	case "preview_creation":
 		_ = s.jobs.ClearQueues(ctx, "preview")
+		s.jobs.CancelActive("preview")
 		_ = s.db.RequeueProcessingWork(ctx, "preview")
 		_ = s.db.FinishSystemTask(ctx, taskID, "stopped", "任务已停止，可从当前进度继续")
 		writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "state": "paused"})
 	case "video_poster_creation":
 		_ = s.jobs.ClearQueues(ctx, "video_poster")
+		s.jobs.CancelActive("video_poster")
 		_ = s.db.RequeueProcessingWork(ctx, "video_poster")
+		_ = s.db.FinishSystemTask(ctx, taskID, "stopped", "任务已停止，可从当前进度继续")
+		writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "state": "paused"})
+	case "storyboard_creation":
+		_ = s.jobs.ClearQueues(ctx, "storyboard")
+		s.jobs.CancelActive("storyboard")
+		_ = s.db.RequeueProcessingWork(ctx, "storyboard")
 		_ = s.db.FinishSystemTask(ctx, taskID, "stopped", "任务已停止，可从当前进度继续")
 		writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "state": "paused"})
 	case "ai_analysis":
@@ -175,8 +208,16 @@ func (s *Server) stopSystemTask(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "ai_stop_failed", "停止 AI 分析失败")
 			return
 		}
+		s.jobs.CancelActive("ai_analyze")
+		s.removeQueuedAIStages(ctx)
 		_ = s.db.FinishSystemTask(ctx, taskID, "stopped", "AI 分析已停止；自动分析同时关闭")
 		writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "state": "paused"})
+	case taskDuplicateScan:
+		if !s.stopDuplicateScan() {
+			writeJSON(w, http.StatusOK, map[string]any{"accepted": false, "state": "idle"})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "state": "stopping"})
 	case taskCacheCleanup:
 		s.cleanupMu.Lock()
 		cancel := s.cleanupCancel
@@ -189,6 +230,105 @@ func (s *Server) stopSystemTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "state": "stopping"})
 	default:
 		writeError(w, http.StatusBadRequest, "task_not_stoppable", "这个任务不能停止")
+	}
+}
+
+func (s *Server) duplicateScanIsRunning() bool {
+	s.duplicateScanMu.Lock()
+	defer s.duplicateScanMu.Unlock()
+	return s.duplicateScanCancel != nil
+}
+
+func (s *Server) duplicateScanFailureCount() int {
+	s.duplicateScanMu.Lock()
+	defer s.duplicateScanMu.Unlock()
+	return s.duplicateScanFailed
+}
+
+func (s *Server) startDuplicateScan() bool {
+	s.duplicateScanMu.Lock()
+	if s.duplicateScanCancel != nil {
+		s.duplicateScanMu.Unlock()
+		return false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.duplicateScanCancel = cancel
+	s.duplicateScanFailed = 0
+	s.duplicateScanMu.Unlock()
+
+	_ = s.db.BeginSystemTask(context.Background(), taskDuplicateScan)
+	go s.runDuplicateScan(ctx)
+	return true
+}
+
+func (s *Server) stopDuplicateScan() bool {
+	s.duplicateScanMu.Lock()
+	cancel := s.duplicateScanCancel
+	s.duplicateScanMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (s *Server) runDuplicateScan(ctx context.Context) {
+	processed := 0
+	failed := 0
+	afterID := int64(0)
+	defer func() {
+		s.duplicateScanMu.Lock()
+		s.duplicateScanCancel = nil
+		s.duplicateScanFailed = failed
+		s.duplicateScanMu.Unlock()
+	}()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = s.db.FinishSystemTask(context.Background(), taskDuplicateScan, "stopped", fmt.Sprintf("已停止；本次完成 %d 项，%d 项读取失败", processed, failed))
+			return
+		}
+		candidates, err := s.db.DuplicateHashCandidatesAfterID(ctx, afterID, 100)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				_ = s.db.FinishSystemTask(context.Background(), taskDuplicateScan, "stopped", fmt.Sprintf("已停止；本次完成 %d 项，%d 项读取失败", processed, failed))
+				return
+			}
+			_ = s.db.FinishSystemTask(context.Background(), taskDuplicateScan, "failed", "读取重复文件候选失败："+err.Error())
+			return
+		}
+		if len(candidates) == 0 {
+			state := "success"
+			message := fmt.Sprintf("扫描完成；本次计算 %d 项", processed)
+			if failed > 0 {
+				state = "warning"
+				message = fmt.Sprintf("扫描完成；本次计算 %d 项，%d 项暂时无法读取", processed, failed)
+			}
+			_ = s.db.FinishSystemTask(context.Background(), taskDuplicateScan, state, message)
+			return
+		}
+		for _, asset := range candidates {
+			afterID = asset.ID
+			if err := ctx.Err(); err != nil {
+				break
+			}
+			absPath, err := s.store.PhotoPath(asset.RelPath)
+			if err == nil {
+				var hash string
+				hash, err = fileSHA256Hex(absPath)
+				if err == nil {
+					err = s.db.SetAssetSHA256Hex(ctx, asset.ID, hash)
+				}
+			}
+			if err != nil {
+				failed++
+				s.duplicateScanMu.Lock()
+				s.duplicateScanFailed = failed
+				s.duplicateScanMu.Unlock()
+				continue
+			}
+			processed++
+		}
 	}
 }
 
@@ -279,6 +419,8 @@ func (s *Server) runQueuedMediaTask(w http.ResponseWriter, r *http.Request, task
 	taskID := "preview_creation"
 	if taskType == "video_poster" {
 		taskID = "video_poster_creation"
+	} else if taskType == "storyboard" {
+		taskID = "storyboard_creation"
 	}
 	if action != "retry_failed" {
 		_ = s.db.BeginSystemTask(r.Context(), taskID)
@@ -297,6 +439,13 @@ func (s *Server) runQueuedMediaTask(w http.ResponseWriter, r *http.Request, task
 	}
 	if items == nil && err == nil {
 		items, err = s.db.WorkItemsForRoots(r.Context(), taskType, roots)
+	}
+	if action == "rebuild" && taskType == "storyboard" {
+		for _, item := range items {
+			if asset, assetErr := s.db.GetAsset(r.Context(), item.AssetID); assetErr == nil {
+				_ = s.store.RemoveCachePrefix(asset.CacheKey, "storyboards", "webp")
+			}
+		}
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "task_work_failed", "读取待处理媒体失败")
@@ -411,11 +560,12 @@ func (s *Server) checkStorageHealth(ctx context.Context) ([]storage.SourceHealth
 	if failed > 0 {
 		state, message = "failed", fmt.Sprintf("%d 个存储来源不可访问", failed)
 		s.scanner.RequestStop()
-		_ = s.jobs.ClearQueues(ctx, "thumb", "preview", "video_poster")
+		_ = s.jobs.ClearQueues(ctx, "thumb", "preview", "video_poster", "storyboard")
 		_ = s.jobs.ClearAIQueue(ctx)
 		_ = s.db.RequeueProcessingWork(ctx, "thumb")
 		_ = s.db.RequeueProcessingWork(ctx, "preview")
 		_ = s.db.RequeueProcessingWork(ctx, "video_poster")
+		_ = s.db.RequeueProcessingWork(ctx, "storyboard")
 	}
 	_ = s.db.FinishSystemTask(ctx, taskStorageHealth, state, message)
 	return statuses, failed, message
@@ -526,41 +676,13 @@ func (s *Server) runOrphanCacheCleanup(parent context.Context) {
 	ctx, cancel := context.WithTimeout(parent, 2*time.Hour)
 	defer cancel()
 	_ = s.db.BeginSystemTask(ctx, taskCacheCleanup)
-	keys, err := s.db.AssetCacheKeys(ctx)
-	deleted, bytes := 0, int64(0)
-	if err == nil {
-		err = filepath.WalkDir(s.store.CacheRoot, func(path string, entry os.DirEntry, walkErr error) error {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if walkErr != nil || entry.IsDir() {
-				return nil
-			}
-			info, infoErr := entry.Info()
-			if infoErr != nil {
-				return nil
-			}
-			base := strings.SplitN(entry.Name(), ".", 2)[0]
-			preserve := cacheFileReferenced(base, keys)
-			rel, _ := filepath.Rel(s.store.CacheRoot, path)
-			if strings.HasPrefix(filepath.ToSlash(rel), "ai-staging/") && time.Since(info.ModTime()) < 24*time.Hour {
-				preserve = true
-			}
-			if preserve || strings.Contains(entry.Name(), ".tmp") && time.Since(info.ModTime()) < 24*time.Hour {
-				return nil
-			}
-			if removeErr := os.Remove(path); removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
-				deleted++
-				bytes += info.Size()
-			}
-			return nil
-		})
-	}
-	status, message := "success", fmt.Sprintf("已删除 %d 个无效缓存文件，释放 %d 字节", deleted, bytes)
+	result, err := s.cachePolicy.Clear(ctx)
+	deleted, bytes := result.DeletedFiles, result.ReleasedBytes
+	status, message := "success", fmt.Sprintf("已删除 %d 个缓存项，释放 %d 字节", deleted, bytes)
 	if errors.Is(err, context.Canceled) {
-		status, message = "stopped", fmt.Sprintf("清理已停止；本次已删除 %d 个无效缓存文件", deleted)
+		status, message = "stopped", fmt.Sprintf("清理已停止；本次已删除 %d 个缓存项", deleted)
 	} else if err != nil {
-		status, message = "failed", "清理无效缓存失败"
+		status, message = "failed", "清理缓存失败"
 	}
 	_ = s.db.FinishSystemTask(context.Background(), taskCacheCleanup, status, message)
 	s.cleanupMu.Lock()
@@ -599,9 +721,63 @@ func (s *Server) startCacheCleanupScheduler() {
 				next = next.Add(24 * time.Hour)
 			}
 			time.Sleep(time.Until(next))
-			s.startOrphanCacheCleanup()
+			s.startScheduledCacheMaintenance()
 		}
 	}()
+}
+
+func (s *Server) startScheduledCacheMaintenance() bool {
+	s.cleanupMu.Lock()
+	if s.cleanupStatus.Running {
+		s.cleanupMu.Unlock()
+		return false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cleanupStatus = CleanupStatusDTO{Running: true, Status: "running", UpdatedAt: time.Now().Unix()}
+	s.cleanupCancel = cancel
+	s.cleanupMu.Unlock()
+	go s.runScheduledCacheMaintenance(ctx)
+	return true
+}
+
+func (s *Server) runScheduledCacheMaintenance(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Hour)
+	defer cancel()
+	_ = s.db.BeginSystemTask(ctx, taskCacheCleanup)
+	before := s.cachePolicy.Usage()
+	partial, err := s.cachePolicy.CleanupAbandoned(ctx, time.Minute)
+	if err == nil && s.aiStager != nil {
+		err = s.aiStager.CleanupAbandoned(ctx)
+	}
+	if err == nil {
+		_, err = s.cachePolicy.EnsureCapacity(ctx, 0)
+	}
+	after := s.cachePolicy.Usage()
+	released := max(int64(0), before.TotalBytes-after.TotalBytes)
+	status, message := "success", fmt.Sprintf("已完成缓存维护，释放 %d 字节", released)
+	if partial.DeletedFiles > 0 {
+		message = fmt.Sprintf("已清除 %d 个中断残留，释放 %d 字节", partial.DeletedFiles, released)
+	}
+	if errors.Is(err, context.Canceled) {
+		status, message = "stopped", "缓存维护已停止"
+	} else if err != nil {
+		status, message = "failed", err.Error()
+	}
+	_ = s.db.FinishSystemTask(context.Background(), taskCacheCleanup, status, message)
+	s.cleanupMu.Lock()
+	cleanupStatus := "done"
+	lastError := ""
+	if status == "stopped" {
+		cleanupStatus = "stopped"
+	} else if status == "failed" {
+		cleanupStatus, lastError = "error", message
+	}
+	s.cleanupStatus = CleanupStatusDTO{Running: false, Status: cleanupStatus, LastError: lastError, UpdatedAt: time.Now().Unix()}
+	s.cleanupCancel = nil
+	s.cleanupMu.Unlock()
+	s.cacheMu.Lock()
+	s.cacheStatsAt = time.Time{}
+	s.cacheMu.Unlock()
 }
 
 func (s *Server) startStorageHealthScheduler() {

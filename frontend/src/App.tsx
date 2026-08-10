@@ -46,7 +46,8 @@ export default function App() {
       <Routes location={routeLocation}>
         <Route index element={<Navigate to="/library" replace />} />
         <Route path="/timeline" element={<Navigate to="/library" replace />} />
-        <Route path="/library" element={<LibraryPage />} />
+        <Route path="/library" element={<LibraryPage key="library" />} />
+        <Route path="/recent" element={<LibraryPage key="recent" mode="recent" />} />
         <Route path="/albums" element={<AlbumsPage />} />
         <Route path="/folders" element={<FoldersPage />} />
         <Route path="/collections" element={<CollectionsPage />} />

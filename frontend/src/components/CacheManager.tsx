@@ -57,7 +57,7 @@ export function CacheManager({ cleanup, progress, onReset, onCleanup }: {
     <>
       <section className="settings-panel cache-overview-panel">
         <div className="settings-panel-title">缓存概览</div>
-        <div className="muted-line cache-overview-intro">缩略图、高清预览、视频封面和播放代理均保存在 Ubuntu 本地缓存中。</div>
+        <div className="muted-line cache-overview-intro">缩略图和视频封面长期保留；播放缓存和高清预览按最近访问时间回收，AI 暂存在处理结束后立即删除。</div>
         <div className="metric-grid cache-summary-grid">
           <Metric label="总占用" value={cachePending ? '统计中' : formatBytes(progress.cache.sizeBytes)} />
           <Metric label="媒体缓存" value={cachePending ? '统计中' : formatBytes(progress.cache.cacheBytes)} />
@@ -72,7 +72,7 @@ export function CacheManager({ cleanup, progress, onReset, onCleanup }: {
         </div>
         {!cachePending && (
           <div className="cache-kind-usage" aria-label="缓存分类占用">
-            <Metric label="缩略图与封面" value={formatBytes((progress.cache.byKind.thumbs ?? 0) + (progress.cache.byKind['video-posters'] ?? 0))} />
+            <Metric label="缩略图、封面与进度预览" value={formatBytes((progress.cache.byKind.thumbs ?? 0) + (progress.cache.byKind['video-posters'] ?? 0) + (progress.cache.byKind.storyboards ?? 0))} />
             <Metric label="图片与预览" value={formatBytes((progress.cache.byKind.originals ?? 0) + (progress.cache.byKind.previews ?? 0))} />
             <Metric label="视频播放" value={formatBytes((progress.cache.byKind['video-chunks'] ?? 0) + (progress.cache.byKind['video-proxies'] ?? 0))} />
             <Metric label="音频播放" value={formatBytes((progress.cache.byKind['audio-chunks'] ?? 0) + (progress.cache.byKind['audio-proxies'] ?? 0))} />
@@ -82,7 +82,7 @@ export function CacheManager({ cleanup, progress, onReset, onCleanup }: {
         {onCleanup && (
           <div className="cache-overview-actions">
             <button type="button" disabled={cleanup?.running} onClick={() => void onCleanup()}>
-              {cleanup?.running ? '正在清理' : '清理无效缓存'}
+              {cleanup?.running ? '正在清理' : '清理可回收缓存'}
             </button>
           </div>
         )}

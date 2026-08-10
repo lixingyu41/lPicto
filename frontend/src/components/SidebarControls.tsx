@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
 import { ChevronRight, Database, EyeOff, Image as ImageIcon, Images, ListChecks, MonitorSmartphone, Music, RectangleHorizontal, RectangleVertical, RotateCw, Sparkles, Square, Star, StarOff, Tags, Trash2, Video } from 'lucide-react';
-import type { Album, AlbumGroup, AssetKind, AssetRating, OrientationFilter } from '../types/api';
+import type { Album, AlbumGroup, AssetKind, AssetRatingFilter, OrientationFilter } from '../types/api';
 import { CompactSidebarMenu, CompactSidebarMenuGroup } from './CompactSidebarMenu';
 import {
   assetGridBatchStateEvent,
@@ -72,7 +72,7 @@ export function SidebarOrientationFilter({ onChange, value }: { onChange: (value
   return <SidebarIconMenu label="方向" value={value} options={orientationFilterOptions} onChange={onChange} />;
 }
 
-export function SidebarRatingFilter({ onChange, value }: { onChange: (value: AssetRating) => void; value: AssetRating }) {
+export function SidebarRatingFilter({ onChange, value }: { onChange: (value: AssetRatingFilter) => void; value: AssetRatingFilter }) {
   return <SidebarIconMenu label="星级" value={value} options={ratingFilterOptions} onChange={onChange} />;
 }
 
@@ -360,7 +360,7 @@ export function SidebarAlbumList({
   );
 }
 
-const ratingValues: AssetRating[] = [0, 1, 2, 3, 4, 5];
+const ratingValues: AssetRatingFilter[] = ['all', 0, 1, 2, 3, 4, 5];
 export const sidebarOrientationOptions: Array<SidebarButtonGroupOption<OrientationFilter>> = [
   { value: 'all', label: '任意' },
   { value: 'landscape', label: '横屏' },
@@ -380,11 +380,11 @@ const orientationFilterOptions: Array<SidebarIconMenuOption<OrientationFilter>> 
   { value: 'portrait', label: '竖屏', renderIcon: () => <RectangleVertical size={18} /> },
 ];
 
-const ratingFilterOptions: Array<SidebarIconMenuOption<AssetRating>> = ratingValues.map((rating) => ({
-  badge: String(rating),
-  label: rating === 0 ? '未评级' : `${rating} 星`,
+const ratingFilterOptions: Array<SidebarIconMenuOption<AssetRatingFilter>> = ratingValues.map((rating) => ({
+  badge: rating === 'all' ? '全' : String(rating),
+  label: rating === 'all' ? '全部' : rating === 0 ? '未评级' : `${rating} 星`,
   renderIcon: (active) =>
-    rating === 0 ? <StarOff size={18} /> : <Star size={18} fill={active ? 'currentColor' : 'none'} />,
+    rating === 0 ? <StarOff size={18} /> : <Star size={18} fill={rating !== 'all' && active ? 'currentColor' : 'none'} />,
   value: rating,
 }));
 

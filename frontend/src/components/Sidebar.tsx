@@ -1,54 +1,96 @@
-import { type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, useCallback, useEffect } from 'react';
-import { FolderTree, Images, Layers, Library, Settings } from 'lucide-react';
+import {
+  type FocusEvent,
+  type MouseEvent,
+  type PointerEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
+import { FolderTree, History, Images, Layers, Library, PanelRightClose, PanelRightOpen, Settings } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
-import { useSidebarPanelValue, type SidebarPanelTarget } from './SidebarContext';
+import { useSidebarPanelValue, useViewerInfoPanel, type SidebarPanelTarget } from './SidebarContext';
 import {
   isPrimarySidebarPanelTarget,
   primaryTargetForPath,
-  type CollapsedSidebarContent,
   type PrimarySidebarPanelTarget,
 } from '../utils/sidebarPrefs';
 import { loadSettingsSection, settingsSectionPath } from '../utils/settingsRoute';
 
 interface Props {
-  collapsed: boolean;
-  collapsedContent: CollapsedSidebarContent;
   expanded: SidebarPanelTarget | null;
   secondaryWidth: number;
   routePathname?: string;
   onSecondaryWidthChange: (width: number) => void;
-  onTogglePrimary: () => void;
   onToggleExpanded: (target: SidebarPanelTarget | null) => void;
 }
 
 const navItems: Array<{
   Icon: typeof Library;
   label: string;
-  compactLabel: string;
   target: PrimarySidebarPanelTarget;
   to: string;
 }> = [
-  { Icon: Library, compactLabel: '库', label: '图库', target: 'library', to: '/library' },
-  { Icon: Images, compactLabel: '册', label: '相册', target: 'albums', to: '/albums' },
-  { Icon: FolderTree, compactLabel: '夹', label: '文件夹', target: 'folders', to: '/folders' },
-  { Icon: Layers, compactLabel: '智', label: '智能', target: 'collections', to: '/collections' },
-  { Icon: Settings, compactLabel: '设', label: '设置', target: 'settings', to: '/settings' },
+  { Icon: Library, label: '图库', target: 'library', to: '/library' },
+  { Icon: History, label: '最近播放', target: 'recent', to: '/recent' },
+  { Icon: Images, label: '相册', target: 'albums', to: '/albums' },
+  { Icon: FolderTree, label: '文件夹', target: 'folders', to: '/folders' },
+  { Icon: Layers, label: '智能', target: 'collections', to: '/collections' },
+  { Icon: Settings, label: '设置', target: 'settings', to: '/settings' },
 ];
 
 export default function Sidebar({
-  collapsed,
-  collapsedContent,
   expanded,
   secondaryWidth,
   routePathname,
   onSecondaryWidthChange,
-  onTogglePrimary,
   onToggleExpanded,
 }: Props) {
   const location = useLocation();
   const effectivePathname = routePathname ?? location.pathname;
   const panels = useSidebarPanelValue();
+  const viewerInfo = useViewerInfoPanel();
   const routeTarget = primaryTargetForPath(effectivePathname);
+  const [primaryMenuOpen, setPrimaryMenuOpen] = useState(false);
+  const primaryMenuHost = useRef<HTMLDivElement | null>(null);
+  const primaryMenuCloseTimer = useRef<number | null>(null);
+  const holdPrimaryMenuUntilPointerMove = useRef(false);
+
+  const cancelPrimaryMenuClose = useCallback(() => {
+    if (primaryMenuCloseTimer.current === null) return;
+    window.clearTimeout(primaryMenuCloseTimer.current);
+    primaryMenuCloseTimer.current = null;
+  }, []);
+  const openPrimaryMenu = useCallback(() => {
+    holdPrimaryMenuUntilPointerMove.current = false;
+    cancelPrimaryMenuClose();
+    setPrimaryMenuOpen(true);
+  }, [cancelPrimaryMenuClose]);
+  const schedulePrimaryMenuClose = useCallback(() => {
+    cancelPrimaryMenuClose();
+    primaryMenuCloseTimer.current = window.setTimeout(() => {
+      primaryMenuCloseTimer.current = null;
+      setPrimaryMenuOpen(false);
+    }, 500);
+  }, [cancelPrimaryMenuClose]);
+
+  useEffect(() => cancelPrimaryMenuClose, [cancelPrimaryMenuClose]);
+
+  useEffect(() => {
+    const handlePointerMove = (event: globalThis.PointerEvent) => {
+      if (!holdPrimaryMenuUntilPointerMove.current) return;
+      holdPrimaryMenuUntilPointerMove.current = false;
+      const hoveredElement = document.elementFromPoint(event.clientX, event.clientY);
+      if (hoveredElement && primaryMenuHost.current?.contains(hoveredElement)) {
+        cancelPrimaryMenuClose();
+        return;
+      }
+      schedulePrimaryMenuClose();
+    };
+    window.addEventListener('pointermove', handlePointerMove, true);
+    return () => window.removeEventListener('pointermove', handlePointerMove, true);
+  }, [cancelPrimaryMenuClose, schedulePrimaryMenuClose]);
 
   useEffect(() => {
     if (expanded && !isPrimarySidebarPanelTarget(expanded) && !panels[expanded]) {
@@ -57,28 +99,21 @@ export default function Sidebar({
   }, [expanded, onToggleExpanded, panels]);
 
   const activeRouteSecondaryTarget = routeTarget && expanded === routeTarget ? routeTarget : null;
-  const activeSecondaryTarget = activeRouteSecondaryTarget;
   const secondaryPanel = activeRouteSecondaryTarget ? panels[activeRouteSecondaryTarget] : null;
   const routeSecondaryLabel = activeRouteSecondaryTarget ? sidebarLabel(activeRouteSecondaryTarget) : routeTarget ? sidebarLabel(routeTarget) : '';
-  const routeSecondaryOpen = activeSecondaryTarget !== null;
   const toggleRouteSecondary = useCallback(() => {
     if (!routeTarget) return;
-    onToggleExpanded(routeSecondaryOpen ? null : routeTarget);
-  }, [onToggleExpanded, routeSecondaryOpen, routeTarget]);
-  const handleSecondaryHeaderKeyDown = useCallback(
-    (event: KeyboardEvent<HTMLDivElement>) => {
-      if (event.key !== 'Enter' && event.key !== ' ') return;
-      event.preventDefault();
-      toggleRouteSecondary();
-    },
-    [toggleRouteSecondary],
-  );
-  const toggleSecondaryForNav = useCallback(
+    onToggleExpanded(activeRouteSecondaryTarget ? null : routeTarget);
+  }, [activeRouteSecondaryTarget, onToggleExpanded, routeTarget]);
+  const openSecondaryForNav = useCallback(
     (target: PrimarySidebarPanelTarget) => {
+      cancelPrimaryMenuClose();
+      holdPrimaryMenuUntilPointerMove.current = true;
+      setPrimaryMenuOpen(true);
       if (!panels[target]) return;
       onToggleExpanded(target);
     },
-    [onToggleExpanded, panels],
+    [cancelPrimaryMenuClose, onToggleExpanded, panels],
   );
   const startResize = useCallback(
     (event: PointerEvent<HTMLButtonElement>) => {
@@ -102,55 +137,82 @@ export default function Sidebar({
     },
     [onSecondaryWidthChange, secondaryWidth],
   );
+  const handleBrandBlur = useCallback((event: FocusEvent<HTMLDivElement>) => {
+    if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
+    schedulePrimaryMenuClose();
+  }, [schedulePrimaryMenuClose]);
 
   return (
     <>
-      <nav className="nav">
-        <div className="brand-row">
-          <button className="brand" type="button" title={collapsed ? '展开一级侧栏' : '折叠一级侧栏'} aria-label={collapsed ? '展开一级侧栏' : '折叠一级侧栏'} onClick={onTogglePrimary}>
-            <span className="brand-mark brand-mark-full">LPicto</span>
-            <span className="brand-mark brand-mark-compact">P</span>
-          </button>
-        </div>
-        <div className="nav-main">
-          {navItems.map(({ Icon, compactLabel, label, target, to }) => (
-            <SidebarItem
-              active={routeTarget === target}
-              compactLabel={collapsedContent === 'character' ? compactLabel : ''}
-              icon={<Icon size={18} />}
-              key={target}
-              label={label}
-              to={target === 'settings' ? settingsSectionPath(loadSettingsSection()) : to}
-              onActivate={() => toggleSecondaryForNav(target)}
-            />
-          ))}
-        </div>
-        <div className="nav-bottom">
-          <div className="nav-bottom-panels" />
-        </div>
-      </nav>
-      {activeSecondaryTarget && (
-        <aside className={`sidebar-secondary sidebar-secondary-${activeSecondaryTarget}`}>
-          {activeRouteSecondaryTarget && (
-            <div className="sidebar-secondary-main">
-              <div
-                aria-label="折叠二级栏"
-                className="sidebar-secondary-header"
-                role="button"
-                tabIndex={0}
-                title="折叠二级栏"
-                onClick={toggleRouteSecondary}
-                onKeyDown={handleSecondaryHeaderKeyDown}
+      <div
+        className="sidebar-brand-host"
+        ref={primaryMenuHost}
+        onBlur={handleBrandBlur}
+        onFocus={openPrimaryMenu}
+        onPointerEnter={(event) => {
+          if (event.pointerType === 'mouse') openPrimaryMenu();
+        }}
+        onPointerLeave={(event) => {
+          if (event.pointerType === 'mouse' && !holdPrimaryMenuUntilPointerMove.current) schedulePrimaryMenuClose();
+        }}
+      >
+        <button
+          aria-expanded={Boolean(activeRouteSecondaryTarget)}
+          aria-haspopup="menu"
+          aria-label={activeRouteSecondaryTarget ? '收回二级菜单' : '展开二级菜单'}
+          className="brand"
+          type="button"
+          onClick={() => {
+            cancelPrimaryMenuClose();
+            toggleRouteSecondary();
+          }}
+        >
+          <span className="brand-mark">LPicto</span>
+        </button>
+        {primaryMenuOpen && (
+          <div aria-label="一级菜单" className="primary-menu-popover" role="menu">
+            {navItems.map(({ Icon, label, target, to }) => (
+              <SidebarItem
+                active={routeTarget === target}
+                icon={<Icon size={18} />}
+                key={target}
+                label={label}
+                to={target === 'settings' ? settingsSectionPath(loadSettingsSection()) : to}
+                onActivate={() => openSecondaryForNav(target)}
+              />
+            ))}
+            {viewerInfo.active && (
+              <button
+                aria-pressed={viewerInfo.visible}
+                className={viewerInfo.visible ? 'nav-link nav-viewer-info-toggle active' : 'nav-link nav-viewer-info-toggle'}
+                role="menuitem"
+                type="button"
+                onClick={() => {
+                  cancelPrimaryMenuClose();
+                  viewerInfo.setVisible(!viewerInfo.visible);
+                  setPrimaryMenuOpen(true);
+                }}
               >
-                <span className="sidebar-secondary-title">{routeSecondaryLabel}</span>
-              </div>
-              {secondaryPanel}
+                <span className="nav-link-icon">
+                  {viewerInfo.visible ? <PanelRightClose size={18} /> : <PanelRightOpen size={18} />}
+                </span>
+                <span className="nav-link-label">查看器信息</span>
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+      {activeRouteSecondaryTarget && (
+        <aside className={`sidebar-secondary sidebar-secondary-${activeRouteSecondaryTarget}`}>
+          <div className="sidebar-secondary-main">
+            <div className="sidebar-secondary-header">
+              <span className="sidebar-secondary-title">{routeSecondaryLabel}</span>
             </div>
-          )}
+            {secondaryPanel}
+          </div>
         </aside>
       )}
-      <div aria-hidden="true" className="sidebar-resize-handle sidebar-resize-primary sidebar-resize-static" />
-      {activeSecondaryTarget && (
+      {activeRouteSecondaryTarget && (
         <button
           aria-label="调整二级栏宽度"
           className="sidebar-resize-handle sidebar-resize-secondary"
@@ -165,14 +227,12 @@ export default function Sidebar({
 
 function SidebarItem({
   active,
-  compactLabel,
   icon,
   label,
   onActivate,
   to,
 }: {
   active: boolean;
-  compactLabel: string;
   icon: ReactNode;
   label: string;
   onActivate: (event: MouseEvent<HTMLAnchorElement>) => void;
@@ -182,16 +242,14 @@ function SidebarItem({
     <NavLink
       to={to}
       className={active ? 'nav-link active' : 'nav-link'}
+      role="menuitem"
       title={label}
       onClick={(event) => {
-        if (active) {
-          event.preventDefault();
-        }
+        if (active) event.preventDefault();
         onActivate(event);
       }}
     >
       <span className="nav-link-icon">{icon}</span>
-      {compactLabel && <span className="nav-link-compact-label" aria-hidden="true">{compactLabel}</span>}
       <span className="nav-link-label">{label}</span>
     </NavLink>
   );

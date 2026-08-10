@@ -64,7 +64,7 @@ func TimelineAt(takenAt, videoCreatedAt *int64, mtime, importedAt int64) int64 {
 
 func (e Extractor) extractImage(ctx context.Context, path string, detection Detection, mtime, importedAt int64) Metadata {
 	meta := Metadata{MimeType: detection.MimeType}
-	data, err := e.run(ctx, "exiftool", "-json", "-n", "-MIMEType", "-ImageWidth", "-ImageHeight", "-DateTimeOriginal", "-CreateDate", path)
+	data, err := e.run(ctx, "exiftool", "-json", "-n", "-MIMEType", "-ImageWidth", "-ImageHeight", "-DateTimeOriginal", "-CreateDate", "-Title", "-ObjectName", "-XPTitle", "-Headline", path)
 	if err != nil {
 		meta.TimelineAt = TimelineAt(nil, nil, mtime, importedAt)
 		meta.Err = err

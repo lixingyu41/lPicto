@@ -3,9 +3,11 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"lpicto/backend/internal/cachepolicy"
@@ -18,6 +20,8 @@ import (
 const (
 	StageBatchLimit          = 100
 	StageBatchMaxBytes int64 = 3 << 30
+	StageMaxIdle             = 24 * time.Hour
+	StageOrphanGrace         = 10 * time.Minute
 )
 
 type Stager struct {
@@ -31,9 +35,10 @@ func (s Stager) Prepare(ctx context.Context, asset model.Asset) (*db.AIStage, er
 		return nil, err
 	} else if existing != nil && existing.State == "ready" {
 		full := filepath.Join(s.Store.CacheRoot, filepath.FromSlash(existing.StagePath))
-		if info, statErr := os.Stat(full); statErr == nil && info.IsDir() {
+		if validStageDirectory(full) {
 			return existing, nil
 		}
+		s.Remove(ctx, existing)
 	}
 	base, err := s.Store.CachePath("ai-staging", asset.CacheKey, "stage")
 	if err != nil {
@@ -88,7 +93,7 @@ func (s Stager) Prepare(ctx context.Context, asset model.Asset) (*db.AIStage, er
 		return nil, err
 	}
 	rel, _ := filepath.Rel(s.Store.CacheRoot, dir)
-	expires := time.Now().Add(24 * time.Hour).Unix()
+	expires := time.Now().Add(StageMaxIdle).Unix()
 	stage := db.AIStage{
 		AssetID: asset.ID, CacheKey: asset.CacheKey, State: "ready",
 		StagePath: filepath.ToSlash(rel), SizeBytes: size, ExpiresAt: &expires,
@@ -98,7 +103,7 @@ func (s Stager) Prepare(ctx context.Context, asset model.Asset) (*db.AIStage, er
 		return nil, err
 	}
 	assetID := asset.ID
-	s.Policy.Register(context.Background(), "ai-staging", asset.CacheKey, filepath.Join(dir, "meta.json"), &assetID, 24*time.Hour)
+	s.Policy.Register(context.Background(), "ai-staging", asset.CacheKey, filepath.Join(dir, "meta.json"), &assetID, 0)
 	return &stage, nil
 }
 
@@ -107,8 +112,141 @@ func (s Stager) Remove(ctx context.Context, stage *db.AIStage) {
 		return
 	}
 	full := filepath.Join(s.Store.CacheRoot, filepath.FromSlash(stage.StagePath))
-	_ = os.RemoveAll(full)
+	if storage.IsWithinRoot(s.Store.CacheRoot, full) {
+		_ = os.RemoveAll(full)
+	}
 	_ = s.DB.DeleteAIStage(ctx, stage.AssetID)
+	_ = s.DB.DeleteCacheEntriesByCacheKey(ctx, "ai-staging", stage.CacheKey)
+}
+
+func (s Stager) Pin(stage *db.AIStage) func() {
+	if stage == nil || s.Policy == nil {
+		return func() {}
+	}
+	full := filepath.Join(s.Store.CacheRoot, filepath.FromSlash(stage.StagePath))
+	return s.Policy.Pin(full)
+}
+
+// CleanupInterrupted is called before workers start. No analysis can still be
+// using a stage marked processing, so every such directory is crash residue.
+func (s Stager) CleanupInterrupted(ctx context.Context) error {
+	items, err := s.DB.AIStages(ctx)
+	if err != nil {
+		return err
+	}
+	for index := range items {
+		if items[index].State == "processing" {
+			s.Remove(ctx, &items[index])
+		}
+	}
+	enabled, enabledErr := s.DB.AIExecutionEnabled(ctx)
+	if enabledErr == nil && !enabled {
+		if err := s.RemoveReady(ctx); err != nil {
+			return err
+		}
+	}
+	if err := s.cleanupOrphanDirectories(ctx, 0); err != nil {
+		return err
+	}
+	return s.DB.DeleteOrphanAIStageCacheEntries(ctx)
+}
+
+func (s Stager) RemoveReady(ctx context.Context) error {
+	items, err := s.DB.AIStages(ctx)
+	if err != nil {
+		return err
+	}
+	for index := range items {
+		if items[index].State == "ready" {
+			s.Remove(ctx, &items[index])
+		}
+	}
+	return nil
+}
+
+func (s Stager) CleanupAbandoned(ctx context.Context) error {
+	items, err := s.DB.AIStages(ctx)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	enabled, enabledErr := s.DB.AIExecutionEnabled(ctx)
+	if enabledErr != nil {
+		return enabledErr
+	}
+	for index := range items {
+		item := &items[index]
+		full := filepath.Join(s.Store.CacheRoot, filepath.FromSlash(item.StagePath))
+		expired := !enabled && item.ExpiresAt != nil && *item.ExpiresAt <= now.Unix()
+		invalid := item.State != "processing" && !validStageDirectory(full)
+		if expired || invalid {
+			s.Remove(ctx, item)
+		}
+	}
+	if err := s.cleanupOrphanDirectories(ctx, StageOrphanGrace); err != nil {
+		return err
+	}
+	return s.DB.DeleteOrphanAIStageCacheEntries(ctx)
+}
+
+func (s Stager) cleanupOrphanDirectories(ctx context.Context, grace time.Duration) error {
+	items, err := s.DB.AIStages(ctx)
+	if err != nil {
+		return err
+	}
+	referenced := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		full := filepath.Clean(filepath.Join(s.Store.CacheRoot, filepath.FromSlash(item.StagePath)))
+		referenced[full] = struct{}{}
+	}
+	root := filepath.Join(s.Store.CacheRoot, "ai-staging")
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	cutoff := time.Now().Add(-grace)
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if !entry.IsDir() || !strings.HasSuffix(entry.Name(), ".stage.d") {
+			return nil
+		}
+		if _, ok := referenced[filepath.Clean(path)]; ok {
+			return filepath.SkipDir
+		}
+		info, err := entry.Info()
+		if err == nil && info.ModTime().After(cutoff) {
+			return filepath.SkipDir
+		}
+		_ = os.RemoveAll(path)
+		return filepath.SkipDir
+	})
+}
+
+func validStageDirectory(root string) bool {
+	metaBytes, err := os.ReadFile(filepath.Join(root, "meta.json"))
+	if err != nil {
+		return false
+	}
+	var meta struct {
+		Ratios []float64 `json:"ratios"`
+	}
+	if json.Unmarshal(metaBytes, &meta) != nil || len(meta.Ratios) == 0 || len(meta.Ratios) > 10 {
+		return false
+	}
+	for index := range meta.Ratios {
+		info, err := os.Stat(filepath.Join(root, fmt.Sprintf("%02d.jpg", index)))
+		if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func videoSampleRatios(duration *float64) []float64 {

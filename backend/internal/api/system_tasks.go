@@ -61,6 +61,11 @@ type SystemTaskDTO struct {
 }
 
 func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
+	mediaScanRun, err := s.db.LastScanRunForTask(r.Context(), "count")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "tasks_failed", "读取媒体扫描任务失败")
+		return
+	}
 	reconcileRun, err := s.db.LastScanRunForTask(r.Context(), "reconcile")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "tasks_failed", "读取图库对账任务失败")
@@ -84,13 +89,16 @@ func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
 	thumbActivity, _ := s.db.LatestMediaJobTask(r.Context(), "thumb")
 	previewActivity, _ := s.db.LatestMediaJobTask(r.Context(), "preview")
 	posterActivity, _ := s.db.LatestMediaJobTask(r.Context(), "video_poster")
+	storyboardActivity, _ := s.db.LatestMediaJobTask(r.Context(), "storyboard")
 	aiHealth, _ := s.db.SystemTaskState(r.Context(), db.SystemTaskAIHealth)
 	storageHealth, _ := s.db.SystemTaskState(r.Context(), taskStorageHealth)
 	cacheCleanup, _ := s.db.SystemTaskState(r.Context(), taskCacheCleanup)
+	duplicateScanState, _ := s.db.SystemTaskState(r.Context(), taskDuplicateScan)
 	sourceIO, _ := s.db.LatestSourceIOBatch(r.Context())
 	thumbnailControl, _ := s.db.SystemTaskState(r.Context(), "thumbnail_creation")
 	previewControl, _ := s.db.SystemTaskState(r.Context(), "preview_creation")
 	posterControl, _ := s.db.SystemTaskState(r.Context(), "video_poster_creation")
+	storyboardControl, _ := s.db.SystemTaskState(r.Context(), "storyboard_creation")
 	aiControl, _ := s.db.SystemTaskState(r.Context(), "ai_analysis")
 	aiStatus, err := s.db.AIStatus(r.Context())
 	if err != nil {
@@ -99,30 +107,43 @@ func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	aiSettings, _ := s.db.GetAISettings(r.Context())
 	aiActivity, _ := s.db.AIActivity(r.Context())
-	mediaAverages, _ := s.db.MediaJobAverageSecondsPerItem(r.Context(), []string{"metadata", "thumb", "preview", "video_poster"})
+	mediaAverages, _ := s.db.MediaJobAverageSecondsPerItem(r.Context(), []string{"metadata", "thumb", "preview", "video_poster", "storyboard"})
 	aiAverage, _ := s.db.AIAverageSecondsPerItem(r.Context())
 	queue := jobs.QueueStats{}
 	if s.jobs != nil {
 		queue = s.jobs.Stats()
 	}
 	scanStatus, _ := s.scanner.Status(r.Context())
+	duplicateTotal, duplicateCompleted, err := s.db.DuplicateHashProgress(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "tasks_failed", "读取重复文件扫描进度失败")
+		return
+	}
 
 	thumbnailTask := thumbnailSystemTask(progress.Thumb, queue.ThumbQueued, queue.ActiveThumb)
 	previewTask := aggregateMediaTask("preview_creation", "高清预览创建", "为浏览器无法直接显示的图片创建高清预览", "媒体入库后自动运行", progress.Preview, queue.PreviewQueued, queue.ActivePreview)
 	posterTask := aggregateMediaTask("video_poster_creation", "视频封面创建", "创建视频播放前显示的首帧封面", "媒体入库后自动运行", progress.VideoPoster, queue.VideoPosterQueued, queue.ActiveVideoPoster)
+	storyboardProgress, _ := s.db.WorkProgress(r.Context(), "storyboard", nil)
+	storyboardTask := aggregateMediaTask("storyboard_creation", "进度预览图创建", "为视频进度条创建鼠标悬停预览图", "手动扫描后自动运行", storyboardProgress, queue.StoryboardQueued, queue.ActiveStoryboard)
+	mediaScanTask := mediaScanSystemTask(mediaScanRun, scanStatus)
+	attachSummaryFailure(&mediaScanTask)
 	metadataTask := metadataSystemTask(metadata, metadataRun, scanStatus)
 	metadataTask.AverageSecondsPerItem = float64MapValue(mediaAverages, "metadata")
 	thumbnailTask.AverageSecondsPerItem = float64MapValue(mediaAverages, "thumb")
 	previewTask.AverageSecondsPerItem = float64MapValue(mediaAverages, "preview")
 	posterTask.AverageSecondsPerItem = float64MapValue(mediaAverages, "video_poster")
+	storyboardTask.AverageSecondsPerItem = float64MapValue(mediaAverages, "storyboard")
 	applyMediaJobActivity(&thumbnailTask, thumbActivity)
 	applyMediaJobActivity(&previewTask, previewActivity)
 	applyMediaJobActivity(&posterTask, posterActivity)
+	applyMediaJobActivity(&storyboardTask, storyboardActivity)
 	applyStoppedState(&thumbnailTask, thumbnailControl)
 	applyStoppedState(&previewTask, previewControl)
 	applyStoppedState(&posterTask, posterControl)
-	thumbnailTask.Actions = manualStartTaskActions(thumbnailTask.Status == "running", progress.Thumb.Error, maxInt(0, progress.Thumb.Total-progress.Thumb.NotRequired))
-	posterTask.Actions = manualStartTaskActions(posterTask.Status == "running", progress.VideoPoster.Error, maxInt(0, progress.VideoPoster.Total-progress.VideoPoster.NotRequired))
+	applyStoppedState(&storyboardTask, storyboardControl)
+	thumbnailTask.Actions = manualStartTaskActions(thumbnailTask.Status == "running", progress.Thumb.Pending+progress.Thumb.Processing, progress.Thumb.Error, maxInt(0, progress.Thumb.Total-progress.Thumb.NotRequired))
+	posterTask.Actions = manualStartTaskActions(posterTask.Status == "running", progress.VideoPoster.Pending+progress.VideoPoster.Processing, progress.VideoPoster.Error, maxInt(0, progress.VideoPoster.Total-progress.VideoPoster.NotRequired))
+	storyboardTask.Actions = manualStartTaskActions(storyboardTask.Status == "running", storyboardProgress.Pending+storyboardProgress.Processing, storyboardProgress.Error, storyboardProgress.Total)
 	aiTask := aiAnalysisSystemTask(aiStatus, aiActivity, queue.AIQueued, queue.ActiveAI, aiSettings.AutoAnalyze || aiSettings.ManualRun)
 	aiTask.AverageSecondsPerItem = aiAverage
 	applyStoppedState(&aiTask, aiControl)
@@ -139,23 +160,35 @@ func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
 	attachMediaFailures(r, s, &thumbnailTask, "thumb")
 	attachMediaFailures(r, s, &previewTask, "preview")
 	attachMediaFailures(r, s, &posterTask, "video_poster")
+	attachMediaFailures(r, s, &storyboardTask, "storyboard")
 	attachAIFailures(r, s, &aiTask)
-	scanTask := scanSystemTask("library_scan", "图库文件对账", "仅检查数据库现有媒体对应的文件路径是否仍然存在", reconcileRun, scanStatus)
+	scanTask := scanSystemTask("library_scan", "媒体库检查", "仅检查数据库现有媒体对应的文件路径是否仍然存在", reconcileRun, scanStatus)
 	attachSummaryFailure(&scanTask)
+	duplicateTask := duplicateScanSystemTask(
+		duplicateScanState,
+		duplicateTotal,
+		duplicateCompleted,
+		s.duplicateScanFailureCount(),
+		s.duplicateScanIsRunning(),
+	)
+	attachSummaryFailure(&duplicateTask)
 	storageTask := storedSystemTask(taskStorageHealth, "存储连接检查", "在集中读取窗口检查每个图库根目录及抽样媒体是否可访问", "每天 03:00 及手动任务前", storageHealth, false)
 	attachSummaryFailure(&storageTask)
 	aiHealthTask := aiHealthSystemTask(aiHealth)
 	attachSummaryFailure(&aiHealthTask)
-	cacheTask := storedSystemTask(taskCacheCleanup, "无效缓存清理", "删除失去数据库引用的缓存和过期临时文件", "每天 03:00", cacheCleanup, false)
+	cacheTask := storedSystemTask(taskCacheCleanup, "缓存清理", "空间不足时按最近访问时间回收播放缓存，并清除 AI 暂存和中断残留；保留缩略图、视频封面与进度预览图", "持续监控；每天 03:00 深度检查", cacheCleanup, false)
 	attachSummaryFailure(&cacheTask)
 	sourceIOTask := sourceIOSystemTask(sourceIO)
 	items := []SystemTaskDTO{
 		sourceIOTask,
 		scanTask,
+		mediaScanTask,
 		metadataTask,
+		duplicateTask,
 		thumbnailTask,
 		previewTask,
 		posterTask,
+		storyboardTask,
 		aiTask,
 		storageTask,
 		aiHealthTask,
@@ -167,6 +200,129 @@ func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func mediaScanSystemTask(run *model.ScanRun, status scanner.Status) SystemTaskDTO {
+	item := SystemTaskDTO{
+		ID: "media_scan", Name: "媒体扫描", Description: "扫描图库目录中的媒体文件；完成后自动触发五个独立处理任务",
+		Schedule: "手动运行", Status: "never", SupportsScope: true,
+	}
+	if run != nil {
+		applyScanRun(&item, run)
+		applyFinishedScanBlockedReason(&item, run)
+		item.Progress = &SystemTaskProgressDTO{Total: run.TotalSeen, Completed: run.TotalSeen, Failed: run.Errors}
+		item.Message = fmt.Sprintf("扫描到 %d 个媒体文件", run.TotalSeen)
+		if run.Status == "running" && (!status.Running || status.Progress.Task != "count") {
+			item.Status = "stopped"
+			item.Succeeded = boolValue(false)
+			item.Message = "媒体扫描当前未运行"
+		}
+	}
+	if status.Running && status.Progress.Task == "count" {
+		item.Status = "running"
+		item.Succeeded = nil
+		item.LastFinishedAt = nil
+		total := maxInt(status.Progress.TotalFiles, status.Progress.DiscoveredFiles)
+		completed := maxInt(status.Progress.ScannedFiles, status.Progress.TotalSeen)
+		item.Progress = &SystemTaskProgressDTO{Total: total, Completed: completed, Pending: maxInt(0, total-completed), Failed: status.Progress.Errors}
+		item.Message = fmt.Sprintf("已扫描 %d / %d", completed, total)
+		item.Processed = completed
+	}
+	waitingToResume := applyLiveScanBlockedReason(&item, status, "count")
+	failed := int(item.FailedCount)
+	item.Actions = []SystemTaskActionDTO{}
+	if item.Status == "running" || waitingToResume {
+		item.Actions = append(item.Actions, SystemTaskActionDTO{ID: "stop", Label: "停止", Kind: "danger", Enabled: true})
+	} else {
+		item.Actions = append(item.Actions, SystemTaskActionDTO{ID: "continue", Label: "继续", Kind: "primary", Enabled: true})
+	}
+	if failed > 0 {
+		item.Actions = append(item.Actions, SystemTaskActionDTO{ID: "retry_failed", Label: fmt.Sprintf("重试失败（%d）", failed), Kind: "secondary", Enabled: true})
+	}
+	item.Actions = append(item.Actions,
+		SystemTaskActionDTO{ID: "rebuild", Label: "全部重建", Kind: "danger", Enabled: item.Status != "running" && !waitingToResume, RequiresConfirmation: true},
+	)
+	return item
+}
+
+func applyLiveScanBlockedReason(item *SystemTaskDTO, status scanner.Status, task string) bool {
+	if item == nil || status.Progress.Task != task || status.Progress.PauseReason == "" {
+		return false
+	}
+	item.Status, item.Succeeded = "pending", nil
+	switch status.Progress.PauseReason {
+	case "playback":
+		item.BlockedReason = "正在播放或加载媒体，任务暂时暂停；播放结束后将自动继续"
+	default:
+		item.BlockedReason = "任务暂时暂停，原因：" + status.Progress.PauseReason
+	}
+	return true
+}
+
+func applyFinishedScanBlockedReason(item *SystemTaskDTO, run *model.ScanRun) {
+	if item == nil || run == nil || run.LastError == nil {
+		return
+	}
+	switch run.Status {
+	case "paused", "interrupted", "skipped":
+		item.BlockedReason = *run.LastError
+	}
+}
+
+func duplicateScanSystemTask(state *db.SystemTaskState, total int, completed int, failed int, running bool) SystemTaskDTO {
+	item := storedSystemTask(
+		taskDuplicateScan,
+		"重复文件扫描",
+		"仅对文件大小相同的媒体计算内容哈希，并让智能页面使用同一结果识别重复文件",
+		"手动运行；新增媒体按需增量检查",
+		state,
+		false,
+	)
+	if total < 0 {
+		total = 0
+	}
+	if completed < 0 {
+		completed = 0
+	}
+	if completed > total {
+		completed = total
+	}
+	remaining := total - completed
+	if failed < 0 {
+		failed = 0
+	}
+	if failed > remaining {
+		failed = remaining
+	}
+	processing := 0
+	if running && remaining > failed {
+		processing = 1
+	}
+	pending := maxInt(0, remaining-failed-processing)
+	item.Progress = &SystemTaskProgressDTO{
+		Total: total, Completed: completed, Pending: pending, Processing: processing, Failed: failed,
+	}
+	item.Processed = completed
+	item.FailedCount = int64(failed)
+	item.CanRetry = remaining > 0
+	if running {
+		item.Status = "running"
+		item.Succeeded = nil
+		item.LastFinishedAt = nil
+	} else if item.Status == "running" {
+		item.Status = "stopped"
+		item.Succeeded = boolValue(false)
+		item.Message = "服务重启后扫描已停止，可重新开始"
+	}
+	if running {
+		item.Actions = []SystemTaskActionDTO{{ID: "stop", Label: "停止", Kind: "danger", Enabled: true}}
+	} else if remaining > 0 {
+		item.Actions = []SystemTaskActionDTO{{ID: "scan", Label: "开始扫描", Kind: "primary", Enabled: true}}
+	} else {
+		item.Actions = []SystemTaskActionDTO{}
+	}
+	applyRunningTaskDuration(&item, state, time.Now().Unix())
+	return item
 }
 
 func sourceIOSystemTask(batch *db.SourceIOBatch) SystemTaskDTO {
@@ -303,51 +459,56 @@ func aggregateMediaTask(id, name, description, schedule string, counts db.WorkSt
 	default:
 		item.Status, item.Succeeded = "success", boolValue(true)
 	}
-	item.Actions = standardMediaTaskActions(item.Status == "running", counts.Pending+counts.Processing+counts.Error, counts.Error, required)
+	item.Actions = standardMediaTaskActions(item.Status == "running", counts.Pending+counts.Processing, counts.Error, required)
 	return item
 }
 
 func standardMediaTaskActions(running bool, continuable, failed, total int) []SystemTaskActionDTO {
-	actions := []SystemTaskActionDTO{
-		{ID: "continue", Label: "继续", Kind: "primary", Enabled: !running && continuable > 0},
+	actions := make([]SystemTaskActionDTO, 0, 3)
+	if running {
+		actions = append(actions, SystemTaskActionDTO{ID: "stop", Label: "停止", Kind: "danger", Enabled: true})
+	} else if continuable > 0 {
+		actions = append(actions, SystemTaskActionDTO{ID: "continue", Label: "继续", Kind: "primary", Enabled: true})
 	}
 	if failed > 0 {
 		actions = append(actions, SystemTaskActionDTO{ID: "retry_failed", Label: fmt.Sprintf("重试失败（%d）", failed), Kind: "secondary", Enabled: true})
 	}
-	actions = append(actions,
-		SystemTaskActionDTO{ID: "rebuild", Label: "全部重建", Kind: "danger", Enabled: !running && total > 0, RequiresConfirmation: true},
-		SystemTaskActionDTO{ID: "stop", Label: "停止", Kind: "danger", Enabled: running},
-	)
+	if total > 0 {
+		actions = append(actions, SystemTaskActionDTO{ID: "rebuild", Label: "全部重建", Kind: "danger", Enabled: !running, RequiresConfirmation: true})
+	}
 	return actions
 }
 
-func manualStartTaskActions(running bool, failed, total int) []SystemTaskActionDTO {
-	actions := []SystemTaskActionDTO{
-		{ID: "start", Label: "手动开始", Kind: "primary", Enabled: !running},
+func manualStartTaskActions(running bool, actionable, failed, total int) []SystemTaskActionDTO {
+	actions := make([]SystemTaskActionDTO, 0, 3)
+	if running {
+		actions = append(actions, SystemTaskActionDTO{ID: "stop", Label: "停止", Kind: "danger", Enabled: true})
+	} else if actionable > 0 {
+		actions = append(actions, SystemTaskActionDTO{ID: "start", Label: "手动开始", Kind: "primary", Enabled: true})
 	}
 	if failed > 0 {
 		actions = append(actions, SystemTaskActionDTO{ID: "retry_failed", Label: fmt.Sprintf("重试失败（%d）", failed), Kind: "secondary", Enabled: true})
 	}
-	actions = append(actions,
-		SystemTaskActionDTO{ID: "rebuild", Label: "全部重建", Kind: "danger", Enabled: !running && total > 0, RequiresConfirmation: true},
-		SystemTaskActionDTO{ID: "stop", Label: "停止", Kind: "danger", Enabled: running},
-	)
+	if total > 0 {
+		actions = append(actions, SystemTaskActionDTO{ID: "rebuild", Label: "全部重建", Kind: "danger", Enabled: !running, RequiresConfirmation: true})
+	}
 	return actions
 }
 
 func thumbnailSystemTask(counts db.WorkStatusCounts, queued, active int) SystemTaskDTO {
 	item := aggregateMediaTask("thumbnail_creation", "缩略图创建", "为瀑布流和媒体列表创建缩略图", "媒体入库后自动运行", counts, queued, active)
-	item.Actions = manualStartTaskActions(item.Status == "running", counts.Error, maxInt(0, counts.Total-counts.NotRequired))
+	item.Actions = manualStartTaskActions(item.Status == "running", counts.Pending+counts.Processing, counts.Error, maxInt(0, counts.Total-counts.NotRequired))
 	return item
 }
 
 func metadataSystemTask(counts db.WorkStatusCounts, run *model.ScanRun, scanStatus scanner.Status) SystemTaskDTO {
-	item := aggregateMediaTask("metadata_extraction", "媒体信息提取", "读取图片尺寸、视频时长、编码和拍摄时间", "媒体入库后自动运行", counts, 0, 0)
+	item := aggregateMediaTask("metadata_extraction", "扫描数据入库", "读取媒体信息并写入媒体库", "媒体扫描完成后自动运行", counts, 0, 0)
 	aggregateStatus, aggregateSucceeded := item.Status, item.Succeeded
 	aggregateProcessed, aggregateFailed := item.Processed, item.FailedCount
 	aggregateMessage, aggregateProgress := item.Message, item.Progress
 	if run != nil {
 		applyScanRun(&item, run)
+		applyFinishedScanBlockedReason(&item, run)
 		item.Status, item.Succeeded = aggregateStatus, aggregateSucceeded
 		item.Processed, item.FailedCount = aggregateProcessed, aggregateFailed
 		item.Message, item.Progress = aggregateMessage, aggregateProgress
@@ -355,7 +516,8 @@ func metadataSystemTask(counts db.WorkStatusCounts, run *model.ScanRun, scanStat
 	if scanStatus.Running && scanStatus.Progress.Task == "metadata" {
 		item.Status = "running"
 	}
-	item.Actions = manualStartTaskActions(item.Status == "running", counts.Error, counts.Total)
+	waitingToResume := applyLiveScanBlockedReason(&item, scanStatus, "metadata")
+	item.Actions = manualStartTaskActions(item.Status == "running" || waitingToResume, counts.Pending+counts.Processing, counts.Error, counts.Total)
 	return item
 }
 
@@ -385,6 +547,7 @@ func scanSystemTask(id, name, description string, run *model.ScanRun, status sca
 	item := SystemTaskDTO{ID: id, Name: name, Description: description, Schedule: "每天 03:00 及手动运行", Status: "never", SupportsScope: true}
 	if run != nil {
 		applyScanRun(&item, run)
+		applyFinishedScanBlockedReason(&item, run)
 		item.Progress = &SystemTaskProgressDTO{Total: run.TotalSeen, Completed: run.TotalSeen, Failed: run.Errors}
 		item.Message = fmt.Sprintf("已核对 %d 项，缺失 %d", run.TotalSeen, run.AssetsDeleted)
 	}
@@ -395,16 +558,11 @@ func scanSystemTask(id, name, description string, run *model.ScanRun, status sca
 		item.Progress = &SystemTaskProgressDTO{Total: total, Completed: completed, Pending: maxInt(0, total-completed), Failed: status.Progress.Errors}
 		item.Message = fmt.Sprintf("已核对 %d / %d，缺失 %d", completed, total, status.Progress.AssetsDeleted)
 	}
-	if item.Status == "running" {
-		item.Actions = []SystemTaskActionDTO{
-			{ID: "reconcile", Label: "开始对账", Kind: "primary", Enabled: false},
-			{ID: "stop", Label: "停止", Kind: "danger", Enabled: true},
-		}
+	waitingToResume := applyLiveScanBlockedReason(&item, status, "reconcile")
+	if item.Status == "running" || waitingToResume {
+		item.Actions = []SystemTaskActionDTO{{ID: "stop", Label: "停止", Kind: "danger", Enabled: true}}
 	} else {
-		item.Actions = []SystemTaskActionDTO{
-			{ID: "reconcile", Label: "开始对账", Kind: "primary", Enabled: true},
-			{ID: "stop", Label: "停止", Kind: "danger", Enabled: false},
-		}
+		item.Actions = []SystemTaskActionDTO{{ID: "reconcile", Label: "开始对账", Kind: "primary", Enabled: true}}
 	}
 	return item
 }
@@ -439,7 +597,7 @@ func aiAnalysisSystemTask(status db.AIStatus, activity db.AIActivity, queued, ac
 	default:
 		item.Status, item.Succeeded = "success", boolValue(true)
 	}
-	item.Actions = standardMediaTaskActions(item.Status == "running", int(status.Pending+status.Stale+status.Processing+status.Failed), int(status.Failed), int(status.Total))
+	item.Actions = standardMediaTaskActions(item.Status == "running", int(status.Pending+status.Stale+status.Processing), int(status.Failed), int(status.Total))
 	setTaskDuration(&item)
 	return item
 }
@@ -449,7 +607,7 @@ func applyAIExecutionState(item *SystemTaskDTO, status db.AIStatus, settings db.
 		return
 	}
 	runRequested := settings.AutoAnalyze || settings.ManualRun
-	continuable := int(status.Pending + status.Stale + status.Processing + status.Failed)
+	continuable := int(status.Pending + status.Stale + status.Processing)
 	if !runRequested {
 		item.Status, item.Succeeded = "stopped", boolValue(false)
 		item.Actions = standardMediaTaskActions(false, continuable, int(status.Failed), int(status.Total))
@@ -483,9 +641,10 @@ func storedSystemTask(id, name, description, schedule string, state *db.SystemTa
 		item.Actions = []SystemTaskActionDTO{{ID: "check", Label: "立即检查", Kind: "primary", Enabled: item.Status != "running"}}
 	case taskCacheCleanup:
 		running := item.Status == "running"
-		item.Actions = []SystemTaskActionDTO{
-			{ID: "cleanup", Label: "立即清理", Kind: "danger", Enabled: !running, RequiresConfirmation: true},
-			{ID: "stop", Label: "停止", Kind: "danger", Enabled: running},
+		if running {
+			item.Actions = []SystemTaskActionDTO{{ID: "stop", Label: "停止", Kind: "danger", Enabled: true}}
+		} else {
+			item.Actions = []SystemTaskActionDTO{{ID: "cleanup", Label: "立即清理", Kind: "danger", Enabled: true, RequiresConfirmation: true}}
 		}
 	}
 	return item

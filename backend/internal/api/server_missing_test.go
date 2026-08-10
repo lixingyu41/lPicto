@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -70,6 +71,38 @@ func TestCacheThumbMissingSourceKeepsAsset(t *testing.T) {
 		t.Fatalf("status = %d, want 404", recorder.Code)
 	}
 	assertAssetActive(t, database, id)
+}
+
+func TestDeleteAssetRecordPurgesMissingAsset(t *testing.T) {
+	server, database, _ := testMissingSourceServer(t)
+	id := testInsertAsset(t, database, "moved.jpg", "missing-record-cache", model.MediaTypeImage)
+	if _, err := database.MarkDeletedWithCache(context.Background(), "moved.jpg", 20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.GetAsset(context.Background(), id); err != sql.ErrNoRows {
+		t.Fatalf("active asset lookup error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := database.GetAssetRecordIncludingDeleted(context.Background(), id); err != nil {
+		t.Fatalf("missing asset record lookup failed: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodDelete, "/api/assets/"+int64String(id)+"/record", nil)
+	server.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", recorder.Code, recorder.Body.String())
+	}
+	var result AssetDeleteResultDTO
+	if err := json.NewDecoder(recorder.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.DeletedAssetIDs) != 1 || result.DeletedAssetIDs[0] != id {
+		t.Fatalf("deleted asset ids = %#v, want [%d]", result.DeletedAssetIDs, id)
+	}
+	if _, err := database.GetAssetRecordIncludingDeleted(context.Background(), id); err != sql.ErrNoRows {
+		t.Fatalf("asset record lookup error = %v, want sql.ErrNoRows", err)
+	}
 }
 
 func TestMissingPhotoRootDoesNotMarkAssetDeleted(t *testing.T) {

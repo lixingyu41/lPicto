@@ -131,7 +131,7 @@ func safeSort(value string) string {
 		return "timeline_desc"
 	}
 	switch field {
-	case "timeline", "imported", "filename", "path", "media_type", "resolution", "duration", "modified", "size", "rating",
+	case "timeline", "imported", "last_played", "filename", "path", "media_type", "resolution", "duration", "modified", "size", "rating",
 		"container", "video_codec", "audio_codec", "fps", "bitrate", "subtitle", "danmaku", "ai_description", "ai_tag":
 		return value
 	}

@@ -144,7 +144,7 @@ func (s *Server) refreshCacheStats() {
 	stats.ByKind = usage.ByKind
 	for kind, size := range usage.ByKind {
 		switch kind {
-		case "ai-staging", "video-chunks", "video-proxies", "originals", "previews":
+		case "ai-staging", "video-chunks", "video-proxies", "audio-chunks", "audio-proxies", "originals", "previews":
 			stats.ReclaimableBytes += size
 		}
 	}

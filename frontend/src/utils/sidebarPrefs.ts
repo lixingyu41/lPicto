@@ -1,6 +1,6 @@
 import type { SidebarPanelTarget } from '../components/SidebarContext';
 
-export type PrimarySidebarPanelTarget = 'library' | 'albums' | 'folders' | 'collections' | 'settings';
+export type PrimarySidebarPanelTarget = 'library' | 'recent' | 'albums' | 'folders' | 'collections' | 'settings';
 export type CollapsedSidebarContent = 'icon' | 'character';
 
 const sidebarSecondaryKey = 'lpicto.sidebarSecondaryExpanded';
@@ -20,11 +20,12 @@ export interface SidebarWidths {
 }
 
 export function isPrimarySidebarPanelTarget(target: SidebarPanelTarget | null | undefined): target is PrimarySidebarPanelTarget {
-  return target === 'library' || target === 'albums' || target === 'folders' || target === 'collections' || target === 'settings';
+  return target === 'library' || target === 'recent' || target === 'albums' || target === 'folders' || target === 'collections' || target === 'settings';
 }
 
 export function primaryTargetForPath(pathname: string): PrimarySidebarPanelTarget | null {
   if (pathname === '/library' || pathname.startsWith('/library/')) return 'library';
+  if (pathname === '/recent' || pathname.startsWith('/recent/')) return 'recent';
   if (pathname === '/albums' || pathname.startsWith('/albums/')) return 'albums';
   if (pathname === '/folders' || pathname.startsWith('/folders/')) return 'folders';
   if (pathname === '/collections' || pathname.startsWith('/collections/') || pathname === '/tags' || pathname.startsWith('/tags/')) return 'collections';
@@ -41,6 +42,7 @@ export function loadSidebarSecondaryExpanded() {
     if (!parsed || typeof parsed !== 'object') return false;
     return (
       parsed.library === true ||
+      parsed.recent === true ||
       parsed.albums === true ||
       parsed.folders === true ||
       parsed.collections === true ||

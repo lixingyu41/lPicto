@@ -16,7 +16,7 @@ import { useAssetDeletedEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
-import type { AITagSummary, Asset, AssetDeletedEvent, AssetKind, AssetRating, Collection, CollectionRule, LibraryAnchor, OrientationFilter, SortKey } from '../types/api';
+import type { AITagSummary, Asset, AssetDeletedEvent, AssetKind, AssetRatingFilter, Collection, CollectionRule, LibraryAnchor, OrientationFilter, SortKey } from '../types/api';
 import { parseAssetGroupMode, serverGroupForMode, type AssetGroupMode } from '../utils/assetGrouping';
 import { removeAssetById } from '../utils/assetSort';
 import {
@@ -34,13 +34,14 @@ import { waterfallPageSize } from '../utils/waterfallPaging';
 
 const pageSize = waterfallPageSize;
 const collectionsStateKey = 'collections';
-const collectionsURLKeys = ['collection', 'sort', 'group', 'q', 'type', 'orientation', 'rating', 'tags'];
+const collectionsURLKeys = ['collection', 'sort', 'group', 'q', 'filename', 'type', 'orientation', 'rating', 'tags'];
 
 interface CollectionsPageState extends GridReturnState {
+	filenameQuery: string;
   groupMode: AssetGroupMode;
   orientation: OrientationFilter;
   query: string;
-  rating: AssetRating;
+  rating: AssetRatingFilter;
   selectedCollectionId: string;
   selectedTags: string[];
   sort: SortKey;
@@ -49,10 +50,11 @@ interface CollectionsPageState extends GridReturnState {
 
 const defaultCollectionsState: CollectionsPageState = {
   ...resetGridState(),
+	filenameQuery: '',
   groupMode: 'none',
   orientation: 'all',
   query: '',
-  rating: 0,
+  rating: 'all',
   selectedCollectionId: 'unclassified',
   selectedTags: [],
   sort: 'timeline_desc',
@@ -77,13 +79,14 @@ export default function CollectionsPage() {
   const previousCollectionIdRef = useRef(initialStateRef.current.selectedCollectionId === 'tags' ? 'unclassified' : initialStateRef.current.selectedCollectionId);
   const [sort, setSort] = useViewerAwareMediaState<SortKey>(initialStateRef.current.sort);
   const [query, setQuery] = useViewerAwareMediaState(initialStateRef.current.query);
+	const [filenameQuery, setFilenameQuery] = useViewerAwareMediaState(initialStateRef.current.filenameQuery);
   const [groupMode, setGroupMode] = useViewerAwareMediaState<AssetGroupMode>(initialStateRef.current.groupMode);
   const [type, setType] = useViewerAwareMediaState<AssetKind>(initialStateRef.current.type);
   const [orientation, setOrientation] = useViewerAwareMediaState<OrientationFilter>(initialStateRef.current.orientation);
   useEffect(() => {
     if (type === 'audio') setOrientation('all');
   }, [type]);
-  const [rating, setRating] = useViewerAwareMediaState<AssetRating>(initialStateRef.current.rating);
+  const [rating, setRating] = useViewerAwareMediaState<AssetRatingFilter>(initialStateRef.current.rating);
   const [anchors, setAnchors] = useState<LibraryAnchor[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [refreshRevision, setRefreshRevision] = useState(0);
@@ -94,6 +97,7 @@ export default function CollectionsPage() {
   const newCollectionInputRef = useRef<HTMLInputElement | null>(null);
   const sidebarState = useSidebarReturnState();
   const serverGroup = serverGroupForMode(groupMode);
+  const activeRating = rating === 'all' ? undefined : rating;
   const currentPageReturnPath = useCallback(() => currentURLPath(location), [location]);
   const selectedCollection = useMemo(
 	() => collections.find((collection) => collection.id === selectedCollectionId) ?? dynamicTagCollection(selectedCollectionId, selectedTags),
@@ -135,14 +139,15 @@ export default function CollectionsPage() {
       if (!selectedCollectionId) {
         return Promise.resolve({ items: [], page, pageSize, hasMore: false });
       }
-      return api.collectionAssets(selectedCollectionId, page, pageSize, sort, query, serverGroup, rating, orientation, type, [], selectedTags);
+      return api.collectionAssets(selectedCollectionId, page, pageSize, sort, query, serverGroup, activeRating, orientation, type, [], selectedTags, filenameQuery);
     },
-    [orientation, query, rating, selectedCollectionId, selectedTags, serverGroup, sort, type],
+    [activeRating, filenameQuery, orientation, query, selectedCollectionId, selectedTags, serverGroup, sort, type],
   );
 
   const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     selectedCollectionId,
     selectedTags,
+		filenameQuery,
     query,
     rating,
     serverGroup,
@@ -172,13 +177,14 @@ export default function CollectionsPage() {
     loadMore,
     loadPrevious,
     pageSize,
-    resetKey: JSON.stringify([selectedCollectionId, selectedTags, query, groupMode, sort, type, orientation, rating]),
+    resetKey: JSON.stringify([selectedCollectionId, selectedTags, filenameQuery, query, groupMode, sort, type, orientation, rating]),
     searchParams,
   });
 
   const currentPageState = useCallback(
     (): CollectionsPageState => ({
       ...getGridState(),
+		filenameQuery,
       groupMode,
       orientation,
       query,
@@ -189,7 +195,7 @@ export default function CollectionsPage() {
       sort,
       type,
     }),
-    [getGridState, groupMode, orientation, query, rating, selectedCollectionId, selectedTags, sidebarState.sidebarExpanded, sort, type],
+    [filenameQuery, getGridState, groupMode, orientation, query, rating, selectedCollectionId, selectedTags, sidebarState.sidebarExpanded, sort, type],
   );
   const saveCurrentState = useCallback(() => savePageState<CollectionsPageState>(collectionsStateKey, currentPageState()), [currentPageState]);
   const scheduleCurrentStateSave = usePersistentPageState(saveCurrentState);
@@ -213,10 +219,10 @@ export default function CollectionsPage() {
     replaceURLState(
       navigate,
       location,
-      { collection: selectedCollectionId, group: groupMode, orientation, q: query, rating, sort, tags: selectedTags.length > 0 ? JSON.stringify(selectedTags) : undefined, type },
+      { collection: selectedCollectionId, filename: filenameQuery, group: groupMode, orientation, q: query, rating: activeRating, sort, tags: selectedTags.length > 0 ? JSON.stringify(selectedTags) : undefined, type },
       collectionsURLKeys,
     );
-  }, [groupMode, location, navigate, orientation, query, rating, searchParams, selectedCollectionId, selectedTags, sort, type]);
+  }, [activeRating, filenameQuery, groupMode, location, navigate, orientation, query, searchParams, selectedCollectionId, selectedTags, sort, type]);
 
   useEffect(() => {
     let live = true;
@@ -227,7 +233,7 @@ export default function CollectionsPage() {
         return;
       }
       try {
-        const result = await api.collectionAnchors(selectedCollectionId, pageSize, sort, query, serverGroup, rating, orientation, type, [], selectedTags);
+        const result = await api.collectionAnchors(selectedCollectionId, pageSize, sort, query, serverGroup, activeRating, orientation, type, [], selectedTags, filenameQuery);
         if (!live) return;
         setAnchors(result.items);
         setTotalCount(result.total);
@@ -241,7 +247,7 @@ export default function CollectionsPage() {
     return () => {
       live = false;
     };
-  }, [orientation, query, rating, refreshRevision, selectedCollectionId, selectedTags, serverGroup, sort, type]);
+  }, [activeRating, filenameQuery, orientation, query, refreshRevision, selectedCollectionId, selectedTags, serverGroup, sort, type]);
 
   useEffect(() => {
     const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);
@@ -287,9 +293,10 @@ export default function CollectionsPage() {
     const rule: CollectionRule = {
       group: serverGroup,
       orientation,
+		q: filenameQuery.trim() || undefined,
       combinedQuery: query.trim() || undefined,
       tagNodes: selectedTags.length > 0 ? JSON.stringify(selectedTags) : undefined,
-      rating,
+      rating: activeRating,
       sort,
       type,
     };
@@ -306,7 +313,7 @@ export default function CollectionsPage() {
     } finally {
       setCreatingCollection(false);
     }
-  }, [creatingCollection, newCollectionName, orientation, query, rating, selectedTags, serverGroup, sort, type]);
+  }, [activeRating, creatingCollection, filenameQuery, newCollectionName, orientation, query, selectedTags, serverGroup, sort, type]);
 
   useEffect(() => {
     if (newCollectionOpen) newCollectionInputRef.current?.focus();
@@ -350,7 +357,11 @@ export default function CollectionsPage() {
         <CompactSortControls sort={sort} onChange={handleSortChange} />
       </SidebarFilterIconRow>
       <label className="sidebar-field">
-        <span>集合内搜索</span>
+        <span>文件名搜索</span>
+		<input value={filenameQuery} onChange={(event) => setFilenameQuery(event.target.value)} placeholder="仅搜索文件名" />
+	  </label>
+	  <label className="sidebar-field">
+		<span>内容搜索</span>
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="文件名或 AI 描述" />
       </label>
       <CollectionSidebarGroup
@@ -469,6 +480,7 @@ export default function CollectionsPage() {
       deleteManualTag,
       createSmartCollection,
       creatingCollection,
+		filenameQuery,
       groupMode,
       handleSortChange,
       newCollectionName,
@@ -532,18 +544,16 @@ export default function CollectionsPage() {
             scrollSignal={scrollResetSignal}
             scrollTarget={scrollTarget}
             scrollTopTarget={scrollTopTarget}
-            buildViewerUrl={(asset) => buildViewerUrl(asset, selectedCollectionId, selectedTags, query, serverGroup, sort, type, orientation, rating, currentPageReturnPath(), currentPageState())}
+            buildViewerUrl={(asset) => buildViewerUrl(asset, selectedCollectionId, selectedTags, filenameQuery, query, serverGroup, sort, type, orientation, rating, currentPageReturnPath(), currentPageState())}
           />
-          {!forceDuplicateGrouping && groupMode !== 'folder' && (
-            <LibraryIndexRail
-              anchors={anchors}
-              sort={sort}
-              scrollRatio={scrollRatio}
-              totalCount={totalCount}
-              pageSize={pageSize}
-              onSeek={seekIndex}
-            />
-          )}
+          <LibraryIndexRail
+            anchors={anchors}
+            hideLabels={groupMode === 'folder'}
+            scrollRatio={scrollRatio}
+            totalCount={totalCount}
+            pageSize={pageSize}
+            onSeek={seekIndex}
+          />
           <PressPreviewOverlay asset={pressPreviewAsset} />
         </div>
       )}
@@ -612,6 +622,7 @@ function initialCollectionsState(searchParams: URLSearchParams, persistedState: 
   const sort = searchParams.get('sort');
   return normalizeTagSelection({
     ...defaultCollectionsState,
+		filenameQuery: searchParams.get('filename') ?? '',
     groupMode: parseAssetGroupMode(searchParams.get('group'), defaultCollectionsState.groupMode),
     orientation: orientationParam(searchParams.get('orientation')),
     query: searchParams.get('q') ?? '',
@@ -626,16 +637,18 @@ function buildViewerUrl(
   asset: Asset,
   collectionId: string,
   selectedTags: string[],
+	filenameQuery: string,
   query: string,
   group: string | undefined,
   sort: SortKey,
   type: AssetKind,
   orientation: OrientationFilter,
-  rating: AssetRating,
+  rating: AssetRatingFilter,
   returnPath: string,
   state: CollectionsPageState,
 ) {
   const params = new URLSearchParams({ collectionId, context: 'collection', sort });
+	if (filenameQuery.trim()) params.set('q', filenameQuery.trim());
 	if (query.trim()) params.set('combinedQuery', query.trim());
 	if (selectedTags.length > 0) params.set('tagNodes', JSON.stringify(selectedTags));
 	if (collectionId.startsWith('tag:')) params.set('combinedTag', collectionId.slice(4));
@@ -643,7 +656,7 @@ function buildViewerUrl(
   if (group) params.set('group', group);
   if (type !== 'all') params.set('type', type);
   if (orientation !== 'all') params.set('orientation', orientation);
-  params.set('rating', String(rating));
+  if (rating !== 'all') params.set('rating', String(rating));
   return appendViewerReturnParams(`/viewer/${asset.id}?${params.toString()}`, returnPath, state);
 }
 

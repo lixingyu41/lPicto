@@ -1,6 +1,6 @@
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 
-export type SidebarPanelTarget = 'library' | 'albums' | 'folders' | 'collections' | 'viewer' | 'settings';
+export type SidebarPanelTarget = 'library' | 'recent' | 'albums' | 'folders' | 'collections' | 'viewer' | 'settings';
 
 type SidebarPanels = Partial<Record<SidebarPanelTarget, ReactNode>>;
 
@@ -11,25 +11,29 @@ export interface SidebarReturnState {
 interface SidebarPanelContextValue {
   panels: SidebarPanels;
   sidebarState: SidebarReturnState;
+  viewerActive: boolean;
+  viewerInfoVisible: boolean;
   setPanel: (target: SidebarPanelTarget, content: ReactNode | null) => void;
-  setSidebarCollapsed: (collapsed: boolean) => void;
   setSidebarExpanded: (target: SidebarPanelTarget | null) => void;
+  setViewerInfoVisible: (visible: boolean) => void;
 }
 
 const SidebarPanelContext = createContext<SidebarPanelContextValue | null>(null);
 
 export function SidebarPanelProvider({
   children,
-  sidebarCollapsed,
   sidebarExpanded,
-  setSidebarCollapsed,
+  viewerActive,
+  viewerInfoVisible,
   setSidebarExpanded,
+  setViewerInfoVisible,
 }: {
   children: ReactNode;
-  sidebarCollapsed: boolean;
   sidebarExpanded: SidebarPanelTarget | null;
-  setSidebarCollapsed: (collapsed: boolean) => void;
+  viewerActive: boolean;
+  viewerInfoVisible: boolean;
   setSidebarExpanded: (target: SidebarPanelTarget | null) => void;
+  setViewerInfoVisible: (visible: boolean) => void;
 }) {
   const [panels, setPanels] = useState<SidebarPanels>({});
   const setPanel = useCallback((target: SidebarPanelTarget, content: ReactNode | null) => {
@@ -48,8 +52,8 @@ export function SidebarPanelProvider({
     [sidebarExpanded],
   );
   const value = useMemo(
-    () => ({ panels, setPanel, setSidebarCollapsed, setSidebarExpanded, sidebarState }),
-    [panels, setPanel, setSidebarCollapsed, setSidebarExpanded, sidebarState],
+    () => ({ panels, setPanel, setSidebarExpanded, setViewerInfoVisible, sidebarState, viewerActive, viewerInfoVisible }),
+    [panels, setPanel, setSidebarExpanded, setViewerInfoVisible, sidebarState, viewerActive, viewerInfoVisible],
   );
   return <SidebarPanelContext.Provider value={value}>{children}</SidebarPanelContext.Provider>;
 }
@@ -68,6 +72,18 @@ export function useSidebarReturnState() {
     throw new Error('useSidebarReturnState must be used inside SidebarPanelProvider');
   }
   return context.sidebarState;
+}
+
+export function useViewerInfoPanel() {
+  const context = useContext(SidebarPanelContext);
+  if (!context) {
+    throw new Error('useViewerInfoPanel must be used inside SidebarPanelProvider');
+  }
+  return {
+    active: context.viewerActive,
+    visible: context.viewerInfoVisible,
+    setVisible: context.setViewerInfoVisible,
+  };
 }
 
 export function useRestoreSidebarState() {
@@ -106,6 +122,7 @@ export function useSidebarPanel(target: SidebarPanelTarget, content: ReactNode, 
 function isSidebarPanelTarget(value: unknown): value is SidebarPanelTarget {
   return (
     value === 'library' ||
+    value === 'recent' ||
     value === 'albums' ||
     value === 'folders' ||
     value === 'collections' ||

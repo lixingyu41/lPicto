@@ -1,6 +1,8 @@
 import type { Asset, SortKey } from '../types/api';
 import { assetGroupLabel, type AssetGroupMode } from './assetGrouping';
 
+const naturalFilenameCollator = new Intl.Collator('und', { numeric: true, sensitivity: 'base' });
+
 interface MergeWindowOptions {
   hasMore: boolean;
   loadedStartIndex?: number;
@@ -146,15 +148,25 @@ function textDesc(a: string, b: string) {
 }
 
 function filenameAsc(a: Asset, b: Asset) {
-  return textAsc(filenameKey(a), filenameKey(b)) || textAsc(a.filename, b.filename);
+  return naturalFilenameCollator.compare(filenameKey(a), filenameKey(b)) || lexicalTextAsc(a.filename, b.filename);
 }
 
 function filenameDesc(a: Asset, b: Asset) {
-  return textDesc(filenameKey(a), filenameKey(b)) || textDesc(a.filename, b.filename);
+  return naturalFilenameCollator.compare(filenameKey(b), filenameKey(a)) || lexicalTextDesc(a.filename, b.filename);
 }
 
 function filenameKey(asset: Asset) {
   return (asset.filenameSortKey || asset.filename).toLowerCase();
+}
+
+function lexicalTextAsc(a: string, b: string) {
+  const left = a.toLowerCase();
+  const right = b.toLowerCase();
+  return left === right ? 0 : left < right ? -1 : 1;
+}
+
+function lexicalTextDesc(a: string, b: string) {
+  return lexicalTextAsc(b, a);
 }
 
 function shouldInsertIntoWindow(current: Asset[], asset: Asset, sort: SortKey, options?: MergeWindowOptions) {

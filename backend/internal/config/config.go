@@ -232,6 +232,7 @@ func (c Config) preparePaths() error {
 		"thumbs",
 		"previews",
 		"video-posters",
+		"storyboards",
 		"video-proxies",
 	} {
 		if err := os.MkdirAll(filepath.Join(c.CacheRoot, rel), 0o755); err != nil {

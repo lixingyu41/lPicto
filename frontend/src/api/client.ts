@@ -49,6 +49,7 @@ import type {
   VideoProxyRuntime,
   VideoProxySettings,
   VideoSegmentStatus,
+  VideoStoryboard,
   AudioProxyRuntime,
 } from '../types/api';
 import { loadMediaViewPreferences } from '../utils/mediaViewPrefs';
@@ -348,9 +349,10 @@ export const api = {
     type?: AssetKind,
     combinedTags: string[] = [],
     tagNodes: string[] = [],
-  ) => request<Page<Asset>>(`/api/collections/${collectionPathID(id)}/assets${qs({ page, pageSize, sort, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined, includeAiSummary: includeAISummary() })}`),
-  collectionAnchors: (id: string, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags: string[] = [], tagNodes: string[] = []) =>
-    request<LibraryAnchorsResponse>(`/api/collections/${collectionPathID(id)}/anchors${qs({ pageSize, sort, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined })}`),
+    filenameQuery = '',
+  ) => request<Page<Asset>>(`/api/collections/${collectionPathID(id)}/assets${qs({ page, pageSize, sort, q: filenameQuery, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined, includeAiSummary: includeAISummary() })}`),
+  collectionAnchors: (id: string, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags: string[] = [], tagNodes: string[] = [], filenameQuery = '') =>
+    request<LibraryAnchorsResponse>(`/api/collections/${collectionPathID(id)}/anchors${qs({ pageSize, sort, q: filenameQuery, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined })}`),
   duplicates: () => request<{ items: DuplicateGroup[] }>('/api/duplicates'),
   duplicateSelection: () => request<{ assetIds: number[]; keepPolicy: 'oldest_imported' }>('/api/duplicates/selection'),
   addAlbumAssets: (id: number, assetIds: number[]) =>
@@ -434,6 +436,8 @@ export const api = {
   assetDeletePlan: (id: number) => request<AssetDeletePlan>(`/api/assets/${id}/delete-plan`),
   deleteAsset: (id: number, token: string) => requestDeleteAsset(`/api/assets/${id}/delete`, token),
   deleteAssetRecord: (id: number) => request<AssetDeleteResult>(`/api/assets/${id}/record`, { method: 'DELETE' }),
+  markAssetPlayed: (id: number) =>
+    request<{ recorded: boolean; lastPlayedAt: number }>(`/api/assets/${id}/played`, { method: 'POST' }),
   assetTags: (id: number) => request<{ items: AssetTag[] }>(`/api/assets/${id}/tags`),
   addAssetTag: (id: number, tag: string) =>
     request<{ items: AssetTag[] }>(`/api/assets/${id}/tags`, {
@@ -487,6 +491,10 @@ export const api = {
     request<Neighbors>(`/api/assets/${id}/neighbors${qs(params)}`, { signal }),
   assetPosition: (id: number, params: Record<string, string | number | undefined | null>) =>
     request<AssetPosition>(`/api/assets/${id}/position${qs(params)}`),
+  assetStoryboard: (id: number, signal?: AbortSignal) =>
+    request<VideoStoryboard>(`/api/assets/${id}/storyboard`, { signal }),
+  generateAssetStoryboard: (id: number, signal?: AbortSignal) =>
+    request<{ accepted: boolean; state: string }>(`/api/assets/${id}/storyboard/generate`, { method: 'POST', signal }),
 };
 
 export function assetThumbUrl(asset: Asset): string {
@@ -519,6 +527,10 @@ export function assetOriginalUrl(asset: Asset): string {
 
 export function assetVideoUrl(asset: Asset): string {
   return `/api/assets/${asset.id}/video?v=${asset.cacheKey}#t=0.001`;
+}
+
+export function assetStoryboardSheetUrl(asset: Asset, sheet: number): string {
+  return `/api/assets/${asset.id}/storyboard/${Math.max(0, Math.floor(sheet))}?v=${asset.cacheKey}`;
 }
 
 export function assetVideoProxyUrl(asset: Asset, startSeconds = 0, session?: VideoProxySessionContext): string {

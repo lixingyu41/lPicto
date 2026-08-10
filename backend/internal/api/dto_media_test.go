@@ -3,6 +3,8 @@ package api
 import (
 	"math"
 	"testing"
+
+	"lpicto/backend/internal/model"
 )
 
 func TestParseAssetMediaDetails(t *testing.T) {
@@ -50,5 +52,30 @@ func TestParseAssetMediaDetailsRejectsBrokenStreamBitrates(t *testing.T) {
 	}
 	if details.OverallBitrate == nil || *details.OverallBitrate != 798377 {
 		t.Fatalf("unexpected overall bitrate: %v", details.OverallBitrate)
+	}
+}
+
+func TestAssetDisplayTitlePriority(t *testing.T) {
+	metadata := `{"format":{"tags":{"title":"  Embedded   title  "}}}`
+	nfo := `{"fields":{"标题":"NFO title"},"groups":[{"items":[{"key":"title","value":"NFO title"}]}]}`
+	asset := model.Asset{Filename: "fallback.mp4", MetadataJSON: &metadata, NFOJSON: &nfo}
+	if got := assetDisplayTitle(asset); got != "Embedded title" {
+		t.Fatalf("display title = %q", got)
+	}
+	asset.MetadataJSON = nil
+	if got := assetDisplayTitle(asset); got != "NFO title" {
+		t.Fatalf("NFO display title = %q", got)
+	}
+	asset.NFOJSON = nil
+	if got := assetDisplayTitle(asset); got != "fallback.mp4" {
+		t.Fatalf("filename display title = %q", got)
+	}
+}
+
+func TestAssetDisplayTitleFromImageMetadata(t *testing.T) {
+	metadata := `[{"SourceFile":"photo.jpg","Title":"Portrait title"}]`
+	asset := model.Asset{Filename: "photo.jpg", MetadataJSON: &metadata}
+	if got := assetDisplayTitle(asset); got != "Portrait title" {
+		t.Fatalf("image display title = %q", got)
 	}
 }

@@ -14,7 +14,7 @@ import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
-import type { Asset, AssetDeletedEvent, AssetKind, AssetRating, Folder, LibraryAnchor, OrientationFilter, SortKey } from '../types/api';
+import type { Asset, AssetDeletedEvent, AssetKind, AssetRatingFilter, Folder, LibraryAnchor, OrientationFilter, SortKey } from '../types/api';
 import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
 import {
   appendViewerReturnParams,
@@ -53,7 +53,7 @@ interface FoldersPageState extends GridReturnState {
   includeSubfolders: boolean;
   orientation: OrientationFilter;
   query: string;
-  rating: AssetRating;
+  rating: AssetRatingFilter;
   sort: SortKey;
   tagFilters: string[];
   type: AssetKind;
@@ -67,7 +67,7 @@ const defaultFoldersState: FoldersPageState = {
   includeSubfolders: true,
   orientation: 'all',
   query: '',
-  rating: 0,
+  rating: 'all',
   sort: 'timeline_desc',
   tagFilters: [],
   type: 'all',
@@ -93,7 +93,7 @@ export default function FoldersPage() {
   const [query, setQuery] = useViewerAwareMediaState(initialStateRef.current.query);
   const [groupMode, setGroupMode] = useViewerAwareMediaState<AssetGroupMode>(initialStateRef.current.groupMode);
   const [includeSubfolders, setIncludeSubfolders] = useViewerAwareMediaState(initialStateRef.current.includeSubfolders);
-  const [rating, setRating] = useViewerAwareMediaState<AssetRating>(initialStateRef.current.rating ?? 0);
+  const [rating, setRating] = useViewerAwareMediaState<AssetRatingFilter>(initialStateRef.current.rating ?? 'all');
   const [orientation, setOrientation] = useViewerAwareMediaState<OrientationFilter>(initialStateRef.current.orientation);
   const [type, setType] = useViewerAwareMediaState<AssetKind>(initialStateRef.current.type);
   useEffect(() => {
@@ -117,6 +117,7 @@ export default function FoldersPage() {
   const folderTreeRef = useRef<HTMLDivElement | null>(null);
   const initializeFolderTreeRef = useRef(folderTreeCache === null);
   const serverGroup = serverGroupForMode(groupMode);
+  const activeRating = rating === 'all' ? undefined : rating;
   const currentLookupId = requestedFolderRelPath === null ? currentId : null;
   const resolvingRequestedFolder = requestedFolderRelPath !== null && current?.relPath !== requestedFolderRelPath;
 
@@ -192,9 +193,9 @@ export default function FoldersPage() {
       if (resolvingRequestedFolder) {
         return Promise.resolve({ items: [], page, pageSize, hasMore: false });
       }
-      return api.folderAssets(currentId, page, pageSize, sort, query, includeSubfolders, serverGroup, rating, orientation, type, undefined, serializeTagFilters(tagFilters));
+      return api.folderAssets(currentId, page, pageSize, sort, query, includeSubfolders, serverGroup, activeRating, orientation, type, undefined, serializeTagFilters(tagFilters));
     },
-    [currentId, includeSubfolders, orientation, query, rating, resolvingRequestedFolder, serverGroup, sort, tagFilters, type],
+    [activeRating, currentId, includeSubfolders, orientation, query, resolvingRequestedFolder, serverGroup, sort, tagFilters, type],
   );
   const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     currentId,
@@ -236,11 +237,11 @@ export default function FoldersPage() {
   const mergeReadyAssets = useCallback(
     (incoming: Asset[]) => {
       const folderRelPath = current?.relPath ?? '';
-      const filtered = incoming.filter((asset) => assetMatchesFolder(asset, folderRelPath, includeSubfolders, query, rating, orientation, type));
+      const filtered = incoming.filter((asset) => assetMatchesFolder(asset, folderRelPath, includeSubfolders, query, activeRating, orientation, type));
       if (filtered.length === 0) return;
       mutateItems((value) => mergeSortedAssets(value, filtered, sort, { hasMore, loadedStartIndex, groupMode }));
     },
-    [current?.relPath, groupMode, hasMore, includeSubfolders, loadedStartIndex, mutateItems, orientation, query, rating, sort, type],
+    [activeRating, current?.relPath, groupMode, hasMore, includeSubfolders, loadedStartIndex, mutateItems, orientation, query, sort, type],
   );
 
   const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
@@ -251,12 +252,12 @@ export default function FoldersPage() {
     if (eventsConnected || !current || resolvingRequestedFolder) return undefined;
     const timer = window.setInterval(() => {
       void api
-        .folderAssets(currentId, 1, pageSize, sort, query, includeSubfolders, serverGroup, rating, orientation, type, undefined, serializeTagFilters(tagFilters))
+        .folderAssets(currentId, 1, pageSize, sort, query, includeSubfolders, serverGroup, activeRating, orientation, type, undefined, serializeTagFilters(tagFilters))
         .then((result) => mergeReadyAssets(result.items))
         .catch(() => undefined);
     }, 30000);
     return () => window.clearInterval(timer);
-  }, [current, currentId, eventsConnected, includeSubfolders, mergeReadyAssets, orientation, query, rating, resolvingRequestedFolder, serverGroup, sort, tagFilters, type]);
+  }, [activeRating, current, currentId, eventsConnected, includeSubfolders, mergeReadyAssets, orientation, query, resolvingRequestedFolder, serverGroup, sort, tagFilters, type]);
 
   const currentPageState = useCallback(
     (): FoldersPageState => ({
@@ -293,7 +294,7 @@ export default function FoldersPage() {
         group: groupMode,
         orientation: orientation === 'all' ? undefined : orientation,
         q: query,
-        rating,
+        rating: activeRating,
         recursive: includeSubfolders ? 1 : 0,
         sort,
         tagNodes: serializeTagFilters(tagFilters),
@@ -301,7 +302,7 @@ export default function FoldersPage() {
       },
       foldersURLKeys,
     );
-  }, [current, currentId, groupMode, includeSubfolders, liveSearchText, location, navigate, orientation, query, rating, requestedFolderRelPath, sort, tagFilters, type]);
+  }, [activeRating, current, currentId, groupMode, includeSubfolders, liveSearchText, location, navigate, orientation, query, requestedFolderRelPath, sort, tagFilters, type]);
 
   const handlePersistentGridScrollState = useCallback(
     (state: { ratio: number; scrollTop: number }) => {
@@ -320,7 +321,7 @@ export default function FoldersPage() {
         return;
       }
       try {
-        const result = await api.folderAnchors(currentId, pageSize, sort, query, includeSubfolders, serverGroup, rating, orientation, type, undefined, serializeTagFilters(tagFilters));
+        const result = await api.folderAnchors(currentId, pageSize, sort, query, includeSubfolders, serverGroup, activeRating, orientation, type, undefined, serializeTagFilters(tagFilters));
         if (live) {
           setAnchors(result.items);
           setTotalCount(result.total);
@@ -336,7 +337,7 @@ export default function FoldersPage() {
     return () => {
       live = false;
     };
-  }, [currentId, includeSubfolders, orientation, query, rating, resolvingRequestedFolder, serverGroup, sort, tagFilters, type]);
+  }, [activeRating, currentId, includeSubfolders, orientation, query, resolvingRequestedFolder, serverGroup, sort, tagFilters, type]);
 
   const handleOpenAsset = useCallback(() => {
     saveCurrentState();
@@ -391,7 +392,7 @@ export default function FoldersPage() {
             group: groupMode,
             orientation: orientation === 'all' ? undefined : orientation,
             q: query,
-            rating,
+            rating: activeRating,
             recursive: includeSubfolders ? 1 : 0,
             sort,
             tagNodes: serializeTagFilters(tagFilters),
@@ -401,7 +402,7 @@ export default function FoldersPage() {
         );
       }
     },
-    [groupMode, includeSubfolders, location, navigate, orientation, query, rating, sort, tagFilters, type],
+    [activeRating, groupMode, includeSubfolders, location, navigate, orientation, query, sort, tagFilters, type],
   );
 
   useEffect(() => {
@@ -411,7 +412,7 @@ export default function FoldersPage() {
     }
   }, [groupMode, sort]);
 
-  const handleRatingChange = useCallback((nextRating: AssetRating) => {
+  const handleRatingChange = useCallback((nextRating: AssetRatingFilter) => {
     setRating(nextRating);
   }, []);
 
@@ -542,16 +543,14 @@ export default function FoldersPage() {
                 )
               }
             />
-            {groupMode !== 'folder' && (
-              <LibraryIndexRail
-                anchors={anchors}
-                sort={sort}
-                scrollRatio={scrollRatio}
-                totalCount={totalCount}
-                pageSize={pageSize}
-                onSeek={seekIndex}
-              />
-            )}
+            <LibraryIndexRail
+              anchors={anchors}
+              hideLabels={groupMode === 'folder'}
+              scrollRatio={scrollRatio}
+              totalCount={totalCount}
+              pageSize={pageSize}
+              onSeek={seekIndex}
+            />
             <PressPreviewOverlay asset={pressPreviewAsset} />
           </div>
         )}
@@ -577,7 +576,9 @@ function foldersStateFromSearchParams(params: URLSearchParams, fallback: Folders
     includeSubfolders: booleanParam(params.get('recursive'), base.includeSubfolders),
     orientation: params.has('orientation') ? orientationParam(params.get('orientation')) : base.orientation,
     query: params.get('q') ?? (hasFolderParams ? '' : base.query),
-    rating: params.has('rating') ? assetRatingParam(params.get('rating')) ?? base.rating : base.rating,
+    rating: params.has('rating')
+      ? params.get('rating') === 'all' ? 'all' : assetRatingParam(params.get('rating')) ?? base.rating
+      : base.rating,
     sort: isSortKey(sort) ? sort : base.sort,
     tagFilters: params.has('tagNodes') || params.has('combinedTags') ? parseTagFilters(params.get('tagNodes') ?? params.get('combinedTags')) : base.tagFilters ?? [],
     type: params.has('type') ? parseAssetKind(params.get('type')) : base.type,
@@ -592,8 +593,8 @@ function typeViewerParam(type: AssetKind) {
   return type === 'all' ? '' : `&type=${type}`;
 }
 
-function ratingViewerParam(rating: AssetRating) {
-  return `&rating=${rating}`;
+function ratingViewerParam(rating: AssetRatingFilter) {
+  return rating === 'all' ? '' : `&rating=${rating}`;
 }
 
 function orientationViewerParam(orientation: OrientationFilter) {

@@ -87,11 +87,11 @@ func (s *Server) deleteAsset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteAssetRecord(w http.ResponseWriter, r *http.Request) {
-	asset, ok := s.assetByParam(w, r)
+	assetID, ok := s.idParam(w, r)
 	if !ok {
 		return
 	}
-	result, err := s.purgeAssetRecords(r.Context(), []int64{asset.ID}, true)
+	result, err := s.purgeAssetRecords(r.Context(), []int64{assetID}, true)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "asset_record_delete_failed", "删除媒体记录失败")
 		return

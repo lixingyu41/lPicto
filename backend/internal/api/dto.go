@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -23,6 +24,7 @@ type APIError struct {
 type AssetDTO struct {
 	ID                int64         `json:"id"`
 	Filename          string        `json:"filename"`
+	DisplayTitle      string        `json:"displayTitle"`
 	FilenameSortKey   string        `json:"filenameSortKey"`
 	RelPath           string        `json:"relPath"`
 	ParentRelPath     string        `json:"parentRelPath"`
@@ -37,6 +39,7 @@ type AssetDTO struct {
 	TimelineAt        int64         `json:"timelineAt"`
 	ImportedAt        int64         `json:"importedAt"`
 	CacheKey          string        `json:"cacheKey"`
+	LastPlayedAt      *int64        `json:"lastPlayedAt,omitempty"`
 	BrowserPlayable   bool          `json:"browserPlayable"`
 	ThumbStatus       string        `json:"thumbStatus"`
 	PreviewStatus     string        `json:"previewStatus"`
@@ -435,6 +438,7 @@ func assetDTO(asset model.Asset) AssetDTO {
 	return AssetDTO{
 		ID:                asset.ID,
 		Filename:          asset.Filename,
+		DisplayTitle:      assetDisplayTitle(asset),
 		FilenameSortKey:   asset.FilenameSortKey,
 		RelPath:           asset.RelPath,
 		ParentRelPath:     asset.ParentRelPath,
@@ -449,6 +453,7 @@ func assetDTO(asset model.Asset) AssetDTO {
 		TimelineAt:        asset.TimelineAt,
 		ImportedAt:        asset.ImportedAt,
 		CacheKey:          asset.CacheKey,
+		LastPlayedAt:      asset.LastPlayedAt,
 		BrowserPlayable:   asset.BrowserPlayable,
 		ThumbStatus:       asset.ThumbStatus,
 		PreviewStatus:     asset.PreviewStatus,
@@ -490,9 +495,91 @@ type assetProbeMetadata struct {
 		RFrameRate   string `json:"r_frame_rate"`
 	} `json:"streams"`
 	Format struct {
-		FormatName string `json:"format_name"`
-		BitRate    string `json:"bit_rate"`
+		FormatName string            `json:"format_name"`
+		BitRate    string            `json:"bit_rate"`
+		Tags       map[string]string `json:"tags"`
 	} `json:"format"`
+}
+
+func assetDisplayTitle(asset model.Asset) string {
+	if title := embeddedMediaTitle(asset.MetadataJSON); title != "" {
+		return title
+	}
+	if title := nfoMediaTitle(asset.NFOJSON); title != "" {
+		return title
+	}
+	return asset.Filename
+}
+
+func embeddedMediaTitle(raw *string) string {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return ""
+	}
+	var probe assetProbeMetadata
+	if json.Unmarshal([]byte(*raw), &probe) == nil {
+		if title := mapValueFold(probe.Format.Tags, "title"); title != "" {
+			return title
+		}
+	}
+	var images []map[string]any
+	if json.Unmarshal([]byte(*raw), &images) == nil && len(images) > 0 {
+		for _, key := range []string{"Title", "ObjectName", "XPTitle", "Headline"} {
+			for field, value := range images[0] {
+				if strings.EqualFold(field, key) {
+					if title := cleanDisplayTitle(fmt.Sprint(value)); title != "" {
+						return title
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func nfoMediaTitle(raw *string) string {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return ""
+	}
+	var value struct {
+		Fields map[string]string `json:"fields"`
+		Groups []struct {
+			Items []struct {
+				Key   string `json:"key"`
+				Value string `json:"value"`
+			} `json:"items"`
+		} `json:"groups"`
+	}
+	if json.Unmarshal([]byte(*raw), &value) != nil {
+		return ""
+	}
+	for _, group := range value.Groups {
+		for _, item := range group.Items {
+			if strings.EqualFold(item.Key, "title") {
+				if title := cleanDisplayTitle(item.Value); title != "" {
+					return title
+				}
+			}
+		}
+	}
+	for _, key := range []string{"标题", "title", "原名", "originaltitle"} {
+		if title := mapValueFold(value.Fields, key); title != "" {
+			return title
+		}
+	}
+	return ""
+}
+
+func mapValueFold(values map[string]string, key string) string {
+	for current, value := range values {
+		if strings.EqualFold(current, key) {
+			return cleanDisplayTitle(value)
+		}
+	}
+	return ""
+}
+
+func cleanDisplayTitle(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
 }
 
 func parseAssetMediaDetails(raw *string) assetMediaDetails {

@@ -12,6 +12,7 @@ type AIStage struct {
 	StagePath string
 	SizeBytes int64
 	ExpiresAt *int64
+	UpdatedAt int64
 }
 
 func (d *DB) UpsertAIStage(ctx context.Context, stage AIStage) error {
@@ -48,9 +49,48 @@ FROM asset_ai_stage WHERE asset_id=$1 AND cache_key=$2`, assetID, cacheKey).Scan
 	return &item, nil
 }
 
+func (d *DB) MarkAIStageProcessing(ctx context.Context, assetID int64, cacheKey string) error {
+	_, err := d.Conn().ExecContext(ctx, `
+UPDATE asset_ai_stage SET state='processing',updated_at=now()
+WHERE asset_id=$1 AND cache_key=$2`, assetID, cacheKey)
+	return err
+}
+
 func (d *DB) DeleteAIStage(ctx context.Context, assetID int64) error {
 	_, err := d.Conn().ExecContext(ctx, `DELETE FROM asset_ai_stage WHERE asset_id=$1`, assetID)
 	return err
+}
+
+func (d *DB) DeleteAIStageByCacheKey(ctx context.Context, cacheKey string) error {
+	_, err := d.Conn().ExecContext(ctx, `DELETE FROM asset_ai_stage WHERE cache_key=$1`, cacheKey)
+	return err
+}
+
+func (d *DB) AIStages(ctx context.Context) ([]AIStage, error) {
+	rows, err := d.Conn().QueryContext(ctx, `
+SELECT asset_id,cache_key,state,stage_path,size_bytes,expires_at,
+       EXTRACT(EPOCH FROM updated_at)::bigint
+FROM asset_ai_stage ORDER BY asset_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []AIStage
+	for rows.Next() {
+		var item AIStage
+		var path sql.NullString
+		var expires sql.NullTime
+		if err := rows.Scan(&item.AssetID, &item.CacheKey, &item.State, &path, &item.SizeBytes, &expires, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		item.StagePath = path.String
+		if expires.Valid {
+			value := expires.Time.Unix()
+			item.ExpiresAt = &value
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
 }
 
 func (d *DB) AIStageStats(ctx context.Context) (ready int, bytes int64, err error) {

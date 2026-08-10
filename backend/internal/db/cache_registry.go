@@ -69,6 +69,51 @@ func (d *DB) DeleteCacheEntry(ctx context.Context, kind, cacheKey, relativePath 
 	return err
 }
 
+func (d *DB) DeleteCacheEntryByPath(ctx context.Context, kind, relativePath string) error {
+	_, err := d.Conn().ExecContext(ctx,
+		`DELETE FROM cache_entry WHERE kind=$1 AND relative_path=$2`,
+		kind, relativePath)
+	return err
+}
+
+func (d *DB) DeleteCacheEntriesByCacheKey(ctx context.Context, kind, cacheKey string) error {
+	_, err := d.Conn().ExecContext(ctx,
+		`DELETE FROM cache_entry WHERE kind=$1 AND cache_key=$2`,
+		kind, cacheKey)
+	return err
+}
+
+func (d *DB) DeleteOrphanAIStageCacheEntries(ctx context.Context) error {
+	_, err := d.Conn().ExecContext(ctx, `
+DELETE FROM cache_entry entry
+WHERE entry.kind='ai-staging'
+  AND NOT EXISTS (
+    SELECT 1 FROM asset_ai_stage stage
+    WHERE stage.cache_key=entry.cache_key
+  )`)
+	return err
+}
+
+func (d *DB) CacheEntryAccessTimes(ctx context.Context) (map[string]int64, error) {
+	rows, err := d.Conn().QueryContext(ctx, `
+SELECT kind,relative_path,EXTRACT(EPOCH FROM last_accessed_at)::bigint
+FROM cache_entry`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[string]int64)
+	for rows.Next() {
+		var kind, relativePath string
+		var accessedAt int64
+		if err := rows.Scan(&kind, &relativePath, &accessedAt); err != nil {
+			return nil, err
+		}
+		result[kind+"\x00"+relativePath] = accessedAt
+	}
+	return result, rows.Err()
+}
+
 func (d *DB) CacheUsageByKind(ctx context.Context) ([]CacheKindUsage, error) {
 	rows, err := d.Conn().QueryContext(ctx, `
 SELECT kind, COALESCE(SUM(size_bytes),0), COUNT(*)

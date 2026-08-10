@@ -1,25 +1,29 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import Hls, { type Fragment } from 'hls.js';
-import { ChevronDown, Database, Maximize2, Minimize2, Pause, Play, RotateCw, Settings, Trash2, Volume2, VolumeX } from 'lucide-react';
-import type { Asset, SubtitleInfo, VideoProxyHeartbeat, VideoProxyRuntime, VideoSegmentStatus } from '../types/api';
+import { Check, ChevronDown, Database, Maximize2, Minimize2, Pause, PictureInPicture2, Play, RotateCw, Settings, SkipBack, SkipForward, Trash2, Volume2, VolumeX } from 'lucide-react';
+import type { Asset, SubtitleInfo, VideoProxyHeartbeat, VideoProxyRuntime, VideoSegmentStatus, VideoStoryboard } from '../types/api';
 import {
   api,
   assetPreviewUrl,
+  assetStoryboardSheetUrl,
   assetSubtitleUrl,
   assetVideoHlsPlaylistUrl,
   assetVideoUrl,
 } from '../api/client';
 import { formatDuration } from '../utils/format';
+import { isSafariBrowser } from '../utils/browser';
 import { normalizeRotation, rotatedContainStyle } from '../utils/rotation';
 import {
   playbackRates,
   playbackModeOptions,
+  zoomScaleRange,
   type ViewerPlaybackMode,
   type ViewerPrefs,
 } from '../utils/viewerPrefs';
 import DanmakuLayer from './DanmakuLayer';
 import { viewerAudioOutputBridge } from './audioOutputBridge';
 import type { ViewerMediaLayerMode } from './mediaLayer';
+import MediaProgressSlider, { mediaBufferedRangesEqual, readMediaBufferedRanges, type MediaBufferedRange } from './MediaProgressSlider';
 
 export interface VideoPlaybackInfo {
   browserCachedBytes: number;
@@ -73,6 +77,10 @@ interface Props {
   onPriorityPreloadComplete: (assetId: number, cacheKey: string) => void;
   onPlaybackInfoChange?: (info: VideoPlaybackInfo | null) => void;
   onPlaybackEnded: () => void;
+  onPrevious: () => void;
+  onNext: () => void;
+  previousEnabled: boolean;
+  nextEnabled: boolean;
   onPlaybackModeChange: (value: ViewerPlaybackMode) => void;
   onPlaybackRateChange: (value: number) => void;
   onRotate: () => void;
@@ -114,6 +122,17 @@ interface VideoNetworkMetrics {
 
 type VideoRuntimeStatus = VideoProxyRuntime | VideoSegmentStatus;
 
+type SafariVideoPresentationMode = 'inline' | 'picture-in-picture' | 'fullscreen';
+
+interface PresentationVideoElement extends HTMLVideoElement {
+  webkitPresentationMode?: SafariVideoPresentationMode;
+  webkitSetPresentationMode?: (mode: SafariVideoPresentationMode) => void;
+  webkitSupportsPresentationMode?: (mode: SafariVideoPresentationMode) => boolean;
+}
+
+const videoHoldZoomDelayMs = 220;
+const videoHoldClickSuppressMs = 350;
+
 let sharedVideoAudio: VideoAudioPreference | null = null;
 
 export default function VideoViewer({
@@ -136,6 +155,10 @@ export default function VideoViewer({
   onPriorityPreloadComplete,
   onPlaybackInfoChange,
   onPlaybackEnded,
+  onPrevious,
+  onNext,
+  previousEnabled,
+  nextEnabled,
   onPlaybackModeChange,
   onPlaybackRateChange,
   onRotate,
@@ -176,9 +199,16 @@ export default function VideoViewer({
   const networkIdleTimer = useRef<number | null>(null);
   const networkProgressTimer = useRef<number | null>(null);
   const activeNetworkFragment = useRef<Fragment | null>(null);
+  const storyboardLoadingRef = useRef(false);
+  const storyboardUnavailableKeyRef = useRef('');
+  const holdZoomTimer = useRef(0);
+  const holdZoomActiveRef = useRef(false);
+  const suppressVideoClickUntil = useRef(0);
+  const holdZoomPointer = useRef({ clientX: 0, clientY: 0 });
   const [liveAsset, setLiveAsset] = useState(asset);
   const [audio, setAudio] = useState<VideoAudioPreference>(() => loadVideoAudioPreference());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [playbackModeOptionsOpen, setPlaybackModeOptionsOpen] = useState(false);
   const [playbackOptionsOpen, setPlaybackOptionsOpen] = useState(false);
   const [danmakuOptionsOpen, setDanmakuOptionsOpen] = useState(false);
   const [proxyFailed, setProxyFailed] = useState(false);
@@ -197,8 +227,12 @@ export default function VideoViewer({
   const [waitingTrigger, setWaitingTrigger] = useState<'none' | 'seek' | 'buffer' | 'network'>('none');
   const [hlsPhase, setHlsPhase] = useState<'idle' | 'manifest' | 'segment' | 'ready' | 'error' | 'direct'>('idle');
   const [bufferedEnd, setBufferedEnd] = useState(0);
+  const [bufferedRanges, setBufferedRanges] = useState<MediaBufferedRange[]>([]);
   const [nativeHlsSource, setNativeHlsSource] = useState('');
   const [proxyStreamEnabled, setProxyStreamEnabled] = useState(false);
+  const [pictureInPictureSupported, setPictureInPictureSupported] = useState(false);
+  const [pictureInPictureActive, setPictureInPictureActive] = useState(false);
+  const [pictureInPictureError, setPictureInPictureError] = useState('');
   const [proxySessionId] = useState(() => createVideoProxySessionId());
   const [proxyStartTime, setProxyStartTime] = useState(0);
   const [proxyRuntime, setProxyRuntime] = useState<VideoSegmentStatus | null>(null);
@@ -206,7 +240,11 @@ export default function VideoViewer({
   const [duration, setDuration] = useState(asset.duration ?? 0);
   const [currentTime, setCurrentTime] = useState(0);
   const [scrubTime, setScrubTime] = useState<number | null>(null);
+  const [storyboard, setStoryboard] = useState<VideoStoryboard | null>(null);
+  const [storyboardHover, setStoryboardHover] = useState<{ percent: number; time: number } | null>(null);
+  const [loadedStoryboardSheets, setLoadedStoryboardSheets] = useState<Set<string>>(() => new Set());
   const [frameSize, setFrameSize] = useState({ width: 0, height: 0 });
+  const [holdZoom, setHoldZoom] = useState({ active: false, originX: 50, originY: 50 });
   const [videoMetrics, setVideoMetrics] = useState({
     decodedHeight: 0,
     decodedWidth: 0,
@@ -259,6 +297,28 @@ export default function VideoViewer({
     void api.prewarmDirectVideo(playbackAsset.id, directPrewarmStart).catch(() => undefined);
   }, [directPrewarmStart, layerMode, playbackAsset.browserPlayable, playbackAsset.id, source, usesProxy]);
   const displayedTime = scrubTime ?? currentTime;
+  const storyboardCandidate = useMemo(() => {
+    if (!storyboard || !storyboardHover || storyboard.interval <= 0 || storyboard.cacheKey !== asset.cacheKey) return null;
+    const frameIndex = Math.min(storyboard.frameCount - 1, Math.max(0, Math.floor(storyboardHover.time / storyboard.interval)));
+    const sheet = Math.floor(frameIndex / (storyboard.columns * storyboard.rows));
+    return {
+      cellIndex: frameIndex % (storyboard.columns * storyboard.rows),
+      imageUrl: assetStoryboardSheetUrl(asset, sheet),
+      sheet,
+    };
+  }, [asset, storyboard, storyboardHover]);
+  const storyboardPreview = storyboard && storyboardHover && storyboardCandidate && loadedStoryboardSheets.has(storyboardCandidate.imageUrl)
+    ? {
+        cellHeight: storyboard.cellHeight,
+        cellIndex: storyboardCandidate.cellIndex,
+        cellWidth: storyboard.cellWidth,
+        columns: storyboard.columns,
+        imageUrl: storyboardCandidate.imageUrl,
+        label: formatDuration(storyboardHover.time),
+        percent: storyboardHover.percent,
+        rows: storyboard.rows,
+      }
+    : null;
   const selectedSubtitle = useMemo(
     () => subtitles.find((subtitle) => subtitle.id === selectedSubtitleId),
     [selectedSubtitleId, subtitles],
@@ -308,7 +368,83 @@ export default function VideoViewer({
     priorityPreloadKeyRef.current = '';
     setFirstFrameReady(false);
     setPreloadSegmentReady(false);
+	storyboardLoadingRef.current = false;
+	storyboardUnavailableKeyRef.current = '';
+	setStoryboard(null);
+	setStoryboardHover(null);
+	setLoadedStoryboardSheets(new Set());
   }, [asset.id, asset.cacheKey]);
+
+  useEffect(() => {
+	if (layerMode !== 'active') return undefined;
+	const controller = new AbortController();
+	let pollTimer: number | null = null;
+	let cancelled = false;
+	const waitForPoll = () => new Promise<void>((resolve) => {
+		pollTimer = window.setTimeout(resolve, 3000);
+	});
+	void (async () => {
+		try {
+			await api.generateAssetStoryboard(asset.id, controller.signal);
+		} catch {
+			return;
+		}
+		while (!cancelled) {
+			try {
+				const result = await api.assetStoryboard(asset.id, controller.signal);
+				if (!cancelled && result.assetId === asset.id && result.cacheKey === asset.cacheKey) {
+					storyboardUnavailableKeyRef.current = '';
+					setStoryboard(result);
+				}
+				return;
+			} catch {
+				if (cancelled) return;
+				await waitForPoll();
+			}
+		}
+	})();
+	return () => {
+		cancelled = true;
+		controller.abort();
+		if (pollTimer !== null) window.clearTimeout(pollTimer);
+	};
+  }, [asset.cacheKey, asset.id, layerMode]);
+
+  useEffect(() => {
+	if (!storyboardCandidate || loadedStoryboardSheets.has(storyboardCandidate.imageUrl)) return undefined;
+	let active = true;
+	const image = new Image();
+	image.onload = () => {
+		if (!active) return;
+		setLoadedStoryboardSheets((current) => {
+			if (current.has(storyboardCandidate.imageUrl)) return current;
+			const next = new Set(current);
+			next.add(storyboardCandidate.imageUrl);
+			return next;
+		});
+	};
+	image.onerror = () => undefined;
+	image.src = storyboardCandidate.imageUrl;
+	return () => {
+		active = false;
+	};
+  }, [loadedStoryboardSheets, storyboardCandidate]);
+
+  function handleStoryboardHover(hover: { percent: number; time: number } | null) {
+	setStoryboardHover(hover);
+	const currentKey = `${asset.id}:${asset.cacheKey}`;
+	if (!hover || storyboard || storyboardLoadingRef.current || storyboardUnavailableKeyRef.current === currentKey) return;
+	storyboardLoadingRef.current = true;
+	const requestedID = asset.id;
+	const requestedKey = asset.cacheKey;
+	void api.assetStoryboard(requestedID).then((result) => {
+		if (result.assetId === requestedID && result.cacheKey === requestedKey) setStoryboard(result);
+	}).catch(() => {
+		storyboardUnavailableKeyRef.current = currentKey;
+	}).finally(() => {
+		storyboardLoadingRef.current = false;
+	});
+  }
 
   useEffect(() => {
     if (layerMode !== 'active' || !usesProxy) return undefined;
@@ -359,6 +495,7 @@ export default function VideoViewer({
 
   const closeSettings = () => {
     setSettingsOpen(false);
+    setPlaybackModeOptionsOpen(false);
     setPlaybackOptionsOpen(false);
     setDanmakuOptionsOpen(false);
   };
@@ -368,6 +505,7 @@ export default function VideoViewer({
       closeSettings();
       return;
     }
+    setPlaybackModeOptionsOpen(false);
     setPlaybackOptionsOpen(false);
     setDanmakuOptionsOpen(false);
     setSettingsOpen(true);
@@ -378,6 +516,94 @@ export default function VideoViewer({
     if (rotation === 0) return undefined;
     return { ...rotatedContainStyle(asset, frameSize), bottom: 'auto', right: 'auto' };
   }, [asset, frameSize.height, frameSize.width]);
+
+  const holdZoomScale = viewerPrefs.zoomMode === 'pixels'
+    ? Math.min(
+        zoomScaleRange.max,
+        Math.max(zoomScaleRange.min, Math.min(frameSize.width, frameSize.height) / Math.max(1, viewerPrefs.zoomPixelArea)),
+      )
+    : Math.min(zoomScaleRange.max, Math.max(zoomScaleRange.min, viewerPrefs.zoomScale));
+  const zoomedMediaStyle = useMemo(() => {
+    if (!holdZoom.active) return mediaStyle;
+    const baseTransform = typeof mediaStyle?.transform === 'string' ? mediaStyle.transform : '';
+    return {
+      ...mediaStyle,
+      transform: `${baseTransform}${baseTransform ? ' ' : ''}scale(${holdZoomScale})`,
+      transformOrigin: `${holdZoom.originX}% ${holdZoom.originY}%`,
+    };
+  }, [holdZoom.active, holdZoom.originX, holdZoom.originY, holdZoomScale, mediaStyle]);
+
+  const clearHoldZoomTimer = () => {
+    if (holdZoomTimer.current) window.clearTimeout(holdZoomTimer.current);
+    holdZoomTimer.current = 0;
+  };
+
+  const updateHoldZoomOrigin = (clientX: number, clientY: number) => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    holdZoomPointer.current = { clientX, clientY };
+    const rect = frame.getBoundingClientRect();
+    const originX = Math.min(100, Math.max(0, ((clientX - rect.left) / Math.max(1, rect.width)) * 100));
+    const originY = Math.min(100, Math.max(0, ((clientY - rect.top) / Math.max(1, rect.height)) * 100));
+    setHoldZoom((current) => ({ ...current, originX, originY }));
+  };
+
+  const endHoldZoom = () => {
+    clearHoldZoomTimer();
+    if (!holdZoomActiveRef.current) return;
+    holdZoomActiveRef.current = false;
+    suppressVideoClickUntil.current = Date.now() + videoHoldClickSuppressMs;
+    setHoldZoom((current) => ({ ...current, active: false }));
+  };
+
+  const handleVideoMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || layerMode !== 'active' || (!firstFrameReady && !posterSource)) return;
+    clearHoldZoomTimer();
+    holdZoomPointer.current = { clientX: event.clientX, clientY: event.clientY };
+    holdZoomTimer.current = window.setTimeout(() => {
+      holdZoomTimer.current = 0;
+      holdZoomActiveRef.current = true;
+      suppressVideoClickUntil.current = Date.now() + 1000;
+      updateHoldZoomOrigin(holdZoomPointer.current.clientX, holdZoomPointer.current.clientY);
+      setHoldZoom((current) => ({ ...current, active: true }));
+    }, videoHoldZoomDelayMs);
+  };
+
+  const handleVideoMouseMove = (event: ReactMouseEvent<HTMLDivElement>) => {
+    holdZoomPointer.current = { clientX: event.clientX, clientY: event.clientY };
+    if (!holdZoomActiveRef.current) return;
+    if (event.buttons !== 1) {
+      endHoldZoom();
+      return;
+    }
+    updateHoldZoomOrigin(event.clientX, event.clientY);
+  };
+
+  const handleVideoSurfaceClick = (event: ReactMouseEvent<HTMLElement>) => {
+    if (Date.now() <= suppressVideoClickUntil.current) {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressVideoClickUntil.current = 0;
+      return;
+    }
+    togglePlay();
+  };
+
+  useEffect(() => {
+    const handleWindowMouseUp = () => endHoldZoom();
+    window.addEventListener('mouseup', handleWindowMouseUp);
+    return () => {
+      window.removeEventListener('mouseup', handleWindowMouseUp);
+      clearHoldZoomTimer();
+    };
+  }, []);
+
+  useEffect(() => {
+    clearHoldZoomTimer();
+    holdZoomActiveRef.current = false;
+    suppressVideoClickUntil.current = 0;
+    setHoldZoom({ active: false, originX: 50, originY: 50 });
+  }, [asset.cacheKey, asset.id, layerMode]);
 
   const startProxyPlayback = () => {
     wantsPlaying.current = true;
@@ -925,6 +1151,7 @@ export default function VideoViewer({
     setWaitingTrigger('none');
     setHlsPhase('idle');
     setBufferedEnd(0);
+    setBufferedRanges([]);
     setCurrentTime(0);
     currentTimeRef.current = 0;
     setScrubTime(null);
@@ -1104,6 +1331,9 @@ export default function VideoViewer({
   }
 
   function updateBufferedRange(video: HTMLVideoElement) {
+    const mediaDuration = duration || asset.duration || video.duration || 0;
+    const ranges = readMediaBufferedRanges(video, mediaDuration);
+    setBufferedRanges((current) => mediaBufferedRangesEqual(current, ranges) ? current : ranges);
     let next = 0;
     for (let index = 0; index < video.buffered.length; index++) {
       const start = video.buffered.start(index);
@@ -1139,9 +1369,75 @@ export default function VideoViewer({
     }, 80);
   }
 
+  useEffect(() => {
+    const video = ref.current as PresentationVideoElement | null;
+    if (!video || layerMode !== 'active' || !isSafariBrowser()) {
+      setPictureInPictureSupported(false);
+      setPictureInPictureActive(false);
+      return undefined;
+    }
+    const webkitSupported = Boolean(
+      video.webkitSetPresentationMode
+      && video.webkitSupportsPresentationMode?.('picture-in-picture'),
+    );
+    const standardSupported = document.pictureInPictureEnabled;
+    setPictureInPictureSupported(webkitSupported || standardSupported);
+
+    const syncPresentationState = () => {
+      setPictureInPictureActive(
+        video.webkitPresentationMode === 'picture-in-picture'
+        || document.pictureInPictureElement === video,
+      );
+    };
+    video.addEventListener('webkitpresentationmodechanged', syncPresentationState);
+    video.addEventListener('enterpictureinpicture', syncPresentationState);
+    video.addEventListener('leavepictureinpicture', syncPresentationState);
+    syncPresentationState();
+    return () => {
+      video.removeEventListener('webkitpresentationmodechanged', syncPresentationState);
+      video.removeEventListener('enterpictureinpicture', syncPresentationState);
+      video.removeEventListener('leavepictureinpicture', syncPresentationState);
+    };
+  }, [asset.cacheKey, asset.id, canPlay, layerMode]);
+
+  async function togglePictureInPicture() {
+    const video = ref.current as PresentationVideoElement | null;
+    if (!video || layerMode !== 'active') return;
+    setPictureInPictureError('');
+    try {
+      if (
+        video.webkitSetPresentationMode
+        && video.webkitSupportsPresentationMode?.('picture-in-picture')
+      ) {
+        video.webkitSetPresentationMode(
+          video.webkitPresentationMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture',
+        );
+        return;
+      }
+
+      if (document.pictureInPictureElement === video) {
+        await document.exitPictureInPicture();
+      } else {
+        await video.requestPictureInPicture();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '当前浏览器无法进入画中画';
+      setPictureInPictureError(message || '当前浏览器无法进入画中画');
+    }
+  }
+
   return (
-    <div className={canPlay ? 'video-stage' : 'video-stage video-stage-pending'}>
-      <div className="video-frame" ref={frameRef}>
+    <div className={`${canPlay ? 'video-stage' : 'video-stage video-stage-pending'}${holdZoom.active ? ' video-hold-zoom-active' : ''}`}>
+      <div
+        className={holdZoom.active ? 'video-frame video-hold-zooming' : 'video-frame'}
+        ref={frameRef}
+        onMouseDown={handleVideoMouseDown}
+        onMouseMove={handleVideoMouseMove}
+        onMouseUp={endHoldZoom}
+        onMouseLeave={() => {
+          if (!holdZoomActiveRef.current) clearHoldZoomTimer();
+        }}
+      >
         {canPlay && (
           <video
             ref={ref}
@@ -1151,8 +1447,8 @@ export default function VideoViewer({
             preload={layerMode === 'prepare' && !preloadSegmentReady ? 'auto' : 'metadata'}
             playsInline
             loop={viewerPrefs.playbackMode === 'single'}
-            style={mediaStyle}
-            onClick={togglePlay}
+            style={zoomedMediaStyle}
+            onClick={handleVideoSurfaceClick}
             onDurationChange={(event) => {
               setDuration(event.currentTarget.duration || asset.duration || 0);
               updateBackgroundPreloadProgress(event.currentTarget);
@@ -1205,7 +1501,10 @@ export default function VideoViewer({
               setSeeking(false);
               setEnded(false);
               setWaitingTrigger('none');
-              if (layerMode === 'active') viewerAudioOutputBridge.mediaStarted(`${asset.id}:${asset.cacheKey}`);
+              if (layerMode === 'active') {
+                viewerAudioOutputBridge.mediaStarted(`${asset.id}:${asset.cacheKey}`);
+                void api.markAssetPlayed(asset.id).catch(() => undefined);
+              }
               updateBufferedRange(event.currentTarget);
             }}
             onPlay={() => {
@@ -1301,10 +1600,10 @@ export default function VideoViewer({
             className={canPlay ? 'video-poster-layer playable' : 'video-poster-layer'}
             type="button"
             disabled={!canPlay}
-            onClick={togglePlay}
+            onClick={handleVideoSurfaceClick}
           >
-            <img src={posterSource} alt={asset.filename} style={mediaStyle} />
-            {canPlay ? (
+            <img src={posterSource} alt={asset.filename} style={zoomedMediaStyle} />
+            {canPlay && !holdZoom.active ? (
               <>
                 <span className="video-big-play">
                   <Play size={34} fill="currentColor" />
@@ -1318,7 +1617,7 @@ export default function VideoViewer({
         )}
         {!posterSource && !canPlay && <div className="video-pending">{statusLabel}</div>}
         {!posterSource && canPlay && usesProxy && !proxyStreamEnabled && (
-          <button className="video-pending video-pending-button" type="button" onClick={togglePlay}>
+          <button className="video-pending video-pending-button" type="button" onClick={handleVideoSurfaceClick}>
             <Play size={34} fill="currentColor" />
             <span>点击播放开始转码</span>
           </button>
@@ -1326,23 +1625,20 @@ export default function VideoViewer({
       </div>
       <div
         className={settingsOpen ? 'video-control-zone settings-open' : 'video-control-zone'}
+        aria-hidden={holdZoom.active}
         onClick={(event) => event.stopPropagation()}
         onPointerDown={(event) => event.stopPropagation()}
       >
         <div className="video-controls">
-          <button type="button" disabled={!canPlay} onClick={togglePlay} title={paused ? '播放' : '暂停'}>
-            {paused ? <Play size={18} /> : <Pause size={18} />}
-          </button>
-          <span className="video-time">{formatDuration(displayedTime)}</span>
-          <input
+          <MediaProgressSlider
             className="video-progress-slider"
-            aria-label="播放进度"
-            max={duration || 0}
-            min={0}
-            step={0.01}
+            ariaLabel="播放进度"
+            buffered={bufferedRanges}
             disabled={!canPlay}
-            type="range"
+            duration={duration}
             value={Math.min(displayedTime, duration || displayedTime)}
+            preview={storyboardPreview}
+            onHoverChange={handleStoryboardHover}
             onBlur={(event) => commitSeek(Number(event.currentTarget.value))}
             onChange={(event) => {
               const next = Number(event.target.value);
@@ -1353,88 +1649,115 @@ export default function VideoViewer({
             onPointerDown={(event) => setScrubTime(Number(event.currentTarget.value))}
             onPointerUp={(event) => commitSeek(Number(event.currentTarget.value))}
           />
-          <span className="video-time">{formatDuration(duration)}</span>
-          <div
-            className="video-control-group video-audio-controls"
-            data-viewer-wheel-control
-            onWheel={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              if (event.deltaY === 0) return;
-              adjustVolume(event.deltaY < 0 ? volumeStep : -volumeStep);
-            }}
-          >
-            <button
-              type="button"
-              disabled={!canPlay}
-              onClick={toggleMute}
-              title={audio.muted ? '取消静音' : '静音'}
-              aria-label={audio.muted ? '取消静音' : '静音'}
-              aria-pressed={audio.muted}
-            >
-              {audio.muted ? <VolumeX size={18} /> : <Volume2 size={18} />}
+          <div className="video-controls-row">
+            <button type="button" aria-label="上一个" disabled={!previousEnabled} onClick={onPrevious} title={previousEnabled ? '上一个' : '上一个尚未预加载完成'}>
+              <SkipBack size={20} />
             </button>
-            <div className="video-volume-popover">
-              <input
-                className="video-volume-slider"
-                aria-label="音量"
-                aria-valuetext={`${Math.round((audio.muted ? 0 : audio.volume) * 100)}%`}
-                max={1}
-                min={0}
-                step={volumeStep}
+            <button className="video-primary-play" type="button" aria-label={paused ? '播放' : '暂停'} disabled={!canPlay} onClick={togglePlay} title={paused ? '播放' : '暂停'}>
+              {paused ? <Play size={24} fill="currentColor" /> : <Pause size={24} fill="currentColor" />}
+            </button>
+            <button type="button" aria-label="下一个" disabled={!nextEnabled} onClick={onNext} title={nextEnabled ? '下一个' : '下一个尚未预加载完成'}>
+              <SkipForward size={20} />
+            </button>
+            <span className="video-time">
+              <span>{formatDuration(displayedTime)}</span>
+              <i>/</i>
+              <span>{formatDuration(duration)}</span>
+            </span>
+            <span className="video-controls-spacer" aria-hidden="true" />
+            <div
+              className="video-control-group video-audio-controls"
+              data-viewer-wheel-control
+              onWheel={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (event.deltaY === 0) return;
+                adjustVolume(event.deltaY < 0 ? volumeStep : -volumeStep);
+              }}
+            >
+              <button
+                type="button"
                 disabled={!canPlay}
-                type="range"
-                value={audio.muted ? 0 : audio.volume}
-                onChange={(event) => {
-                  const next = clampVolume(Number(event.target.value));
-                  if (!ref.current) return;
-                  ref.current.volume = next;
-                  ref.current.muted = next === 0;
-                }}
-              />
+                onClick={toggleMute}
+                title={audio.muted ? '取消静音' : '静音'}
+                aria-label={audio.muted ? '取消静音' : '静音'}
+                aria-pressed={audio.muted}
+              >
+                {audio.muted ? <VolumeX size={20} /> : <Volume2 size={20} />}
+              </button>
+              <div className="video-volume-popover">
+                <input
+                  className="video-volume-slider"
+                  aria-label="音量"
+                  aria-valuetext={`${Math.round((audio.muted ? 0 : audio.volume) * 100)}%`}
+                  max={1}
+                  min={0}
+                  step={volumeStep}
+                  disabled={!canPlay}
+                  type="range"
+                  value={audio.muted ? 0 : audio.volume}
+                  onChange={(event) => {
+                    const next = clampVolume(Number(event.target.value));
+                    if (!ref.current) return;
+                    ref.current.volume = next;
+                    ref.current.muted = next === 0;
+                  }}
+                />
+              </div>
             </div>
-          </div>
-          <div className="video-control-group video-settings-wrap" data-viewer-wheel-control ref={settingsRef}>
-            <button
-              className={settingsOpen ? 'active' : undefined}
-              type="button"
-              title="视频设置"
-              aria-label="视频设置"
-              aria-expanded={settingsOpen}
-              aria-haspopup="dialog"
-              onPointerDown={(event) => {
-                if (event.button === 0) toggleSettings();
-              }}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' || event.key === ' ') toggleSettings();
-              }}
-            >
-              <Settings size={18} />
-            </button>
-            {settingsOpen && (
+            <div className="video-control-group video-settings-wrap" data-viewer-wheel-control ref={settingsRef}>
+              <button
+                className={settingsOpen ? 'active' : undefined}
+                type="button"
+                title="视频设置"
+                aria-label="视频设置"
+                aria-expanded={settingsOpen}
+                aria-haspopup="dialog"
+                onPointerDown={(event) => {
+                  if (event.button === 0) toggleSettings();
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') toggleSettings();
+                }}
+              >
+                <Settings size={20} />
+              </button>
+              {settingsOpen && (
               <div className="video-settings-popover" role="dialog" aria-label="视频设置">
-                <label className="video-settings-row">
-                  <span>播放模式</span>
-                  <select
-                    aria-label="播放模式"
-                    value={viewerPrefs.playbackMode}
-                    onChange={(event) => onPlaybackModeChange(event.currentTarget.value as ViewerPlaybackMode)}
-                  >
+                {playbackModeOptionsOpen && (
+                  <div className="video-settings-choice-list" role="listbox" aria-label="播放模式">
                     {playbackModeOptions.map((option) => (
-                      <option key={option.value} value={option.value}>{option.label}</option>
+                      <button
+                        className={option.value === viewerPrefs.playbackMode ? 'video-settings-choice selected' : 'video-settings-choice'}
+                        key={option.value}
+                        type="button"
+                        role="option"
+                        aria-selected={option.value === viewerPrefs.playbackMode}
+                        onClick={() => {
+                          onPlaybackModeChange(option.value as ViewerPlaybackMode);
+                          setPlaybackModeOptionsOpen(false);
+                        }}
+                      >
+                        <span>{option.label}</span>
+                        {option.value === viewerPrefs.playbackMode && <Check size={16} />}
+                      </button>
                     ))}
-                  </select>
-                </label>
+                  </div>
+                )}
                 <button
                   className="video-settings-expand"
                   type="button"
-                  aria-expanded={playbackOptionsOpen}
-                  onClick={() => setPlaybackOptionsOpen((value) => !value)}
+                  aria-expanded={playbackModeOptionsOpen}
+                  onClick={() => {
+                    setPlaybackModeOptionsOpen((value) => !value);
+                    setPlaybackOptionsOpen(false);
+                    setDanmakuOptionsOpen(false);
+                  }}
                 >
-                  <span>播放速度</span>
+                  <span>播放模式</span>
                   <span className="video-settings-expand-value">
-                    <output>{formatDiscreteValue(playbackRate)}</output>
-                    <ChevronDown className={playbackOptionsOpen ? 'expanded' : undefined} size={16} />
+                    <output>{playbackModeOptions.find((option) => option.value === viewerPrefs.playbackMode)?.label ?? '顺序播放'}</output>
+                    <ChevronDown className={playbackModeOptionsOpen ? 'expanded' : undefined} size={16} />
                   </span>
                 </button>
                 {playbackOptionsOpen && (
@@ -1448,6 +1771,22 @@ export default function VideoViewer({
                     />
                   </div>
                 )}
+                <button
+                  className="video-settings-expand"
+                  type="button"
+                  aria-expanded={playbackOptionsOpen}
+                  onClick={() => {
+                    setPlaybackOptionsOpen((value) => !value);
+                    setPlaybackModeOptionsOpen(false);
+                    setDanmakuOptionsOpen(false);
+                  }}
+                >
+                  <span>播放速度</span>
+                  <span className="video-settings-expand-value">
+                    <output>{formatDiscreteValue(playbackRate)}</output>
+                    <ChevronDown className={playbackOptionsOpen ? 'expanded' : undefined} size={16} />
+                  </span>
+                </button>
                 <label className={hasSubtitles ? 'video-settings-row video-settings-toggle-row' : 'video-settings-row video-settings-toggle-row disabled'}>
                   <span>弹幕</span>
                   <span className="video-settings-switch">
@@ -1480,7 +1819,11 @@ export default function VideoViewer({
                   type="button"
                   disabled={!hasSubtitles}
                   aria-expanded={danmakuOptionsOpen}
-                  onClick={() => setDanmakuOptionsOpen((value) => !value)}
+                  onClick={() => {
+                    setDanmakuOptionsOpen((value) => !value);
+                    setPlaybackModeOptionsOpen(false);
+                    setPlaybackOptionsOpen(false);
+                  }}
                 >
                   <span>弹幕设置</span>
                   <ChevronDown className={danmakuOptionsOpen ? 'expanded' : undefined} size={16} />
@@ -1558,20 +1901,36 @@ export default function VideoViewer({
                   <Database size={16} />
                 </button>
               </div>
-            )}
-          </div>
-          <div className="video-control-group video-option-controls">
-            <button
-              type="button"
-              title={fullscreen ? '退出全屏' : '全屏'}
-              onClick={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                onToggleFullscreen();
-              }}
-            >
-              {fullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
-            </button>
+              )}
+            </div>
+            <div className="video-control-group video-option-controls">
+              {pictureInPictureSupported && (
+              <button
+                type="button"
+                className={pictureInPictureActive ? 'active' : undefined}
+                aria-label={pictureInPictureActive ? '退出画中画' : '画中画'}
+                title={pictureInPictureError || (pictureInPictureActive ? '退出画中画' : '画中画')}
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  void togglePictureInPicture();
+                }}
+              >
+                <PictureInPicture2 size={20} />
+              </button>
+              )}
+              <button
+                type="button"
+                title={fullscreen ? '退出全屏' : '全屏'}
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onToggleFullscreen();
+                }}
+              >
+                {fullscreen ? <Minimize2 size={20} /> : <Maximize2 size={20} />}
+              </button>
+            </div>
           </div>
         </div>
       </div>

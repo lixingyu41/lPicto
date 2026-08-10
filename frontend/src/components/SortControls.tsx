@@ -10,6 +10,7 @@ import {
   FileText,
   FolderInput,
   Gauge,
+  History,
   ScanLine,
   Star,
   Timer,
@@ -23,6 +24,7 @@ export type SortDirection = 'asc' | 'desc';
 const sortFields: Array<{ value: SortField; label: string; icon: LucideIcon }> = [
   { value: 'timeline', label: '时间', icon: CalendarDays },
   { value: 'imported', label: '导入时间', icon: FolderInput },
+  { value: 'last_played', label: '最近播放', icon: History },
   { value: 'modified', label: '修改时间', icon: FileClock },
   { value: 'size', label: '大小', icon: Database },
   { value: 'filename', label: '文件名', icon: FileText },

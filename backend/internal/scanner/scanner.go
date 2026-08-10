@@ -59,6 +59,7 @@ type Status struct {
 type Progress struct {
 	State           string                  `json:"state"`
 	RequestedAction string                  `json:"requestedAction"`
+	PauseReason     string                  `json:"pauseReason,omitempty"`
 	Task            string                  `json:"task"`
 	Reason          string                  `json:"reason"`
 	Phase           string                  `json:"phase"`
@@ -158,8 +159,9 @@ const (
 type scanCommandKind string
 
 const (
-	scanCommandStart scanCommandKind = "start"
-	scanCommandStop  scanCommandKind = "stop"
+	scanCommandStart           scanCommandKind = "start"
+	scanCommandStop            scanCommandKind = "stop"
+	scanCommandPlaybackPreempt scanCommandKind = "playback_preempt"
 )
 
 type scanCommand struct {
@@ -292,7 +294,33 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 	var cancel context.CancelFunc
 	var done <-chan struct{}
 	var activeStart *scanRequest
+	var resumeStart *scanRequest
 	var pendingStart *scanRequest
+	var resumeTimer <-chan time.Time
+	startPendingIfReady := func() {
+		if (resumeStart == nil && pendingStart == nil) || done != nil || ctx.Err() != nil {
+			return
+		}
+		if s.Jobs != nil {
+			active, err := s.Jobs.PlaybackPriorityActive(ctx)
+			if err == nil && active {
+				s.setPausedProgress("playback", false)
+				resumeTimer = time.After(250 * time.Millisecond)
+				return
+			}
+		}
+		var next scanRequest
+		if resumeStart != nil {
+			next = *resumeStart
+			resumeStart = nil
+		} else {
+			next = *pendingStart
+			pendingStart = nil
+		}
+		resumeTimer = nil
+		cancel, done = s.startRun(ctx, next)
+		activeStart = &next
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -305,6 +333,16 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 			case scanCommandStart:
 				req := cmd.req
 				if done == nil {
+					if resumeStart != nil || pendingStart != nil {
+						if resumeStart == nil || !sameScanRequest(*resumeStart, req) {
+							if pendingStart == nil || !sameScanRequest(*pendingStart, req) {
+								pendingStart = &req
+							}
+						}
+						startPendingIfReady()
+						cmd.reply <- CommandResult{Accepted: true, Started: done != nil, State: s.currentState()}
+						continue
+					}
 					cancel, done = s.startRun(ctx, req)
 					activeStart = &req
 					cmd.reply <- CommandResult{Accepted: true, Started: true, State: "running"}
@@ -330,7 +368,9 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 				s.setStopping("start")
 				cmd.reply <- CommandResult{Accepted: true, Started: false, State: "stopping"}
 			case scanCommandStop:
+				resumeStart = nil
 				pendingStart = nil
+				resumeTimer = nil
 				if done == nil {
 					s.setIdleProgress()
 					cmd.reply <- CommandResult{Accepted: false, Paused: false, State: "idle"}
@@ -341,6 +381,20 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 				}
 				s.setStopping("stop")
 				cmd.reply <- CommandResult{Accepted: true, Paused: true, State: "stopping"}
+			case scanCommandPlaybackPreempt:
+				if done == nil || activeStart == nil || !sameScanRequest(*activeStart, cmd.req) {
+					cmd.reply <- CommandResult{Accepted: false, State: s.currentState()}
+					continue
+				}
+				if resumeStart == nil && (pendingStart == nil || isAutomaticScanRequest(*pendingStart)) {
+					retry := *activeStart
+					resumeStart = &retry
+				}
+				if cancel != nil {
+					cancel()
+				}
+				s.setPausedProgress("playback", true)
+				cmd.reply <- CommandResult{Accepted: true, Paused: true, State: "paused"}
 			default:
 				cmd.reply <- CommandResult{Accepted: false, State: s.currentState()}
 			}
@@ -348,14 +402,14 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 			done = nil
 			cancel = nil
 			activeStart = nil
-			if pendingStart != nil && ctx.Err() == nil {
-				next := *pendingStart
-				pendingStart = nil
-				cancel, done = s.startRun(ctx, next)
-				activeStart = &next
+			if (resumeStart != nil || pendingStart != nil) && ctx.Err() == nil {
+				startPendingIfReady()
 				continue
 			}
 			s.setIdleAfterRun()
+		case <-resumeTimer:
+			resumeTimer = nil
+			startPendingIfReady()
 		}
 	}
 }
@@ -366,7 +420,7 @@ func sameScanRequest(a scanRequest, b scanRequest) bool {
 
 func isAutomaticScanRequest(req scanRequest) bool {
 	reason := strings.TrimSpace(req.reason)
-	return strings.HasPrefix(reason, "auto_") || strings.HasPrefix(reason, "fsnotify") || strings.HasPrefix(reason, "count_changed:")
+	return reason == "storage_recovered" || strings.HasPrefix(reason, "auto_") || strings.HasPrefix(reason, "fsnotify") || strings.HasPrefix(reason, "count_changed:")
 }
 
 func equalStringSet(a []string, b []string) bool {
@@ -419,6 +473,10 @@ func (s *Scanner) Pause() bool {
 
 func (s *Scanner) RequestStop() CommandResult {
 	return s.submitCommand(scanCommand{kind: scanCommandStop})
+}
+
+func (s *Scanner) requestPlaybackPreempt(req scanRequest) CommandResult {
+	return s.submitCommand(scanCommand{kind: scanCommandPlaybackPreempt, req: req})
 }
 
 func (s *Scanner) StartPeriodic(ctx context.Context, interval time.Duration) {
@@ -498,6 +556,7 @@ func (s *Scanner) setIdleAfterRun() {
 	s.cancel = nil
 	s.progress.State = "idle"
 	s.progress.RequestedAction = ""
+	s.progress.PauseReason = ""
 	s.progress.Phase = "idle"
 	s.mu.Unlock()
 	s.publishStatus()
@@ -508,8 +567,23 @@ func (s *Scanner) setStopping(requestedAction string) {
 	if s.running {
 		s.progress.State = "stopping"
 		s.progress.RequestedAction = requestedAction
+		s.progress.PauseReason = ""
 		s.progress.Phase = "stopping"
 	}
+	s.mu.Unlock()
+	s.publishStatus()
+}
+
+func (s *Scanner) setPausedProgress(reason string, running bool) {
+	s.mu.Lock()
+	s.running = running
+	if !running {
+		s.cancel = nil
+	}
+	s.progress.State = "paused"
+	s.progress.RequestedAction = "resume"
+	s.progress.PauseReason = reason
+	s.progress.Phase = "waiting"
 	s.mu.Unlock()
 	s.publishStatus()
 }
@@ -560,7 +634,7 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 	defer func() {
 		state, message := "success", ""
 		if ctx.Err() != nil {
-			state, message = "preempted", "当前媒体播放已抢占 NAS 读取"
+			state, message = "preempted", s.currentPauseMessage()
 		}
 		_ = s.DB.FinishSourceIOBatch(context.Background(), sourceBatchID, state, 0, 0, message)
 	}()
@@ -573,7 +647,7 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 			for {
 				active, _ := s.Jobs.PlaybackPriorityActive(ctx)
 				if active {
-					s.RequestStop()
+					s.requestPlaybackPreempt(req)
 					return
 				}
 				select {
@@ -863,11 +937,35 @@ func (s *Scanner) runCount(ctx context.Context, runID int64, scanRoots []string,
 	errors := 0
 	var lastError *string
 	countedAnyLibrary := false
+	estimatedTotal := 0
+	for _, library := range libraries {
+		if scanRootsOverlap(library.Roots, scanRoots) {
+			estimatedTotal += library.DiscoveredFiles
+		}
+	}
+	s.updateCountProgress(0, estimatedTotal)
+	lastReported := 0
+	reportProgress := func(counted int) {
+		if counted-lastReported < 100 {
+			return
+		}
+		lastReported = counted
+		s.updateCountProgress(counted, estimatedTotal)
+	}
 	for _, library := range libraries {
 		if !scanRootsOverlap(library.Roots, scanRoots) {
 			continue
 		}
-		count, err := CountMediaFilesForRoots(ctx, s.Store, library.Roots)
+		base := total
+		count, err := CountMediaFilesForRootsProgress(ctx, s.Store, library.Roots, func(current int) {
+			reportProgress(base + current)
+		})
+		if ctx.Err() != nil {
+			total += count
+			s.updateCountProgress(total, estimatedTotal)
+			s.finishPaused(runID, counters{totalSeen: total})
+			return
+		}
 		if err != nil {
 			errors++
 			message := "文件数量扫描失败"
@@ -883,13 +981,18 @@ func (s *Scanner) runCount(ctx context.Context, runID int64, scanRoots []string,
 		}
 		total += count
 		countedAnyLibrary = true
-		s.updateProgressTotalFiles(total)
+		s.updateCountProgress(total, estimatedTotal)
 		if strings.HasPrefix(reason, "auto_count") && library.DiscoveredAt != nil && library.DiscoveredFiles != count && s.Jobs != nil {
 			s.Jobs.Enqueue(jobs.Task{Type: "scan_metadata", Reason: "count_changed:" + library.Name, Roots: append([]string(nil), library.Roots...)})
 		}
 	}
 	if !countedAnyLibrary {
-		count, err := CountMediaFilesForRoots(ctx, s.Store, scanRoots)
+		count, err := CountMediaFilesForRootsProgress(ctx, s.Store, scanRoots, reportProgress)
+		if ctx.Err() != nil {
+			s.updateCountProgress(count, estimatedTotal)
+			s.finishPaused(runID, counters{totalSeen: count})
+			return
+		}
 		if err != nil {
 			errors++
 			message := "文件数量扫描失败"
@@ -897,8 +1000,9 @@ func (s *Scanner) runCount(ctx context.Context, runID int64, scanRoots []string,
 			logger.Warn("count media files failed", "roots", scanRoots, "error", err)
 		}
 		total = count
-		s.updateProgressTotalFiles(total)
+		s.updateCountProgress(total, estimatedTotal)
 	}
+	s.updateCountProgress(total, total)
 	s.updateProgressPhase("finished")
 	status := "finished"
 	if errors > 0 {
@@ -906,6 +1010,11 @@ func (s *Scanner) runCount(ctx context.Context, runID int64, scanRoots []string,
 	}
 	_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: status, TotalSeen: total, Errors: errors, LastError: lastError})
 	logger.Info("file count scan finished", "total", total, "errors", errors)
+	if errors == 0 && strings.HasPrefix(reason, "task:media_scan") && s.Jobs != nil {
+		s.Jobs.Enqueue(jobs.Task{
+			Type: "scan_metadata", Reason: "media_scan_completed", Roots: append([]string(nil), scanRoots...), Priority: 10,
+		})
+	}
 }
 
 func (s *Scanner) runThumbnailRebuild(ctx context.Context, runID int64, scanRoots []string, logger *slog.Logger) {
@@ -959,7 +1068,7 @@ func (s *Scanner) runThumbnailContinue(ctx context.Context, runID int64, scanRoo
 
 func (s *Scanner) finishPaused(runID int64, counts counters) {
 	s.updateProgressPhase("paused")
-	message := "扫描已暂停"
+	message := s.currentPauseMessage()
 	_ = s.DB.FinishScanRun(context.Background(), runID, db.ScanFinish{
 		Status:        "paused",
 		TotalSeen:     counts.totalSeen,
@@ -969,6 +1078,24 @@ func (s *Scanner) finishPaused(runID int64, counts counters) {
 		Errors:        counts.errors,
 		LastError:     &message,
 	})
+}
+
+func (s *Scanner) currentPauseMessage() string {
+	s.mu.Lock()
+	reason := s.progress.PauseReason
+	requestedAction := s.progress.RequestedAction
+	s.mu.Unlock()
+	switch reason {
+	case "playback":
+		return "正在播放或加载媒体，媒体扫描暂时暂停；播放结束后将自动继续"
+	}
+	if requestedAction == "stop" {
+		return "用户已停止媒体扫描"
+	}
+	if requestedAction == "start" {
+		return "媒体扫描正在切换到新的执行请求"
+	}
+	return "媒体扫描已暂停"
 }
 
 func (s *Scanner) countScanFiles(ctx context.Context, roots []string, logger *slog.Logger) int {
@@ -1833,6 +1960,22 @@ func (s *Scanner) updateProgressTotalFiles(totalFiles int) {
 	s.publishStatus()
 }
 
+func (s *Scanner) updateCountProgress(counted int, estimatedTotal int) {
+	if counted < 0 {
+		counted = 0
+	}
+	if estimatedTotal < counted {
+		estimatedTotal = counted
+	}
+	s.mu.Lock()
+	s.progress.DiscoveredFiles = counted
+	s.progress.TotalFiles = estimatedTotal
+	s.progress.ScannedFiles = counted
+	s.progress.TotalSeen = counted
+	s.mu.Unlock()
+	s.publishStatus()
+}
+
 func (s *Scanner) addDiscoveredFile(root string, hasRoot bool) {
 	s.mu.Lock()
 	if s.running {
@@ -1926,6 +2069,9 @@ func (s *Scanner) enqueueWork(assetID int64, mediaType string, previewStatus str
 		s.Jobs.Enqueue(jobs.Task{Type: "thumb", AssetID: assetID})
 	} else if mediaType == model.MediaTypeVideo {
 		s.Jobs.Enqueue(jobs.Task{Type: "video_poster", AssetID: assetID})
+		if needed, err := s.DB.EnsureStoryboardPending(context.Background(), assetID, true); err == nil && needed {
+			s.Jobs.Enqueue(jobs.Task{Type: "storyboard", AssetID: assetID})
+		}
 	}
 	if !rebuild && mediaType == model.MediaTypeImage && previewStatus == model.StatusPending {
 		s.Jobs.Enqueue(jobs.Task{Type: "preview", AssetID: assetID})
@@ -1945,6 +2091,11 @@ func (s *Scanner) enqueuePendingWork(asset model.Asset) {
 	}
 	if asset.MediaType == model.MediaTypeVideo && recoverableWorkStatus(asset.VideoPosterStatus) {
 		s.Jobs.Enqueue(jobs.Task{Type: "video_poster", AssetID: asset.ID})
+	}
+	if asset.MediaType == model.MediaTypeVideo {
+		if needed, err := s.DB.EnsureStoryboardPending(context.Background(), asset.ID, false); err == nil && needed {
+			s.Jobs.Enqueue(jobs.Task{Type: "storyboard", AssetID: asset.ID})
+		}
 	}
 	if asset.MediaType == model.MediaTypeImage && recoverableWorkStatus(asset.PreviewStatus) {
 		s.Jobs.Enqueue(jobs.Task{Type: "preview", AssetID: asset.ID})

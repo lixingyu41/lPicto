@@ -32,7 +32,7 @@ func (s *Server) collections(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("read system collection count cache failed", "error", err)
 	}
 	for i := range system {
-		if system[i].SystemKind == db.SystemCollectionAIPending || system[i].SystemKind == db.SystemCollectionAIReady || system[i].SystemKind == db.SystemCollectionAIFailed {
+		if system[i].SystemKind == db.SystemCollectionAll || system[i].SystemKind == db.SystemCollectionAIPending || system[i].SystemKind == db.SystemCollectionAIReady || system[i].SystemKind == db.SystemCollectionAIFailed || system[i].SystemKind == db.SystemCollectionStoryboardReady {
 			if count, countErr := s.db.CountSystemCollectionAssets(r.Context(), system[i].SystemKind, db.AssetListOptions{Page: 1, PageSize: 1}); countErr == nil {
 				system[i].AssetCount = count
 			}
@@ -277,6 +277,9 @@ func (s *Server) duplicateSelection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ensureDuplicateHashes(ctx context.Context) error {
+	if s.duplicateScanIsRunning() {
+		return nil
+	}
 	candidates, err := s.db.DuplicateHashCandidates(ctx, 200)
 	if err != nil {
 		return err
@@ -318,7 +321,7 @@ func (s *Server) collectionAssetOptions(r *http.Request, page int, pageSize int)
 	}
 	return db.AssetListOptions{
 		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
-		CombinedQuery: strings.TrimSpace(r.URL.Query().Get("combinedQuery")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
+		Query: strings.TrimSpace(r.URL.Query().Get("q")), CombinedQuery: strings.TrimSpace(r.URL.Query().Get("combinedQuery")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
 		ManualTag: strings.TrimSpace(r.URL.Query().Get("manualTag")), CombinedTag: strings.TrimSpace(r.URL.Query().Get("combinedTag")), CombinedTags: combinedTagsQuery(r), TagNodes: tagNodesQuery(r), AIDescription: strings.TrimSpace(r.URL.Query().Get("aiDescription")), AITag: strings.TrimSpace(r.URL.Query().Get("aiTag")), Orientation: searchOrientation(r),
 	}
 }
@@ -332,7 +335,8 @@ func optionsFromCollectionRule(rule *string, page int, pageSize int) db.AssetLis
 	if err := json.Unmarshal([]byte(*rule), &raw); err != nil {
 		return opts
 	}
-	opts.CombinedQuery = stringRule(raw, "combinedQuery", "q", "query")
+	opts.Query = stringRule(raw, "filenameQuery", "filename", "q")
+	opts.CombinedQuery = stringRule(raw, "combinedQuery", "query")
 	opts.NFOQuery = stringRule(raw, "nfo")
 	opts.NFOActor = stringRule(raw, "nfoActor")
 	opts.NFOID = stringRule(raw, "nfoId")
@@ -378,6 +382,9 @@ func mergeCollectionOptions(base db.AssetListOptions, override db.AssetListOptio
 	}
 	if override.CombinedQuery != "" {
 		base.CombinedQuery = override.CombinedQuery
+	}
+	if override.Query != "" {
+		base.Query = override.Query
 	}
 	if override.Type != "" {
 		base.Type = override.Type

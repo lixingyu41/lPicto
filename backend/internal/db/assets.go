@@ -107,6 +107,7 @@ type AssetListOptions struct {
 	AlbumUnassigned bool
 	AlbumIDs        []int64
 	IncludeHidden   bool
+	PlayedOnly      bool
 }
 
 type NeighborOptions struct {
@@ -149,6 +150,7 @@ type NeighborOptions struct {
 	AlbumIDs        []int64
 	IncludeHidden   bool
 	VisibleOnly     bool
+	PlayedOnly      bool
 }
 
 type NFOOptionOptions struct {
@@ -211,6 +213,7 @@ type libraryAnchorRow struct {
 	ImportedAt      int64
 	Size            int64
 	TimelineAt      int64
+	LastPlayedAt    *int64
 }
 
 const assetGroupFolder = "folder"
@@ -479,6 +482,21 @@ func (d *DB) GetAssetRecordIncludingDeleted(ctx context.Context, id int64) (mode
 	return scanAsset(row)
 }
 
+func (d *DB) MarkAssetPlayed(ctx context.Context, id int64) (*int64, error) {
+	var playedAt int64
+	err := d.conn.QueryRowContext(ctx, `
+UPDATE media_asset
+SET last_played_at = now()
+WHERE id = ?
+  AND media_type = 2
+  AND deleted_at IS NULL
+RETURNING EXTRACT(EPOCH FROM last_played_at)::BIGINT`, id).Scan(&playedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &playedAt, nil
+}
+
 func (d *DB) ListLibraryAssets(ctx context.Context, opts AssetListOptions) (model.Page[model.Asset], error) {
 	return d.listAssets(ctx, opts, false)
 }
@@ -559,9 +577,9 @@ func (d *DB) anchorsForFilter(ctx context.Context, where string, args []any, sor
 	if pageSize <= 0 {
 		pageSize = 100
 	}
-	query := "SELECT filename, filename_sort_key, parent_rel_path, size, imported_at, timeline_at FROM assets WHERE " + where + " ORDER BY " + groupedSortSQL(group, sort)
+	query := "SELECT filename, filename_sort_key, parent_rel_path, size, imported_at, timeline_at, last_played_at FROM assets WHERE " + where + " ORDER BY " + groupedSortSQL(group, sort)
 	if group == assetGroupFolder {
-		query = folderGroupedRankedSQL(where, sort) + "SELECT filename, filename_sort_key, parent_rel_path, size, imported_at, timeline_at FROM ranked ORDER BY " + folderGroupSortSQL(sort)
+		query = folderGroupedRankedSQL(where, sort) + "SELECT filename, filename_sort_key, parent_rel_path, size, imported_at, timeline_at, last_played_at FROM ranked ORDER BY " + folderGroupSortSQL(sort)
 	}
 	rows, err := d.conn.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -571,9 +589,11 @@ func (d *DB) anchorsForFilter(ctx context.Context, where string, args []any, sor
 	var items []libraryAnchorRow
 	for rows.Next() {
 		var item libraryAnchorRow
-		if err := rows.Scan(&item.Filename, &item.FilenameSortKey, &item.ParentRelPath, &item.Size, &item.ImportedAt, &item.TimelineAt); err != nil {
+		var lastPlayedAt sql.NullInt64
+		if err := rows.Scan(&item.Filename, &item.FilenameSortKey, &item.ParentRelPath, &item.Size, &item.ImportedAt, &item.TimelineAt, &lastPlayedAt); err != nil {
 			return LibraryAnchorResult{}, err
 		}
+		item.LastPlayedAt = int64Ptr(lastPlayedAt)
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -699,6 +719,11 @@ func uniformAnchors(sort string, items []libraryAnchorRow, pageSize int) []Libra
 
 func anchorScaleValue(sort string, item libraryAnchorRow) int64 {
 	switch sort {
+	case "last_played_asc", "last_played_desc":
+		if item.LastPlayedAt != nil {
+			return *item.LastPlayedAt
+		}
+		return 0
 	case "imported_asc", "imported_desc":
 		return item.ImportedAt
 	case "size", "size_asc", "size_desc":
@@ -771,7 +796,9 @@ func assetGroupAnchor(item libraryAnchorRow, group string, sort string) (string,
 	switch group {
 	case "day", "month", "year":
 		value := item.TimelineAt
-		if strings.HasPrefix(sort, "imported_") {
+		if strings.HasPrefix(sort, "last_played_") && item.LastPlayedAt != nil {
+			value = *item.LastPlayedAt
+		} else if strings.HasPrefix(sort, "imported_") {
 			value = item.ImportedAt
 		}
 		date := time.Unix(value, 0).Local()
@@ -1249,7 +1276,7 @@ func assetListOptionsFromNeighbor(opts NeighborOptions) AssetListOptions {
 		NFOQuery: opts.NFOQuery, NFOActor: opts.NFOActor, NFOID: opts.NFOID, NFOTag: opts.NFOTag, ManualTag: opts.ManualTag, CombinedTag: opts.CombinedTag, CombinedTags: opts.CombinedTags, TagNodes: opts.TagNodes, AIDescription: opts.AIDescription, AITag: opts.AITag, NFOTitle: opts.NFOTitle, NFOYear: opts.NFOYear,
 		MinWidth: opts.MinWidth, MaxWidth: opts.MaxWidth, MinHeight: opts.MinHeight, MaxHeight: opts.MaxHeight, MatchAnyAxis: opts.MatchAnyAxis,
 		MinDuration: opts.MinDuration, MaxDuration: opts.MaxDuration, MinSize: opts.MinSize, MaxSize: opts.MaxSize, Orientation: opts.Orientation,
-		Rating: opts.Rating, AlbumUnassigned: opts.AlbumUnassigned, AlbumIDs: opts.AlbumIDs, IncludeHidden: opts.IncludeHidden,
+		Rating: opts.Rating, AlbumUnassigned: opts.AlbumUnassigned, AlbumIDs: opts.AlbumIDs, IncludeHidden: opts.IncludeHidden, PlayedOnly: opts.PlayedOnly,
 	}
 }
 
@@ -1365,6 +1392,9 @@ func (d *DB) neighborSide(ctx context.Context, where string, args []any, conditi
 }
 
 func fastMediaNeighborEligible(opts AssetListOptions, contextName string) bool {
+	if opts.PlayedOnly {
+		return false
+	}
 	if contextName != "library" && contextName != "rating" {
 		return false
 	}
@@ -1430,6 +1460,9 @@ ORDER BY candidate.rn`
 func assetFilterSQL(opts AssetListOptions, timeline bool) (string, []any) {
 	where := []string{"is_live = true"}
 	var args []any
+	if opts.PlayedOnly {
+		where = append(where, "media_type = 'video'", "last_played_at IS NOT NULL")
+	}
 	if !opts.IncludeHidden {
 		where = append(where, "hidden = false")
 	}
@@ -1687,6 +1720,17 @@ func nfoFieldFilterSQL(field string) (string, bool) {
 	}
 }
 
+func naturalFilenameOrderSQL(sortColumn, filenameColumn, direction, idColumn string) string {
+	return sortColumn + ` COLLATE "lpicto_natural_numeric" ` + direction +
+		", " + filenameColumn + " " + direction + ", " + idColumn + " " + direction
+}
+
+func naturalFilenameNeighborSQL(operator string) string {
+	key := `filename_sort_key COLLATE "lpicto_natural_numeric"`
+	return "(" + key + " " + operator + " ? OR (" + key + " = ? AND lower(filename) " + operator + " ?) OR (" +
+		key + " = ? AND lower(filename) = ? AND id " + operator + " ?))"
+}
+
 func sortSQL(sort string) string {
 	direction := "DESC"
 	idDirection := "DESC"
@@ -1702,9 +1746,9 @@ func sortSQL(sort string) string {
 	case "timeline_asc":
 		return "sort_time_value ASC, id ASC"
 	case "filename", "filename_asc":
-		return "filename_sort_key ASC, lower(filename) ASC, id ASC"
+		return naturalFilenameOrderSQL("filename_sort_key", "lower(filename)", "ASC", "id")
 	case "filename_desc":
-		return "filename_sort_key DESC, lower(filename) DESC, id DESC"
+		return naturalFilenameOrderSQL("filename_sort_key", "lower(filename)", "DESC", "id")
 	case "size", "size_desc":
 		return "size DESC, id DESC"
 	case "size_asc":
@@ -1713,6 +1757,10 @@ func sortSQL(sort string) string {
 		return "imported_at_value ASC, id ASC"
 	case "imported_desc":
 		return "imported_at_value DESC, id DESC"
+	case "last_played_asc":
+		return "last_played_at_value ASC, id ASC"
+	case "last_played_desc":
+		return "last_played_at_value DESC, id DESC"
 	case "path_asc", "path_desc":
 		return order("lower(rel_path)")
 	case "media_type_asc", "media_type_desc":
@@ -1775,6 +1823,9 @@ func groupedSortSQL(group string, sort string) string {
 }
 
 func groupTimeSQL(sort string) string {
+	if strings.HasPrefix(sort, "last_played_") {
+		return "last_played_at_value"
+	}
 	if strings.HasPrefix(sort, "imported_") {
 		return "imported_at_value"
 	}
@@ -1799,8 +1850,9 @@ func folderGroupedRankedSQL(where string, sort string) string {
   SELECT filtered.*,
     FIRST_VALUE(timeline_at) OVER folder_window AS folder_timeline_at,
     FIRST_VALUE(imported_at) OVER folder_window AS folder_imported_at,
+    FIRST_VALUE(last_played_at) OVER folder_window AS folder_last_played_at,
     FIRST_VALUE(size) OVER folder_window AS folder_size,
-    FIRST_VALUE(filename_sort_key) OVER folder_window AS folder_filename_sort_key,
+    FIRST_VALUE(filename_sort_key COLLATE "lpicto_natural_numeric") OVER folder_window AS folder_filename_sort_key,
     FIRST_VALUE(lower(filename)) OVER folder_window AS folder_filename,
     FIRST_VALUE(id) OVER folder_window AS folder_id
   FROM filtered
@@ -1814,9 +1866,9 @@ func folderGroupSortSQL(sort string) string {
 	case "timeline_asc":
 		groupOrder = "folder_timeline_at ASC, folder_id ASC"
 	case "filename", "filename_asc":
-		groupOrder = "folder_filename_sort_key ASC, folder_filename ASC, folder_id ASC"
+		groupOrder = naturalFilenameOrderSQL("folder_filename_sort_key", "folder_filename", "ASC", "folder_id")
 	case "filename_desc":
-		groupOrder = "folder_filename_sort_key DESC, folder_filename DESC, folder_id DESC"
+		groupOrder = naturalFilenameOrderSQL("folder_filename_sort_key", "folder_filename", "DESC", "folder_id")
 	case "size", "size_desc":
 		groupOrder = "folder_size DESC, folder_id DESC"
 	case "size_asc":
@@ -1825,6 +1877,10 @@ func folderGroupSortSQL(sort string) string {
 		groupOrder = "folder_imported_at ASC, folder_id ASC"
 	case "imported_desc":
 		groupOrder = "folder_imported_at DESC, folder_id DESC"
+	case "last_played_asc":
+		groupOrder = "folder_last_played_at ASC, folder_id ASC"
+	case "last_played_desc":
+		groupOrder = "folder_last_played_at DESC, folder_id DESC"
 	default:
 		groupOrder = "folder_timeline_at DESC, folder_id DESC"
 	}
@@ -1833,6 +1889,11 @@ func folderGroupSortSQL(sort string) string {
 
 func anchorParts(sort string, item libraryAnchorRow) (string, string, string, int64) {
 	switch sort {
+	case "last_played_asc", "last_played_desc":
+		if item.LastPlayedAt != nil {
+			return dateAnchorParts(*item.LastPlayedAt)
+		}
+		return dateAnchorParts(0)
 	case "filename", "filename_asc", "filename_desc":
 		label := filenameAnchorLabel(item.FilenameSortKey)
 		return "name:" + label, label, "letter", 0
@@ -1860,7 +1921,7 @@ func dateAnchorGroups(unix int64) (string, string) {
 }
 
 func isTimeSort(sort string) bool {
-	return sort == "timeline_asc" || sort == "timeline_desc" || sort == "imported_asc" || sort == "imported_desc" || sort == ""
+	return sort == "timeline_asc" || sort == "timeline_desc" || sort == "imported_asc" || sort == "imported_desc" || sort == "last_played_asc" || sort == "last_played_desc" || sort == ""
 }
 
 func sizeAnchorLabel(size int64) string {
@@ -1921,16 +1982,16 @@ func neighborCondition(current model.Asset, sort string, previous bool) (string,
 		key := assetFilenameSortKey(current.Filename, current.FilenameSortKey)
 		name := strings.ToLower(current.Filename)
 		if previous {
-			return "(filename_sort_key < ? OR (filename_sort_key = ? AND lower(filename) < ?) OR (filename_sort_key = ? AND lower(filename) = ? AND id < ?))", []any{key, key, name, key, name, current.ID}, "filename_sort_key DESC, lower(filename) DESC, id DESC"
+			return naturalFilenameNeighborSQL("<"), []any{key, key, name, key, name, current.ID}, naturalFilenameOrderSQL("filename_sort_key", "lower(filename)", "DESC", "id")
 		}
-		return "(filename_sort_key > ? OR (filename_sort_key = ? AND lower(filename) > ?) OR (filename_sort_key = ? AND lower(filename) = ? AND id > ?))", []any{key, key, name, key, name, current.ID}, "filename_sort_key ASC, lower(filename) ASC, id ASC"
+		return naturalFilenameNeighborSQL(">"), []any{key, key, name, key, name, current.ID}, naturalFilenameOrderSQL("filename_sort_key", "lower(filename)", "ASC", "id")
 	case "filename_desc":
 		key := assetFilenameSortKey(current.Filename, current.FilenameSortKey)
 		name := strings.ToLower(current.Filename)
 		if previous {
-			return "(filename_sort_key > ? OR (filename_sort_key = ? AND lower(filename) > ?) OR (filename_sort_key = ? AND lower(filename) = ? AND id > ?))", []any{key, key, name, key, name, current.ID}, "filename_sort_key ASC, lower(filename) ASC, id ASC"
+			return naturalFilenameNeighborSQL(">"), []any{key, key, name, key, name, current.ID}, naturalFilenameOrderSQL("filename_sort_key", "lower(filename)", "ASC", "id")
 		}
-		return "(filename_sort_key < ? OR (filename_sort_key = ? AND lower(filename) < ?) OR (filename_sort_key = ? AND lower(filename) = ? AND id < ?))", []any{key, key, name, key, name, current.ID}, "filename_sort_key DESC, lower(filename) DESC, id DESC"
+		return naturalFilenameNeighborSQL("<"), []any{key, key, name, key, name, current.ID}, naturalFilenameOrderSQL("filename_sort_key", "lower(filename)", "DESC", "id")
 	case "size", "size_desc":
 		if previous {
 			return "(size > ? OR (size = ? AND id > ?))", []any{current.Size, current.Size, current.ID}, "size ASC, id ASC"
@@ -1986,7 +2047,7 @@ width, height, duration, taken_at, imported_at, timeline_at, cache_key, browser_
 scan_status, thumb_status, preview_status, video_poster_status, video_proxy_status,
 rotation, rating,
 metadata_json, nfo_json, nfo_search_text, error, deleted_at, created_at, updated_at,
-hidden, sha256, has_subtitle, has_danmaku FROM ` + source
+hidden, sha256, has_subtitle, has_danmaku, last_played_at FROM ` + source
 }
 
 func assetRatingSQL(source string) string {
@@ -1997,14 +2058,14 @@ func scanAsset(row interface{ Scan(dest ...any) error }) (model.Asset, error) {
 	var asset model.Asset
 	var mime, metadata, nfoJSON, nfoSearchText, errorText sql.NullString
 	var sha256Text sql.NullString
-	var width, height, takenAt, deletedAt sql.NullInt64
+	var width, height, takenAt, deletedAt, lastPlayedAt sql.NullInt64
 	var duration sql.NullFloat64
 	var browserPlayable int
 	err := row.Scan(&asset.ID, &asset.RelPath, &asset.ParentRelPath, &asset.Filename, &asset.FilenameSortKey, &asset.Ext, &asset.MediaType, &mime, &asset.Size, &asset.Mtime,
 		&width, &height, &duration, &takenAt, &asset.ImportedAt, &asset.TimelineAt, &asset.CacheKey, &browserPlayable,
 		&asset.ScanStatus, &asset.ThumbStatus, &asset.PreviewStatus, &asset.VideoPosterStatus, &asset.VideoProxyStatus,
 		&asset.Rotation, &asset.Rating, &metadata, &nfoJSON, &nfoSearchText, &errorText, &deletedAt, &asset.CreatedAt, &asset.UpdatedAt,
-		&asset.Hidden, &sha256Text, &asset.HasSubtitle, &asset.HasDanmaku)
+		&asset.Hidden, &sha256Text, &asset.HasSubtitle, &asset.HasDanmaku, &lastPlayedAt)
 	if err != nil {
 		return model.Asset{}, err
 	}
@@ -2018,6 +2079,7 @@ func scanAsset(row interface{ Scan(dest ...any) error }) (model.Asset, error) {
 	asset.NFOSearchText = stringPtr(nfoSearchText)
 	asset.Error = stringPtr(errorText)
 	asset.DeletedAt = int64Ptr(deletedAt)
+	asset.LastPlayedAt = int64Ptr(lastPlayedAt)
 	asset.SHA256 = stringPtr(sha256Text)
 	asset.BrowserPlayable = browserPlayable == 1
 	asset.Rotation = NormalizeRotation(asset.Rotation)

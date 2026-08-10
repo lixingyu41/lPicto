@@ -1,4 +1,4 @@
-export type MediaViewMode = 'waterfall' | 'list';
+export type MediaViewMode = 'waterfall' | 'list' | 'grid';
 
 export type MediaColumnId =
   | 'media'
@@ -23,8 +23,9 @@ export type MediaColumnId =
   | 'aiTags';
 
 export interface MediaViewPreferences {
-  version: 3;
+  version: number;
   mode: MediaViewMode;
+  videoHoverPreview: boolean;
   visibleColumns: MediaColumnId[];
   columnOrder: MediaColumnId[];
   columnWidths: Partial<Record<MediaColumnId, number>>;
@@ -60,6 +61,12 @@ export const mediaLayoutDefinitions: MediaLayoutDefinition[] = [
     description: '每行一个媒体并显示可配置字段',
     configurableColumns: true,
   },
+  {
+    id: 'grid',
+    label: '网格',
+    description: '固定尺寸卡片按行列排列',
+    configurableColumns: false,
+  },
 ];
 
 export const mediaColumnDefinitions: MediaColumnDefinition[] = [
@@ -90,8 +97,9 @@ const defaultOrder = mediaColumnDefinitions.map((column) => column.id);
 const defaultVisible: MediaColumnId[] = ['media', 'timeline', 'size', 'rating'];
 
 export const defaultMediaViewPreferences: MediaViewPreferences = {
-  version: 3,
+  version: 4,
   mode: 'waterfall',
+  videoHoverPreview: true,
   visibleColumns: defaultVisible,
   columnOrder: defaultOrder,
   columnWidths: {},
@@ -117,7 +125,7 @@ export function normalizeMediaViewPreferences(value: Partial<MediaViewPreference
   const requestedOrder = Array.isArray(value?.columnOrder) ? value.columnOrder.filter((id): id is MediaColumnId => known.has(id as MediaColumnId)) : [];
   const columnOrder = [...requestedOrder, ...defaultOrder.filter((id) => !requestedOrder.includes(id))];
   const requestedVisible = Array.isArray(value?.visibleColumns) ? value.visibleColumns.filter((id): id is MediaColumnId => known.has(id as MediaColumnId)) : [];
-  if (value?.version !== 3) {
+  if (value?.version !== 3 && value?.version !== 4) {
     if (!requestedVisible.includes('aiTags')) requestedVisible.push('aiTags');
     if (!requestedVisible.includes('palette')) requestedVisible.push('palette');
   }
@@ -130,8 +138,9 @@ export function normalizeMediaViewPreferences(value: Partial<MediaViewPreference
     }
   });
   return {
-    version: 3,
-    mode: value?.mode === 'list' ? 'list' : 'waterfall',
+    version: 4,
+    mode: value?.mode === 'list' || value?.mode === 'grid' ? value.mode : 'waterfall',
+    videoHoverPreview: value?.videoHoverPreview !== false,
     visibleColumns,
     columnOrder,
     columnWidths,

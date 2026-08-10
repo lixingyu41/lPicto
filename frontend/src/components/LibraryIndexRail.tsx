@@ -1,9 +1,9 @@
-import { useMemo, useRef, useState, type CSSProperties } from 'react';
-import type { LibraryAnchor, SortKey } from '../types/api';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import type { LibraryAnchor } from '../types/api';
 
 interface Props {
   anchors: LibraryAnchor[];
-  sort: SortKey;
+  hideLabels?: boolean;
   scrollRatio: number;
   totalCount: number;
   pageSize: number;
@@ -21,12 +21,76 @@ interface PickResult {
   position: number;
 }
 
-export default function LibraryIndexRail({ anchors, sort, scrollRatio, totalCount, pageSize, onSeek }: Props) {
+export default function LibraryIndexRail({ anchors, hideLabels = false, scrollRatio, totalCount, pageSize, onSeek }: Props) {
   const railRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
+  const wheelAnimationRef = useRef(0);
+  const wheelTargetRef = useRef<number | null>(null);
+  const wheelFrameTimeRef = useRef(0);
   const [active, setActive] = useState<ActiveBubble | null>(null);
   const [dragging, setDragging] = useState(false);
   const visibleAnchors = useMemo(() => anchors.filter((anchor) => anchor.position >= 0 && anchor.position <= 1), [anchors]);
+  const visibleMarks = useMemo(() => sampleAnchors(visibleAnchors, 8), [visibleAnchors]);
+
+  function cancelWheelAnimation() {
+    if (wheelAnimationRef.current) window.cancelAnimationFrame(wheelAnimationRef.current);
+    wheelAnimationRef.current = 0;
+    wheelTargetRef.current = null;
+    wheelFrameTimeRef.current = 0;
+  }
+
+  useEffect(() => {
+    const rail = railRef.current;
+    if (!rail) return undefined;
+    const scrollElement = rail.parentElement?.querySelector<HTMLElement>('.grid-scroll');
+    if (!scrollElement) return undefined;
+    const cancelForGridInput = () => cancelWheelAnimation();
+    const handleWheel = (event: WheelEvent) => {
+      const unit = event.deltaMode === 1
+        ? 16
+        : event.deltaMode === 2
+          ? scrollElement.clientHeight
+          : 1;
+      const delta = event.deltaY !== 0 ? event.deltaY : event.deltaX;
+      if (delta === 0) return;
+      event.preventDefault();
+      const maxScroll = Math.max(0, scrollElement.scrollHeight - scrollElement.clientHeight);
+      const currentTarget = wheelTargetRef.current ?? scrollElement.scrollTop;
+      wheelTargetRef.current = Math.min(maxScroll, Math.max(0, currentTarget + delta * unit * 2));
+      if (wheelAnimationRef.current) return;
+      wheelFrameTimeRef.current = performance.now();
+      const animate = (now: number) => {
+        const target = wheelTargetRef.current;
+        if (target === null) {
+          cancelWheelAnimation();
+          return;
+        }
+        const elapsed = Math.min(48, Math.max(1, now - wheelFrameTimeRef.current));
+        wheelFrameTimeRef.current = now;
+        const distance = target - scrollElement.scrollTop;
+        if (Math.abs(distance) < 0.5) {
+          scrollElement.scrollTop = target;
+          cancelWheelAnimation();
+          return;
+        }
+        const progress = 1 - Math.exp(-elapsed / 70);
+        scrollElement.scrollTop += distance * progress;
+        wheelAnimationRef.current = window.requestAnimationFrame(animate);
+      };
+      wheelAnimationRef.current = window.requestAnimationFrame(animate);
+    };
+    rail.addEventListener('wheel', handleWheel, { passive: false });
+    scrollElement.addEventListener('wheel', cancelForGridInput, { passive: true });
+    scrollElement.addEventListener('pointerdown', cancelForGridInput, { passive: true });
+    scrollElement.addEventListener('touchstart', cancelForGridInput, { passive: true });
+    return () => {
+      rail.removeEventListener('wheel', handleWheel);
+      scrollElement.removeEventListener('wheel', cancelForGridInput);
+      scrollElement.removeEventListener('pointerdown', cancelForGridInput);
+      scrollElement.removeEventListener('touchstart', cancelForGridInput);
+      cancelWheelAnimation();
+    };
+  }, [visibleAnchors.length]);
 
   if (visibleAnchors.length === 0) return null;
   const thumbPosition = clampRatio(dragging && active ? active.position : scrollRatio);
@@ -66,6 +130,7 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, totalCoun
       className="library-index-rail"
       ref={railRef}
       onPointerDown={(event) => {
+        cancelWheelAnimation();
         event.preventDefault();
         event.currentTarget.setPointerCapture(event.pointerId);
         draggingRef.current = true;
@@ -95,24 +160,23 @@ export default function LibraryIndexRail({ anchors, sort, scrollRatio, totalCoun
       }}
       onPointerLeave={() => {
         if (!draggingRef.current) {
+          cancelWheelAnimation();
           setActive(null);
         }
       }}
     >
       <div className="library-index-track" />
       <div className="library-index-scroll-thumb" style={railPositionStyle(thumbPosition)} />
-      {visibleAnchors.map((anchor) => (
+      {visibleMarks.map((anchor) => (
         <button
           className={`library-index-mark ${anchor.kind}`}
           key={anchor.key}
           style={railPositionStyle(anchor.position)}
-          title={anchor.label}
+          title={hideLabels ? undefined : anchor.label}
           type="button"
-        >
-          {showInlineLabel(sort) && <span>{anchor.label}</span>}
-        </button>
+        />
       ))}
-      {active && (
+      {active && !hideLabels && (
         <div className="library-index-bubble" style={railPositionStyle(active.position)}>
           {active.label}
         </div>
@@ -152,6 +216,15 @@ function pageForRatio(anchors: LibraryAnchor[], ratio: number, totalCount: numbe
   return sorted[sorted.length - 1].page;
 }
 
-function showInlineLabel(sort: SortKey) {
-  return sort === 'filename' || sort === 'filename_asc' || sort === 'filename_desc' || sort === 'size' || sort === 'size_asc' || sort === 'size_desc';
+function sampleAnchors(anchors: LibraryAnchor[], limit: number) {
+  if (anchors.length <= limit) return anchors;
+  const result: LibraryAnchor[] = [];
+  const used = new Set<number>();
+  for (let index = 0; index < limit; index += 1) {
+    const sourceIndex = Math.round((index * (anchors.length - 1)) / (limit - 1));
+    if (used.has(sourceIndex)) continue;
+    used.add(sourceIndex);
+    result.push(anchors[sourceIndex]);
+  }
+  return result;
 }

@@ -265,6 +265,8 @@ func (s *Server) ensureVideoProxyRuntime(asset model.Asset, startSeconds float64
 }
 
 func (s *Server) serveCachedVideoProxy(w http.ResponseWriter, r *http.Request, asset model.Asset, state *videoProxyRuntime, sessionID string) {
+	releaseCache := s.cachePolicy.Pin(state.DestPath)
+	defer releaseCache()
 	file, err := os.Open(state.DestPath)
 	if err != nil {
 		s.markVideoProxyError(state.CacheKey, err)
@@ -278,6 +280,7 @@ func (s *Server) serveCachedVideoProxy(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	cacheSettings := s.videoProxyCacheSettings(r.Context())
+	s.cachePolicy.Touch(r.Context(), "video-proxies", state.CacheKey, state.DestPath)
 	s.markVideoProxyStream(state.CacheKey, sessionID, true, cacheSettings)
 	defer s.markVideoProxyStream(state.CacheKey, sessionID, false, cacheSettings)
 	w.Header().Set("Content-Type", "video/mp4")
@@ -289,6 +292,10 @@ func (s *Server) serveCachedVideoProxy(w http.ResponseWriter, r *http.Request, a
 }
 
 func (s *Server) serveLiveVideoProxy(w http.ResponseWriter, r *http.Request, asset model.Asset, state *videoProxyRuntime, sessionID string) {
+	releaseDest := s.cachePolicy.Pin(state.DestPath)
+	defer releaseDest()
+	releaseTemp := s.cachePolicy.Pin(state.TempPath)
+	defer releaseTemp()
 	cacheSettings := s.videoProxyCacheSettings(r.Context())
 	s.markVideoProxyStream(state.CacheKey, sessionID, true, cacheSettings)
 	defer s.markVideoProxyStream(state.CacheKey, sessionID, false, cacheSettings)
@@ -352,6 +359,10 @@ func openGrowingFile(ctx context.Context, state *videoProxyRuntime) (*os.File, e
 }
 
 func (s *Server) runVideoProxyTranscode(asset model.Asset, runtimeKey string, startSeconds float64, dest string, tmp string) {
+	releaseDest := s.cachePolicy.Pin(dest)
+	defer releaseDest()
+	releaseTemp := s.cachePolicy.Pin(tmp)
+	defer releaseTemp()
 	_ = os.Remove(tmp)
 	source, err := s.store.PhotoPath(asset.RelPath)
 	if err != nil {
@@ -689,6 +700,8 @@ func (s *Server) finishVideoProxyTranscode(asset model.Asset, runtimeKey string,
 		_ = os.Remove(tmp)
 	} else {
 		_ = touchFile(dest, now)
+		assetID := asset.ID
+		s.cachePolicy.Register(context.Background(), "video-proxies", runtimeKey, dest, &assetID, 0)
 	}
 	if dbErr := s.db.SetAssetWorkStatus(context.Background(), asset.ID, "video_proxy_status", status, message); dbErr != nil && s.logger != nil {
 		s.logger.Warn("set video proxy final status failed", "assetID", asset.ID, "status", status, "error", dbErr)

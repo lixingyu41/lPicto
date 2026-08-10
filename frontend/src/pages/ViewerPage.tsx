@@ -11,7 +11,7 @@ import {
 } from 'react';
 import { useLocation, useNavigate, useParams, useSearchParams, type Location } from 'react-router-dom';
 import { Check, FolderOpen, GripHorizontal, LogOut, Plus, X } from 'lucide-react';
-import { api } from '../api/client';
+import { api, assetThumbUrl } from '../api/client';
 import type {
   Asset,
 	AssetAIResult,
@@ -32,12 +32,12 @@ import RatingStars, { normalizeAssetRating } from '../components/RatingStars';
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format';
 import ImageViewer from '../viewer/ImageViewer';
 import VideoViewer, { type VideoPlaybackInfo } from '../viewer/VideoViewer';
-import AudioViewer from '../viewer/AudioViewer';
+import AudioViewer, { type AudioPlaybackInfo } from '../viewer/AudioViewer';
 import { viewerAudioOutputBridge } from '../viewer/audioOutputBridge';
 import type { ViewerMediaLayerMode } from '../viewer/mediaLayer';
 import { useKeyboard } from '../hooks/useKeyboard';
-import { useRestoreSidebarState, type SidebarReturnState } from '../components/SidebarContext';
-import { nextRotation } from '../utils/rotation';
+import { useRestoreSidebarState, useViewerInfoPanel, type SidebarReturnState } from '../components/SidebarContext';
+import { nextRotation, rotatedCoverStyle } from '../utils/rotation';
 import {
   decodeReturnState,
   emitAssetRatingChanged,
@@ -75,6 +75,12 @@ interface ViewerPageProps {
 interface ViewerLocationState {
   backgroundLocation?: Location;
   initialAsset?: Asset;
+}
+
+interface SafariFullscreenVideo extends HTMLVideoElement {
+  webkitDisplayingFullscreen?: boolean;
+  webkitEnterFullscreen?: () => void;
+  webkitExitFullscreen?: () => void;
 }
 
 const wheelStepThreshold = 60;
@@ -117,6 +123,7 @@ const neighborParamKeys = new Set([
   'nfoTitle',
   'nfoYear',
   'orientation',
+  'playedOnly',
   'q',
   'rating',
   'recursive',
@@ -151,6 +158,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const [viewerPrefs, setViewerPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
   const [playbackRate, setPlaybackRate] = useState(() => loadViewerPrefs().playbackRate);
   const [videoPlaybackInfo, setVideoPlaybackInfo] = useState<VideoPlaybackInfo | null>(null);
+  const [audioPlaybackInfo, setAudioPlaybackInfo] = useState<AudioPlaybackInfo | null>(null);
   const [videoProxyRuntime, setVideoProxyRuntime] = useState<VideoSegmentStatus | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deletePlan, setDeletePlan] = useState<AssetDeletePlan | null>(null);
@@ -161,6 +169,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const [recordDeleteError, setRecordDeleteError] = useState<string | null>(null);
   const [recordDeleteSubmitting, setRecordDeleteSubmitting] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  const [fullscreenFallback, setFullscreenFallback] = useState(false);
   const [assetInfoCollapsed, setAssetInfoCollapsed] = useState(false);
   const [viewerPanelWidth, setViewerPanelWidth] = useState(() => loadViewerPanelWidth());
   const [viewerAvailableWidth, setViewerAvailableWidth] = useState(() => window.innerWidth);
@@ -175,6 +184,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const mediaDetailsPosition = useMemo(() => ({ x: 16, y: 16 }), []);
   const viewerReturnStateRef = useRef(decodeReturnState<Partial<SidebarReturnState>>(searchParams.get('returnState'), {}));
   const restoreSidebarState = useRestoreSidebarState();
+  const viewerInfoPanelState = useViewerInfoPanel();
   const viewerLocationState = location.state as ViewerLocationState | null;
   const backgroundLocation = viewerLocationState?.backgroundLocation;
   const assetId = Number(params.assetId || assetIdFromPath(location.pathname) || 0);
@@ -299,6 +309,16 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       return 'idle';
     });
   }, [backgroundVideoPreloadKey, currentMediaKey, currentPriorityReady, indicatorAssets, mediaWindowKeys, preloadRangeKeys, preparedMediaStatus]);
+  const viewerNeighborSlots = useMemo(
+    () => indicatorAssets.flatMap((asset, index) => (
+      index === viewerIndicatorCenter ? [] : [{ asset, status: viewerPreloadIndicators[index] }]
+    )),
+    [indicatorAssets, viewerPreloadIndicators],
+  );
+  const previousAsset = activeNeighbors?.previous[0];
+  const nextAsset = activeNeighbors?.next[0];
+  const previousReady = Boolean(previousAsset && preparedMediaStatus[mediaReadyKey(previousAsset.id, previousAsset.cacheKey)] === 'ready');
+  const nextReady = Boolean(nextAsset && preparedMediaStatus[mediaReadyKey(nextAsset.id, nextAsset.cacheKey)] === 'ready');
 
   useLayoutEffect(() => {
     if (!current) return;
@@ -522,6 +542,10 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     setVideoPlaybackInfo(info);
   }, []);
 
+  const handleCurrentAudioPlaybackInfoChange = useCallback((info: AudioPlaybackInfo | null) => {
+    setAudioPlaybackInfo(info);
+  }, []);
+
   const handleMediaReady = useCallback((sourceAssetId: number, sourceCacheKey: string) => {
     const key = mediaReadyKey(sourceAssetId, sourceCacheKey);
     setPreparedMediaStatus((existing) => existing[key] === 'ready' ? existing : { ...existing, [key]: 'ready' });
@@ -646,7 +670,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     }
     void (async () => {
       const context = searchParams.get('context');
-      const fallback = context === 'folder' ? '/folders' : context === 'album' ? '/albums' : '/library';
+      const fallback = context === 'folder' ? '/folders' : context === 'album' ? '/albums' : context === 'recent' ? '/recent' : '/library';
       const returnPath = searchParams.get('returnPath');
       const targetPath = returnPathMatchesFallback(returnPath, fallback) ? returnPath! : fallback;
       const restoreState = await returnStateForCurrentAsset(searchParams, current?.id);
@@ -866,10 +890,42 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       void document.exitFullscreen();
       return;
     }
-    if (target) {
-      void target.requestFullscreen();
+
+    const video = target?.querySelector<HTMLVideoElement>('[data-layer-mode="active"] video');
+    const safariVideo = video as SafariFullscreenVideo | undefined;
+    if (safariVideo?.webkitDisplayingFullscreen) {
+      safariVideo.webkitExitFullscreen?.();
+      return;
     }
-  }, []);
+    if (fullscreenFallback) {
+      setFullscreenFallback(false);
+      setFullscreen(false);
+      return;
+    }
+
+    // iPhone Safari does not expose the element Fullscreen API. Its native
+    // video presentation API must be invoked synchronously from this click.
+    if (safariVideo?.webkitEnterFullscreen && document.fullscreenEnabled !== true) {
+      try {
+        safariVideo.webkitEnterFullscreen();
+        setFullscreen(true);
+        return;
+      } catch {
+        // Fall through to the viewport-covering mode below.
+      }
+    }
+
+    if (target?.requestFullscreen) {
+      void target.requestFullscreen().catch(() => {
+        setFullscreenFallback(true);
+        setFullscreen(true);
+      });
+      return;
+    }
+
+    setFullscreenFallback(true);
+    setFullscreen(true);
+  }, [fullscreenFallback]);
 
   const startViewerPanelResize = useCallback(
     (event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -904,10 +960,29 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       const target = viewerBodyRef.current;
       const fullscreenElement = document.fullscreenElement;
       setFullscreen(Boolean(fullscreenElement && target && (fullscreenElement === target || fullscreenElement.contains(target))));
+      if (fullscreenElement) setFullscreenFallback(false);
     }
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
+
+  useEffect(() => {
+    const videos = viewerBodyRef.current?.querySelectorAll<HTMLVideoElement>('video');
+    if (!videos?.length) return undefined;
+    const onBegin = () => {
+      setFullscreenFallback(false);
+      setFullscreen(true);
+    };
+    const onEnd = () => setFullscreen(false);
+    videos.forEach((video) => {
+      video.addEventListener('webkitbeginfullscreen', onBegin);
+      video.addEventListener('webkitendfullscreen', onEnd);
+    });
+    return () => videos.forEach((video) => {
+      video.removeEventListener('webkitbeginfullscreen', onBegin);
+      video.removeEventListener('webkitendfullscreen', onEnd);
+    });
+  }, [mediaWindow]);
 
   useKeyboard(
     useCallback(
@@ -947,6 +1022,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       sidecars={sidecars}
       tags={assetTags}
       preloadIndicators={viewerPreloadIndicators}
+      neighborSlots={viewerNeighborSlots}
       aiResult={assetAI}
       aiError={assetAIError}
       aiTagError={aiTagError}
@@ -1031,6 +1107,10 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onPriorityPreloadComplete={handlePriorityPreloadComplete}
           onPlaybackInfoChange={handleCurrentPlaybackInfoChange}
           onPlaybackEnded={playNextAsset}
+          onPrevious={() => previousAsset && goAsset(previousAsset, -1)}
+          onNext={() => nextAsset && goAsset(nextAsset, 1)}
+          previousEnabled={previousReady}
+          nextEnabled={nextReady}
           onPlaybackModeChange={updatePlaybackMode}
           onPlaybackRateChange={updatePlaybackRate}
           onRotate={() => void rotateCurrentAsset()}
@@ -1054,7 +1134,12 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onDeleteRecord={openRecordDeleteDialog}
           onMediaError={handleMediaError}
           onMediaReady={handleMediaReady}
+          onPlaybackInfoChange={handleCurrentAudioPlaybackInfoChange}
           onPlaybackEnded={playNextAsset}
+          onPrevious={() => previousAsset && goAsset(previousAsset, -1)}
+          onNext={() => nextAsset && goAsset(nextAsset, 1)}
+          previousEnabled={previousReady}
+          nextEnabled={nextReady}
           onPlaybackModeChange={updatePlaybackMode}
           onPlaybackRateChange={updatePlaybackRate}
           onToggleMediaDetails={() => setMediaDetailsOpen((open) => !open)}
@@ -1073,7 +1158,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     <>
       <section
         ref={viewerRef}
-        className={overlay ? 'viewer-page viewer-overlay' : 'viewer-page'}
+        className={`${overlay ? 'viewer-page viewer-overlay' : 'viewer-page'}${viewerInfoPanelState.visible ? '' : ' viewer-info-hidden'}${fullscreenFallback ? ' viewer-fullscreen-fallback' : ''}`}
         style={viewerStyle}
       >
         <div
@@ -1095,22 +1180,27 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
               asset={current}
               containerRef={viewerBodyRef}
               initialPosition={mediaDetailsPosition}
-              playbackInfo={videoPlaybackInfo}
+              audioPlaybackInfo={audioPlaybackInfo}
+              videoPlaybackInfo={videoPlaybackInfo}
               runtime={currentVideoProxyRuntime}
               onClose={() => setMediaDetailsOpen(false)}
             />
           )}
         </div>
-        <button
-          aria-label="调整查看器信息栏宽度"
-          className="viewer-info-resize-handle"
-          title="拖动调整查看器信息栏宽度"
-          type="button"
-          onPointerDown={startViewerPanelResize}
-        />
-        <aside className="viewer-info-panel" data-viewer-wheel-control>
-          {viewerInfoPanel}
-        </aside>
+        {viewerInfoPanelState.visible && (
+          <>
+            <button
+              aria-label="调整查看器信息栏宽度"
+              className="viewer-info-resize-handle"
+              title="拖动调整查看器信息栏宽度"
+              type="button"
+              onPointerDown={startViewerPanelResize}
+            />
+            <aside className="viewer-info-panel" data-viewer-wheel-control>
+              {viewerInfoPanel}
+            </aside>
+          </>
+        )}
       </section>
       {deleteDialogOpen && (
         <AssetDeleteDialog
@@ -1212,8 +1302,9 @@ function ViewerSidebarPanel({
   error,
   sidecarError,
   sidecars,
-  tags,
+	tags,
 	preloadIndicators,
+	neighborSlots,
 	aiResult,
 	aiError,
   aiTagError,
@@ -1238,8 +1329,9 @@ function ViewerSidebarPanel({
   error: string | null;
   sidecarError: string | null;
   sidecars: AssetSidecars | null;
-  tags: AssetTag[];
+	tags: AssetTag[];
 	preloadIndicators: ViewerLoadIndicatorStatus[];
+	neighborSlots: ViewerNeighborSlot[];
 	aiResult: AssetAIResult | null;
 	aiError: string | null;
   aiTagError: string | null;
@@ -1390,6 +1482,76 @@ function ViewerSidebarPanel({
           {nfoGroups.length === 0 && nfoFieldEntries.length === 0 && sidecars.nfo.text && <pre>{sidecars.nfo.text}</pre>}
         </div>
       )}
+      <ViewerNeighborThumbnails slots={neighborSlots} />
+    </div>
+  );
+}
+
+interface ViewerNeighborSlot {
+  asset?: Asset;
+  status: ViewerLoadIndicatorStatus;
+}
+
+function ViewerNeighborThumbnails({ slots }: { slots: ViewerNeighborSlot[] }) {
+  const previous = slots.slice(0, viewerRetainRadius);
+  const next = slots.slice(viewerRetainRadius, viewerRetainRadius * 2);
+  return (
+    <section className="viewer-neighbor-thumbnails" aria-label="前后媒体">
+      <div className="viewer-neighbor-thumbnail-grid">
+        {previous.map((slot, index) => (
+          <ViewerNeighborThumbnail key={slot.asset ? mediaReadyKey(slot.asset.id, slot.asset.cacheKey) : `previous-${index}`} slot={slot} />
+        ))}
+      </div>
+      <div className="viewer-neighbor-thumbnail-divider" aria-hidden="true" />
+      <div className="viewer-neighbor-thumbnail-grid">
+        {next.map((slot, index) => (
+          <ViewerNeighborThumbnail key={slot.asset ? mediaReadyKey(slot.asset.id, slot.asset.cacheKey) : `next-${index}`} slot={slot} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ViewerNeighborThumbnail({ slot }: { slot: ViewerNeighborSlot }) {
+  const frameRef = useRef<HTMLDivElement | null>(null);
+  const [frameSize, setFrameSize] = useState({ width: 0, height: 0 });
+  useLayoutEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const update = () => {
+      const rect = frame.getBoundingClientRect();
+      setFrameSize({ width: rect.width, height: rect.height });
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(frame);
+    return () => observer.disconnect();
+  }, []);
+
+  const asset = slot.asset;
+  const showThumbnail = Boolean(asset && (asset.mediaType === 'audio' || asset.thumbStatus === 'ready'));
+  return (
+    <div
+      className={`viewer-neighbor-thumbnail${asset ? '' : ' is-empty'}`}
+      ref={frameRef}
+      title={asset?.displayTitle || asset?.filename || '没有媒体'}
+    >
+      {showThumbnail && asset && (
+        <img
+          alt={asset.displayTitle || asset.filename}
+          draggable={false}
+          src={assetThumbUrl(asset)}
+          style={rotatedCoverStyle(asset, frameSize)}
+          onError={(event) => {
+            event.currentTarget.hidden = true;
+          }}
+        />
+      )}
+      <span
+        className={`sidebar-viewer-preload-dot viewer-neighbor-thumbnail-status ${slot.status}`}
+        aria-label={slot.status === 'ready' ? '加载好了' : slot.status === 'loading' ? '加载过程中' : '没有加载'}
+        title={slot.status === 'ready' ? '加载好了' : slot.status === 'loading' ? '加载过程中' : '没有加载'}
+      />
     </div>
   );
 }
@@ -1630,6 +1792,19 @@ function videoPlaybackInfoLabel(info: VideoPlaybackInfo | null) {
   return info.playbackStateLabel;
 }
 
+function audioPlaybackInfoLabel(info: AudioPlaybackInfo | null) {
+  if (!info || !info.sourceReady) return info?.proxyProgress ? `兼容转换 ${Math.round(info.proxyProgress * 100)}%` : '准备中';
+  if (info.playing) return '播放中';
+  if (info.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return '加载中';
+  return '已暂停';
+}
+
+function playbackTransferBitrateLabel(info: VideoPlaybackInfo | null) {
+  if (!info) return '等待统计';
+  if (info.networkBytesPerSecond <= 0) return '当前无传输';
+  return formatBitrate(info.networkBytesPerSecond * 8);
+}
+
 function videoProxyRuntimeLabel(runtime: VideoSegmentStatus) {
   if (runtime.message) return runtime.message;
   if (runtime.status === 'cached' || runtime.cached) return '已缓存';
@@ -1641,16 +1816,18 @@ function videoProxyRuntimeLabel(runtime: VideoSegmentStatus) {
 
 function MediaDetailsCard({
   asset,
+  audioPlaybackInfo,
   containerRef,
   initialPosition,
-  playbackInfo,
+  videoPlaybackInfo,
   runtime,
   onClose,
 }: {
   asset: Asset;
+  audioPlaybackInfo: AudioPlaybackInfo | null;
   containerRef: RefObject<HTMLDivElement | null>;
   initialPosition: { x: number; y: number };
-  playbackInfo: VideoPlaybackInfo | null;
+  videoPlaybackInfo: VideoPlaybackInfo | null;
   runtime: VideoSegmentStatus | null;
   onClose: () => void;
 }) {
@@ -1681,8 +1858,8 @@ function MediaDetailsCard({
     const card = cardRef.current;
     if (!container || !card) return;
     const measure = () => {
-      const player = container.querySelector<HTMLElement>('.video-frame, .image-stage');
-      const media = container.querySelector<HTMLElement>('.viewer-video, .viewer-image');
+      const player = container.querySelector<HTMLElement>('.video-frame, .image-stage, .audio-stage');
+      const media = container.querySelector<HTMLElement>('.viewer-video, .viewer-image, .audio-artwork-shell');
       const windowRect = container.getBoundingClientRect();
       const playerRect = player?.getBoundingClientRect();
       const mediaRect = media?.getBoundingClientRect();
@@ -1700,8 +1877,8 @@ function MediaDetailsCard({
     const observer = new ResizeObserver(measure);
     observer.observe(container);
     observer.observe(card);
-    const player = container.querySelector<HTMLElement>('.video-frame, .image-stage');
-    const media = container.querySelector<HTMLElement>('.viewer-video, .viewer-image');
+    const player = container.querySelector<HTMLElement>('.video-frame, .image-stage, .audio-stage');
+    const media = container.querySelector<HTMLElement>('.viewer-video, .viewer-image, .audio-artwork-shell');
     if (player) observer.observe(player);
     if (media) observer.observe(media);
     const timer = window.setInterval(measure, 500);
@@ -1715,7 +1892,7 @@ function MediaDetailsCard({
     setPosition(clampPosition(initialPosition));
   }, [clampPosition, initialPosition.x, initialPosition.y]);
 
-  const rows = mediaDetailRows(asset, playbackInfo, layout, runtime);
+  const rows = mediaDetailRows(asset, videoPlaybackInfo, audioPlaybackInfo, layout, runtime);
   const runtimeProgress = runtime ? Math.round(Math.min(1, Math.max(0, runtime.progress || 0)) * 100) : 0;
   return (
     <div
@@ -1768,7 +1945,6 @@ function MediaDetailsCard({
           <X size={16} />
         </button>
       </div>
-      <div className="viewer-media-details-name" title={asset.filename}>{asset.filename}</div>
       <dl className="viewer-media-details-list">
         {rows.map((row) => (
           <div key={row.label}>
@@ -1788,7 +1964,8 @@ function MediaDetailsCard({
 
 function mediaDetailRows(
   asset: Asset,
-  info: VideoPlaybackInfo | null,
+  videoInfo: VideoPlaybackInfo | null,
+  audioInfo: AudioPlaybackInfo | null,
   layout: {
     mediaHeight: number;
     mediaWidth: number;
@@ -1799,58 +1976,51 @@ function mediaDetailRows(
   },
   runtime: VideoSegmentStatus | null,
 ) {
-  const rows = [
-    { label: '媒体类型', value: asset.mediaType === 'video' ? '视频' : asset.mediaType === 'audio' ? '音频' : '图片' },
-    { label: asset.mediaType === 'video' ? '视频分辨率' : asset.mediaType === 'audio' ? '全局封面尺寸' : '图片分辨率', value: asset.mediaType === 'audio' ? '1024 x 1024 px' : formatDimensions(asset.width, asset.height) },
+  const layoutRows = [
     { label: '当前显示尺寸', value: formatDimensions(layout.mediaWidth, layout.mediaHeight) },
     { label: '播放器区域', value: formatDimensions(layout.playerWidth, layout.playerHeight) },
     { label: '播放器窗口', value: `${formatDimensions(layout.windowWidth, layout.windowHeight)} · 宽 ${layout.windowWidth}px` },
   ];
+
+  if (asset.mediaType === 'image') {
+    return [{ label: '显示状态', value: layout.mediaWidth > 0 && layout.mediaHeight > 0 ? '已显示' : '准备中' }, ...layoutRows];
+  }
+
   if (asset.mediaType === 'audio') {
-    rows.splice(1, 0,
+    const bufferedPercent = audioInfo?.duration
+      ? Math.round(Math.min(1, Math.max(0, audioInfo.bufferedEnd / audioInfo.duration)) * 100)
+      : 0;
+    return [
+      { label: '播放状态', value: audioPlaybackInfoLabel(audioInfo) },
       { label: '播放来源', value: asset.browserPlayable ? '原文件按需读取' : 'FLAC 无损兼容缓存' },
-      { label: '播放位置', value: `0:00 / ${formatDuration(asset.duration || 0)}` },
-    );
-    rows.push(
-      { label: '音频码率', value: formatBitrate(asset.audioBitrate) },
-      { label: '总码率', value: formatBitrate(asset.overallBitrate) },
-      { label: '音频编码', value: asset.audioCodec || '未知' },
-      { label: '封装格式', value: asset.container || '未知' },
-      { label: '源文件总大小', value: formatBytes(asset.size) },
-    );
-    return rows;
+      { label: '播放位置', value: `${formatDuration(audioInfo?.currentTime ?? 0)} / ${formatDuration(audioInfo?.duration || asset.duration || 0)}` },
+      { label: '播放速度', value: `${formatDecimal(audioInfo?.playbackRate || 1)}x` },
+      { label: '缓存进度', value: audioInfo?.duration ? `${bufferedPercent}% · 至 ${formatDuration(audioInfo.bufferedEnd)}` : '等待媒体信息' },
+      ...layoutRows,
+    ];
   }
-  if (asset.mediaType !== 'video') return rows;
-  const bufferedPercent = info?.duration ? Math.round(Math.min(1, Math.max(0, info.bufferedEnd / info.duration)) * 100) : 0;
-  const droppedPercent = info?.totalFrames ? (info.droppedFrames / info.totalFrames) * 100 : 0;
-  const playbackRows = [{ label: '播放状态', value: videoPlaybackInfoLabel(info) }];
-  if (info?.notPlayingReason) {
-    playbackRows.push({ label: '未播放原因', value: info.notPlayingReason });
-    playbackRows.push({ label: '原因详情', value: videoNotPlayingDetail(info, runtime) });
+
+  const bufferedPercent = videoInfo?.duration ? Math.round(Math.min(1, Math.max(0, videoInfo.bufferedEnd / videoInfo.duration)) * 100) : 0;
+  const droppedPercent = videoInfo?.totalFrames ? (videoInfo.droppedFrames / videoInfo.totalFrames) * 100 : 0;
+  const rows = [{ label: '播放状态', value: videoPlaybackInfoLabel(videoInfo) }];
+  if (videoInfo?.notPlayingReason) {
+    rows.push({ label: '未播放原因', value: videoInfo.notPlayingReason });
+    rows.push({ label: '原因详情', value: videoNotPlayingDetail(videoInfo, runtime) });
   }
-  playbackRows.push(
-    { label: '播放位置', value: `${formatDuration(info?.currentTime ?? 0)} / ${formatDuration(info?.duration || asset.duration || 0)}` },
-    { label: '播放来源', value: asset.browserPlayable ? '原文件按需读取' : 'HLS 实时分片转码' },
-  );
-  rows.splice(1, 0, ...playbackRows);
   rows.push(
-    { label: '当前分辨率', value: formatDimensions(info?.decodedWidth, info?.decodedHeight) },
-    { label: '视频帧率', value: asset.fps ? `${formatDecimal(asset.fps)} FPS` : '未知' },
-    { label: '视频码率', value: formatBitrate(asset.videoBitrate) },
-    { label: '音频码率', value: formatBitrate(asset.audioBitrate) },
-    { label: '总码率', value: formatBitrate(asset.overallBitrate) },
-    { label: '视频编码', value: asset.videoCodec || '未知' },
-    { label: '音频编码', value: asset.audioCodec || '未知' },
-    { label: '封装格式', value: asset.container || '未知' },
-    { label: '播放速度', value: `${formatDecimal(info?.playbackRate || 1)}x` },
-    { label: '网络加载速度', value: info ? `${formatBytes(Math.round(info.networkBytesPerSecond))}/s` : '等待统计' },
-    { label: '当前分片大小', value: currentSegmentSizeLabel(asset, info, runtime) },
-    { label: '浏览器缓存', value: browserMediaCacheLabel(asset, info, runtime) },
+    { label: '播放位置', value: `${formatDuration(videoInfo?.currentTime ?? 0)} / ${formatDuration(videoInfo?.duration || asset.duration || 0)}` },
+    { label: '播放来源', value: asset.browserPlayable ? '原文件按需读取' : 'HLS 实时分片转码' },
+    { label: '播放分辨率', value: formatDimensions(videoInfo?.decodedWidth, videoInfo?.decodedHeight) },
+    { label: '播放速度', value: `${formatDecimal(videoInfo?.playbackRate || 1)}x` },
+    { label: '当前传输码率', value: playbackTransferBitrateLabel(videoInfo) },
+    { label: '网络加载速度', value: videoInfo ? `${formatBytes(Math.round(videoInfo.networkBytesPerSecond))}/s` : '等待统计' },
+    { label: '当前分片大小', value: currentSegmentSizeLabel(asset, videoInfo, runtime) },
+    { label: '浏览器缓存', value: browserMediaCacheLabel(asset, videoInfo, runtime) },
     { label: '媒体缓存', value: serverMediaCacheLabel(asset, runtime) },
-    { label: '源文件总大小', value: formatBytes(asset.size) },
-    { label: '缓存进度', value: info?.duration ? `${bufferedPercent}% · 至 ${formatDuration(info.bufferedEnd)}` : '等待媒体信息' },
-    { label: '丢帧', value: info?.totalFrames ? `${info.droppedFrames} / ${info.totalFrames} (${formatDecimal(droppedPercent)}%)` : '暂无统计' },
+    { label: '缓存进度', value: videoInfo?.duration ? `${bufferedPercent}% · 至 ${formatDuration(videoInfo.bufferedEnd)}` : '等待媒体信息' },
+    { label: '丢帧', value: videoInfo?.totalFrames ? `${videoInfo.droppedFrames} / ${videoInfo.totalFrames} (${formatDecimal(droppedPercent)}%)` : '暂无统计' },
     { label: '转码状态', value: asset.browserPlayable ? '无需转码' : runtime ? videoProxyRuntimeLabel(runtime) : '等待分片' },
+    ...layoutRows,
   );
   if (runtime?.segmentIndex !== undefined && runtime.segmentIndex >= 0) {
     rows.push({
@@ -1936,13 +2106,21 @@ function formatDecimal(value: number) {
 function assetInfoRows(asset: Asset, tags: AssetTag[]) {
   const rows = [
     { label: '类型', value: asset.mediaType === 'image' ? '照片' : asset.mediaType === 'audio' ? '音频' : '视频' },
-    { label: '大小', value: formatBytes(asset.size) },
+    { label: '文件大小', value: formatBytes(asset.size) },
     { label: '时间', value: formatDateTime(asset.timelineAt) },
     { label: '星级', value: asset.rating === 0 ? '未评级' : `${asset.rating} 星` },
   ];
-  if (asset.width && asset.height) rows.push({ label: '尺寸', value: `${asset.width} x ${asset.height}` });
+  if (asset.width && asset.height) rows.push({ label: '文件分辨率', value: `${asset.width} x ${asset.height}` });
   if ((asset.mediaType === 'video' || asset.mediaType === 'audio') && asset.duration !== null) rows.push({ label: '时长', value: formatDuration(asset.duration) });
   if (asset.mediaType !== 'audio') rows.push({ label: '旋转', value: `${asset.rotation || 0}°` });
+  if (asset.mediaType === 'video' || asset.mediaType === 'audio') {
+    rows.push({ label: '封装格式', value: asset.container || '未知' });
+    if (asset.mediaType === 'video') rows.push({ label: '视频编码', value: asset.videoCodec || '未知' });
+    rows.push({ label: '音频编码', value: asset.audioCodec || '未知' });
+    rows.push({ label: '文件总码率', value: formatBitrate(asset.overallBitrate) });
+    if (asset.mediaType === 'video') rows.push({ label: '视频码率', value: formatBitrate(asset.videoBitrate) });
+    rows.push({ label: '音频码率', value: formatBitrate(asset.audioBitrate) });
+  }
   rows.push({ label: '标签', value: tags.length > 0 ? tags.map((item) => item.tag).join('、') : '无标签' });
   return rows;
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/model"
 	"lpicto/backend/internal/scanner"
 )
 
@@ -36,11 +37,73 @@ func TestSystemTaskResultLabels(t *testing.T) {
 
 func TestLibraryReconcileTaskUsesManualReconcileAction(t *testing.T) {
 	item := scanSystemTask("library_scan", "图库文件对账", "对账", nil, scanner.Status{})
-	if got := taskActionIDs(item.Actions); got != "reconcile,stop" {
+	if got := taskActionIDs(item.Actions); got != "reconcile" {
 		t.Fatalf("reconcile actions = %q", got)
 	}
 	if item.Actions[0].Label != "开始对账" || !item.Actions[0].Enabled {
 		t.Fatalf("reconcile action = %#v", item.Actions[0])
+	}
+}
+
+func TestMediaScanTaskUsesIndependentDiscoveryProgress(t *testing.T) {
+	item := mediaScanSystemTask(&model.ScanRun{Status: "finished", TotalSeen: 25}, scanner.Status{})
+	if item.ID != "media_scan" || item.Name != "媒体扫描" || item.Progress == nil || item.Progress.Total != 25 {
+		t.Fatalf("media scan task = %#v", item)
+	}
+	if got := taskActionIDs(item.Actions); got != "continue,rebuild" {
+		t.Fatalf("media scan actions = %q", got)
+	}
+	running := mediaScanSystemTask(nil, scanner.Status{Running: true, Progress: scanner.Progress{Task: "count", TotalFiles: 30, ScannedFiles: 12}})
+	if running.Status != "running" || running.Progress == nil || running.Progress.Completed != 12 || running.Progress.Pending != 18 {
+		t.Fatalf("running media scan task = %#v", running)
+	}
+}
+
+func TestMediaScanTaskDoesNotKeepStaleRunningState(t *testing.T) {
+	item := mediaScanSystemTask(&model.ScanRun{Status: "running"}, scanner.Status{})
+	if item.Status != "stopped" || item.Succeeded == nil || *item.Succeeded {
+		t.Fatalf("stale media scan task = %#v", item)
+	}
+}
+
+func TestMediaScanTaskShowsPlaybackPauseAndKeepsAutomaticResumePending(t *testing.T) {
+	item := mediaScanSystemTask(
+		&model.ScanRun{Status: "paused", TotalSeen: 12},
+		scanner.Status{Progress: scanner.Progress{State: "paused", Task: "count", PauseReason: "playback", TotalFiles: 30, ScannedFiles: 12}},
+	)
+	if item.Status != "pending" || !strings.Contains(item.BlockedReason, "播放结束后将自动继续") {
+		t.Fatalf("paused media scan task = %#v", item)
+	}
+	if item.Actions[0].ID != "stop" || !item.Actions[0].Enabled {
+		t.Fatalf("paused media scan actions = %#v", item.Actions)
+	}
+}
+
+func TestDuplicateScanTaskReportsAggregateProgress(t *testing.T) {
+	startedAt := int64(100)
+	item := duplicateScanSystemTask(
+		&db.SystemTaskState{Status: "running", LastStartedAt: &startedAt},
+		10,
+		4,
+		2,
+		true,
+	)
+	if item.Status != "running" || item.Progress == nil {
+		t.Fatalf("running duplicate task = %#v", item)
+	}
+	if item.Progress.Total != 10 || item.Progress.Completed != 4 || item.Progress.Processing != 1 || item.Progress.Pending != 3 || item.Progress.Failed != 2 {
+		t.Fatalf("duplicate progress = %#v", item.Progress)
+	}
+	if got := taskActionIDs(item.Actions); got != "stop" {
+		t.Fatalf("duplicate actions = %q", got)
+	}
+	if !item.Actions[0].Enabled {
+		t.Fatalf("running duplicate actions = %#v", item.Actions)
+	}
+
+	item = duplicateScanSystemTask(&db.SystemTaskState{Status: "running", LastStartedAt: &startedAt}, 10, 4, 0, false)
+	if item.Status != "stopped" || taskActionIDs(item.Actions) != "scan" || !item.Actions[0].Enabled {
+		t.Fatalf("stale duplicate task = %#v", item)
 	}
 }
 
@@ -156,11 +219,14 @@ func TestThumbnailTaskUsesAggregateQueueState(t *testing.T) {
 	if item.Status != "success" || item.Succeeded == nil || !*item.Succeeded {
 		t.Fatalf("completed thumbnail task = %#v", item)
 	}
+	if got := taskActionIDs(item.Actions); got != "rebuild" {
+		t.Fatalf("completed thumbnail should hide start and stop: %#v", item.Actions)
+	}
 }
 
 func TestStandardTaskActions(t *testing.T) {
 	thumbnail := thumbnailSystemTask(db.WorkStatusCounts{Total: 10, Ready: 3, Pending: 5, Error: 2}, 0, 0)
-	if got := taskActionIDs(thumbnail.Actions); got != "start,retry_failed,rebuild,stop" {
+	if got := taskActionIDs(thumbnail.Actions); got != "start,retry_failed,rebuild" {
 		t.Fatalf("thumbnail actions = %#v", thumbnail.Actions)
 	}
 	if thumbnail.Actions[0].Label != "手动开始" {
@@ -170,16 +236,16 @@ func TestStandardTaskActions(t *testing.T) {
 		t.Fatalf("thumbnail labels = %#v", thumbnail.Actions)
 	}
 	aiTask := aiAnalysisSystemTask(db.AIStatus{Total: 10, Pending: 7, Failed: 2, Ready: 1}, db.AIActivity{}, 0, 0, false)
-	if got := taskActionIDs(aiTask.Actions); got != "continue,retry_failed,rebuild,stop" {
+	if got := taskActionIDs(aiTask.Actions); got != "continue,retry_failed,rebuild" {
 		t.Fatalf("AI actions = %#v", aiTask.Actions)
 	}
 	failedOnly := thumbnailSystemTask(db.WorkStatusCounts{Total: 2, Error: 2}, 0, 0)
-	if !failedOnly.Actions[0].Enabled {
-		t.Fatalf("manual start should be enabled for failed work: %#v", failedOnly.Actions)
+	if got := taskActionIDs(failedOnly.Actions); got != "retry_failed,rebuild" {
+		t.Fatalf("failed-only thumbnail actions = %#v", failedOnly.Actions)
 	}
 	failedAIOnly := aiAnalysisSystemTask(db.AIStatus{Total: 2, Failed: 2}, db.AIActivity{}, 0, 0, false)
-	if !failedAIOnly.Actions[0].Enabled {
-		t.Fatalf("AI continue should be enabled for failed work: %#v", failedAIOnly.Actions)
+	if got := taskActionIDs(failedAIOnly.Actions); got != "retry_failed,rebuild" {
+		t.Fatalf("failed-only AI actions = %#v", failedAIOnly.Actions)
 	}
 	running := thumbnailSystemTask(db.WorkStatusCounts{Total: 10, Pending: 10}, 1, 0)
 	for _, action := range running.Actions {

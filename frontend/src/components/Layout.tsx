@@ -6,17 +6,12 @@ import type { StorageStatus } from '../types/api';
 import { SidebarPanelProvider, type SidebarPanelTarget } from './SidebarContext';
 import {
   isPrimarySidebarPanelTarget,
-  loadCollapsedSidebarContent,
-  loadSidebarCollapsed,
   loadSidebarSecondaryExpanded,
   loadSidebarWidths,
   normalizeSidebarWidths,
   primaryTargetForPath,
-  saveSidebarCollapsed,
   saveSidebarSecondaryExpanded,
   saveSidebarWidths,
-  sidebarAppearanceChanged,
-  type CollapsedSidebarContent,
   type SidebarWidths,
 } from '../utils/sidebarPrefs';
 
@@ -29,11 +24,11 @@ interface Props {
 export default function Layout({ children, overlay = null, routeLocation }: Props) {
   const location = useLocation();
   const effectivePathname = routeLocation?.pathname ?? location.pathname;
-  const [sidebarCollapsed, setSidebarCollapsedState] = useState(() => loadSidebarCollapsed());
-  const [collapsedSidebarContent, setCollapsedSidebarContent] = useState<CollapsedSidebarContent>(() => loadCollapsedSidebarContent());
   const [sidebarWidths, setSidebarWidths] = useState<SidebarWidths>(() => loadSidebarWidths());
   const [routeEntering, setRouteEntering] = useState(false);
   const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
+  const [viewerInfoVisible, setViewerInfoVisible] = useState(true);
+  const viewerActive = Boolean(overlay) || location.pathname.startsWith('/viewer/');
   const routeTarget = primaryTargetForPath(effectivePathname);
   const [sidebarExpanded, setSidebarExpandedState] = useState<SidebarPanelTarget | null>(() =>
     routeTarget && loadSidebarSecondaryExpanded() ? routeTarget : null,
@@ -41,9 +36,6 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
   const sidebarPanelOpen = sidebarExpanded !== null && sidebarExpanded === routeTarget;
   const shellClass = [
     'app-shell',
-    sidebarCollapsed ? 'sidebar-primary-collapsed' : 'sidebar-primary-open',
-    sidebarCollapsed ? 'sidebar-primary-icon-only' : '',
-    sidebarCollapsed && collapsedSidebarContent === 'character' ? 'sidebar-primary-character-only' : '',
     sidebarPanelOpen ? 'sidebar-panel-open' : 'sidebar-panel-closed',
   ]
     .filter(Boolean)
@@ -62,19 +54,9 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
     },
     [],
   );
-  const setSidebarCollapsed = useCallback((collapsed: boolean) => {
-    saveSidebarCollapsed(collapsed);
-    setSidebarCollapsedState(collapsed);
-  }, []);
   useEffect(() => {
     setSidebarExpandedState(routeTarget && loadSidebarSecondaryExpanded() ? routeTarget : null);
   }, [routeTarget]);
-
-  useEffect(() => {
-    const refresh = () => setCollapsedSidebarContent(loadCollapsedSidebarContent());
-    window.addEventListener(sidebarAppearanceChanged, refresh);
-    return () => window.removeEventListener(sidebarAppearanceChanged, refresh);
-  }, []);
 
   useEffect(() => {
     setRouteEntering(false);
@@ -109,31 +91,24 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
     });
   }, []);
 
-  const togglePrimarySidebar = useCallback(() => {
-    setSidebarCollapsed(!sidebarCollapsed);
-  }, [setSidebarCollapsed, sidebarCollapsed]);
-
   const shellStyle = {
-    '--sidebar-primary-width': `${sidebarWidths.primary}px`,
     '--sidebar-secondary-width': `${sidebarWidths.secondary}px`,
   } as CSSProperties;
 
   return (
     <SidebarPanelProvider
-      sidebarCollapsed={sidebarCollapsed}
       sidebarExpanded={sidebarExpanded}
-      setSidebarCollapsed={setSidebarCollapsed}
+      viewerActive={viewerActive}
+      viewerInfoVisible={viewerInfoVisible}
       setSidebarExpanded={setSidebarExpanded}
+      setViewerInfoVisible={setViewerInfoVisible}
     >
       <div className={shellClass} style={shellStyle}>
-        <aside className={sidebarCollapsed ? 'sidebar is-primary-collapsed' : 'sidebar'}>
+        <aside className="sidebar">
           <Sidebar
-            collapsed={sidebarCollapsed}
-            collapsedContent={collapsedSidebarContent}
             expanded={sidebarExpanded}
             routePathname={effectivePathname}
             secondaryWidth={sidebarWidths.secondary}
-            onTogglePrimary={togglePrimarySidebar}
             onToggleExpanded={setSidebarExpanded}
             onSecondaryWidthChange={(width) => updateSidebarWidth('secondary', width)}
           />

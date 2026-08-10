@@ -22,7 +22,7 @@ import type {
   Asset,
   AssetDeletedEvent,
   AssetKind,
-  AssetRating,
+  AssetRatingFilter,
   LibraryAnchor,
   NFOFilterField,
   OrientationFilter,
@@ -46,7 +46,6 @@ import { waterfallPageSize } from '../utils/waterfallPaging';
 import { parseTagFilters, serializeTagFilters } from '../utils/tagFilters';
 
 const pageSize = waterfallPageSize;
-const libraryStateKey = 'library';
 const libraryURLKeys = [
   'q',
 	'visible',
@@ -82,6 +81,7 @@ const libraryURLKeys = [
 ];
 
 type SearchAlbumFilterMode = 'all' | 'none' | 'albums';
+type DurationUnit = 'seconds' | 'minutes' | 'hours';
 
 interface LibraryPageState extends GridReturnState {
 	aiDescriptionQuery: string;
@@ -94,6 +94,7 @@ interface LibraryPageState extends GridReturnState {
   durationMaxMinutes: string;
   durationMinMinutes: string;
   durationRange?: string;
+  durationUnit: DurationUnit;
   nfoActorQuery: string;
   nfoIDQuery: string;
   nfoQuery: string;
@@ -103,7 +104,7 @@ interface LibraryPageState extends GridReturnState {
   orientation: OrientationFilter;
   groupMode: AssetGroupMode;
   query: string;
-  rating: AssetRating;
+  rating: AssetRatingFilter;
   resolutionRange?: string;
   resolutionXRange: string;
   resolutionYRange: string;
@@ -127,6 +128,7 @@ const defaultLibraryState: LibraryPageState = {
   durationMaxMinutes: '',
   durationMinMinutes: '',
   durationRange: '',
+  durationUnit: 'minutes',
   nfoActorQuery: '',
   nfoIDQuery: '',
   nfoQuery: '',
@@ -136,7 +138,7 @@ const defaultLibraryState: LibraryPageState = {
   orientation: 'all',
   groupMode: 'none',
   query: '',
-  rating: 0,
+  rating: 'all',
   resolutionRange: '',
   resolutionXRange: '',
   resolutionYRange: '',
@@ -148,16 +150,22 @@ const defaultLibraryState: LibraryPageState = {
   type: 'all',
 };
 
-export default function LibraryPage() {
+export default function LibraryPage({ mode = 'library' }: { mode?: 'library' | 'recent' }) {
   const [searchParams] = useSearchParams();
   const location = useLocation();
   const navigate = useNavigate();
-  const persistedState = loadPageState<LibraryPageState>(libraryStateKey, defaultLibraryState);
+  const recentMode = mode === 'recent';
+  const pageStateKey = recentMode ? 'recent' : 'library';
+  const defaultPageState = useMemo<LibraryPageState>(
+    () => (recentMode ? { ...defaultLibraryState, sort: 'last_played_desc' } : defaultLibraryState),
+    [recentMode],
+  );
+  const persistedState = loadPageState<LibraryPageState>(pageStateKey, defaultPageState);
   const initialStateRef = useRef(
-    initialLibraryState(searchParams, persistedState),
+    initialLibraryState(searchParams, persistedState, defaultPageState),
   );
   const initialResolution = initialResolutionRanges(initialStateRef.current);
-  const initialDuration = initialDurationMinuteRanges(initialStateRef.current);
+  const initialDuration = initialDurationRanges(initialStateRef.current);
   const [query, setQuery] = useViewerAwareMediaState(initialStateRef.current.query);
 	const [aiDescriptionQuery, setAIDescriptionQuery] = useViewerAwareMediaState(initialStateRef.current.aiDescriptionQuery ?? '');
   const [nfoQuery, setNFOQuery] = useViewerAwareMediaState(initialStateRef.current.nfoQuery);
@@ -167,7 +175,7 @@ export default function LibraryPage() {
   const [nfoTitleQuery, setNFOTitleQuery] = useViewerAwareMediaState(initialStateRef.current.nfoTitleQuery ?? '');
   const [nfoYearQuery, setNFOYearQuery] = useViewerAwareMediaState(initialStateRef.current.nfoYearQuery ?? '');
   const [type, setType] = useViewerAwareMediaState<AssetKind>(initialStateRef.current.type);
-  const [rating, setRating] = useViewerAwareMediaState<AssetRating>(initialStateRef.current.rating ?? 0);
+  const [rating, setRating] = useViewerAwareMediaState<AssetRatingFilter>(initialStateRef.current.rating ?? 'all');
   const [sort, setSort] = useViewerAwareMediaState<SortKey>(initialStateRef.current.sort);
   const [resolutionXRange, setResolutionXRange] = useViewerAwareMediaState(initialResolution.x);
   const [resolutionYRange, setResolutionYRange] = useViewerAwareMediaState(initialResolution.y);
@@ -175,6 +183,7 @@ export default function LibraryPage() {
   const [dateTo, setDateTo] = useViewerAwareMediaState(initialStateRef.current.dateTo);
   const [durationMinMinutes, setDurationMinMinutes] = useViewerAwareMediaState(initialDuration.min);
   const [durationMaxMinutes, setDurationMaxMinutes] = useViewerAwareMediaState(initialDuration.max);
+  const [durationUnit, setDurationUnit] = useViewerAwareMediaState<DurationUnit>(initialStateRef.current.durationUnit);
   const [orientation, setOrientation] = useViewerAwareMediaState<OrientationFilter>(initialStateRef.current.orientation);
   const [albumFilterMode, setAlbumFilterMode] = useViewerAwareMediaState<SearchAlbumFilterMode>(initialStateRef.current.albumFilterMode);
   const [albumFilterCardCollapsed, setAlbumFilterCardCollapsed] = useState(initialStateRef.current.albumFilterCardCollapsed ?? false);
@@ -209,6 +218,7 @@ export default function LibraryPage() {
   const searchRequest = useMemo<LibraryFilterParams>(
     () => ({
       albumFilter: albumFilterMode === 'none' ? 'none' : undefined,
+      playedOnly: recentMode ? 1 : undefined,
       albumIds: albumIdsParam,
       q: query.trim() || undefined,
 		visible: includeUnavailable ? 'all' : undefined,
@@ -221,13 +231,13 @@ export default function LibraryPage() {
       nfoTag: nfoTagQuery.trim() || undefined,
       nfoTitle: nfoTitleQuery.trim() || undefined,
       nfoYear: nfoYearQuery.trim() || undefined,
-      rating,
+      rating: rating === 'all' ? undefined : rating,
       type,
       sort,
       ...parseResolutionRanges(resolutionXRange, resolutionYRange, orientation),
       from: datetimeLocalToUnix(dateFrom),
       to: datetimeLocalToUnix(dateTo),
-      ...parseDurationMinuteRange(durationMinMinutes, durationMaxMinutes),
+      ...parseDurationRange(durationMinMinutes, durationMaxMinutes, durationUnit),
       orientation,
       group: serverGroup,
       sizeMin: mbToBytes(sizeMinMB),
@@ -235,6 +245,7 @@ export default function LibraryPage() {
     }),
     [
       dateFrom,
+      recentMode,
 		includeUnavailable,
 		aiDescriptionQuery,
       dateTo,
@@ -242,6 +253,7 @@ export default function LibraryPage() {
       albumIdsParam,
       durationMaxMinutes,
       durationMinMinutes,
+      durationUnit,
       nfoActorQuery,
       nfoIDQuery,
       nfoQuery,
@@ -360,6 +372,7 @@ export default function LibraryPage() {
       dateTo,
       durationMaxMinutes,
       durationMinMinutes,
+      durationUnit,
       nfoActorQuery,
       nfoIDQuery,
       nfoQuery,
@@ -389,6 +402,7 @@ export default function LibraryPage() {
       dateTo,
       durationMaxMinutes,
       durationMinMinutes,
+      durationUnit,
       getGridState,
       groupMode,
       nfoActorQuery,
@@ -413,22 +427,22 @@ export default function LibraryPage() {
   );
 
   const saveCurrentState = useCallback(() => {
-    savePageState<LibraryPageState>(libraryStateKey, currentPageState());
-  }, [currentPageState]);
+    savePageState<LibraryPageState>(pageStateKey, currentPageState());
+  }, [currentPageState, pageStateKey]);
   const toggleAlbumFilterCard = useCallback(() => {
     setAlbumFilterCardCollapsed((current) => {
       const next = !current;
-      savePageState<LibraryPageState>(libraryStateKey, { ...currentPageState(), albumFilterCardCollapsed: next });
+      savePageState<LibraryPageState>(pageStateKey, { ...currentPageState(), albumFilterCardCollapsed: next });
       return next;
     });
-  }, [currentPageState]);
+  }, [currentPageState, pageStateKey]);
   const toggleSearchCard = useCallback(() => {
     setSearchCardCollapsed((current) => {
       const next = !current;
-      savePageState<LibraryPageState>(libraryStateKey, { ...currentPageState(), searchCardCollapsed: next });
+      savePageState<LibraryPageState>(pageStateKey, { ...currentPageState(), searchCardCollapsed: next });
       return next;
     });
-  }, [currentPageState]);
+  }, [currentPageState, pageStateKey]);
   const scheduleCurrentStateSave = usePersistentPageState(saveCurrentState);
 
   useEffect(() => {
@@ -457,7 +471,7 @@ export default function LibraryPage() {
         orientation,
         q: query.trim(),
 		visible: searchRequest.visible,
-        rating,
+        rating: rating === 'all' ? undefined : rating,
         sizeMax: searchRequest.sizeMax,
         sizeMin: searchRequest.sizeMin,
         sort,
@@ -543,11 +557,11 @@ export default function LibraryPage() {
     setNFOTitleQuery('');
     setNFOYearQuery('');
     setType('all');
-    setRating(0);
+    setRating('all');
     setAlbumFilterMode('all');
     setAlbumIds([]);
     setCollapsedGroupKeys(new Set());
-    setSort('timeline_desc');
+    setSort(recentMode ? 'last_played_desc' : 'timeline_desc');
     setTagFilters([]);
     setResolutionXRange('');
     setResolutionYRange('');
@@ -559,11 +573,18 @@ export default function LibraryPage() {
     setGroupMode('none');
     setSizeMinMB('');
     setSizeMaxMB('');
-  }, []);
+  }, [recentMode]);
 
-  const handleRatingChange = useCallback((nextRating: AssetRating) => {
+  const handleRatingChange = useCallback((nextRating: AssetRatingFilter) => {
     setRating(nextRating);
   }, []);
+
+  const handleDurationUnitChange = useCallback((nextUnit: DurationUnit) => {
+    if (nextUnit === durationUnit) return;
+    setDurationMinMinutes(convertDurationValue(durationMinMinutes, durationUnit, nextUnit));
+    setDurationMaxMinutes(convertDurationValue(durationMaxMinutes, durationUnit, nextUnit));
+    setDurationUnit(nextUnit);
+  }, [durationMaxMinutes, durationMinMinutes, durationUnit]);
 
   const handleSelectAllAlbums = useCallback(() => {
     setAlbumFilterMode('all');
@@ -617,7 +638,7 @@ export default function LibraryPage() {
   }, []);
 
   useSidebarPanel(
-    'library',
+    recentMode ? 'recent' : 'library',
     <div className="sidebar-control-stack sidebar-library-panel">
       <SidebarFilterIconRow>
         <SidebarMediaTypeList value={type} onChange={setType} />
@@ -704,13 +725,33 @@ export default function LibraryPage() {
                 <input type="datetime-local" value={dateTo} onChange={(event) => setDateTo(event.target.value)} />
               </label>
             </div>
+            <div className="sidebar-field">
+              <span>时长单位</span>
+              <div className="sidebar-segmented" role="group" aria-label="视频时长单位">
+                {([
+                  ['seconds', '秒'],
+                  ['minutes', '分钟'],
+                  ['hours', '小时'],
+                ] as const).map(([unit, label]) => (
+                  <button
+                    className={durationUnit === unit ? 'active' : ''}
+                    type="button"
+                    aria-pressed={durationUnit === unit}
+                    key={unit}
+                    onClick={() => handleDurationUnitChange(unit)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="sidebar-field-grid">
               <label className="sidebar-field">
-                <span>最短分钟</span>
+                <span>最短时长</span>
                 <input inputMode="decimal" value={durationMinMinutes} onChange={(event) => setDurationMinMinutes(event.target.value)} />
               </label>
               <label className="sidebar-field">
-                <span>最长分钟</span>
+                <span>最长时长</span>
                 <input inputMode="decimal" value={durationMaxMinutes} onChange={(event) => setDurationMaxMinutes(event.target.value)} />
               </label>
             </div>
@@ -751,7 +792,9 @@ export default function LibraryPage() {
       collapsedGroupKeys,
       durationMaxMinutes,
       durationMinMinutes,
+      durationUnit,
       groupMode,
+      handleDurationUnitChange,
       handleRatingChange,
       handleSelectAllAlbums,
       handleSelectUnassignedAlbums,
@@ -796,7 +839,7 @@ export default function LibraryPage() {
     <section className="page media-page">
       {error && <div className="error-line">{error}</div>}
       {items.length === 0 && !loading ? (
-        <EmptyState text="没有匹配资源" />
+        <EmptyState text={recentMode ? '暂无播放记录' : '没有匹配资源'} />
       ) : (
         <div className="library-grid-shell">
           <AssetGrid
@@ -823,18 +866,16 @@ export default function LibraryPage() {
             scrollSignal={scrollResetSignal}
             scrollTarget={scrollTarget}
             scrollTopTarget={scrollTopTarget}
-            buildViewerUrl={(asset) => buildViewerUrl(asset, searchRequest, currentPageState(), currentPageReturnPath())}
+            buildViewerUrl={(asset) => buildViewerUrl(asset, searchRequest, currentPageState(), currentPageReturnPath(), recentMode)}
           />
-          {groupMode !== 'folder' && (
-            <LibraryIndexRail
-              anchors={anchors}
-              sort={sort}
-              scrollRatio={scrollRatio}
-              totalCount={totalCount}
-              pageSize={pageSize}
-              onSeek={seekIndex}
-            />
-          )}
+          <LibraryIndexRail
+            anchors={anchors}
+            hideLabels={groupMode === 'folder'}
+            scrollRatio={scrollRatio}
+            totalCount={totalCount}
+            pageSize={pageSize}
+            onSeek={seekIndex}
+          />
           <PressPreviewOverlay asset={pressPreviewAsset} />
         </div>
       )}
@@ -842,15 +883,16 @@ export default function LibraryPage() {
   );
 }
 
-function initialLibraryState(searchParams: URLSearchParams, persistedState: LibraryPageState): LibraryPageState {
+function initialLibraryState(searchParams: URLSearchParams, persistedState: LibraryPageState, defaultPageState: LibraryPageState): LibraryPageState {
   if (searchParams.has('restore')) {
-    return decodeReturnState<LibraryPageState>(searchParams.get('restore'), persistedState);
+    const restored = decodeReturnState<LibraryPageState>(searchParams.get('restore'), persistedState);
+    return { ...restored, durationUnit: parseDurationUnit(restored.durationUnit) };
   }
   if (!hasSearchStateParams(searchParams)) {
-    return persistedState;
+    return { ...persistedState, durationUnit: parseDurationUnit(persistedState.durationUnit) };
   }
   return {
-    ...defaultLibraryState,
+    ...defaultPageState,
     albumFilterCardCollapsed: persistedState.albumFilterCardCollapsed ?? false,
     searchCardCollapsed: persistedState.searchCardCollapsed ?? false,
     ...albumFilterStateFromSearchParams(searchParams),
@@ -863,14 +905,15 @@ function initialLibraryState(searchParams: URLSearchParams, persistedState: Libr
     nfoTitleQuery: searchParams.get('nfoTitle') ?? '',
     nfoYearQuery: searchParams.get('nfoYear') ?? '',
     type: parseAssetKindParam(searchParams.get('type')),
-    sort: parseSortParam(searchParams.get('sort')),
+    sort: parseSortParam(searchParams.get('sort'), defaultPageState.sort),
     orientation: parseOrientationParam(searchParams.get('orientation')),
     rating: assetRatingParam(searchParams.get('rating')) ?? defaultLibraryState.rating,
     groupMode: parseAssetGroupMode(searchParams.get('group'), 'none'),
     resolutionXRange: rangeInputFromParams(searchParams.get('widthMin'), searchParams.get('widthMax')),
     resolutionYRange: rangeInputFromParams(searchParams.get('heightMin'), searchParams.get('heightMax')),
-    durationMinMinutes: secondsParamToMinutes(searchParams.get('durationMin')),
-    durationMaxMinutes: secondsParamToMinutes(searchParams.get('durationMax')),
+    durationMinMinutes: secondsParamToDurationValue(searchParams.get('durationMin'), parseDurationUnit(persistedState.durationUnit)),
+    durationMaxMinutes: secondsParamToDurationValue(searchParams.get('durationMax'), parseDurationUnit(persistedState.durationUnit)),
+    durationUnit: parseDurationUnit(persistedState.durationUnit),
     sizeMinMB: bytesParamToMB(searchParams.get('sizeMin')),
     sizeMaxMB: bytesParamToMB(searchParams.get('sizeMax')),
     dateFrom: unixParamToDatetimeLocal(searchParams.get('from')),
@@ -957,8 +1000,8 @@ function parseOrientationParam(value: string | null): OrientationFilter {
   return value === 'landscape' || value === 'portrait' ? value : 'all';
 }
 
-function parseSortParam(value: string | null): SortKey {
-  return isSortKey(value) ? value : 'timeline_desc';
+function parseSortParam(value: string | null, fallback: SortKey = 'timeline_desc'): SortKey {
+  return isSortKey(value) ? value : fallback;
 }
 
 function rangeInputFromParams(minValue: string | null, maxValue: string | null) {
@@ -969,16 +1012,16 @@ function rangeInputFromParams(minValue: string | null, maxValue: string | null) 
   return `${min ?? ''}-${max ?? ''}`;
 }
 
-function secondsParamToMinutes(value: string | null) {
+function secondsParamToDurationValue(value: string | null, unit: DurationUnit) {
   const seconds = positiveNumber(value ?? '');
   if (seconds === undefined) return '';
-  return formatMinuteValue(seconds / 60);
+  return formatNumberValue(seconds / durationUnitSeconds(unit));
 }
 
 function bytesParamToMB(value: string | null) {
   const bytes = positiveNumber(value ?? '');
   if (bytes === undefined) return '';
-  return formatMinuteValue(bytes / (1024 * 1024));
+  return formatNumberValue(bytes / (1024 * 1024));
 }
 
 function unixParamToDatetimeLocal(value: string | null) {
@@ -990,9 +1033,9 @@ function unixParamToDatetimeLocal(value: string | null) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function buildViewerUrl(asset: Asset, params: LibraryFilterParams, state: LibraryPageState, returnPath: string) {
+function buildViewerUrl(asset: Asset, params: LibraryFilterParams, state: LibraryPageState, returnPath: string, recentMode: boolean) {
   const query = new URLSearchParams(searchQueryEntries(params));
-  query.set('context', 'library');
+  query.set('context', recentMode ? 'recent' : 'library');
   return appendViewerReturnParams(`/viewer/${asset.id}?${query.toString()}`, returnPath, state);
 }
 
@@ -1022,12 +1065,13 @@ function parseResolutionRanges(
   };
 }
 
-function parseDurationMinuteRange(minValue: string, maxValue: string): Pick<LibraryFilterParams, 'durationMin' | 'durationMax'> {
+function parseDurationRange(minValue: string, maxValue: string, unit: DurationUnit): Pick<LibraryFilterParams, 'durationMin' | 'durationMax'> {
   const min = positiveNumber(minValue);
   const max = positiveNumber(maxValue);
+  const multiplier = durationUnitSeconds(unit);
   return {
-    durationMin: min === undefined ? undefined : min * 60,
-    durationMax: max === undefined ? undefined : max * 60,
+    durationMin: min === undefined ? undefined : roundDurationSeconds(min * multiplier),
+    durationMax: max === undefined ? undefined : roundDurationSeconds(max * multiplier),
   };
 }
 
@@ -1072,18 +1116,39 @@ function initialResolutionRanges(state: LibraryPageState): { x: string; y: strin
   return { x: x ?? '', y: y ?? '' };
 }
 
-function initialDurationMinuteRanges(state: LibraryPageState): { min: string; max: string } {
+function initialDurationRanges(state: LibraryPageState): { min: string; max: string } {
   if (state.durationMinMinutes || state.durationMaxMinutes) {
     return { min: state.durationMinMinutes ?? '', max: state.durationMaxMinutes ?? '' };
   }
   const range = parseNumberRange(state.durationRange ?? '');
+  const multiplier = durationUnitSeconds(parseDurationUnit(state.durationUnit));
   return {
-    min: range.min === undefined ? '' : formatMinuteValue(range.min / 60),
-    max: range.max === undefined ? '' : formatMinuteValue(range.max / 60),
+    min: range.min === undefined ? '' : formatNumberValue(range.min / multiplier),
+    max: range.max === undefined ? '' : formatNumberValue(range.max / multiplier),
   };
 }
 
-function formatMinuteValue(value: number): string {
+function formatNumberValue(value: number): string {
   if (!Number.isFinite(value)) return '';
-  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(3)));
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(9)));
+}
+
+function parseDurationUnit(value: unknown): DurationUnit {
+  return value === 'seconds' || value === 'hours' ? value : 'minutes';
+}
+
+function durationUnitSeconds(unit: DurationUnit) {
+  if (unit === 'seconds') return 1;
+  if (unit === 'hours') return 3600;
+  return 60;
+}
+
+function roundDurationSeconds(value: number) {
+  return Math.round(value * 1000) / 1000;
+}
+
+function convertDurationValue(value: string, from: DurationUnit, to: DurationUnit) {
+  const parsed = positiveNumber(value);
+  if (parsed === undefined) return value.trim() === '' ? '' : value;
+  return formatNumberValue((parsed * durationUnitSeconds(from)) / durationUnitSeconds(to));
 }

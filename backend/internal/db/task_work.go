@@ -29,6 +29,9 @@ func taskWorkDefinition(taskType string) (taskWorkSpec, bool) {
 }
 
 func (d *DB) WorkProgress(ctx context.Context, taskType string, roots []string) (WorkStatusCounts, error) {
+	if taskType == "storyboard" {
+		return d.storyboardProgress(ctx, roots)
+	}
 	spec, ok := taskWorkDefinition(taskType)
 	if !ok {
 		return WorkStatusCounts{}, fmt.Errorf("unsupported task type %s", taskType)
@@ -41,6 +44,9 @@ func (d *DB) WorkProgress(ctx context.Context, taskType string, roots []string) 
 }
 
 func (d *DB) WorkItemsForRoots(ctx context.Context, taskType string, roots []string) ([]WorkItem, error) {
+	if taskType == "storyboard" {
+		return d.storyboardWorkItemsForRoots(ctx, roots, []string{model.StatusPending, model.StatusProcessing})
+	}
 	return d.workItemsForRoots(ctx, taskType, roots, []string{model.StatusPending, model.StatusProcessing})
 }
 
@@ -97,6 +103,9 @@ func (d *DB) workItemsForRoots(ctx context.Context, taskType string, roots []str
 }
 
 func (d *DB) RetryFailedWorkForRoots(ctx context.Context, taskType string, roots []string) ([]WorkItem, error) {
+	if taskType == "storyboard" {
+		return d.retryFailedStoryboardWorkForRoots(ctx, roots)
+	}
 	spec, ok := taskWorkDefinition(taskType)
 	if !ok {
 		return nil, fmt.Errorf("unsupported task type %s", taskType)
@@ -146,6 +155,9 @@ SELECT reset.id,assets.media_type FROM reset JOIN assets ON assets.id=reset.id`,
 }
 
 func (d *DB) ResetWorkForRoots(ctx context.Context, taskType string, roots []string) (int, error) {
+	if taskType == "storyboard" {
+		return d.resetStoryboardWorkForRoots(ctx, roots)
+	}
 	spec, ok := taskWorkDefinition(taskType)
 	if !ok {
 		return 0, fmt.Errorf("unsupported task type %s", taskType)
@@ -177,6 +189,10 @@ func (d *DB) ResetWorkForRoots(ctx context.Context, taskType string, roots []str
 }
 
 func (d *DB) RequeueProcessingWork(ctx context.Context, taskType string) error {
+	if taskType == "storyboard" {
+		_, err := d.conn.ExecContext(ctx, `UPDATE media_job SET status=?,finished_at=NULL WHERE job_type='storyboard' AND status=?`, model.StatusPending, model.StatusProcessing)
+		return err
+	}
 	spec, ok := taskWorkDefinition(taskType)
 	if !ok {
 		return fmt.Errorf("unsupported task type %s", taskType)
@@ -281,6 +297,121 @@ ON CONFLICT(asset_id,job_type) DO UPDATE SET status='pending',error_text=NULL,st
 
 func (d *DB) SetMetadataJobStatus(ctx context.Context, assetID int64, status string, message *string) error {
 	return d.upsertMediaJob(ctx, assetID, "metadata_status", status, message, util.UnixNow())
+}
+
+func (d *DB) SetStoryboardJobStatus(ctx context.Context, assetID int64, status string, message *string) error {
+	return d.upsertMediaJob(ctx, assetID, "storyboard_status", status, message, util.UnixNow())
+}
+
+func (d *DB) StoryboardJobStatus(ctx context.Context, assetID int64) (string, error) {
+	var status string
+	err := d.conn.QueryRowContext(ctx, `SELECT status FROM media_job WHERE asset_id=? AND job_type='storyboard'`, assetID).Scan(&status)
+	return status, err
+}
+
+// EnsureStoryboardPending creates missing historical work and optionally resets
+// a changed media version. It returns true only when the item should be queued.
+func (d *DB) EnsureStoryboardPending(ctx context.Context, assetID int64, reset bool) (bool, error) {
+	if reset {
+		if err := d.SetStoryboardJobStatus(ctx, assetID, model.StatusPending, nil); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	result, err := d.conn.ExecContext(ctx, `
+INSERT INTO media_job(asset_id,job_type,status,error_text,started_at,finished_at)
+VALUES(?,'storyboard','pending',NULL,NULL,NULL)
+ON CONFLICT(asset_id,job_type) DO NOTHING`, assetID)
+	if err != nil {
+		return false, err
+	}
+	if inserted, _ := result.RowsAffected(); inserted > 0 {
+		return true, nil
+	}
+	status, err := d.StoryboardJobStatus(ctx, assetID)
+	return status == model.StatusPending || status == model.StatusProcessing, err
+}
+
+func (d *DB) storyboardProgress(ctx context.Context, roots []string) (WorkStatusCounts, error) {
+	where, args, err := taskRootsWhere(roots)
+	if err != nil {
+		return WorkStatusCounts{}, err
+	}
+	var counts WorkStatusCounts
+	err = d.conn.QueryRowContext(ctx, `
+SELECT COUNT(*),
+  COALESCE(SUM(CASE WHEN mj.status='ready' THEN 1 ELSE 0 END),0),
+  COALESCE(SUM(CASE WHEN COALESCE(mj.status,'pending')='pending' THEN 1 ELSE 0 END),0),
+  COALESCE(SUM(CASE WHEN mj.status='processing' THEN 1 ELSE 0 END),0),
+  COALESCE(SUM(CASE WHEN mj.status='error' THEN 1 ELSE 0 END),0),0
+FROM assets a LEFT JOIN media_job mj ON mj.asset_id=a.id AND mj.job_type='storyboard'
+WHERE `+strings.ReplaceAll(where, "rel_path", "a.rel_path")+` AND a.media_type=?`, append(args, model.MediaTypeVideo)...).Scan(
+		&counts.Total, &counts.Ready, &counts.Pending, &counts.Processing, &counts.Error, &counts.NotRequired)
+	return counts, err
+}
+
+func (d *DB) storyboardWorkItemsForRoots(ctx context.Context, roots []string, statuses []string) ([]WorkItem, error) {
+	where, args, err := taskRootsWhere(roots)
+	if err != nil {
+		return nil, err
+	}
+	if len(statuses) == 0 {
+		return []WorkItem{}, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(statuses)), ",")
+	queryArgs := append([]any(nil), args...)
+	queryArgs = append(queryArgs, model.MediaTypeVideo)
+	for _, status := range statuses {
+		queryArgs = append(queryArgs, status)
+	}
+	rows, err := d.conn.QueryContext(ctx, `
+SELECT a.id FROM assets a LEFT JOIN media_job mj ON mj.asset_id=a.id AND mj.job_type='storyboard'
+WHERE `+strings.ReplaceAll(where, "rel_path", "a.rel_path")+` AND a.media_type=?
+  AND COALESCE(mj.status,'pending') IN (`+placeholders+`)
+ORDER BY a.timeline_at DESC,a.id DESC`, queryArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]WorkItem, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, WorkItem{Type: "storyboard", AssetID: id})
+	}
+	return items, rows.Err()
+}
+
+func (d *DB) retryFailedStoryboardWorkForRoots(ctx context.Context, roots []string) ([]WorkItem, error) {
+	items, err := d.storyboardWorkItemsForRoots(ctx, roots, []string{model.StatusError})
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if err := d.SetStoryboardJobStatus(ctx, item.AssetID, model.StatusPending, nil); err != nil {
+			return nil, err
+		}
+	}
+	return items, nil
+}
+
+func (d *DB) resetStoryboardWorkForRoots(ctx context.Context, roots []string) (int, error) {
+	where, args, err := taskRootsWhere(roots)
+	if err != nil {
+		return 0, err
+	}
+	result, err := d.conn.ExecContext(ctx, `
+INSERT INTO media_job(asset_id,job_type,status,error_text,started_at,finished_at)
+SELECT id,'storyboard','pending',NULL,NULL,NULL FROM assets
+WHERE `+where+` AND media_type=?
+ON CONFLICT(asset_id,job_type) DO UPDATE SET status='pending',error_text=NULL,started_at=NULL,finished_at=NULL`, append(args, model.MediaTypeVideo)...)
+	if err != nil {
+		return 0, err
+	}
+	count, _ := result.RowsAffected()
+	return int(count), nil
 }
 
 func (d *DB) AssetCacheKeys(ctx context.Context) (map[string]struct{}, error) {

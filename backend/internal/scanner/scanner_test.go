@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/media"
 	"lpicto/backend/internal/storage"
 )
@@ -116,6 +117,51 @@ func TestStopThenStartRunsLatestRequest(t *testing.T) {
 	}
 	waitScannerIdle(t, ctx, scan)
 	assertActiveRelPaths(t, ctx, database, []string{"Z/latest.jpg"})
+}
+
+func TestPlaybackPauseAutomaticallyResumesScan(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	installSlowExifTool(t, 500*time.Millisecond)
+	scan, database := newTestScanner(t, ctx)
+	scan.Extractor = media.Extractor{CommandTimeout: 2 * time.Second}
+	scan.Jobs = jobs.New(slog.Default(), nil)
+
+	writeTestFile(t, scan.Store, "Y/resume.jpg")
+	jobs.MarkForegroundActive(700 * time.Millisecond)
+	if result := scan.RequestMetadataScanRoots("task:media_scan", []string{"Y"}); !result.Accepted {
+		t.Fatalf("scan start result = %#v", result)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	observedPause := false
+	for time.Now().Before(deadline) {
+		status, err := scan.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Progress.PauseReason == "playback" {
+			observedPause = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !observedPause {
+		t.Fatal("scan did not expose playback pause reason")
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := scan.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !status.Running && status.Progress.State == "idle" && status.Progress.PauseReason == "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	assertActiveRelPaths(t, ctx, database, []string{"Y/resume.jpg"})
 }
 
 func TestMetadataPathScanProcessesUnchangedPendingAsset(t *testing.T) {

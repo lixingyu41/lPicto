@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Check, Music, Play, Plus, Square, X } from 'lucide-react';
-import type { Asset, SortField, SortKey } from '../types/api';
-import { api, assetThumbUrl } from '../api/client';
-import { effectiveAspect, rotatedCoverStyle } from '../utils/rotation';
+import type { Asset, SortField, SortKey, VideoStoryboard } from '../types/api';
+import { api, assetStoryboardSheetUrl, assetThumbUrl } from '../api/client';
+import { effectiveAspect, normalizeRotation, rotatedCoverStyle } from '../utils/rotation';
 import { assetGroupLabel, type AssetGroupMode } from '../utils/assetGrouping';
 import { gridRowHeightChanged, gridRowHeightForLevel, loadGridRowHeightLevel } from '../utils/gridPrefs';
 import { preloadViewerAsset } from '../utils/imagePreload';
@@ -96,6 +96,9 @@ const minTileWidth = 84;
 const maxAspect = 2.8;
 const minAspect = 0.42;
 const gap = 10;
+const fixedGridCardAspect = 1.5;
+const fixedGridFooterHeight = 54;
+const storyboardHoverDelayMs = 800;
 const pressPreviewDelayMs = 220;
 const pressPreviewDragSlopPx = 6;
 const pressPreviewClickSuppressMs = 180;
@@ -123,6 +126,12 @@ const mediaLayoutDrivers: Record<MediaViewPreferences['mode'], MediaLayoutDriver
     table: true,
     buildRows: (assets, _width, groupMode, sort, rowHeight, duplicateGrouping) => (
       buildListRows(assets, groupMode, sort, rowHeight, duplicateGrouping)
+    ),
+  },
+  grid: {
+    table: false,
+    buildRows: (assets, width, groupMode, sort, rowHeight, duplicateGrouping) => (
+      buildFixedGridRows(assets, width, groupMode, sort, rowHeight, duplicateGrouping)
     ),
   },
 };
@@ -412,7 +421,7 @@ export default function AssetGrid({
 
   useEffect(() => {
     virtualizer.measure();
-  }, [rowHeight, virtualizer]);
+  }, [gridRows, virtualizer]);
 
   useEffect(() => {
     emitScrollState();
@@ -575,6 +584,65 @@ export default function AssetGrid({
               </a>
             );
           }
+          if (mediaViewPrefs.mode === 'grid') {
+            const thumbnailHeight = Math.max(1, gridRow.height - fixedGridFooterHeight);
+            return (
+              <div
+                className="grid-row fixed-grid-row"
+                key={row.key}
+                style={{ transform: `translateY(${row.start}px)`, height: gridRow.height }}
+              >
+                {gridRow.items.map(({ asset, width: tileWidth }) => (
+                  <a
+                    className={`${tileClassName(asset.id)} asset-fixed-grid-card`}
+                    href={buildViewerUrl(asset)}
+                    key={asset.id}
+                    data-asset-id={asset.id}
+                    draggable={false}
+                    style={{ width: tileWidth, height: gridRow.height }}
+                    title={asset.displayTitle || asset.filename}
+                    onFocus={() => preloadViewerAsset(asset)}
+                    onMouseEnter={() => scheduleHoverPreload(asset)}
+                    onMouseLeave={clearHoverPreloadTimer}
+                    onMouseDown={(event) => startPressPreview(event, asset)}
+                    onDragStart={(event) => event.preventDefault()}
+                    onClick={(event) => handleAssetClick(event, asset)}
+                  >
+                    <div className="asset-fixed-grid-media" style={{ height: thumbnailHeight }}>
+                      <AssetTileMedia
+                        asset={asset}
+                        hoverStoryboardEnabled={mediaViewPrefs.videoHoverPreview}
+                        rowHeight={thumbnailHeight}
+                        tileWidth={tileWidth}
+                      />
+                      {asset.mediaType === 'video' && (
+                        <span className="asset-video-chip" title="视频">
+                          <Play size={12} fill="currentColor" />
+                        </span>
+                      )}
+                      {asset.mediaType === 'audio' && (
+                        <span className="asset-video-chip asset-audio-chip" title="音频">
+                          <Music size={12} />
+                        </span>
+                      )}
+                    </div>
+                    <div className="asset-fixed-grid-footer">
+                      <span className="asset-fixed-grid-name" title={asset.displayTitle || asset.filename}>{asset.displayTitle || asset.filename}</span>
+                      <span className="asset-fixed-grid-meta">
+                        <span>{formatListBytes(asset.size)}</span>
+                        {asset.mediaType === 'video' && <small>{formatDuration(asset.duration) || '—'}</small>}
+                      </span>
+                    </div>
+                    {selectionMode && (
+                      <span className={selectedAssetIds.has(asset.id) ? 'asset-select-box selected' : 'asset-select-box'}>
+                        <Square size={14} />
+                      </span>
+                    )}
+                  </a>
+                ))}
+              </div>
+            );
+          }
           return (
             <div
               className="grid-row"
@@ -589,7 +657,7 @@ export default function AssetGrid({
                     key={asset.id}
                     data-asset-id={asset.id}
                     draggable={false}
-                    style={{ width: tileWidth, height: rowHeight }}
+                    style={{ width: tileWidth, height: gridRow.height }}
                     title={asset.filename}
                     onFocus={() => preloadViewerAsset(asset)}
                     onMouseEnter={() => scheduleHoverPreload(asset)}
@@ -600,7 +668,8 @@ export default function AssetGrid({
                   >
                     <AssetTileMedia
                       asset={asset}
-                      rowHeight={rowHeight}
+                      hoverStoryboardEnabled={mediaViewPrefs.videoHoverPreview}
+                      rowHeight={gridRow.height}
                       tileWidth={tileWidth}
                     />
                     {asset.mediaType === 'video' && (
@@ -1033,31 +1102,98 @@ function usesNativeNavigation(event: ReactMouseEvent<HTMLAnchorElement>) {
   return event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0;
 }
 
+interface StoryboardManifestCacheEntry {
+  checkedAt: number;
+  manifest: VideoStoryboard | null;
+  request?: Promise<VideoStoryboard | null>;
+}
+
+const storyboardManifestCache = new Map<string, StoryboardManifestCacheEntry>();
+const storyboardMissingRetryMs = 60_000;
+const storyboardManifestCacheLimit = 256;
+
+function existingStoryboard(asset: Asset) {
+  const key = `${asset.id}:${asset.cacheKey}`;
+  const now = Date.now();
+  const cached = storyboardManifestCache.get(key);
+  if (cached?.request) return cached.request;
+  if (cached && (cached.manifest || now - cached.checkedAt < storyboardMissingRetryMs)) {
+    storyboardManifestCache.delete(key);
+    storyboardManifestCache.set(key, cached);
+    return Promise.resolve(cached.manifest);
+  }
+  const request = api.assetStoryboard(asset.id).then((manifest) => {
+    cacheStoryboardManifest(key, { checkedAt: Date.now(), manifest });
+    return manifest;
+  }).catch(() => {
+    cacheStoryboardManifest(key, { checkedAt: Date.now(), manifest: null });
+    return null;
+  });
+  cacheStoryboardManifest(key, { checkedAt: now, manifest: null, request });
+  return request;
+}
+
+function cacheStoryboardManifest(key: string, entry: StoryboardManifestCacheEntry) {
+  storyboardManifestCache.delete(key);
+  storyboardManifestCache.set(key, entry);
+  while (storyboardManifestCache.size > storyboardManifestCacheLimit) {
+    const oldest = storyboardManifestCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    storyboardManifestCache.delete(oldest);
+  }
+}
+
+function desktopHoverAvailable() {
+  return window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+}
+
 function AssetTileMedia({
   asset,
+  hoverStoryboardEnabled = false,
   rowHeight,
   tileWidth,
 }: {
   asset: Asset;
+  hoverStoryboardEnabled?: boolean;
   rowHeight: number;
   tileWidth: number;
 }) {
   const [sourceFailed, setSourceFailed] = useState(false);
+  const [storyboard, setStoryboard] = useState<VideoStoryboard | null>(null);
+  const [hoverRatio, setHoverRatio] = useState<number | null>(null);
+  const [loadedStoryboardSheets, setLoadedStoryboardSheets] = useState<Set<string>>(() => new Set());
+  const pendingHoverRatio = useRef<number | null>(null);
+  const hoverFrame = useRef(0);
+  const hoverDelayTimer = useRef(0);
+  const hoverArmed = useRef(false);
+  const assetIdentity = `${asset.id}:${asset.cacheKey}`;
+  const assetIdentityRef = useRef(assetIdentity);
+  assetIdentityRef.current = assetIdentity;
 
   useEffect(() => {
     setSourceFailed(false);
+    setStoryboard(null);
+    setHoverRatio(null);
+    setLoadedStoryboardSheets(new Set());
+    pendingHoverRatio.current = null;
+    hoverArmed.current = false;
+    if (hoverDelayTimer.current) window.clearTimeout(hoverDelayTimer.current);
+    hoverDelayTimer.current = 0;
+    if (hoverFrame.current) window.cancelAnimationFrame(hoverFrame.current);
+    hoverFrame.current = 0;
   }, [asset.id, asset.cacheKey]);
 
+  useEffect(() => () => {
+    if (hoverDelayTimer.current) window.clearTimeout(hoverDelayTimer.current);
+    if (hoverFrame.current) window.cancelAnimationFrame(hoverFrame.current);
+  }, []);
+
   const thumbReady = assetReadyForThumb(asset);
-  if (!thumbReady || sourceFailed) {
-    return (
+  const baseMedia = !thumbReady || sourceFailed ? (
       <div className="asset-media-placeholder" title={asset.filename}>
         <span>{asset.filename}</span>
       </div>
-    );
-  }
-
-  return (
+  ) : (
     <img
       className="asset-media"
       src={assetThumbUrl(asset)}
@@ -1070,6 +1206,128 @@ function AssetTileMedia({
         setSourceFailed(true);
       }}
     />
+  );
+
+  const storyboardEnabled = hoverStoryboardEnabled && asset.mediaType === 'video';
+  const frameIndex = storyboard && hoverRatio !== null
+    ? Math.min(storyboard.frameCount - 1, Math.max(0, Math.floor(hoverRatio * storyboard.frameCount)))
+    : -1;
+  const framesPerSheet = storyboard ? storyboard.columns * storyboard.rows : 0;
+  const sheet = frameIndex >= 0 && framesPerSheet > 0 ? Math.floor(frameIndex / framesPerSheet) : -1;
+  const cell = frameIndex >= 0 && framesPerSheet > 0 ? frameIndex % framesPerSheet : -1;
+  const sheetURL = storyboard && sheet >= 0 ? assetStoryboardSheetUrl(asset, sheet) : '';
+
+  useEffect(() => {
+    if (!sheetURL || loadedStoryboardSheets.has(sheetURL)) return undefined;
+    let active = true;
+    const image = new Image();
+    image.decoding = 'async';
+    image.onload = () => {
+      void image.decode().catch(() => undefined).finally(() => {
+        if (!active) return;
+        setLoadedStoryboardSheets((current) => {
+          if (current.has(sheetURL)) return current;
+          const next = new Set(current);
+          next.add(sheetURL);
+          return next;
+        });
+      });
+    };
+    image.onerror = () => undefined;
+    image.src = sheetURL;
+    return () => {
+      active = false;
+    };
+  }, [loadedStoryboardSheets, sheetURL]);
+
+  if (!storyboardEnabled) return baseMedia;
+
+  const previewRotation = normalizeRotation(asset.rotation);
+  const previewQuarterTurn = previewRotation === 90 || previewRotation === 270;
+  const sourceAspect = asset.width && asset.height && asset.width > 0 && asset.height > 0
+    ? asset.width / asset.height
+    : 16 / 9;
+  const storyboardCellAspect = storyboard ? storyboard.cellWidth / storyboard.cellHeight : 16 / 9;
+  const previewContentWidth = storyboard
+    ? sourceAspect >= storyboardCellAspect ? storyboard.cellWidth : storyboard.cellHeight * sourceAspect
+    : 0;
+  const previewContentHeight = storyboard
+    ? sourceAspect >= storyboardCellAspect ? storyboard.cellWidth / sourceAspect : storyboard.cellHeight
+    : 0;
+  const previewContentLeft = storyboard ? (storyboard.cellWidth - previewContentWidth) / 2 : 0;
+  const previewContentTop = storyboard ? (storyboard.cellHeight - previewContentHeight) / 2 : 0;
+  const previewRotatedWidth = previewQuarterTurn ? previewContentHeight : previewContentWidth;
+  const previewRotatedHeight = previewQuarterTurn ? previewContentWidth : previewContentHeight;
+  const previewScale = storyboard
+    ? Math.min(tileWidth / Math.max(1, previewRotatedWidth), rowHeight / Math.max(1, previewRotatedHeight))
+    : 0;
+  const previewWidth = previewContentWidth * previewScale;
+  const previewHeight = previewContentHeight * previewScale;
+  const cellColumn = storyboard && cell >= 0 ? cell % storyboard.columns : 0;
+  const cellRow = storyboard && cell >= 0 ? Math.floor(cell / storyboard.columns) : 0;
+  const previewStyle: CSSProperties | undefined = storyboard && sheetURL && loadedStoryboardSheets.has(sheetURL)
+    ? {
+        backgroundImage: `url("${sheetURL}")`,
+        backgroundPosition: `${-(cellColumn * storyboard.cellWidth + previewContentLeft) * previewScale}px ${-(cellRow * storyboard.cellHeight + previewContentTop) * previewScale}px`,
+        backgroundSize: `${storyboard.columns * storyboard.cellWidth * previewScale}px ${storyboard.rows * storyboard.cellHeight * previewScale}px`,
+        height: previewHeight,
+        left: (tileWidth - previewWidth) / 2,
+        position: 'absolute',
+        top: (rowHeight - previewHeight) / 2,
+        transform: previewRotation === 0 ? undefined : `rotate(${previewRotation}deg)`,
+        transformOrigin: 'center',
+        width: previewWidth,
+      }
+    : undefined;
+
+  const updateHoverPosition = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!desktopHoverAvailable()) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    pendingHoverRatio.current = Math.min(1, Math.max(0, (event.clientX - rect.left) / Math.max(1, rect.width)));
+    if (!hoverArmed.current) return;
+    if (hoverFrame.current) return;
+    hoverFrame.current = window.requestAnimationFrame(() => {
+      hoverFrame.current = 0;
+      setHoverRatio(pendingHoverRatio.current);
+    });
+  };
+
+  return (
+    <div
+      className="asset-storyboard-hover-layer"
+      onMouseEnter={(event) => {
+        if (!desktopHoverAvailable()) return;
+        updateHoverPosition(event);
+        const requestedIdentity = assetIdentity;
+        if (hoverDelayTimer.current) window.clearTimeout(hoverDelayTimer.current);
+        hoverDelayTimer.current = window.setTimeout(() => {
+          hoverDelayTimer.current = 0;
+          if (assetIdentityRef.current !== requestedIdentity || pendingHoverRatio.current === null) return;
+          hoverArmed.current = true;
+          setHoverRatio(pendingHoverRatio.current);
+          void existingStoryboard(asset).then((manifest) => {
+            if (assetIdentityRef.current === requestedIdentity && hoverArmed.current) setStoryboard(manifest);
+          });
+        }, storyboardHoverDelayMs);
+      }}
+      onMouseLeave={() => {
+        if (hoverDelayTimer.current) window.clearTimeout(hoverDelayTimer.current);
+        hoverDelayTimer.current = 0;
+        hoverArmed.current = false;
+        pendingHoverRatio.current = null;
+        if (hoverFrame.current) window.cancelAnimationFrame(hoverFrame.current);
+        hoverFrame.current = 0;
+        setHoverRatio(null);
+      }}
+      onMouseMove={updateHoverPosition}
+    >
+      {baseMedia}
+      {hoverRatio !== null && previewStyle && (
+        <div className="asset-storyboard-hover-preview" aria-hidden="true">
+          <span style={previewStyle} />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1554,6 +1812,76 @@ function buildListRows(
   return rows;
 }
 
+function buildFixedGridRows(
+  assets: Asset[],
+  containerWidth: number,
+  groupMode: AssetGroupMode,
+  sort: SortKey,
+  thumbnailHeight: number,
+  duplicateGrouping: boolean,
+): GridRow[] {
+  if (containerWidth <= 0) return [];
+  const targetCardWidth = Math.min(containerWidth, Math.max(minTileWidth, Math.round(thumbnailHeight * fixedGridCardAspect)));
+  const cardsPerRow = Math.max(1, Math.round((containerWidth + gap) / (targetCardWidth + gap)));
+  const cardWidth = (containerWidth - gap * (cardsPerRow - 1)) / cardsPerRow;
+  const fittedThumbnailHeight = Math.max(1, Math.round(cardWidth / fixedGridCardAspect));
+  const cardHeight = fittedThumbnailHeight + fixedGridFooterHeight;
+  const rows: GridRow[] = [];
+  let items: RowItem[] = [];
+  let currentGroup = '';
+  let currentDuplicate = '';
+  let rowIndex = 0;
+
+  function flushRow() {
+    if (items.length === 0) return;
+    rows.push({
+      key: `fixed-grid-row-${rowIndex}`,
+      type: 'assets',
+      items,
+      height: cardHeight,
+      startAssetIndex: items[0].index,
+      endAssetIndex: items[items.length - 1].index,
+    });
+    rowIndex += 1;
+    items = [];
+  }
+
+  assets.forEach((asset, assetIndex) => {
+    const groupLabel = assetGroupLabel(asset, groupMode, sort);
+    if (groupLabel && groupLabel !== currentGroup) {
+      flushRow();
+      currentGroup = groupLabel;
+      currentDuplicate = '';
+      rows.push({
+        key: `fixed-grid-group-${groupLabel}-${asset.id}`,
+        type: 'group',
+        label: groupLabel,
+        height: groupHeaderHeight,
+        assetIndex,
+      });
+    }
+    if (duplicateGrouping) {
+      const duplicateKey = asset.sha256 ? `${asset.sha256}:${asset.size}` : `asset-${asset.id}`;
+      if (duplicateKey !== currentDuplicate) {
+        flushRow();
+        currentDuplicate = duplicateKey;
+        rows.push({
+          key: `fixed-grid-duplicate-${duplicateKey}`,
+          type: 'group',
+          label: duplicateGroupLabel(duplicateKey),
+          height: groupHeaderHeight,
+          assetIndex,
+          variant: 'duplicate',
+        });
+      }
+    }
+    items.push({ asset, index: assetIndex, width: cardWidth });
+    if (items.length >= cardsPerRow) flushRow();
+  });
+  flushRow();
+  return rows;
+}
+
 function buildRows(
   assets: Asset[],
   containerWidth: number,
@@ -1568,22 +1896,21 @@ function buildRows(
   }
   const rows: GridRow[] = [];
   let items: RowItem[] = [];
-  let usedWidth = 0;
   let currentGroup = '';
   let rowIndex = 0;
-  function flushRow(stretch: boolean) {
+  function flushRow(justify: boolean) {
     if (items.length === 0) return;
+    const fitted = justify ? fitJustifiedRow(items, containerWidth) : { height: rowHeight, items };
     rows.push({
       key: `row-${rowIndex}`,
       type: 'assets',
-      items: stretch ? stretchRow(items, containerWidth) : items,
-      height: rowHeight,
+      items: fitted.items,
+      height: fitted.height,
       startAssetIndex: items[0].index,
       endAssetIndex: items[items.length - 1].index,
     });
     rowIndex += 1;
     items = [];
-    usedWidth = 0;
   }
   for (const [assetIndex, asset] of assets.entries()) {
     const groupLabel = assetGroupLabel(asset, groupMode, sort);
@@ -1593,12 +1920,24 @@ function buildRows(
       rows.push({ key: `group-${groupLabel}-${asset.id}`, type: 'group', label: groupLabel, height: groupHeaderHeight, assetIndex });
     }
     const tileWidth = Math.min(containerWidth, Math.max(minTileWidth, Math.round(rowHeight * assetAspect(asset))));
-    const nextWidth = usedWidth + (items.length > 0 ? gap : 0) + tileWidth;
-    if (items.length > 0 && nextWidth > containerWidth) {
+    const nextItem = { asset, index: assetIndex, width: tileWidth };
+    const candidate = [...items, nextItem];
+    const candidateHeight = justifiedRowHeight(candidate, containerWidth);
+    if (candidateHeight <= rowHeight) {
+      if (items.length > 0) {
+        const currentHeight = justifiedRowHeight(items, containerWidth);
+        if (Math.abs(currentHeight - rowHeight) < Math.abs(candidateHeight - rowHeight)) {
+          flushRow(true);
+          items.push(nextItem);
+          if (justifiedRowHeight(items, containerWidth) <= rowHeight) flushRow(true);
+          continue;
+        }
+      }
+      items.push(nextItem);
       flushRow(true);
+      continue;
     }
-    items.push({ asset, index: assetIndex, width: tileWidth });
-    usedWidth += (items.length > 1 ? gap : 0) + tileWidth;
+    items.push(nextItem);
   }
   flushRow(false);
   return rows;
@@ -1703,6 +2042,28 @@ function stretchRow(items: RowItem[], containerWidth: number): RowItem[] {
     remaining -= width;
     return { ...item, width };
   });
+}
+
+function justifiedRowHeight(items: RowItem[], containerWidth: number) {
+  if (items.length === 0) return 0;
+  const available = containerWidth - gap * Math.max(0, items.length - 1);
+  const aspectTotal = items.reduce((sum, item) => sum + assetAspect(item.asset), 0);
+  return available > 0 && aspectTotal > 0 ? available / aspectTotal : 0;
+}
+
+function fitJustifiedRow(items: RowItem[], containerWidth: number): { height: number; items: RowItem[] } {
+  const height = justifiedRowHeight(items, containerWidth);
+  if (height <= 0) return { height: 1, items };
+  const available = containerWidth - gap * Math.max(0, items.length - 1);
+  let remaining = available;
+  const fitted = items.map((item, index) => {
+    const width = index === items.length - 1
+      ? remaining
+      : Math.max(1, Math.round(assetAspect(item.asset) * height));
+    remaining -= width;
+    return { ...item, width };
+  });
+  return { height, items: fitted };
 }
 
 function assetAspect(asset: Asset): number {

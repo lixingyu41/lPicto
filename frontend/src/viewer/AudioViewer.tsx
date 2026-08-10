@@ -1,11 +1,24 @@
 import { useEffect, useRef, useState } from 'react';
-import { Database, Maximize2, Minimize2, Pause, Play, Settings, Trash2, Volume2, VolumeX } from 'lucide-react';
+import { Database, Maximize2, Minimize2, Pause, Play, Settings, SkipBack, SkipForward, Trash2, Volume2, VolumeX } from 'lucide-react';
 import { api, assetAudioCoverUrl, assetAudioUrl } from '../api/client';
 import type { Asset } from '../types/api';
 import { formatDuration } from '../utils/format';
 import { playbackModeOptions, playbackRates, type ViewerPlaybackMode, type ViewerPrefs } from '../utils/viewerPrefs';
 import { viewerAudioOutputBridge } from './audioOutputBridge';
 import type { ViewerMediaLayerMode } from './mediaLayer';
+import MediaProgressSlider, { mediaBufferedRangesEqual, readMediaBufferedRanges, type MediaBufferedRange } from './MediaProgressSlider';
+
+export interface AudioPlaybackInfo {
+  bufferedEnd: number;
+  currentTime: number;
+  duration: number;
+  networkState: number;
+  playbackRate: number;
+  playing: boolean;
+  proxyProgress: number;
+  readyState: number;
+  sourceReady: boolean;
+}
 
 interface Props {
   asset: Asset;
@@ -20,7 +33,12 @@ interface Props {
   onDeleteRecord: () => void;
   onMediaError: (assetId: number, cacheKey: string, message: string) => void;
   onMediaReady: (assetId: number, cacheKey: string) => void;
+  onPlaybackInfoChange?: (info: AudioPlaybackInfo | null) => void;
   onPlaybackEnded: () => void;
+  onPrevious: () => void;
+  onNext: () => void;
+  previousEnabled: boolean;
+  nextEnabled: boolean;
   onPlaybackModeChange: (value: ViewerPlaybackMode) => void;
   onPlaybackRateChange: (value: number) => void;
   onToggleMediaDetails: () => void;
@@ -50,7 +68,12 @@ export default function AudioViewer({
   onDeleteRecord,
   onMediaError,
   onMediaReady,
+  onPlaybackInfoChange,
   onPlaybackEnded,
+  onPrevious,
+  onNext,
+  previousEnabled,
+  nextEnabled,
   onPlaybackModeChange,
   onPlaybackRateChange,
   onToggleMediaDetails,
@@ -63,6 +86,10 @@ export default function AudioViewer({
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(asset.duration ?? 0);
+  const [bufferedEnd, setBufferedEnd] = useState(0);
+  const [bufferedRanges, setBufferedRanges] = useState<MediaBufferedRange[]>([]);
+  const [mediaReadyState, setMediaReadyState] = useState(0);
+  const [mediaNetworkState, setMediaNetworkState] = useState(0);
   const [audioPreference, setAudioPreference] = useState(loadAudioPreference);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -73,7 +100,30 @@ export default function AudioViewer({
     setPlaying(false);
     setCurrentTime(0);
     setDuration(asset.duration ?? 0);
+    setBufferedEnd(0);
+    setBufferedRanges([]);
+    setMediaReadyState(0);
+    setMediaNetworkState(0);
   }, [asset.id, asset.cacheKey, asset.browserPlayable, asset.duration]);
+
+  useEffect(() => {
+    if (layerMode !== 'active') return;
+    onPlaybackInfoChange?.({
+      bufferedEnd,
+      currentTime,
+      duration,
+      networkState: mediaNetworkState,
+      playbackRate,
+      playing,
+      proxyProgress,
+      readyState: mediaReadyState,
+      sourceReady,
+    });
+  }, [bufferedEnd, currentTime, duration, layerMode, mediaNetworkState, mediaReadyState, onPlaybackInfoChange, playbackRate, playing, proxyProgress, sourceReady]);
+
+  useEffect(() => () => {
+    if (layerMode === 'active') onPlaybackInfoChange?.(null);
+  }, [asset.id, asset.cacheKey, layerMode, onPlaybackInfoChange]);
 
   useEffect(() => {
     if (!preloadEnabled || asset.browserPlayable) return;
@@ -150,6 +200,18 @@ export default function AudioViewer({
     onMediaReady(asset.id, asset.cacheKey);
   };
 
+  const updateMediaState = (element: HTMLAudioElement) => {
+    setMediaReadyState(element.readyState);
+    setMediaNetworkState(element.networkState);
+    let end = 0;
+    for (let index = 0; index < element.buffered.length; index++) {
+      end = Math.max(end, element.buffered.end(index));
+    }
+    setBufferedEnd(end);
+    const ranges = readMediaBufferedRanges(element, duration || asset.duration || element.duration || 0);
+    setBufferedRanges((current) => mediaBufferedRangesEqual(current, ranges) ? current : ranges);
+  };
+
   const updatePreference = (next: AudioPreference) => {
     setAudioPreference(next);
     localStorage.setItem(audioPreferenceKey, JSON.stringify(next));
@@ -204,19 +266,27 @@ export default function AudioViewer({
           preload="auto"
           src={assetAudioUrl(asset)}
           loop={viewerPrefs.playbackMode === 'single'}
-          onCanPlay={markReady}
-          onLoadedMetadata={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : asset.duration ?? 0)}
-          onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-          onPlay={() => setPlaying(true)}
-          onPlaying={() => {
+          onCanPlay={(event) => { markReady(); updateMediaState(event.currentTarget); }}
+          onLoadedMetadata={(event) => {
+            setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : asset.duration ?? 0);
+            updateMediaState(event.currentTarget);
+          }}
+          onProgress={(event) => updateMediaState(event.currentTarget)}
+          onTimeUpdate={(event) => { setCurrentTime(event.currentTarget.currentTime); updateMediaState(event.currentTarget); }}
+          onWaiting={(event) => updateMediaState(event.currentTarget)}
+          onPlay={(event) => { setPlaying(true); updateMediaState(event.currentTarget); }}
+          onPlaying={(event) => {
+            updateMediaState(event.currentTarget);
             if (layerMode === 'active') viewerAudioOutputBridge.mediaStarted(`${asset.id}:${asset.cacheKey}`);
           }}
-          onPause={() => {
+          onPause={(event) => {
             setPlaying(false);
+            updateMediaState(event.currentTarget);
             if (layerMode === 'active') viewerAudioOutputBridge.mediaStopped(`${asset.id}:${asset.cacheKey}`);
           }}
-          onEnded={() => {
+          onEnded={(event) => {
             setPlaying(false);
+            updateMediaState(event.currentTarget);
             if (viewerPrefs.playbackMode === 'continuous') onPlaybackEnded();
             viewerAudioOutputBridge.mediaStopped(`${asset.id}:${asset.cacheKey}`);
           }}
@@ -225,16 +295,21 @@ export default function AudioViewer({
       )}
       {layerMode === 'active' && (
         <div className="audio-controls" data-viewer-wheel-control>
+          <button type="button" aria-label="上一个" disabled={!previousEnabled} onClick={onPrevious} title={previousEnabled ? '上一个' : '上一个尚未预加载完成'}>
+            <SkipBack size={20} />
+          </button>
           <button type="button" aria-label={playing ? '暂停' : '播放'} onClick={togglePlayback}>
             {playing ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
           </button>
+          <button type="button" aria-label="下一个" disabled={!nextEnabled} onClick={onNext} title={nextEnabled ? '下一个' : '下一个尚未预加载完成'}>
+            <SkipForward size={20} />
+          </button>
           <span>{formatDuration(currentTime)}</span>
-          <input
-            aria-label="音频进度"
-            type="range"
-            min={0}
-            max={Math.max(duration, 0.01)}
-            step={0.01}
+          <MediaProgressSlider
+            ariaLabel="音频进度"
+            buffered={bufferedRanges}
+            className="audio-progress-slider"
+            duration={duration}
             value={Math.min(currentTime, Math.max(duration, 0.01))}
             onChange={(event) => {
               const value = Number(event.target.value);

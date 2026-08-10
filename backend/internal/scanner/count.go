@@ -12,15 +12,24 @@ import (
 )
 
 func CountMediaFilesForRoots(ctx context.Context, store storage.Store, roots []string) (int, error) {
+	return CountMediaFilesForRootsProgress(ctx, store, roots, nil)
+}
+
+func CountMediaFilesForRootsProgress(ctx context.Context, store storage.Store, roots []string, onProgress func(int)) (int, error) {
 	normalized, err := db.NormalizeScanFolders(roots)
 	if err != nil {
 		return 0, err
 	}
 	total := 0
 	var firstErr error
+	reportFound := func() {
+		total++
+		if onProgress != nil {
+			onProgress(total)
+		}
+	}
 	for _, root := range normalized {
-		count, err := countMediaRoot(ctx, store, root)
-		total += count
+		_, err := countMediaRoot(ctx, store, root, reportFound)
 		if err == nil {
 			continue
 		}
@@ -28,8 +37,7 @@ func CountMediaFilesForRoots(ctx context.Context, store storage.Store, roots []s
 			firstErr = err
 		}
 		if root == "" {
-			manifestCount, manifestErr := countManifestMediaTopLevel(ctx, store)
-			total += manifestCount
+			_, manifestErr := countManifestMediaTopLevel(ctx, store, reportFound)
 			if firstErr == nil {
 				firstErr = manifestErr
 			}
@@ -38,7 +46,7 @@ func CountMediaFilesForRoots(ctx context.Context, store storage.Store, roots []s
 	return total, firstErr
 }
 
-func countMediaRoot(ctx context.Context, store storage.Store, rootRel string) (int, error) {
+func countMediaRoot(ctx context.Context, store storage.Store, rootRel string, onFound func()) (int, error) {
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
@@ -46,7 +54,7 @@ func countMediaRoot(ctx context.Context, store storage.Store, rootRel string) (i
 		total := 0
 		var firstErr error
 		for _, rel := range store.RootRelPaths() {
-			count, err := countMediaRoot(ctx, store, rel)
+			count, err := countMediaRoot(ctx, store, rel, onFound)
 			total += count
 			if firstErr == nil {
 				firstErr = err
@@ -65,10 +73,10 @@ func countMediaRoot(ctx context.Context, store storage.Store, rootRel string) (i
 	if !info.IsDir() {
 		return 0, nil
 	}
-	return countMediaDir(ctx, store, rootPath)
+	return countMediaDir(ctx, store, rootPath, onFound)
 }
 
-func countMediaDir(ctx context.Context, store storage.Store, dirPath string) (int, error) {
+func countMediaDir(ctx context.Context, store storage.Store, dirPath string, onFound func()) (int, error) {
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
@@ -82,13 +90,16 @@ func countMediaDir(ctx context.Context, store storage.Store, dirPath string) (in
 		if entry.Type()&os.ModeSymlink != 0 {
 			count, err := countMediaSymlink(store, absPath)
 			total += count
+			if count > 0 && onFound != nil {
+				onFound()
+			}
 			if readErr == nil {
 				readErr = err
 			}
 			continue
 		}
 		if entry.IsDir() {
-			count, err := countMediaDir(ctx, store, absPath)
+			count, err := countMediaDir(ctx, store, absPath, onFound)
 			total += count
 			if readErr == nil {
 				readErr = err
@@ -97,6 +108,9 @@ func countMediaDir(ctx context.Context, store storage.Store, dirPath string) (in
 		}
 		if media.DetectByPath(entry.Name()).OK {
 			total++
+			if onFound != nil {
+				onFound()
+			}
 		}
 	}
 	return total, readErr
@@ -120,7 +134,7 @@ func countMediaSymlink(store storage.Store, absPath string) (int, error) {
 	return 0, nil
 }
 
-func countManifestMediaTopLevel(ctx context.Context, store storage.Store) (int, error) {
+func countManifestMediaTopLevel(ctx context.Context, store storage.Store, onFound func()) (int, error) {
 	folders, err := storage.LoadSourceFolderManifest(store.DataRoot)
 	if err != nil {
 		return 0, err
@@ -128,7 +142,7 @@ func countManifestMediaTopLevel(ctx context.Context, store storage.Store) (int, 
 	total := 0
 	var firstErr error
 	for _, rel := range storage.ManifestTopLevelFolders(folders) {
-		count, err := countMediaRoot(ctx, store, rel)
+		count, err := countMediaRoot(ctx, store, rel, onFound)
 		total += count
 		if firstErr == nil {
 			firstErr = err

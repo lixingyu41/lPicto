@@ -539,6 +539,10 @@ func (s *Server) removeVideoSegmentCaches(assetCacheKey string) error {
 }
 
 func (s *Server) runVideoSegmentTranscode(ctx context.Context, asset model.Asset, plan videoSegmentPlan, dest string, tmp string) {
+	releaseDest := s.cachePolicy.Pin(dest)
+	defer releaseDest()
+	releaseTemp := s.cachePolicy.Pin(tmp)
+	defer releaseTemp()
 	_ = os.Remove(tmp)
 	source, err := s.store.PhotoPath(asset.RelPath)
 	if err != nil {
@@ -584,6 +588,10 @@ func (s *Server) runVideoSegmentTranscode(ctx context.Context, asset model.Asset
 		err = cause
 	}
 	s.finishVideoSegmentTranscode(plan.CacheKey, dest, tmp, err)
+	if err == nil {
+		assetID := asset.ID
+		s.cachePolicy.Register(context.Background(), "video-proxies", plan.CacheKey, dest, &assetID, 0)
+	}
 }
 
 func (s *Server) acquireScheduledVideoSegmentSlot(ctx context.Context, cacheKey string) (func(), error) {
@@ -960,6 +968,8 @@ func (s *Server) waitVideoSegment(ctx context.Context, state *videoSegmentRuntim
 }
 
 func (s *Server) serveCachedVideoSegment(w http.ResponseWriter, r *http.Request, state *videoSegmentRuntime) {
+	releaseCache := s.cachePolicy.Pin(state.DestPath)
+	defer releaseCache()
 	file, err := os.Open(state.DestPath)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "cache_not_ready", "缓存尚未生成")
@@ -971,6 +981,7 @@ func (s *Server) serveCachedVideoSegment(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusNotFound, "cache_not_ready", "缓存尚未生成")
 		return
 	}
+	s.cachePolicy.Touch(r.Context(), "video-proxies", state.CacheKey, state.DestPath)
 	w.Header().Set("Content-Type", "video/mp2t")
 	w.Header().Set("Cache-Control", "public, max-age=1200")
 	w.Header().Set("ETag", `"`+state.CacheKey+`"`)

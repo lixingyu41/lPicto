@@ -239,6 +239,8 @@ func (s *Server) aiPauseReason(ctx context.Context, status db.AIStatus, settings
 		switch s.jobs.BackgroundBlocker(ctx) {
 		case "playback", "foreground":
 			return "正在播放或加载媒体，AI 暂时暂停"
+		case "storyboard":
+			return "正在创建视频进度预览图，AI 暂时暂停"
 		case "load":
 			return "系统负载较高，AI 暂时等待"
 		case "memory":
@@ -288,6 +290,7 @@ func (s *Server) updateAISettings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "ai_queue_clear_failed", "停止 AI 队列失败")
 			return
 		}
+		s.removeQueuedAIStages(r.Context())
 		_ = s.db.FinishSystemTask(r.Context(), "ai_analysis", "stopped", "AI 自动分析已停止")
 	}
 	writeJSON(w, http.StatusOK, settings)
@@ -321,8 +324,18 @@ func (s *Server) stopAIManually(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.removeQueuedAIStages(r.Context())
 	_ = s.db.FinishSystemTask(r.Context(), "ai_analysis", "stopped", "AI 手动分析已停止")
 	writeJSON(w, http.StatusOK, settings)
+}
+
+func (s *Server) removeQueuedAIStages(ctx context.Context) {
+	if s.aiStager == nil {
+		return
+	}
+	if err := s.aiStager.RemoveReady(ctx); err != nil && s.logger != nil {
+		s.logger.Warn("remove queued AI staging failed", "error", err)
+	}
 }
 
 func (s *Server) enqueueAIBackfillNow(ctx context.Context) (int, error) {

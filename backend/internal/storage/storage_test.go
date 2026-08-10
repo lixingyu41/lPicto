@@ -129,6 +129,7 @@ func TestRemoveCacheDeletesVariants(t *testing.T) {
 		{kind: "thumbs", ext: "webp"},
 		{kind: "previews", ext: "webp"},
 		{kind: "video-posters", ext: "jpg"},
+		{kind: "storyboards", ext: "webp"},
 		{kind: "video-proxies", ext: "mp4"},
 	} {
 		path, err := store.CachePath(item.kind, cacheKey, item.ext)
@@ -152,6 +153,7 @@ func TestRemoveCacheDeletesVariants(t *testing.T) {
 		{kind: "thumbs", ext: "webp"},
 		{kind: "previews", ext: "webp"},
 		{kind: "video-posters", ext: "jpg"},
+		{kind: "storyboards", ext: "webp"},
 		{kind: "video-proxies", ext: "mp4"},
 	} {
 		path, err := store.CachePath(item.kind, cacheKey, item.ext)

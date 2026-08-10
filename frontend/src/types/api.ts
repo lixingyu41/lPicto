@@ -4,10 +4,12 @@ export type OrientationFilter = 'all' | 'landscape' | 'portrait';
 export type NFOFilterField = 'actor' | 'id' | 'tag' | 'title' | 'year';
 export type AssetServerGroup = 'day' | 'month' | 'year' | 'size' | 'letter' | 'folder';
 export type AssetRating = 0 | 1 | 2 | 3 | 4 | 5;
+export type AssetRatingFilter = AssetRating | 'all';
 export type AlbumAssetFilter = 'none';
 export type SortField =
   | 'timeline'
   | 'imported'
+  | 'last_played'
   | 'filename'
   | 'path'
   | 'media_type'
@@ -30,6 +32,7 @@ export type SortKey = 'filename' | 'size' | `${SortField}_${'asc' | 'desc'}`;
 export interface Asset {
   id: number;
   filename: string;
+  displayTitle: string;
   filenameSortKey: string;
   relPath: string;
   parentRelPath: string;
@@ -44,6 +47,7 @@ export interface Asset {
   timelineAt: number;
   importedAt: number;
   cacheKey: string;
+  lastPlayedAt?: number | null;
   browserPlayable: boolean;
   thumbStatus: string;
   previewStatus: string;
@@ -66,6 +70,18 @@ export interface Asset {
   aiTags?: AssetAITag[];
   manualTags?: AssetTag[];
   palette?: AIColor[];
+}
+
+export interface VideoStoryboard {
+  assetId: number;
+  cacheKey: string;
+  frameCount: number;
+  sheetCount: number;
+  columns: number;
+  rows: number;
+  cellWidth: number;
+  cellHeight: number;
+  interval: number;
 }
 
 export interface VideoProxyRuntime {
@@ -234,7 +250,7 @@ export interface TagSummary {
   createdAt: number;
 }
 
-export type SystemCollectionKind = 'unclassified' | 'unrated' | 'untagged' | 'with_danmaku' | 'with_subtitles' | 'needs_transcode' | 'duplicates' | 'missing' | 'hidden' | 'ai_pending' | 'ai_ready' | 'ai_failed';
+export type SystemCollectionKind = 'all' | 'unclassified' | 'unrated' | 'untagged' | 'with_danmaku' | 'with_subtitles' | 'needs_transcode' | 'duplicates' | 'missing' | 'hidden' | 'ai_pending' | 'ai_ready' | 'ai_failed' | 'storyboard_ready';
 
 export interface CollectionRule extends LibraryFilterParams {
   name?: string;
@@ -312,6 +328,7 @@ export interface AssetDeleteResult {
 }
 
 export interface LibraryFilterParams {
+  playedOnly?: 1;
   q?: string;
   visible?: 'all';
   combinedQuery?: string;
@@ -388,6 +405,7 @@ export interface ScanStatus {
 export interface ScanProgress {
   state: string;
   requestedAction: string;
+  pauseReason?: string;
   task: string;
   reason: string;
   phase: string;

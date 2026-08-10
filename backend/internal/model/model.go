@@ -18,6 +18,7 @@ type Asset struct {
 	ImportedAt        int64
 	TimelineAt        int64
 	CacheKey          string
+	LastPlayedAt      *int64
 	BrowserPlayable   bool
 	ScanStatus        string
 	ThumbStatus       string

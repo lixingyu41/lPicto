@@ -84,6 +84,7 @@ export function booleanParam(value: string | null, fallback: boolean) {
 }
 
 export function assetRatingParam(value: string | null): AssetRating | null {
+  if (value === null || value.trim() === '') return null;
   const parsed = Number(value);
   if (parsed === 0 || parsed === 1 || parsed === 2 || parsed === 3 || parsed === 4 || parsed === 5) {
     return parsed;
