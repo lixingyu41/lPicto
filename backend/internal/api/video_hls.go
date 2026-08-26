@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,11 +60,12 @@ type videoSegmentPlan struct {
 	StartSeconds   float64
 	Duration       float64
 	TotalDuration  float64
-	SegmentSeconds int
+	SegmentSeconds float64
 	SegmentCount   int
 }
 
 const videoPrioritySegmentCount = 5
+const videoFirstSegmentSeconds = 2.0
 const videoSegmentPriorityHeader = "X-LPicto-Segment-Priority"
 
 const (
@@ -111,9 +113,9 @@ func (s *Server) videoHLSPlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 	session := videoProxySessionFromRequest(r)
 	priority := videoSegmentPriorityName(videoSegmentPriorityFromRequest(r, videoSegmentPriorityBalanced))
-	segmentSeconds := s.videoSegmentSeconds()
+	segmentSeconds := s.adaptiveVideoSegmentSeconds(asset)
 	segmentCount := videoSegmentCount(duration, segmentSeconds)
-	targetDuration := int(math.Ceil(float64(segmentSeconds)))
+	targetDuration := int(math.Ceil(segmentSeconds))
 	query := videoSegmentQuery(asset, session, priority)
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-store")
@@ -230,6 +232,22 @@ func (s *Server) videoHLSPrewarm(w http.ResponseWriter, r *http.Request) {
 	if start < 0 {
 		start = 0
 	}
+	if queryBool(r.URL.Query().Get("all")) {
+		segmentSeconds := s.adaptiveVideoSegmentSeconds(asset)
+		segmentCount := videoSegmentCount(assetDuration(asset), segmentSeconds)
+		if start > segmentCount {
+			start = segmentCount
+		}
+		started := s.startVideoSegmentFullWarm(asset, start, s.videoProxyCacheSettings(r.Context()))
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"accepted":       true,
+			"queuedSegments": segmentCount - start,
+			"required":       true,
+			"segmentSeconds": segmentSeconds,
+			"started":        started,
+		})
+		return
+	}
 	count, _ := strconv.Atoi(r.URL.Query().Get("count"))
 	if count < 1 || count > videoPrioritySegmentCount {
 		count = videoPrioritySegmentCount
@@ -237,6 +255,7 @@ func (s *Server) videoHLSPrewarm(w http.ResponseWriter, r *http.Request) {
 	session := videoProxySessionFromRequest(r)
 	cacheSettings := s.videoProxyCacheSettings(r.Context())
 	priority := videoSegmentPriorityFromRequest(r, videoSegmentPriorityCritical)
+	segmentSeconds := s.adaptiveVideoSegmentSeconds(asset)
 	completed := 0
 	for index := start; index < start+count; index++ {
 		plan, err := s.videoSegmentPlan(asset, index)
@@ -264,7 +283,57 @@ func (s *Server) videoHLSPrewarm(w http.ResponseWriter, r *http.Request) {
 		}
 		completed++
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"cachedSegments": completed, "required": true})
+	writeJSON(w, http.StatusOK, map[string]any{"cachedSegments": completed, "required": true, "segmentSeconds": segmentSeconds})
+}
+
+func (s *Server) startVideoSegmentFullWarm(asset model.Asset, start int, cacheSettings videoProxyCacheSettings) bool {
+	key := "hls:" + asset.CacheKey
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &videoFullWarmJob{cancel: cancel}
+	if !s.registerVideoFullWarmJob(key, job) {
+		cancel()
+		return false
+	}
+	go func() {
+		defer s.finishVideoFullWarmJob(key, job)
+		s.warmAllVideoSegments(ctx, asset, start, cacheSettings)
+	}()
+	return true
+}
+
+func (s *Server) warmAllVideoSegments(ctx context.Context, asset model.Asset, start int, cacheSettings videoProxyCacheSettings) {
+	stopPriority := s.holdPlaybackPriority(ctx)
+	defer stopPriority()
+	sessionID := fmt.Sprintf("full-cache-%d", asset.ID)
+	defer s.stopVideoSegmentSession(asset.ID, sessionID)
+	segmentCount := videoSegmentCount(assetDuration(asset), s.adaptiveVideoSegmentSeconds(asset))
+	for index := start; index < segmentCount; index++ {
+		if ctx.Err() != nil {
+			return
+		}
+		plan, err := s.videoSegmentPlan(asset, index)
+		if err != nil {
+			return
+		}
+		state, cached, err := s.ensureVideoSegmentRuntime(asset, plan, sessionID, cacheSettings, videoSegmentPriorityBalanced)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("full video segment warmup failed to queue", "assetID", asset.ID, "segmentIndex", index, "error", err)
+			}
+			continue
+		}
+		if cached {
+			continue
+		}
+		if err := s.waitVideoSegment(ctx, state); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if s.logger != nil {
+				s.logger.Warn("full video segment warmup failed", "assetID", asset.ID, "segmentIndex", index, "error", err)
+			}
+		}
+	}
 }
 
 func (s *Server) videoHLSSessionStop(w http.ResponseWriter, r *http.Request) {
@@ -291,12 +360,12 @@ func (s *Server) videoSegmentPlan(asset model.Asset, index int) (videoSegmentPla
 	if duration <= 0 {
 		return videoSegmentPlan{}, errVideoSegmentDurationMissing
 	}
-	segmentSeconds := s.videoSegmentSeconds()
+	segmentSeconds := s.adaptiveVideoSegmentSeconds(asset)
 	count := videoSegmentCount(duration, segmentSeconds)
 	if index < 0 || index >= count {
 		return videoSegmentPlan{}, errVideoSegmentOutOfRange
 	}
-	start := float64(index * segmentSeconds)
+	start := videoSegmentStartSeconds(segmentSeconds, index)
 	segmentDuration := videoSegmentDuration(duration, segmentSeconds, index)
 	return videoSegmentPlan{
 		CacheKey:       videoSegmentCacheKey(asset.CacheKey, segmentSeconds, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, index),
@@ -359,7 +428,6 @@ func (s *Server) ensureVideoSegmentRuntime(asset model.Asset, plan videoSegmentP
 		_ = touchFile(dest, now)
 		return state, true, nil
 	}
-	s.preemptVideoSegmentsLocked(plan.CacheKey, priority)
 	if state.Queued || state.Transcoding {
 		if priority > state.Priority {
 			state.Priority = priority
@@ -401,17 +469,6 @@ func (s *Server) ensureVideoSegmentRuntime(asset model.Asset, plan videoSegmentP
 	return state, false, nil
 }
 
-func (s *Server) preemptVideoSegmentsLocked(cacheKey string, priority int) {
-	for key, running := range s.videoSegmentStates {
-		if key == cacheKey || running == nil || (!running.Queued && !running.Transcoding) || running.Cancel == nil {
-			continue
-		}
-		if running.Priority < priority && (running.Claiming || running.Transcoding) {
-			running.Cancel(errVideoSegmentPreempted)
-		}
-	}
-}
-
 func (s *Server) stopVideoSegmentSession(assetID int64, sessionID string) int {
 	sessionID = sanitizeVideoProxyID(sessionID, "legacy")
 	cancelled := 0
@@ -424,12 +481,17 @@ func (s *Server) stopVideoSegmentSession(assetID int64, sessionID string) int {
 		if videoSegmentSessionCountLocked(state) > 0 {
 			continue
 		}
-		if state.Queued || state.Claiming || state.Transcoding {
+		if state.Queued || state.Claiming {
 			state.DeleteOnDone = true
 			if state.Cancel != nil {
 				state.Cancel(errVideoSegmentSessionStop)
 			}
 			cancelled++
+			continue
+		}
+		if state.Transcoding {
+			// A started segment is allowed to finish so the work remains reusable
+			// for the next viewer instead of being discarded mid-encode.
 			continue
 		}
 		delete(s.videoSegmentStates, key)
@@ -502,6 +564,7 @@ func videoSegmentSessionCountLocked(state *videoSegmentRuntime) int {
 }
 
 func (s *Server) removeVideoSegmentCaches(assetCacheKey string) error {
+	s.cancelVideoFullWarm(assetCacheKey)
 	prefix := assetCacheKey + "-hls-"
 	var done []<-chan struct{}
 	s.videoProxyMu.Lock()
@@ -643,17 +706,39 @@ func (s *Server) acquireScheduledVideoSegmentSlot(ctx context.Context, cacheKey 
 }
 
 func (s *Server) videoSegmentQueueHeadLocked() *videoSegmentRuntime {
-	var selected *videoSegmentRuntime
+	maxPriority := -1
+	activeSessions := map[string]struct{}{}
 	for _, state := range s.videoSegmentStates {
-		if state == nil || !state.Queued || state.Cancel == nil {
+		if state == nil {
 			continue
 		}
-		if selected == nil || state.Priority > selected.Priority ||
-			(state.Priority == selected.Priority && state.QueueOrder < selected.QueueOrder) {
+		if state.Transcoding || state.Claiming {
+			if sessionID := sanitizeVideoProxyID(state.SessionID, ""); sessionID != "" {
+				activeSessions[sessionID] = struct{}{}
+			}
+		}
+		if state.Queued && !state.Claiming && state.Cancel != nil && state.Priority > maxPriority {
+			maxPriority = state.Priority
+		}
+	}
+	var selected *videoSegmentRuntime
+	var fallback *videoSegmentRuntime
+	for _, state := range s.videoSegmentStates {
+		if state == nil || !state.Queued || state.Claiming || state.Cancel == nil || state.Priority != maxPriority {
+			continue
+		}
+		if fallback == nil || state.QueueOrder < fallback.QueueOrder {
+			fallback = state
+		}
+		_, sessionBusy := activeSessions[sanitizeVideoProxyID(state.SessionID, "")]
+		if !sessionBusy && (selected == nil || state.QueueOrder < selected.QueueOrder) {
 			selected = state
 		}
 	}
-	return selected
+	if selected != nil {
+		return selected
+	}
+	return fallback
 }
 
 func (s *Server) markPlaybackPriority(ctx context.Context) {
@@ -999,7 +1084,8 @@ func (s *Server) videoSegmentStatus(asset model.Asset, sessionID string) VideoSe
 		SegmentIndex:        -1,
 		State:               "idle",
 		Status:              "idle",
-		Duration:            float64(s.videoSegmentSeconds()),
+		Duration:            s.adaptiveVideoSegmentSeconds(asset),
+		SegmentSeconds:      s.adaptiveVideoSegmentSeconds(asset),
 		UpdatedAt:           now.Unix(),
 		ServerTime:          now.Unix(),
 		CachedBytes:         cacheSummary.CachedBytes,
@@ -1012,7 +1098,7 @@ func (s *Server) videoSegmentStatus(asset model.Asset, sessionID string) VideoSe
 	defer s.videoProxyMu.Unlock()
 	var selected *videoSegmentRuntime
 	for _, state := range s.videoSegmentStates {
-		if state == nil || state.AssetID != asset.ID || !videoSegmentHasSessionLocked(state, sessionID) {
+		if state == nil || state.AssetID != asset.ID || (sessionID != "legacy" && !videoSegmentHasSessionLocked(state, sessionID)) {
 			continue
 		}
 		if selected == nil || state.Priority > selected.Priority ||
@@ -1067,12 +1153,13 @@ type videoSegmentCacheSummary struct {
 }
 
 func (s *Server) videoSegmentCacheSummary(asset model.Asset) videoSegmentCacheSummary {
-	segmentCount := videoSegmentCount(assetDuration(asset), s.videoSegmentSeconds())
+	segmentSeconds := s.adaptiveVideoSegmentSeconds(asset)
+	segmentCount := videoSegmentCount(assetDuration(asset), segmentSeconds)
 	summary := videoSegmentCacheSummary{SegmentCount: segmentCount}
 	if segmentCount == 0 || strings.TrimSpace(asset.CacheKey) == "" {
 		return summary
 	}
-	firstKey := videoSegmentCacheKey(asset.CacheKey, s.videoSegmentSeconds(), s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, 0)
+	firstKey := videoSegmentCacheKey(asset.CacheKey, segmentSeconds, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, 0)
 	firstPath, err := s.store.CacheFilePath("video-proxies", firstKey, "ts")
 	if err != nil {
 		return summary
@@ -1093,7 +1180,7 @@ func (s *Server) videoSegmentCacheSummary(asset model.Asset) videoSegmentCacheSu
 		entrySizes[entry.Name()] = info.Size()
 	}
 	for index := 0; index < segmentCount; index++ {
-		key := videoSegmentCacheKey(asset.CacheKey, s.videoSegmentSeconds(), s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, index)
+		key := videoSegmentCacheKey(asset.CacheKey, segmentSeconds, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, index)
 		if size, ok := entrySizes[key+".ts"]; ok {
 			summary.CachedSegments++
 			summary.CachedBytes += size
@@ -1125,23 +1212,151 @@ func (s *Server) videoSegmentSeconds() int {
 	return s.cfg.VideoSegmentSeconds
 }
 
-func videoSegmentCount(duration float64, segmentSeconds int) int {
-	if duration <= 0 || segmentSeconds < 1 {
-		return 0
+func (s *Server) adaptiveVideoSegmentSeconds(asset model.Asset) float64 {
+	duration := assetDuration(asset)
+	if duration > 0 && duration <= 4 {
+		return duration
 	}
-	return int(math.Ceil(duration / float64(segmentSeconds)))
+	maximum := float64(s.videoSegmentSeconds())
+	if maximum > 4 {
+		maximum = 4
+	}
+	if maximum < 2 {
+		maximum = 2
+	}
+	bitrate := float64(0)
+	if duration > 0 && asset.Size > 0 {
+		bitrate = float64(asset.Size) * 8 / duration
+	}
+	width, height, fps, codec, metadataBitrate := videoSegmentMetadata(asset.MetadataJSON)
+	if width <= 0 && asset.Width != nil {
+		width = *asset.Width
+	}
+	if height <= 0 && asset.Height != nil {
+		height = *asset.Height
+	}
+	if metadataBitrate > 0 {
+		bitrate = metadataBitrate
+	}
+	if width <= 0 || height <= 0 {
+		width, height = 1280, 720
+	}
+	if fps <= 0 {
+		fps = 30
+	}
+	codecFactor := 1.0
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "h264", "avc", "avc1":
+		codecFactor = 1
+	case "hevc", "h265", "vp9":
+		codecFactor = 1.35
+	case "av1":
+		codecFactor = 1.6
+	default:
+		if strings.TrimSpace(codec) != "" {
+			codecFactor = 1.2
+		}
+	}
+	secondsByBytes := maximum
+	if bitrate > 0 {
+		secondsByBytes = float64(64<<20) * 8 / bitrate
+	}
+	megapixels := float64(width*height) / 1_000_000
+	secondsByWork := 300 / math.Max(0.1, megapixels*fps*codecFactor)
+	seconds := math.Min(maximum, math.Min(secondsByBytes, secondsByWork))
+	seconds = math.Max(2, seconds)
+	seconds = math.Floor(seconds*2) / 2
+	if seconds < 2 {
+		return 2
+	}
+	return seconds
 }
 
-func videoSegmentDuration(totalDuration float64, segmentSeconds int, index int) float64 {
-	start := float64(index * segmentSeconds)
+func videoSegmentMetadata(raw *string) (width int, height int, fps float64, codec string, bitrate float64) {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return
+	}
+	var probe struct {
+		Streams []struct {
+			CodecType    string `json:"codec_type"`
+			CodecName    string `json:"codec_name"`
+			Width        int    `json:"width"`
+			Height       int    `json:"height"`
+			AvgFrameRate string `json:"avg_frame_rate"`
+			RFrameRate   string `json:"r_frame_rate"`
+			BitRate      string `json:"bit_rate"`
+		} `json:"streams"`
+		Format struct {
+			BitRate string `json:"bit_rate"`
+		} `json:"format"`
+	}
+	if json.Unmarshal([]byte(*raw), &probe) != nil {
+		return
+	}
+	for _, stream := range probe.Streams {
+		if stream.CodecType != "video" {
+			continue
+		}
+		width, height, codec = stream.Width, stream.Height, stream.CodecName
+		fps = parseVideoSegmentFrameRate(stream.AvgFrameRate)
+		if fps <= 0 {
+			fps = parseVideoSegmentFrameRate(stream.RFrameRate)
+		}
+		bitrate, _ = strconv.ParseFloat(stream.BitRate, 64)
+		break
+	}
+	if formatBitrate, err := strconv.ParseFloat(probe.Format.BitRate, 64); err == nil && formatBitrate > 0 {
+		bitrate = formatBitrate
+	}
+	return
+}
+
+func parseVideoSegmentFrameRate(value string) float64 {
+	parts := strings.Split(strings.TrimSpace(value), "/")
+	if len(parts) == 2 {
+		numerator, _ := strconv.ParseFloat(parts[0], 64)
+		denominator, _ := strconv.ParseFloat(parts[1], 64)
+		if denominator > 0 {
+			return numerator / denominator
+		}
+	}
+	valueFloat, _ := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	return valueFloat
+}
+
+func videoSegmentCount(duration float64, segmentSeconds float64) int {
+	if duration <= 0 || segmentSeconds <= 0 {
+		return 0
+	}
+	first := math.Min(videoFirstSegmentSeconds, segmentSeconds)
+	if duration <= first {
+		return 1
+	}
+	return 1 + int(math.Ceil((duration-first)/segmentSeconds))
+}
+
+func videoSegmentDuration(totalDuration float64, segmentSeconds float64, index int) float64 {
+	start := videoSegmentStartSeconds(segmentSeconds, index)
 	if totalDuration <= start {
 		return 0
 	}
-	return minFloat(float64(segmentSeconds), totalDuration-start)
+	target := segmentSeconds
+	if index == 0 {
+		target = math.Min(videoFirstSegmentSeconds, segmentSeconds)
+	}
+	return minFloat(target, totalDuration-start)
 }
 
-func videoSegmentCacheKey(assetCacheKey string, segmentSeconds int, maxHeight int, crf int, hwAccel string, index int) string {
-	profile := fmt.Sprintf("hls-v3:%s:%d:%d:%d:%s:%d", assetCacheKey, segmentSeconds, maxHeight, crf, strings.ToLower(strings.TrimSpace(hwAccel)), index)
+func videoSegmentStartSeconds(segmentSeconds float64, index int) float64 {
+	if index <= 0 {
+		return 0
+	}
+	first := math.Min(videoFirstSegmentSeconds, segmentSeconds)
+	return first + float64(index-1)*segmentSeconds
+}
+
+func videoSegmentCacheKey(assetCacheKey string, segmentSeconds float64, maxHeight int, crf int, hwAccel string, index int) string {
+	profile := fmt.Sprintf("hls-v5:%s:%d:%d:%d:%s:%d", assetCacheKey, int(math.Round(segmentSeconds*1000)), maxHeight, crf, strings.ToLower(strings.TrimSpace(hwAccel)), index)
 	sum := sha1.Sum([]byte(profile))
 	return fmt.Sprintf("%s-hls-%s", assetCacheKey, hex.EncodeToString(sum[:])[:16])
 }

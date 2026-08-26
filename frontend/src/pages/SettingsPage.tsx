@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import Toolbar from '../components/Toolbar';
-import { useSidebarPanel } from '../components/SidebarContext';
 import { api } from '../api/client';
 import type { AISettings, CleanupStatus, ProcessingProgress, ScanLibrary, ScanLibraryProgress, ScanStatus, StorageStatus, SystemTask, VideoProxySettings, WorkStatusCounts } from '../types/api';
 import { useAssetReadyEvents, useScanStatusEvents } from '../hooks/useAssetReadyEvents';
@@ -28,6 +27,7 @@ import {
 import { CacheManager } from '../components/CacheManager';
 import { ScanManager } from '../components/ScanManager';
 import { loadSettingsSection, saveSettingsSection, settingsSectionFromSlug, settingsSectionPath, settingsSections, type SettingsSectionId } from '../utils/settingsRoute';
+import { loadImmersiveChromeSize, saveImmersiveChromeSize, type ImmersiveChromeSize } from '../utils/immersiveChromePrefs';
 
 export default function SettingsPage() {
   const navigate = useNavigate();
@@ -43,6 +43,7 @@ export default function SettingsPage() {
   const [error, setError] = useState<string | null>(null);
   const [rowHeightLevel, setRowHeightLevel] = useState<GridRowHeightLevel>(() => loadGridRowHeightLevel());
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => loadThemeMode());
+  const [immersiveChromeSize, setImmersiveChromeSize] = useState<ImmersiveChromeSize>(() => loadImmersiveChromeSize());
   const [viewerPrefs, setViewerPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
   const [mediaViewPrefs, setMediaViewPrefs] = useState<MediaViewPreferences>(() => loadMediaViewPreferences());
   const [draggedMediaColumn, setDraggedMediaColumn] = useState<MediaColumnId | null>(null);
@@ -55,17 +56,7 @@ export default function SettingsPage() {
   const [videoProxySaving, setVideoProxySaving] = useState(false);
   const [aiSettings, setAISettings] = useState<AISettings | null>(null);
   const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
-  const [aiSettingsSaving, setAISettingsSaving] = useState(false);
-  const [aiStopping, setAIStopping] = useState(false);
   const [systemTasks, setSystemTasks] = useState<SystemTask[]>([]);
-  const [taskActionBusy, setTaskActionBusy] = useState<string | null>(null);
-  const [stoppingTaskIds, setStoppingTaskIds] = useState<Set<string>>(() => new Set());
-  const [taskScopes, setTaskScopes] = useState<Record<string, string>>({});
-  const [taskConfirmation, setTaskConfirmation] = useState<{
-    task: SystemTask;
-    action: SystemTask['actions'][number];
-    scope: string;
-  } | null>(null);
   const progressRefreshTimer = useRef<number | null>(null);
   const progressRefreshInFlight = useRef(false);
   const progressRefreshQueued = useRef(false);
@@ -227,10 +218,6 @@ export default function SettingsPage() {
   }, [refreshInitial]);
 
   useEffect(() => {
-    setTaskScopes((current) => Object.fromEntries(Object.entries(current).filter(([, id]) => id === 'all' || libraries.some((library) => library.id === id))));
-  }, [libraries]);
-
-  useEffect(() => {
     if (activeSettingsSection !== 'ai') return;
     let live = true;
     const refresh = () => void Promise.all([api.aiSettings(), api.storageStatus()])
@@ -257,10 +244,6 @@ export default function SettingsPage() {
         const result = await api.systemTasks();
         if (!live) return;
         setSystemTasks(result.items);
-        setStoppingTaskIds((current) => {
-          const next = new Set(Array.from(current).filter((id) => systemTaskIsStillRunning(result.items, id)));
-          return next.size === current.size ? current : next;
-        });
         const activelyChanging = result.items.some((task) =>
           task.status === 'running' ||
           (task.progress?.queued ?? 0) > 0 ||
@@ -369,57 +352,6 @@ export default function SettingsPage() {
     }
   }
 
-  async function executeSystemTask(task: SystemTask, action: SystemTask['actions'][number], selectedScope: string) {
-    if (taskActionBusy) return;
-    const key = `${task.id}:${action.id}`;
-    const stopping = action.id === 'stop';
-    if (stopping) {
-      setStoppingTaskIds((current) => new Set(current).add(task.id));
-    }
-    setTaskActionBusy(key);
-    setError(null);
-    try {
-      if (stopping) {
-        await api.stopSystemTask(task.id);
-      } else {
-        await api.runSystemTask(task.id, action.id, selectedScope === 'all' ? null : selectedScope);
-      }
-      const [tasksResult] = await Promise.all([
-        api.systemTasks(),
-        refreshActivity(),
-        refreshLibraries(),
-      ]);
-      setSystemTasks(tasksResult.items);
-      setStoppingTaskIds((current) => {
-        if (!current.has(task.id) || systemTaskIsStillRunning(tasksResult.items, task.id)) return current;
-        const next = new Set(current);
-        next.delete(task.id);
-        return next;
-      });
-    } catch (err) {
-      if (stopping) {
-        setStoppingTaskIds((current) => {
-          const next = new Set(current);
-          next.delete(task.id);
-          return next;
-        });
-      }
-      setError(err instanceof Error ? err.message : '执行任务失败');
-    } finally {
-      setTaskActionBusy(null);
-    }
-  }
-
-  function runSystemTask(task: SystemTask, action: SystemTask['actions'][number]) {
-    if (taskActionBusy || !action.enabled) return;
-    const selectedScope = task.supportsScope ? (taskScopes[task.id] ?? 'all') : 'all';
-    if (action.requiresConfirmation) {
-      setTaskConfirmation({ task, action, scope: selectedScope });
-      return;
-    }
-    void executeSystemTask(task, action, selectedScope);
-  }
-
   function updateViewerPrefs(next: ViewerPrefs) {
     saveViewerPrefs(next);
     setViewerPrefs(loadViewerPrefs());
@@ -431,7 +363,6 @@ export default function SettingsPage() {
   }
 
   function toggleMediaColumn(column: MediaColumnId, checked: boolean) {
-    if (column === 'media') return;
     const visibleColumns = checked
       ? Array.from(new Set([...mediaViewPrefs.visibleColumns, column]))
       : mediaViewPrefs.visibleColumns.filter((id) => id !== column);
@@ -439,7 +370,7 @@ export default function SettingsPage() {
   }
 
   function moveMediaColumnDuringDrag(target: MediaColumnId) {
-    if (!draggedMediaColumn || draggedMediaColumn === target || draggedMediaColumn === 'media' || target === 'media') return;
+    if (!draggedMediaColumn || draggedMediaColumn === target) return;
     mediaColumnRectsBeforeMove.current = new Map(
       Array.from(mediaColumnElements.current.entries()).map(([id, element]) => [id, element.getBoundingClientRect()]),
     );
@@ -462,6 +393,11 @@ export default function SettingsPage() {
   function updateThemeMode(next: ThemeMode) {
     setThemeMode(next);
     saveThemeMode(next);
+  }
+
+  function updateImmersiveChromeSize(next: ImmersiveChromeSize) {
+    setImmersiveChromeSize(next);
+    saveImmersiveChromeSize(next);
   }
 
   function updateRowHeightLevel(next: GridRowHeightLevel) {
@@ -495,46 +431,6 @@ export default function SettingsPage() {
     }
   }
 
-  async function updateAIAutomatic(enabled: boolean) {
-    if (aiSettingsSaving) return;
-    setAISettingsSaving(true);
-    setError(null);
-    try {
-      const saved = await api.updateAISettings(enabled);
-      setAISettings(saved);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '保存 AI 设置失败');
-    } finally {
-      setAISettingsSaving(false);
-    }
-  }
-
-  async function toggleAIManualRun() {
-    if (!aiSettings || aiSettings.autoAnalyze || aiSettingsSaving) return;
-    const stopping = aiSettings.manualRun;
-    if (stopping) setAIStopping(true);
-    setAISettingsSaving(true);
-    setError(null);
-    try {
-      const saved = stopping
-        ? await api.stopAIManually()
-        : (await api.runAIManually()).settings;
-      setAISettings(saved);
-      if (stopping) {
-        for (let attempt = 0; attempt < 30; attempt += 1) {
-          const status = await api.aiStatus();
-          if (status.active === 0 && status.queued === 0) break;
-          await new Promise((resolve) => window.setTimeout(resolve, 500));
-        }
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '切换手动 AI 分析失败');
-    } finally {
-      setAIStopping(false);
-      setAISettingsSaving(false);
-    }
-  }
-
   async function saveLibraryAIFocus(id: string, focus: string) {
     const updated = await api.updateScanLibraryAIFocus(id, focus);
     setLibraries((current) => current.map((library) => library.id === id ? updated : library));
@@ -545,32 +441,24 @@ export default function SettingsPage() {
     return api.reindexScanLibraryAI(id);
   }
 
-  useSidebarPanel(
-    'settings',
-    <div className="sidebar-control-stack">
-      <div className="sidebar-list">
-        {settingsSections.map((section) => (
-          <button
-            aria-current={activeSettingsSection === section.id ? 'page' : undefined}
-            className={activeSettingsSection === section.id ? 'sidebar-list-row active' : 'sidebar-list-row'}
-            key={section.id}
-            type="button"
-            onClick={() => selectSettingsSection(section.id)}
-          >
-            <span className="sidebar-list-marker" aria-hidden="true" />
-            <span>{section.label}</span>
-          </button>
-        ))}
-      </div>
-    </div>,
-    [activeSettingsSection, selectSettingsSection],
-  );
-
   return (
     <section className="page settings-page">
       <Toolbar title="设置" showScanAction={false} />
       <div className="settings-scroll">
         <div className="settings-layout">
+          <nav className="settings-section-nav" aria-label="设置菜单">
+            {settingsSections.map((section) => (
+              <button
+                aria-current={activeSettingsSection === section.id ? 'page' : undefined}
+                className={activeSettingsSection === section.id ? 'active' : ''}
+                key={section.id}
+                type="button"
+                onClick={() => selectSettingsSection(section.id)}
+              >
+                {section.label}
+              </button>
+            ))}
+          </nav>
           <div className="settings-content">
             {error && <div className="error-line">{error}</div>}
 
@@ -687,6 +575,22 @@ export default function SettingsPage() {
                       >
                         深色
                       </button>
+                    </div>
+                  </div>
+                  <div className="settings-field settings-field-wide settings-field-spaced">
+                    <span>悬浮菜单尺寸</span>
+                    <div className="settings-segmented five-options" aria-label="悬浮菜单尺寸">
+                      {([1, 2, 3, 4, 5] as const).map((size) => (
+                        <button
+                          className={immersiveChromeSize === size ? 'active' : ''}
+                          key={size}
+                          type="button"
+                          title={size === 1 ? '最小' : size === 5 ? '最大' : `尺寸 ${size}`}
+                          onClick={() => updateImmersiveChromeSize(size)}
+                        >
+                          {size}
+                        </button>
+                      ))}
                     </div>
                   </div>
                   <div className="settings-field settings-field-wide settings-field-spaced">
@@ -868,12 +772,10 @@ export default function SettingsPage() {
                     {mediaViewPrefs.columnOrder.map((columnId) => {
                       const definition = mediaColumnDefinitions.find((column) => column.id === columnId);
                       if (!definition) return null;
-                      const locked = columnId === 'media';
-                      const selected = locked || mediaViewPrefs.visibleColumns.includes(columnId);
+                      const selected = mediaViewPrefs.visibleColumns.includes(columnId);
                       return (
                         <div
                           aria-checked={selected}
-                          aria-disabled={locked}
                           className={[
                             'media-column-setting',
                             selected ? 'selected' : '',
@@ -885,29 +787,26 @@ export default function SettingsPage() {
                             else mediaColumnElements.current.delete(columnId);
                           }}
                           role="checkbox"
-                          tabIndex={locked ? -1 : 0}
+                          tabIndex={0}
                           onDragEnter={() => moveMediaColumnDuringDrag(columnId)}
                           onDragOver={(event) => event.preventDefault()}
                           onDrop={(event) => {
                             event.preventDefault();
                             finishMediaColumnDrag();
                           }}
-                          onClick={() => {
-                            if (!locked) toggleMediaColumn(columnId, !selected);
-                          }}
+                          onClick={() => toggleMediaColumn(columnId, !selected)}
                           onKeyDown={(event) => {
-                            if (locked || (event.key !== 'Enter' && event.key !== ' ')) return;
+                            if (event.key !== 'Enter' && event.key !== ' ') return;
                             event.preventDefault();
                             toggleMediaColumn(columnId, !selected);
                           }}
                         >
                           <span
-                            aria-hidden={locked}
-                            className={locked ? 'media-column-drag locked' : 'media-column-drag'}
-                            draggable={!locked}
-                            role={locked ? undefined : 'button'}
-                            tabIndex={locked ? undefined : 0}
-                            title={locked ? undefined : `拖动“${definition.label}”调整顺序`}
+                            className="media-column-drag"
+                            draggable
+                            role="button"
+                            tabIndex={0}
+                            title={`拖动“${definition.label}”调整顺序`}
                             onClick={(event) => event.stopPropagation()}
                             onDragEnd={finishMediaColumnDrag}
                             onDragStart={(event) => {
@@ -932,46 +831,19 @@ export default function SettingsPage() {
 
             {activeSettingsSection === 'ai' && (
               <AISettingsPanel
-                busy={aiSettingsSaving}
                 libraries={libraries}
                 settings={aiSettings}
-                stopping={aiStopping}
-				storageAvailable={storageStatus?.available !== false}
-                onAutomaticChange={(enabled) => void updateAIAutomatic(enabled)}
                 onReanalyzeLibrary={reanalyzeLibraryAI}
                 onSaveLibraryFocus={saveLibraryAIFocus}
-                onToggleManual={() => void toggleAIManualRun()}
               />
             )}
 
             {activeSettingsSection === 'tasks' && (
-              <TaskSettingsPanel
-                actionBusy={taskActionBusy}
-                libraries={libraries}
-                scopes={taskScopes}
-                stoppingTaskIds={stoppingTaskIds}
-                tasks={systemTasks}
-                onAction={runSystemTask}
-                onScopeChange={(taskId, libraryId) => setTaskScopes((current) => ({ ...current, [taskId]: libraryId }))}
-              />
+              <TaskSettingsPanel tasks={systemTasks} />
             )}
           </div>
         </div>
       </div>
-      {taskConfirmation && (
-        <TaskConfirmationDialog
-          action={taskConfirmation.action}
-          busy={taskActionBusy !== null}
-          scopeLabel={taskScopeLabel(taskConfirmation.scope, libraries)}
-          task={taskConfirmation.task}
-          onCancel={() => setTaskConfirmation(null)}
-          onConfirm={() => {
-            const pending = taskConfirmation;
-            setTaskConfirmation(null);
-            void executeSystemTask(pending.task, pending.action, pending.scope);
-          }}
-        />
-      )}
     </section>
   );
 }
@@ -987,25 +859,15 @@ const rowHeightOptions: Array<{ label: string; value: GridRowHeightLevel }> = [
 const bytesPerGB = 1024 ** 3;
 const videoProxyMaxTTLMinutes = 30 * 24 * 60;
 function AISettingsPanel({
-  busy,
   libraries,
   settings,
-  stopping,
-  storageAvailable,
-  onAutomaticChange,
   onReanalyzeLibrary,
   onSaveLibraryFocus,
-  onToggleManual,
 }: {
-  busy: boolean;
   libraries: ScanLibrary[];
   settings: AISettings | null;
-  stopping: boolean;
-	storageAvailable: boolean;
-  onAutomaticChange: (enabled: boolean) => void;
   onReanalyzeLibrary: (id: string) => Promise<{ accepted: boolean; count: number; libraryId: string }>;
   onSaveLibraryFocus: (id: string, focus: string) => Promise<ScanLibrary>;
-  onToggleManual: () => void;
 }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [saved, setSaved] = useState<Set<string>>(new Set());
@@ -1026,27 +888,7 @@ function AISettingsPanel({
     <section className="settings-panel settings-section ai-settings-panel">
       <div className="settings-panel-title">AI 分析</div>
       <div className="ai-settings-controls">
-        <label className="settings-check-row settings-field-wide">
-          <input
-            checked={settings.autoAnalyze}
-            disabled={busy}
-            type="checkbox"
-            onChange={(event) => onAutomaticChange(event.target.checked)}
-          />
-          <span>自动分析新增媒体并持续补齐图库</span>
-        </label>
-        <div className="settings-help-line">
-			<span>{stopping ? '正在停止分析…' : !storageAvailable ? '停' : settings.autoAnalyze ? '自动模式运行中' : settings.manualRun ? '手动全库分析运行中' : '自动分析已关闭'}</span>
-          <button
-            className="settings-save-button"
-            disabled={busy || settings.autoAnalyze}
-            type="button"
-            onClick={onToggleManual}
-          >
-            {stopping && <span aria-hidden="true" className="button-progress-spinner" />}
-            {stopping ? '正在停止' : busy ? '处理中' : settings.manualRun ? '停止手动分析' : '手动开始'}
-          </button>
-        </div>
+        <div className="settings-help-line">新增媒体会在基础缓存完成后自动进入 AI 分析，无需手动启动或停止。</div>
       </div>
       <div className="ai-focus-settings">
         <div className="settings-panel-title">按图库重点识别</div>
@@ -1117,124 +959,32 @@ function AISettingsPanel({
   );
 }
 
-function TaskConfirmationDialog({ action, busy, scopeLabel, task, onCancel, onConfirm }: {
-  action: SystemTask['actions'][number];
-  busy: boolean;
-  scopeLabel: string;
-  task: SystemTask;
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !busy) onCancel();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [busy, onCancel]);
-  const cleanup = action.id === 'cleanup';
-  const restart = action.id === 'restart';
-  const title = cleanup ? '确认清理缓存' : restart ? '确认重启服务' : '确认全部重建';
-  const detail = cleanup
-    ? '只会删除没有数据库引用的缓存和超过 24 小时的临时文件。'
-    : restart
-      ? 'AI 服务会立即重启，当前分析会中断并在服务恢复后重新排队。'
-      : '该范围内已经完成的结果会被重置并重新处理，任务启动后可停止，但已完成的处理不会回滚。';
-  const confirmLabel = cleanup ? '立即清理' : restart ? '重启服务' : '全部重建';
-  return (
-    <div className="modal-backdrop task-confirmation-backdrop" role="presentation" onMouseDown={(event) => {
-      if (event.target === event.currentTarget && !busy) onCancel();
-    }}>
-      <div aria-describedby="task-confirmation-description" aria-labelledby="task-confirmation-title" aria-modal="true" className="task-confirmation-dialog" role="dialog">
-        <div className="modal-title" id="task-confirmation-title">{title}</div>
-        <div className="task-confirmation-content" id="task-confirmation-description">
-          <div><span>任务</span><strong>{task.name}</strong></div>
-          <div><span>执行范围</span><strong>{scopeLabel}</strong></div>
-          <p>{detail}</p>
-        </div>
-        <div className="modal-actions">
-          <button className="command-button" disabled={busy} type="button" onClick={onCancel}>取消</button>
-          <button className="command-button danger" disabled={busy} type="button" onClick={onConfirm}>{confirmLabel}</button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function taskScopeLabel(scope: string, libraries: ScanLibrary[]) {
-  if (scope === 'all') return '全部图库';
-  return libraries.find((library) => library.id === scope)?.name ?? '所选图库';
-}
-
-const systemTaskGroups = [
+const automaticTaskPipelines = [
   {
-    id: 'background',
-    name: '后台任务',
-    taskIds: ['cache_cleanup', 'ai_health_check', 'storage_health_check', 'library_scan', 'source_io_scheduler'],
+    id: 'media_pipeline',
+    name: '媒体自动处理',
+    description: '发现新媒体后自动完成入库、缩略图、封面、高清预览和进度预览图。',
+    taskIds: ['media_scan', 'thumbnail_creation', 'video_poster_creation', 'preview_creation', 'storyboard_creation'],
   },
   {
-    id: 'intelligence',
-    name: '智能任务',
+    id: 'intelligence_pipeline',
+    name: '智能分析',
+    description: '媒体基础缓存就绪后，自动执行 AI 分析和重复文件索引。',
     taskIds: ['ai_analysis', 'duplicate_scan'],
   },
   {
-    id: 'library',
-    name: '媒体库',
-    taskIds: ['media_scan'],
+    id: 'maintenance_pipeline',
+    name: '后台维护',
+    description: '自动检查任务执行器、存储、NAS 监听、AI 服务和缓存空间。',
+    taskIds: ['task_executor_health', 'storage_health_check', 'nas_realtime_watcher', 'ai_health_check', 'cache_cleanup', 'library_scan', 'source_io_scheduler'],
   },
 ] as const;
 
-interface SystemTaskNode {
-  task: SystemTask;
-  children: SystemTask[];
-}
-
-const mediaScanChildIDs = ['metadata_extraction', 'thumbnail_creation', 'video_poster_creation', 'preview_creation', 'storyboard_creation'] as const;
-
-function systemTaskIsStillRunning(tasks: SystemTask[], taskId: string) {
-  return tasks.some((task) => task.id === taskId && task.status === 'running');
-}
-
-function systemTaskNodes(tasks: SystemTask[]): SystemTaskNode[] {
-  const byID = new Map(tasks.map((task) => [task.id, task]));
-  const childIDs = new Set<string>(mediaScanChildIDs);
-  const nodes: SystemTaskNode[] = [];
-  const mediaScan = byID.get('media_scan');
-  const mediaChildren = mediaScanChildIDs.map((id) => byID.get(id)).filter((task): task is SystemTask => Boolean(task));
-  if (mediaScan) nodes.push({ task: mediaScan, children: mediaChildren });
-  for (const task of tasks) {
-    if (task.id === 'media_scan' || childIDs.has(task.id)) continue;
-    nodes.push({ task, children: [] });
-  }
-  return nodes;
-}
-
-function groupedSystemTasks(tasks: SystemTask[]) {
-  const nodes = systemTaskNodes(tasks);
-  const byID = new Map(nodes.map((node) => [node.task.id, node]));
-  const assigned = new Set<string>(systemTaskGroups.flatMap((group) => [...group.taskIds]));
-  const groups = systemTaskGroups.map((group) => ({
-    ...group,
-    tasks: group.taskIds.map((taskID) => byID.get(taskID)).filter((node): node is SystemTaskNode => Boolean(node)),
-  }));
-  const remaining = nodes.filter((node) => !assigned.has(node.task.id));
-  if (remaining.length > 0) groups[0].tasks.push(...remaining);
-  return groups.filter((group) => group.tasks.length > 0);
-}
-
-function TaskSettingsPanel({ actionBusy, libraries, scopes, stoppingTaskIds, tasks, onAction, onScopeChange }: {
-  actionBusy: string | null;
-  libraries: ScanLibrary[];
-  scopes: Record<string, string>;
-  stoppingTaskIds: Set<string>;
-  tasks: SystemTask[];
-  onAction: (task: SystemTask, action: SystemTask['actions'][number]) => void;
-  onScopeChange: (taskId: string, libraryId: string) => void;
-}) {
+function TaskSettingsPanel({ tasks }: { tasks: SystemTask[] }) {
   const navigate = useNavigate();
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set(['intelligence', 'library']));
-  const [expandedTasks, setExpandedTasks] = useState<Set<string>>(() => new Set());
+  const [globalScanStarting, setGlobalScanStarting] = useState(false);
+  const [globalScanMessage, setGlobalScanMessage] = useState('');
   useEffect(() => {
     if (!tasks.some((task) => task.status === 'running')) return;
     setNowSeconds(Math.floor(Date.now() / 1000));
@@ -1260,41 +1010,40 @@ function TaskSettingsPanel({ actionBusy, libraries, scopes, stoppingTaskIds, tas
       }).toString(),
     });
   }, [navigate]);
-  const taskGroups = groupedSystemTasks(tasks);
-  const renderTask = (task: SystemTask, children: SystemTask[] = [], nested = false) => {
-    const stopping = stoppingTaskIds.has(task.id);
-    const expanded = expandedTasks.has(task.id);
+  const byID = new Map(tasks.map((task) => [task.id, task]));
+  const assigned = new Set<string>(automaticTaskPipelines.flatMap((pipeline) => [...pipeline.taskIds]));
+  const pipelines = automaticTaskPipelines.map((pipeline) => {
+    const members = pipeline.taskIds.map((id) => byID.get(id)).filter((task): task is SystemTask => Boolean(task));
+    if (pipeline.id === 'maintenance_pipeline') {
+      members.push(...tasks.filter((task) => !assigned.has(task.id)));
+    }
+    return { ...pipeline, members, task: mergeAutomaticTasks(pipeline.id, pipeline.name, pipeline.description, members) };
+  });
+  const countedTaskIDs = new Set(['media_scan', 'thumbnail_creation', 'video_poster_creation', 'preview_creation', 'storyboard_creation', 'ai_analysis', 'duplicate_scan']);
+  const countedTasks = tasks.filter((task) => countedTaskIDs.has(task.id));
+  const active = countedTasks.reduce((sum, task) => sum + (task.progress?.processing ?? 0), 0);
+  const queued = countedTasks.reduce((sum, task) => sum + Math.max(task.progress?.queued ?? 0, task.progress?.pending ?? 0), 0);
+  const failed = countedTasks.reduce((sum, task) => sum + (task.progress?.failed ?? 0), 0);
+  const executor = byID.get('task_executor_health');
+  const mediaScan = byID.get('media_scan');
+  const globalScanRunning = globalScanStarting || mediaScan?.status === 'running';
+  const globalStatus = executor?.status === 'failed' ? 'failed' : active > 0 ? 'running' : queued > 0 ? 'pending' : failed > 0 ? 'warning' : 'success';
+  const renderPipeline = (task: SystemTask, members: SystemTask[]) => {
     const finishedAt = task.status === 'running' ? null : task.lastFinishedAt;
     const durationSeconds = task.status === 'running' && task.lastStartedAt != null
       ? Math.max(0, nowSeconds - task.lastStartedAt)
       : task.durationSeconds;
     const hasTimeline = task.lastStartedAt != null || finishedAt != null || durationSeconds != null || task.nextRunAt != null;
     const hasFailures = (task.failures?.length ?? 0) > 0;
-    const hasDetails = hasTimeline || !task.progress || hasFailures;
+    const hasDetails = hasTimeline || hasFailures;
     return (
       <article
-        aria-label={`${task.name}，${stopping ? '正在停止' : systemTaskStatusLabel(task.status)}`}
-        className={`system-task-card status-${stopping ? 'stopping' : task.status}${children.length > 0 ? ' has-children' : ''}${nested ? ' is-nested' : ''}`}
+        aria-label={`${task.name}，${systemTaskStatusLabel(task.status)}`}
+        className={`system-task-card automatic-task-card status-${task.status}`}
         key={task.id}
       >
         <div className="system-task-heading">
           <div className="system-task-title">
-            {children.length > 0 && (
-              <button
-                aria-expanded={expanded}
-                className="system-task-children-toggle"
-                type="button"
-                title={expanded ? '收起子任务' : '展开子任务'}
-                onClick={() => setExpandedTasks((current) => {
-                  const next = new Set(current);
-                  if (next.has(task.id)) next.delete(task.id);
-                  else next.add(task.id);
-                  return next;
-                })}
-              >
-                <span aria-hidden="true">›</span>
-              </button>
-            )}
             <span
               aria-describedby={`task-description-${task.id}`}
               className="system-task-name-wrap"
@@ -1306,34 +1055,7 @@ function TaskSettingsPanel({ actionBusy, libraries, scopes, stoppingTaskIds, tas
               </span>
             </span>
           </div>
-          <div className="system-task-actions">
-            {task.supportsScope && (
-              <select
-                aria-label={`${task.name}执行范围`}
-                disabled={task.status === 'running' || actionBusy !== null}
-                value={scopes[task.id] ?? 'all'}
-                onChange={(event) => onScopeChange(task.id, event.target.value)}
-              >
-                <option value="all">全部图库</option>
-                {libraries.map((library) => <option key={library.id} value={library.id}>{library.name}</option>)}
-              </select>
-            )}
-            {task.actions.map((action) => {
-              const key = `${task.id}:${action.id}`;
-              return (
-                <button
-                  className={`settings-save-button system-task-run-button ${action.kind}`}
-                  disabled={!action.enabled || actionBusy !== null || stopping}
-                  key={action.id}
-                  type="button"
-                  onClick={() => onAction(task, action)}
-                >
-                  {(actionBusy === key || (stopping && action.id === 'stop')) && <span aria-hidden="true" className="button-progress-spinner" />}
-                  {stopping && action.id === 'stop' ? '正在停止' : actionBusy === key ? taskActionBusyLabel(action.id) : action.label}
-                </button>
-              );
-            })}
-          </div>
+          <span className={`automatic-task-state status-${task.status}`}>{systemTaskStatusLabel(task.status)}</span>
         </div>
         {task.progress && (
           <SystemTaskProgress
@@ -1347,6 +1069,17 @@ function TaskSettingsPanel({ actionBusy, libraries, scopes, stoppingTaskIds, tas
             {task.blockedReason}
           </div>
         )}
+        <div className="automatic-task-stages">
+          {members.map((member) => {
+            const memberPending = Math.max(member.progress?.queued ?? 0, member.progress?.pending ?? 0);
+            return (
+              <div className={`automatic-task-stage status-${member.status}`} key={member.id}>
+                <strong>{automaticTaskStageName(member)}</strong>
+                <span>{automaticTaskStageSummary(member, memberPending)}</span>
+              </div>
+            );
+          })}
+        </div>
         {hasDetails && <div className="system-task-details">
           {hasTimeline && (
             <div className="system-task-timeline">
@@ -1359,52 +1092,97 @@ function TaskSettingsPanel({ actionBusy, libraries, scopes, stoppingTaskIds, tas
           {!task.progress && <div className="system-task-message">{task.message || '尚未运行'}</div>}
           {hasFailures && <SystemTaskFailures task={task} onOpen={openFailureInLibrary} />}
         </div>}
-        {children.length > 0 && expanded && (
-          <div className="system-task-children">
-            {children.map((child) => renderTask(child, [], true))}
-          </div>
-        )}
       </article>
     );
   };
   return (
     <section className="settings-panel settings-section system-tasks-panel">
-      <div className="settings-panel-title">系统任务</div>
-      <div className="system-task-groups">
+      <div className="settings-panel-title">自动任务</div>
+      <div className={`automatic-task-overview status-${globalStatus}`}>
+        <div><strong>{automaticTaskOverviewTitle(globalStatus)}</strong><span>{executor?.message || '系统会自动安排全部处理任务'}</span></div>
+        <div className="automatic-task-overview-actions">
+          <div className="automatic-task-overview-stats"><span>处理中 <b>{active.toLocaleString()}</b></span><span>待处理 <b>{queued.toLocaleString()}</b></span><span>失败 <b>{failed.toLocaleString()}</b></span></div>
+          <button
+            aria-busy={globalScanStarting}
+            className="automatic-task-global-scan"
+            disabled={globalScanRunning}
+            type="button"
+            onClick={() => {
+              setGlobalScanStarting(true);
+              setGlobalScanMessage('');
+              void api.runSystemTask('media_scan', 'scan', null)
+                .then(() => setGlobalScanMessage('全局扫描已加入队列'))
+                .catch((err) => setGlobalScanMessage(err instanceof Error ? err.message : '全局扫描启动失败'))
+                .finally(() => setGlobalScanStarting(false));
+            }}
+          >
+            {globalScanRunning && <span aria-hidden="true" className="button-progress-spinner" />}
+            {globalScanRunning ? '扫描中' : '全局扫描'}
+          </button>
+        </div>
+      </div>
+      {globalScanMessage && <div className="automatic-task-global-scan-message" role="status">{globalScanMessage}</div>}
+      <div className="system-task-groups automatic-task-groups">
         {tasks.length === 0 && <div className="muted-line">读取中</div>}
-        {taskGroups.map((group) => {
-          const expanded = expandedGroups.has(group.id);
-          const groupedTasks = group.tasks.flatMap((node) => [node.task, ...node.children]);
-          const runningCount = groupedTasks.filter((task) => task.status === 'running').length;
-          const failedCount = groupedTasks.filter((task) => task.failedCount > 0).length;
-          return (
-            <section className={`system-task-group${expanded ? ' expanded' : ''}`} key={group.id}>
-              <button
-                aria-expanded={expanded}
-                className="system-task-group-toggle"
-                type="button"
-                onClick={() => setExpandedGroups((current) => {
-                  const next = new Set(current);
-                  if (next.has(group.id)) next.delete(group.id);
-                  else next.add(group.id);
-                  return next;
-                })}
-              >
-                <span className="system-task-group-chevron" aria-hidden="true">›</span>
-                <span>{group.name}</span>
-                <span className="system-task-group-summary">
-                  {runningCount > 0 && <small className="running">运行 {runningCount}</small>}
-                  {failedCount > 0 && <small className="failed">异常 {failedCount}</small>}
-                  <small>{group.tasks.length} 项</small>
-                </span>
-              </button>
-              {expanded && <div className="system-task-list">{group.tasks.map((node) => renderTask(node.task, node.children))}</div>}
-            </section>
-          );
-        })}
+        {pipelines.map((pipeline) => renderPipeline(pipeline.task, pipeline.members))}
       </div>
     </section>
   );
+}
+
+function mergeAutomaticTasks(id: string, name: string, description: string, members: SystemTask[]): SystemTask {
+  const progress = members.reduce((sum, task) => ({
+    total: sum.total + (task.progress?.total ?? 0),
+    completed: sum.completed + (task.progress?.completed ?? 0),
+    queued: 0,
+    pending: sum.pending + Math.max(task.progress?.queued ?? 0, task.progress?.pending ?? 0),
+    processing: sum.processing + (task.progress?.processing ?? 0),
+    failed: sum.failed + (task.progress?.failed ?? 0),
+  }), { total: 0, completed: 0, queued: 0, pending: 0, processing: 0, failed: 0 });
+  const status: SystemTask['status'] = members.some((task) => task.status === 'failed') ? 'failed'
+    : members.some((task) => task.status === 'running') ? 'running'
+      : members.some((task) => task.status === 'warning') ? 'warning'
+        : members.some((task) => task.status === 'pending') ? 'pending'
+          : members.length > 0 && members.every((task) => task.status === 'success' || task.status === 'skipped') ? 'success' : 'never';
+  const starts = members.map((task) => task.lastStartedAt).filter((value): value is number => value != null);
+  const finishes = members.map((task) => task.lastFinishedAt).filter((value): value is number => value != null);
+  const failures = members.flatMap((task) => task.failures ?? []).slice(0, 100);
+  return {
+    id, name, description, schedule: '全自动', status, succeeded: status === 'success' ? true : status === 'failed' ? false : null,
+    lastStartedAt: starts.length > 0 ? Math.min(...starts) : null,
+    lastFinishedAt: finishes.length > 0 ? Math.max(...finishes) : null,
+    nextRunAt: null, durationSeconds: null, averageSecondsPerItem: null,
+    message: '', blockedReason: members.find((task) => task.blockedReason)?.blockedReason,
+    lastError: members.find((task) => task.lastError)?.lastError ?? '', processed: progress.completed,
+    failedCount: members.reduce((sum, task) => sum + Number(task.failedCount || 0), 0), canRetry: false,
+    supportsScope: false, progress, actions: [], failures,
+  };
+}
+
+function automaticTaskStageName(task: SystemTask) {
+  const names: Record<string, string> = {
+    media_scan: '发现与入库', thumbnail_creation: '缩略图', video_poster_creation: '视频封面', preview_creation: '高清预览', storyboard_creation: '进度预览',
+    ai_analysis: 'AI 分析', duplicate_scan: '重复索引', task_executor_health: '执行器自检', storage_health_check: '存储连接', nas_realtime_watcher: 'NAS 监听',
+    ai_health_check: 'AI 服务', cache_cleanup: '缓存空间', library_scan: '媒体库检查', source_io_scheduler: '读取调度',
+  };
+  return names[task.id] ?? task.name;
+}
+
+function automaticTaskStageSummary(task: SystemTask, pending: number) {
+  if (task.status === 'running') return `处理中 ${Math.max(1, task.progress?.processing ?? 0).toLocaleString()}`;
+  if (task.status === 'failed') return `失败 ${(task.progress?.failed ?? task.failedCount ?? 0).toLocaleString()}`;
+  if (pending > 0) return `待处理 ${pending.toLocaleString()}`;
+  if (task.status === 'success') return '正常';
+  if (task.status === 'warning') return '自动等待';
+  return systemTaskStatusLabel(task.status);
+}
+
+function automaticTaskOverviewTitle(status: SystemTask['status']) {
+  if (status === 'failed') return '自动处理异常';
+  if (status === 'running') return '正在自动处理';
+  if (status === 'pending') return '任务正在等待调度';
+  if (status === 'warning') return '部分任务需要关注';
+  return '自动处理正常';
 }
 
 function SystemTaskFailures({ task, onOpen }: { task: SystemTask; onOpen: (path: string) => void }) {
@@ -1440,11 +1218,9 @@ function SystemTaskProgress({ averageSecondsPerItem, task }: { averageSecondsPer
   const progress = task.progress!;
   const percent = progress.total > 0 ? Math.min(100, progress.completed / progress.total * 100) : 0;
   const stats = [
-    { label: '总计', value: progress.total, tone: 'neutral' },
-    { label: '已完成', value: progress.completed, tone: 'success' },
-    { label: '队列', value: progress.queued ?? 0, tone: 'queued' },
+    { label: '已处理', value: progress.completed, tone: 'success' },
+    { label: '待处理', value: Math.max(progress.queued ?? 0, progress.pending), tone: 'queued' },
     { label: '处理中', value: progress.processing, tone: 'running' },
-    { label: '等待', value: progress.pending, tone: 'pending' },
     { label: '失败', value: progress.failed, tone: 'failed' },
   ];
   return (
@@ -1503,14 +1279,6 @@ function formatTaskDuration(seconds: number) {
   if (minutes < 60) return rest > 0 ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`;
   const hours = Math.floor(minutes / 60);
   return `${hours} 小时 ${minutes % 60} 分钟`;
-}
-
-function taskActionBusyLabel(action: string) {
-  if (action === 'stop') return '停止中';
-  if (action === 'cleanup') return '清理中';
-  if (action === 'check') return '检查中';
-  if (action === 'restart') return '重启中';
-  return '启动中';
 }
 
 function formatCacheGB(bytes: number) {

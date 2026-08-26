@@ -13,6 +13,8 @@ import {
 } from '../utils/viewerPrefs';
 import { rotatedContainStyle } from '../utils/rotation';
 import { viewerImageUrl } from '../utils/imagePreload';
+import { setViewerMediaZoomActive } from '../utils/viewerInteractionState';
+import { assetThumbUrl } from '../api/client';
 import type { ViewerMediaLayerMode } from './mediaLayer';
 
 interface Props {
@@ -20,7 +22,6 @@ interface Props {
   deleting: boolean;
   fullscreen: boolean;
   layerMode: ViewerMediaLayerMode;
-  mediaDetailsOpen: boolean;
   preloadEnabled: boolean;
   playbackMode: ViewerPlaybackMode;
   slideshowSeconds: number;
@@ -31,7 +32,6 @@ interface Props {
   onPlaybackEnded: () => void;
   onPlaybackModeChange: (value: ViewerPlaybackMode) => void;
   onRotate: () => void;
-  onToggleMediaDetails: () => void;
   onToggleFullscreen: () => void;
 }
 
@@ -43,8 +43,15 @@ interface ZoomState {
   backgroundY: number;
 }
 
-export default function ImageViewer({ asset, deleting, fullscreen, layerMode, mediaDetailsOpen, preloadEnabled, playbackMode, slideshowSeconds, onDelete, onDeleteRecord, onMediaError, onMediaReady, onPlaybackEnded, onPlaybackModeChange, onRotate, onToggleMediaDetails, onToggleFullscreen }: Props) {
+interface DecodedImageSize {
+  height: number;
+  key: string;
+  width: number;
+}
+
+export default function ImageViewer({ asset, deleting, fullscreen, layerMode, preloadEnabled, playbackMode, slideshowSeconds, onDelete, onDeleteRecord, onMediaError, onMediaReady, onPlaybackEnded, onPlaybackModeChange, onRotate, onToggleFullscreen }: Props) {
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const thumbnailRef = useRef<HTMLImageElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const settingsRef = useRef<HTMLDivElement | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -58,14 +65,33 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, me
   });
   const [stageSize, setStageSize] = useState({ height: 0, width: 0 });
   const [readyImageKey, setReadyImageKey] = useState('');
+  const [decodedImageKey, setDecodedImageKey] = useState('');
+  const [decodedImageSize, setDecodedImageSize] = useState<DecodedImageSize | null>(null);
   const src = viewerImageUrl(asset);
+  const thumbnailSrc = assetThumbUrl(asset);
   const imageKey = `${asset.id}:${asset.cacheKey}:${src}`;
   const mainImageReady = readyImageKey === imageKey;
+  const finalImageDecoded = decodedImageKey === imageKey;
+  const displayTier = mainImageReady ? 'original' : 'thumbnail';
+  const displayedAsset = useMemo(
+    () => mainImageReady && decodedImageSize?.key === imageKey
+      ? { ...asset, width: decodedImageSize.width, height: decodedImageSize.height }
+      : asset,
+    [asset, decodedImageSize, imageKey, mainImageReady],
+  );
   const imageStyle = useMemo(
-    () => rotatedContainStyle(asset, stageSize),
-    [asset, stageSize.height, stageSize.width],
+    () => rotatedContainStyle(displayedAsset, stageSize),
+    [displayedAsset, stageSize.height, stageSize.width],
   );
   const zoomPointer = useRef({ clientX: 0, clientY: 0 });
+  const zoomActiveRef = useRef(false);
+  const zoomActivityOwner = useRef<object>({});
+
+  useEffect(() => {
+    const active = layerMode === 'active' && zoom.active;
+    setViewerMediaZoomActive(zoomActivityOwner.current, active);
+    return () => setViewerMediaZoomActive(zoomActivityOwner.current, false);
+  }, [layerMode, zoom.active]);
 
   useEffect(() => {
     function onPrefsChanged() {
@@ -115,6 +141,7 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, me
   useEffect(() => {
     if (!zoom.active) return;
     function endZoom() {
+      zoomActiveRef.current = false;
       setZoom((current) => ({ ...current, active: false }));
     }
     window.addEventListener('mouseup', endZoom);
@@ -122,6 +149,12 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, me
   }, [zoom.active]);
 
   useEffect(() => {
+    if (zoom.active || !finalImageDecoded) return;
+    setReadyImageKey(imageKey);
+  }, [finalImageDecoded, imageKey, zoom.active]);
+
+  useEffect(() => {
+    zoomActiveRef.current = false;
     setZoom({
       active: false,
       backgroundHeight: 0,
@@ -129,6 +162,7 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, me
       backgroundX: 0,
       backgroundY: 0,
     });
+    setDecodedImageSize(null);
   }, [src]);
 
   useEffect(() => {
@@ -145,13 +179,17 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, me
   }, []);
 
   function updateZoom(clientX: number, clientY: number, nextPrefs = prefs) {
-    const image = imageRef.current;
+    const image = mainImageReady ? imageRef.current : thumbnailRef.current;
     const stage = stageRef.current;
     if (!image || !stage) return;
     zoomPointer.current = { clientX, clientY };
     const stageRect = stage.getBoundingClientRect();
-    const naturalWidth = image.naturalWidth || asset.width || stageRect.width;
-    const naturalHeight = image.naturalHeight || asset.height || stageRect.height;
+    const naturalWidth = mainImageReady
+      ? image.naturalWidth || asset.width || stageRect.width
+      : asset.width || image.naturalWidth || stageRect.width;
+    const naturalHeight = mainImageReady
+      ? image.naturalHeight || asset.height || stageRect.height
+      : asset.height || image.naturalHeight || stageRect.height;
     const imageRect = containRect(stageRect, naturalWidth, naturalHeight);
     if (naturalWidth <= 0 || naturalHeight <= 0 || imageRect.width <= 0 || imageRect.height <= 0) return;
 
@@ -210,32 +248,38 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, me
     <div
       ref={stageRef}
       className={zoom.active ? 'image-stage zooming' : 'image-stage'}
+      data-image-tier={displayTier}
       onMouseDown={(event) => {
+        if (isMobileViewerInteraction()) return;
         if (event.button !== 0) return;
-        if (!mainImageReady) return;
+        if (!mainImageReady && !(thumbnailRef.current?.complete && thumbnailRef.current.naturalWidth > 0)) return;
         event.preventDefault();
+        zoomActiveRef.current = true;
         updateZoom(event.clientX, event.clientY);
         setZoom((current) => ({ ...current, active: true }));
       }}
       onMouseMove={(event) => {
+        if (isMobileViewerInteraction()) return;
         if (!zoom.active) return;
         if (event.buttons !== 1) {
+          zoomActiveRef.current = false;
           setZoom((current) => ({ ...current, active: false }));
           return;
         }
         updateZoom(event.clientX, event.clientY);
       }}
       onMouseUp={() => {
+        zoomActiveRef.current = false;
         setZoom((current) => ({ ...current, active: false }));
       }}
     >
       {preloadEnabled && <img
         key={src}
         ref={imageRef}
-        className={mainImageReady ? 'viewer-image' : 'viewer-image viewer-image-loading'}
+        className={mainImageReady ? 'viewer-image viewer-image-original viewer-image-ready' : 'viewer-image viewer-image-original viewer-image-loading'}
         src={src}
         alt={asset.filename}
-        decoding={layerMode === 'active' ? 'sync' : 'async'}
+        decoding="async"
         fetchPriority={layerMode === 'active' ? 'high' : 'low'}
         loading="eager"
         draggable={false}
@@ -246,18 +290,33 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, me
             .catch(() => undefined)
             .then(() => {
               if (imageRef.current !== image || image.getAttribute('src') !== src || !image.complete || image.naturalWidth <= 0) return;
-              setReadyImageKey(imageKey);
+              setDecodedImageSize({ key: imageKey, width: image.naturalWidth, height: image.naturalHeight });
+              setDecodedImageKey(imageKey);
+              if (!zoomActiveRef.current) setReadyImageKey(imageKey);
               onMediaReady(asset.id, asset.cacheKey);
             });
         }}
         onError={() => onMediaError(asset.id, asset.cacheKey, '图片加载失败')}
         onDragStart={(event) => event.preventDefault()}
       />}
+      {preloadEnabled && !mainImageReady && (
+        <img
+          ref={thumbnailRef}
+          className="viewer-image viewer-image-placeholder"
+          src={thumbnailSrc}
+          alt=""
+          decoding="async"
+          fetchPriority={layerMode === 'active' ? 'high' : 'low'}
+          draggable={false}
+          style={imageStyle}
+          onDragStart={(event) => event.preventDefault()}
+        />
+      )}
       {zoom.active && (
         <div
-          className="image-zoom-layer"
+          className="image-zoom-layer image-zoom-layer-preview"
           style={{
-            backgroundImage: `url("${src}")`,
+            backgroundImage: `url("${mainImageReady ? src : thumbnailSrc}")`,
             backgroundPosition: `${zoom.backgroundX}px ${zoom.backgroundY}px`,
             backgroundSize: `${zoom.backgroundWidth}px ${zoom.backgroundHeight}px`,
           }}
@@ -299,18 +358,6 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, me
                   <span>图片旋转</span>
                   <span><output>{asset.rotation || 0}°</output><RotateCw size={16} /></span>
                 </button>
-                <label className="video-settings-row video-settings-toggle-row">
-                  <span>媒体详情</span>
-                  <span className="video-settings-switch">
-                    <input
-                      aria-label="媒体详情"
-                      type="checkbox"
-                      checked={mediaDetailsOpen}
-                      onChange={onToggleMediaDetails}
-                    />
-                    <span aria-hidden="true" />
-                  </span>
-                </label>
                 <button
                   className="video-settings-action danger"
                   type="button"
@@ -362,6 +409,10 @@ function clampNumber(value: number, min: number, max: number) {
 function roundNumber(value: number, decimals: number) {
   const scale = 10 ** decimals;
   return Math.round(value * scale) / scale;
+}
+
+function isMobileViewerInteraction() {
+  return typeof window !== 'undefined' && window.matchMedia('(hover: none) and (pointer: coarse)').matches;
 }
 
 function containRect(container: DOMRect, naturalWidth: number, naturalHeight: number) {

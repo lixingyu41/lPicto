@@ -11,7 +11,7 @@ import LibraryIndexRail from '../components/LibraryIndexRail';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
 import { SidebarFilterIconRow, SidebarMediaTypeList, SidebarOrientationFilter, SidebarRatingFilter } from '../components/SidebarControls';
 import { CompactSortControls, isSortKey } from '../components/SortControls';
-import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
+import { useSidebarBrowseTools, useSidebarPanel, useSidebarQueryChips, useSidebarReturnState, useSidebarScopeTitle, type BrowseQueryChip, type BrowseTools } from '../components/SidebarContext';
 import { useAssetDeletedEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
@@ -103,6 +103,15 @@ export default function CollectionsPage() {
 	() => collections.find((collection) => collection.id === selectedCollectionId) ?? dynamicTagCollection(selectedCollectionId, selectedTags),
     [collections, selectedCollectionId, selectedTags],
   );
+  useSidebarScopeTitle('collections', selectedCollection ? `智能 / ${selectedCollection.name}` : '智能', [selectedCollection?.id, selectedCollection?.name]);
+  const queryChips = useMemo<BrowseQueryChip[]>(() => {
+    const chips: BrowseQueryChip[] = [];
+    if (filenameQuery.trim()) chips.push({ id: 'filename', label: `文件名: ${filenameQuery.trim()}`, onRemove: () => setFilenameQuery('') });
+    if (query.trim()) chips.push({ id: 'ai', label: `AI: ${query.trim()}`, onRemove: () => setQuery('') });
+    if (selectedTags.length > 0) chips.push({ id: 'tags', label: `标签 ${selectedTags.length}`, onRemove: () => setSelectedTags([]) });
+    return chips;
+  }, [filenameQuery, query, selectedTags]);
+  useSidebarQueryChips('collections', queryChips, [queryChips]);
   const preserveMissingAssets = selectedCollectionId === 'missing' || selectedCollection?.systemKind === 'missing';
   const forceDuplicateGrouping = selectedCollectionId === 'duplicates' || selectedCollection?.systemKind === 'duplicates';
   const autoSelectDuplicateAssets = useCallback(async () => {
@@ -286,6 +295,22 @@ export default function CollectionsPage() {
     },
     [groupMode],
   );
+  const browseTools = useMemo<BrowseTools>(() => ({
+    groupMode,
+    onGroupChange: setGroupMode,
+    onOrientationChange: setOrientation,
+    onRatingChange: setRating,
+    onSortChange: handleSortChange,
+    onTagFilterChange: setSelectedTags,
+    onTypeChange: setType,
+    orientation,
+    panelModes: ['search', 'filters'],
+    rating,
+    sort,
+    tagFilters: selectedTags,
+    type,
+  }), [groupMode, handleSortChange, orientation, rating, selectedTags, sort, type]);
+  useSidebarBrowseTools('collections', browseTools, [browseTools]);
 
   const createSmartCollection = useCallback(async () => {
     const name = newCollectionName.trim();
@@ -356,14 +381,17 @@ export default function CollectionsPage() {
         <CompactAssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
         <CompactSortControls sort={sort} onChange={handleSortChange} />
       </SidebarFilterIconRow>
+      <div className="sidebar-panel-section sidebar-panel-search">
       <label className="sidebar-field">
         <span>文件名搜索</span>
 		<input value={filenameQuery} onChange={(event) => setFilenameQuery(event.target.value)} placeholder="仅搜索文件名" />
 	  </label>
-	  <label className="sidebar-field">
+      <label className="sidebar-field">
 		<span>内容搜索</span>
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="文件名或 AI 描述" />
       </label>
+      </div>
+      <div className="sidebar-panel-section sidebar-panel-scope">
       <CollectionSidebarGroup
         collapsed={systemCollectionsCollapsed}
         collapsible
@@ -427,7 +455,8 @@ export default function CollectionsPage() {
           </div>
         )}
       </section>
-      <section className="sidebar-collection-section sidebar-ai-tag-card" aria-labelledby="collections-tags-title">
+      </div>
+      <section className="sidebar-collection-section sidebar-ai-tag-card sidebar-panel-section sidebar-panel-filters" aria-labelledby="collections-tags-title">
         <div className="sidebar-section-title-row">
           <button
             aria-expanded={!aiTagCardCollapsed}

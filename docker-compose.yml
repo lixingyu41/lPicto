@@ -4,6 +4,25 @@ x-paths:
   cache: &cache-source ${LPICTO_CACHE:-./data/cache}
 
 services:
+  gateway:
+    image: caddy:2.10-alpine
+    ports:
+      - "${LPICTO_BIND:-127.0.0.1}:18443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
   api:
     build:
       context: .
@@ -16,9 +35,19 @@ services:
       - TZ=${TZ:-Asia/Shanghai}
       - AI_URL=http://ai:8090
       - FFMPEG_HWACCEL=none
+      - LIVE_VIDEO_PROXY_MAX_ACTIVE=${LIVE_VIDEO_PROXY_MAX_ACTIVE:-2}
+      - VIDEO_SEGMENT_SECONDS=${VIDEO_SEGMENT_SECONDS:-4}
+      - MEDIA_ORIGIN_PORTS=${MEDIA_ORIGIN_PORTS:-18081,18082,18083,18084}
+      - NAS_WATCHER_TOKEN=${NAS_WATCHER_TOKEN:-}
+      - NAS_WATCHER_ROOTS=${NAS_WATCHER_ROOTS:-PIC=nas/PIC;VID=nas/VID}
+      - NAS_WATCHER_OFFLINE_SECONDS=${NAS_WATCHER_OFFLINE_SECONDS:-90}
     command: ["all"]
     ports:
       - "${LPICTO_BIND:-127.0.0.1}:${LPICTO_PORT:-18080}:8080"
+      - "${LPICTO_BIND:-127.0.0.1}:18081:8080"
+      - "${LPICTO_BIND:-127.0.0.1}:18082:8080"
+      - "${LPICTO_BIND:-127.0.0.1}:18083:8080"
+      - "${LPICTO_BIND:-127.0.0.1}:18084:8080"
     group_add:
       - "${LPICTO_MEDIA_GID:-950}"
     volumes:
@@ -126,3 +155,7 @@ services:
 networks:
   ai-internal:
     internal: true
+
+volumes:
+  caddy-data:
+  caddy-config:

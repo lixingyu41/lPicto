@@ -25,7 +25,10 @@ export function usePagedLoader<T>(
     setLoading(true);
     setError(null);
     try {
-      const result = await loadPageRef.current(pageToLoad);
+      const result = await loadPageWithTransientRetry(
+        () => loadPageRef.current(pageToLoad),
+        () => requestId.current === currentRequest,
+      );
       if (requestId.current !== currentRequest) return;
       assertPageContract(result, pageToLoad, responsePageSize);
       setItems((prev) => (replace ? result.items : [...prev, ...result.items]));
@@ -60,7 +63,10 @@ export function usePagedLoader<T>(
     setLoading(true);
     setError(null);
     try {
-      const result = await loadPageRef.current(pageToLoad);
+      const result = await loadPageWithTransientRetry(
+        () => loadPageRef.current(pageToLoad),
+        () => requestId.current === currentRequest,
+      );
       if (requestId.current !== currentRequest) return null;
       assertPageContract(result, pageToLoad, responsePageSize);
       beforePrepend?.(result);
@@ -120,6 +126,24 @@ export function usePagedLoader<T>(
   }, []);
 
   return { items, hasMore, hasPrevious: startPage > 1, loading, error, loadMore, loadPrevious, reset, jumpToPage, mutateItems };
+}
+
+async function loadPageWithTransientRetry<T>(loadPage: () => Promise<Page<T>>, isCurrent: () => boolean) {
+  try {
+    return await loadPage();
+  } catch (error) {
+    if (!isCurrent() || !isTransientLoadError(error)) throw error;
+    await new Promise((resolve) => window.setTimeout(resolve, 300));
+    if (!isCurrent()) throw error;
+    return loadPage();
+  }
+}
+
+function isTransientLoadError(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  return error.message === '请求超时'
+    || error.name === 'AbortError'
+    || /Failed to fetch|NetworkError|网络连接失败/i.test(error.message);
 }
 
 function assertPageContract<T>(result: Page<T>, requestedPage: number, pageSizeRef: { current: number }) {

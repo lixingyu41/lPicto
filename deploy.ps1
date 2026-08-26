@@ -142,11 +142,13 @@ upsert_env LPICTO_MEDIA /mnt "$STAGING/.env"
 upsert_env LPICTO_DATA ./data/app "$STAGING/.env"
 upsert_env LPICTO_CACHE ./data/cache "$STAGING/.env"
 upsert_env FFMPEG_HWACCEL none "$STAGING/.env"
-upsert_env LIVE_VIDEO_PROXY_MAX_ACTIVE 1 "$STAGING/.env"
-upsert_env VIDEO_PRELOAD_SEGMENTS 5 "$STAGING/.env"
+upsert_env LIVE_VIDEO_PROXY_MAX_ACTIVE 2 "$STAGING/.env"
+upsert_env VIDEO_PRELOAD_SEGMENTS 2 "$STAGING/.env"
 upsert_env ENABLE_FS_WATCH false "$STAGING/.env"
 upsert_env FILE_COUNT_SCAN_INTERVAL_MINUTES 0 "$STAGING/.env"
 upsert_env SCAN_INTERVAL_MINUTES 0 "$STAGING/.env"
+upsert_env NAS_WATCHER_ROOTS 'PIC=nas/PIC;VID=nas/VID' "$STAGING/.env"
+upsert_env NAS_WATCHER_OFFLINE_SECONDS 90 "$STAGING/.env"
 mkdir -p "$STAGING/data/app" "$STAGING/data/cache"
 
 echo '校验本机上传的锁定版本 AI 模型（旧服务保持运行）'
@@ -182,17 +184,16 @@ if [ -d "$PROJECT" ] && [ -f "$PROJECT/docker-compose.yml" ]; then
   compose down --remove-orphans >/tmp/lpicto-compose-down.$TS.log 2>&1 || true
 fi
 
-if [ -d "$PROJECT/data" ]; then
-  rm -rf "$STAGING/data"
-  mv "$PROJECT/data" "$STAGING/data"
-fi
-mkdir -p "$STAGING/data/app" "$STAGING/data/cache"
-
 if [ -d "$PROJECT" ]; then
   mv "$PROJECT" "$BACKUP"
   echo "旧版本备份：$BACKUP"
 fi
 mv "$STAGING" "$PROJECT"
+if [ -d "$BACKUP/data" ]; then
+  rm -rf "$PROJECT/data"
+  mv "$BACKUP/data" "$PROJECT/data"
+fi
+mkdir -p "$PROJECT/data/app" "$PROJECT/data/cache"
 trap - EXIT
 echo '修复共享缓存目录权限'
 docker_cmd run --rm -v "$PROJECT/data/cache:/cache" --entrypoint sh redis:7-alpine \
@@ -220,14 +221,14 @@ for _ in $(seq 1 90); do
 done
 if [ "$health_ok" != 1 ]; then
   echo '错误：健康检查超时，显示服务日志'
-  compose logs --tail=120 api ai postgres redis
+  compose logs --tail=120 gateway api ai postgres redis
   exit 22
 fi
 
 echo '当前容器状态'
 compose ps
 echo '检查所有容器依赖与挂载权限'
-for service in api; do
+for service in api gateway; do
   container="lpicto-${service}-1"
   service_health=''
   for _ in $(seq 1 30); do

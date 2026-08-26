@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"sort"
-	"strings"
 	"time"
 
 	"lpicto/backend/internal/db"
@@ -206,15 +205,7 @@ func (s *Server) albumAssets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, pageSize := s.page(r, s.cfg.PageSizeDefault)
-	typeFilter := safeType(r.URL.Query().Get("type"))
-	if typeFilter == "all" {
-		typeFilter = ""
-	}
-	opts := db.AssetListOptions{
-		Page: page, PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
-		Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-		Orientation: searchOrientation(r), CombinedTags: combinedTagsQuery(r), TagNodes: tagNodesQuery(r),
-	}
+	opts := s.libraryAssetOptions(r, page, pageSize)
 	assets, err := s.db.ListAlbumAssets(r.Context(), id, opts)
 	s.recordFilterTiming(w, r, started)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -240,21 +231,7 @@ func (s *Server) albumAnchors(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, pageSize := s.page(r, s.cfg.PageSizeDefault)
-	typeFilter := safeType(r.URL.Query().Get("type"))
-	if typeFilter == "all" {
-		typeFilter = ""
-	}
-	anchorResult, err := s.db.AlbumAnchors(r.Context(), id, db.AssetListOptions{
-		PageSize:     pageSize,
-		Type:         typeFilter,
-		Sort:         safeSort(r.URL.Query().Get("sort")),
-		Group:        safeGroup(r.URL.Query().Get("group")),
-		Query:        strings.TrimSpace(r.URL.Query().Get("q")),
-		VisibleOnly:  visibleOnly(r),
-		Rating:       ratingQueryPtr(r, "rating"),
-		Orientation:  searchOrientation(r),
-		CombinedTags: combinedTagsQuery(r), TagNodes: tagNodesQuery(r),
-	})
+	anchorResult, err := s.db.AlbumAnchors(r.Context(), id, s.libraryAssetOptions(r, 1, pageSize))
 	s.recordFilterTiming(w, r, started)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "album_not_found", "相册不存在")

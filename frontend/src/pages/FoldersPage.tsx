@@ -1,4 +1,4 @@
-import { type Ref, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { ChevronsUp, ChevronRight, Folder as FolderIcon } from 'lucide-react';
 import AssetGrid from '../components/AssetGrid';
@@ -15,7 +15,7 @@ import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
 import type { Asset, AssetDeletedEvent, AssetKind, AssetRatingFilter, Folder, LibraryAnchor, OrientationFilter, SortKey } from '../types/api';
-import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
+import { useSidebarBrowseTools, useSidebarPanel, useSidebarQueryChips, useSidebarReturnState, useSidebarScopeTitle, type BrowseQueryChip, type BrowseTools } from '../components/SidebarContext';
 import {
   appendViewerReturnParams,
   decodeReturnState,
@@ -120,6 +120,14 @@ export default function FoldersPage() {
   const activeRating = rating === 'all' ? undefined : rating;
   const currentLookupId = requestedFolderRelPath === null ? currentId : null;
   const resolvingRequestedFolder = requestedFolderRelPath !== null && current?.relPath !== requestedFolderRelPath;
+  useSidebarScopeTitle('folders', current ? `文件夹 / ${current.name}` : '文件夹', [current?.id, current?.name]);
+  const queryChips = useMemo<BrowseQueryChip[]>(() => {
+    const chips: BrowseQueryChip[] = [];
+    if (query.trim()) chips.push({ id: 'search', label: `搜索: ${query.trim()}`, onRemove: () => setQuery('') });
+    if (tagFilters.length > 0) chips.push({ id: 'tags', label: `标签 ${tagFilters.length}`, onRemove: () => setTagFilters([]) });
+    return chips;
+  }, [query, tagFilters]);
+  useSidebarQueryChips('folders', queryChips, [queryChips]);
 
   useEffect(() => {
     let live = true;
@@ -434,6 +442,23 @@ export default function FoldersPage() {
     setCollapsedFolderKeys(new Set(tree.filter((folder) => (childrenByParent.get(folder.relPath)?.length ?? 0) > 0 && !keepOpen.has(folder.relPath)).map((folder) => folder.relPath)));
   }, [childrenByParent, currentId, folderByRelPath, tree]);
 
+  const browseTools = useMemo<BrowseTools>(() => ({
+    groupMode,
+    onGroupChange: setGroupMode,
+    onOrientationChange: setOrientation,
+    onRatingChange: handleRatingChange,
+    onSortChange: setSort,
+    onTagFilterChange: setTagFilters,
+    onTypeChange: setType,
+    orientation,
+    panelModes: ['search', 'filters'],
+    rating,
+    sort,
+    tagFilters,
+    type,
+  }), [groupMode, handleRatingChange, orientation, rating, sort, tagFilters, type]);
+  useSidebarBrowseTools('folders', browseTools, [browseTools]);
+
   useSidebarPanel(
     'folders',
     <div className="sidebar-control-stack sidebar-folder-panel">
@@ -444,33 +469,35 @@ export default function FoldersPage() {
         <CompactAssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
         <CompactSortControls sort={sort} onChange={setSort} />
       </SidebarFilterIconRow>
-      <div className="sidebar-folder-action-row">
-        <button className="sidebar-command" type="button" onClick={collapseOtherFolders}>
-          <ChevronsUp size={15} />
-          <span>全部折叠</span>
-        </button>
+      <div className="sidebar-panel-section sidebar-panel-scope">
+        <SidebarSelect
+          label="文件夹范围"
+          value={includeSubfolders ? 'recursive' : 'direct'}
+          options={[
+            { value: 'recursive', label: '含子文件夹' },
+            { value: 'direct', label: '仅本层' },
+          ]}
+          onChange={(value) => setIncludeSubfolders(value === 'recursive')}
+        />
+        <div className="sidebar-folder-action-row">
+          <button className="sidebar-command" type="button" onClick={collapseOtherFolders}>
+            <ChevronsUp size={15} />
+            <span>全部折叠</span>
+          </button>
+        </div>
+        <SidebarFolderTree
+          childrenByParent={childrenByParent}
+          collapsedKeys={collapsedFolderKeys}
+          currentId={currentId}
+          error={treeError}
+          includeSubfolders={includeSubfolders}
+          loading={treeLoading}
+          onSelect={selectFolder}
+          onToggle={toggleFolderCollapsed}
+          treeRef={folderTreeRef}
+        />
       </div>
-      <SidebarFolderTree
-        childrenByParent={childrenByParent}
-        collapsedKeys={collapsedFolderKeys}
-        currentId={currentId}
-        error={treeError}
-        includeSubfolders={includeSubfolders}
-        loading={treeLoading}
-        onSelect={selectFolder}
-        onToggle={toggleFolderCollapsed}
-        treeRef={folderTreeRef}
-      />
-      <SidebarSelect
-        label="范围"
-        value={includeSubfolders ? 'recursive' : 'direct'}
-        options={[
-          { value: 'recursive', label: '含子文件夹' },
-          { value: 'direct', label: '仅本层' },
-        ]}
-        onChange={(value) => setIncludeSubfolders(value === 'recursive')}
-      />
-      <label className="sidebar-field sidebar-folder-search-field">
+      <label className="sidebar-field sidebar-folder-search-field sidebar-panel-section sidebar-panel-search">
         <span>搜索</span>
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="当前文件夹" />
       </label>
@@ -634,28 +661,96 @@ function SidebarFolderTree({
   loading: boolean;
   onSelect: (folder: Folder) => void;
   onToggle: (key: string) => void;
-  treeRef: Ref<HTMLDivElement>;
+  treeRef: MutableRefObject<HTMLDivElement | null>;
 }) {
   const roots = visibleSidebarFolderRoots(childrenByParent);
+  const scrollViewportRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const topScrollRef = useRef<HTMLDivElement | null>(null);
+  const [contentWidth, setContentWidth] = useState(0);
+  const [hasHorizontalOverflow, setHasHorizontalOverflow] = useState(false);
+
+  const updateScrollDimensions = useCallback(() => {
+    const viewport = scrollViewportRef.current;
+    const content = contentRef.current;
+    if (!viewport || !content) return;
+    const nextWidth = Math.ceil(content.scrollWidth);
+    setContentWidth((value) => (value === nextWidth ? value : nextWidth));
+    setHasHorizontalOverflow(nextWidth > viewport.clientWidth + 1);
+  }, []);
+
+  useEffect(() => {
+    const viewport = scrollViewportRef.current;
+    const content = contentRef.current;
+    if (!viewport || !content) return undefined;
+    const observer = new ResizeObserver(updateScrollDimensions);
+    observer.observe(viewport);
+    observer.observe(content);
+    const frame = window.requestAnimationFrame(updateScrollDimensions);
+    window.addEventListener('resize', updateScrollDimensions);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener('resize', updateScrollDimensions);
+      observer.disconnect();
+    };
+  }, [updateScrollDimensions]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(updateScrollDimensions);
+    const settleTimer = window.setTimeout(updateScrollDimensions, 240);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(settleTimer);
+    };
+  }, [collapsedKeys, contentWidth, updateScrollDimensions]);
+
+  const setTreeViewport = useCallback((node: HTMLDivElement | null) => {
+    scrollViewportRef.current = node;
+    treeRef.current = node;
+  }, [treeRef]);
+
+  const syncHorizontalScroll = useCallback((source: HTMLDivElement | null, target: HTMLDivElement | null) => {
+    if (!source || !target || target.scrollLeft === source.scrollLeft) return;
+    target.scrollLeft = source.scrollLeft;
+  }, []);
+
   return (
-    <div className="sidebar-folder-tree" role="tree" aria-label="文件夹" ref={treeRef}>
-      {roots.length === 0 ? (
-        <div className={error ? 'error-line' : 'muted-line'}>{loading ? '正在加载文件夹' : error || '暂无文件夹'}</div>
-      ) : (
-        roots.map((folder) => (
-          <SidebarFolderNode
-            childrenByParent={childrenByParent}
-            collapsedKeys={collapsedKeys}
-            currentId={currentId}
-            depth={0}
-            folder={folder}
-            includeSubfolders={includeSubfolders}
-            key={folder.relPath || 'root'}
-            onSelect={onSelect}
-            onToggle={onToggle}
-          />
-        ))
-      )}
+    <div className={`sidebar-folder-tree-shell${hasHorizontalOverflow ? ' has-horizontal-overflow' : ''}`}>
+      <div
+        aria-hidden="true"
+        className="sidebar-folder-tree-top-scroll"
+        ref={topScrollRef}
+        onScroll={() => syncHorizontalScroll(topScrollRef.current, scrollViewportRef.current)}
+      >
+        <div className="sidebar-folder-tree-top-track" style={{ width: `${contentWidth}px` }} />
+      </div>
+      <div
+        className="sidebar-folder-tree"
+        role="tree"
+        aria-label="文件夹"
+        ref={setTreeViewport}
+        onScroll={() => syncHorizontalScroll(scrollViewportRef.current, topScrollRef.current)}
+      >
+        <div className="sidebar-folder-tree-content" ref={contentRef}>
+          {roots.length === 0 ? (
+            <div className={error ? 'error-line' : 'muted-line'}>{loading ? '正在加载文件夹' : error || '暂无文件夹'}</div>
+          ) : (
+            roots.map((folder) => (
+              <SidebarFolderNode
+                childrenByParent={childrenByParent}
+                collapsedKeys={collapsedKeys}
+                currentId={currentId}
+                depth={0}
+                folder={folder}
+                includeSubfolders={includeSubfolders}
+                key={folder.relPath || 'root'}
+                onSelect={onSelect}
+                onToggle={onToggle}
+              />
+            ))
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -705,6 +800,7 @@ function SidebarFolderNode({
         data-folder-id={folderID(folder)}
         aria-level={depth + 1}
         role="treeitem"
+        style={{ paddingInlineStart: `${depth * 16}px` }}
       >
         <button
           aria-label={expanded ? '折叠文件夹' : '展开文件夹'}

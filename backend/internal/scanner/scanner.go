@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,8 @@ type Scanner struct {
 	lastStart int64
 	progress  Progress
 }
+
+const globalScanReason = "global_scan"
 
 type StatusReporter interface {
 	SetScanStatus(context.Context, Status) error
@@ -133,23 +136,33 @@ type scanState struct {
 	roots         []string
 	task          scanTask
 	forceMetadata bool
+	deferWork     bool
+	deferredWork  map[int64]scanDeferredWork
 	mu            sync.Mutex
 	wg            sync.WaitGroup
 	writerWG      sync.WaitGroup
 }
 
+type scanDeferredWork struct {
+	assetID       int64
+	mediaType     string
+	previewStatus string
+}
+
 type scanRequest struct {
-	reason      string
-	roots       []string
-	paths       []string
-	hasOverride bool
-	task        scanTask
+	reason           string
+	roots            []string
+	paths            []string
+	hasOverride      bool
+	excludeRootFiles bool
+	task             scanTask
 }
 
 type scanTask string
 
 const (
 	scanTaskMetadata      scanTask = "metadata"
+	scanTaskMediaScan     scanTask = "media_scan"
 	scanTaskReconcile     scanTask = "reconcile"
 	scanTaskCount         scanTask = "count"
 	scanTaskThumbContinue scanTask = "thumb_continue"
@@ -159,9 +172,8 @@ const (
 type scanCommandKind string
 
 const (
-	scanCommandStart           scanCommandKind = "start"
-	scanCommandStop            scanCommandKind = "stop"
-	scanCommandPlaybackPreempt scanCommandKind = "playback_preempt"
+	scanCommandStart scanCommandKind = "start"
+	scanCommandStop  scanCommandKind = "stop"
 )
 
 type scanCommand struct {
@@ -229,6 +241,18 @@ func (s *Scanner) RequestMetadataScanPaths(reason string, roots []string, paths 
 	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), paths: append([]string(nil), paths...), hasOverride: true, task: scanTaskMetadata})
 }
 
+func (s *Scanner) RequestMediaScan(reason string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, task: scanTaskMediaScan})
+}
+
+func (s *Scanner) RequestMediaScanRoots(reason string, roots []string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: true, task: scanTaskMediaScan})
+}
+
+func (s *Scanner) RequestMediaScanNestedRoots(reason string, roots []string) CommandResult {
+	return s.requestStart(scanRequest{reason: reason, roots: append([]string(nil), roots...), hasOverride: true, excludeRootFiles: true, task: scanTaskMediaScan})
+}
+
 func (s *Scanner) RequestThumbnailRebuild(reason string) CommandResult {
 	return s.requestStart(scanRequest{reason: reason, task: scanTaskThumbRebuild})
 }
@@ -294,30 +318,13 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 	var cancel context.CancelFunc
 	var done <-chan struct{}
 	var activeStart *scanRequest
-	var resumeStart *scanRequest
-	var pendingStart *scanRequest
-	var resumeTimer <-chan time.Time
+	var pendingStarts []scanRequest
 	startPendingIfReady := func() {
-		if (resumeStart == nil && pendingStart == nil) || done != nil || ctx.Err() != nil {
+		if len(pendingStarts) == 0 || done != nil || ctx.Err() != nil {
 			return
 		}
-		if s.Jobs != nil {
-			active, err := s.Jobs.PlaybackPriorityActive(ctx)
-			if err == nil && active {
-				s.setPausedProgress("playback", false)
-				resumeTimer = time.After(250 * time.Millisecond)
-				return
-			}
-		}
-		var next scanRequest
-		if resumeStart != nil {
-			next = *resumeStart
-			resumeStart = nil
-		} else {
-			next = *pendingStart
-			pendingStart = nil
-		}
-		resumeTimer = nil
+		next := pendingStarts[0]
+		pendingStarts = pendingStarts[1:]
 		cancel, done = s.startRun(ctx, next)
 		activeStart = &next
 	}
@@ -333,12 +340,8 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 			case scanCommandStart:
 				req := cmd.req
 				if done == nil {
-					if resumeStart != nil || pendingStart != nil {
-						if resumeStart == nil || !sameScanRequest(*resumeStart, req) {
-							if pendingStart == nil || !sameScanRequest(*pendingStart, req) {
-								pendingStart = &req
-							}
-						}
+					if len(pendingStarts) > 0 {
+						pendingStarts = enqueueScanRequest(pendingStarts, req, isAutomaticScanRequest(req))
 						startPendingIfReady()
 						cmd.reply <- CommandResult{Accepted: true, Started: done != nil, State: s.currentState()}
 						continue
@@ -352,25 +355,23 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 					cmd.reply <- CommandResult{Accepted: true, Started: false, State: s.currentState()}
 					continue
 				}
-				if pendingStart != nil && sameScanRequest(*pendingStart, req) {
+				if containsScanRequest(pendingStarts, req) {
 					cmd.reply <- CommandResult{Accepted: true, Started: false, State: s.currentState()}
 					continue
 				}
 				if isAutomaticScanRequest(req) {
-					pendingStart = &req
+					pendingStarts = enqueueScanRequest(pendingStarts, req, true)
 					cmd.reply <- CommandResult{Accepted: true, Started: false, State: s.currentState()}
 					continue
 				}
-				pendingStart = &req
+				pendingStarts = []scanRequest{req}
 				if cancel != nil {
 					cancel()
 				}
 				s.setStopping("start")
 				cmd.reply <- CommandResult{Accepted: true, Started: false, State: "stopping"}
 			case scanCommandStop:
-				resumeStart = nil
-				pendingStart = nil
-				resumeTimer = nil
+				pendingStarts = nil
 				if done == nil {
 					s.setIdleProgress()
 					cmd.reply <- CommandResult{Accepted: false, Paused: false, State: "idle"}
@@ -381,20 +382,6 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 				}
 				s.setStopping("stop")
 				cmd.reply <- CommandResult{Accepted: true, Paused: true, State: "stopping"}
-			case scanCommandPlaybackPreempt:
-				if done == nil || activeStart == nil || !sameScanRequest(*activeStart, cmd.req) {
-					cmd.reply <- CommandResult{Accepted: false, State: s.currentState()}
-					continue
-				}
-				if resumeStart == nil && (pendingStart == nil || isAutomaticScanRequest(*pendingStart)) {
-					retry := *activeStart
-					resumeStart = &retry
-				}
-				if cancel != nil {
-					cancel()
-				}
-				s.setPausedProgress("playback", true)
-				cmd.reply <- CommandResult{Accepted: true, Paused: true, State: "paused"}
 			default:
 				cmd.reply <- CommandResult{Accepted: false, State: s.currentState()}
 			}
@@ -402,20 +389,73 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 			done = nil
 			cancel = nil
 			activeStart = nil
-			if (resumeStart != nil || pendingStart != nil) && ctx.Err() == nil {
+			if len(pendingStarts) > 0 && ctx.Err() == nil {
 				startPendingIfReady()
 				continue
 			}
 			s.setIdleAfterRun()
-		case <-resumeTimer:
-			resumeTimer = nil
-			startPendingIfReady()
 		}
 	}
 }
 
+func containsScanRequest(queue []scanRequest, req scanRequest) bool {
+	for _, queued := range queue {
+		if sameScanRequest(queued, req) {
+			return true
+		}
+	}
+	return false
+}
+
+func enqueueScanRequest(queue []scanRequest, req scanRequest, coalesce bool) []scanRequest {
+	if !coalesce {
+		return append(queue, req)
+	}
+	for index := range queue {
+		if queue[index].task != req.task {
+			continue
+		}
+		queue[index] = mergeScanRequests(queue[index], req)
+		return queue
+	}
+	return append(queue, req)
+}
+
+func mergeScanRequests(existing, incoming scanRequest) scanRequest {
+	merged := existing
+	merged.excludeRootFiles = existing.excludeRootFiles && incoming.excludeRootFiles
+	if !existing.hasOverride || !incoming.hasOverride {
+		merged.hasOverride = false
+		merged.roots = nil
+	} else {
+		merged.roots = mergeStringSets(existing.roots, incoming.roots)
+	}
+	if len(existing.paths) == 0 || len(incoming.paths) == 0 {
+		merged.paths = nil
+	} else {
+		merged.paths = mergeStringSets(existing.paths, incoming.paths)
+	}
+	return merged
+}
+
+func mergeStringSets(first, second []string) []string {
+	values := make(map[string]struct{}, len(first)+len(second))
+	for _, value := range first {
+		values[value] = struct{}{}
+	}
+	for _, value := range second {
+		values[value] = struct{}{}
+	}
+	merged := make([]string, 0, len(values))
+	for value := range values {
+		merged = append(merged, value)
+	}
+	sort.Strings(merged)
+	return merged
+}
+
 func sameScanRequest(a scanRequest, b scanRequest) bool {
-	return a.task == b.task && equalStringSet(a.roots, b.roots) && equalStringSet(a.paths, b.paths)
+	return a.task == b.task && a.hasOverride == b.hasOverride && a.excludeRootFiles == b.excludeRootFiles && equalStringSet(a.roots, b.roots) && equalStringSet(a.paths, b.paths)
 }
 
 func isAutomaticScanRequest(req scanRequest) bool {
@@ -473,10 +513,6 @@ func (s *Scanner) Pause() bool {
 
 func (s *Scanner) RequestStop() CommandResult {
 	return s.submitCommand(scanCommand{kind: scanCommandStop})
-}
-
-func (s *Scanner) requestPlaybackPreempt(req scanRequest) CommandResult {
-	return s.submitCommand(scanCommand{kind: scanCommandPlaybackPreempt, req: req})
 }
 
 func (s *Scanner) StartPeriodic(ctx context.Context, interval time.Duration) {
@@ -627,7 +663,7 @@ func nextStatusRevision() int64 {
 func (s *Scanner) run(ctx context.Context, req scanRequest) {
 	logger := s.Logger.With("reason", req.reason)
 	priority := 100
-	if strings.HasPrefix(req.reason, "task:") {
+	if strings.HasPrefix(req.reason, "task:") || req.reason == globalScanReason {
 		priority = 50
 	}
 	sourceBatchID, _ := s.DB.BeginSourceIOBatch(context.Background(), req.reason, priority)
@@ -638,28 +674,8 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 		}
 		_ = s.DB.FinishSourceIOBatch(context.Background(), sourceBatchID, state, 0, 0, message)
 	}()
-	stopMonitor := make(chan struct{})
-	defer close(stopMonitor)
-	if s.Jobs != nil {
-		go func() {
-			ticker := time.NewTicker(200 * time.Millisecond)
-			defer ticker.Stop()
-			for {
-				active, _ := s.Jobs.PlaybackPriorityActive(ctx)
-				if active {
-					s.requestPlaybackPreempt(req)
-					return
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-stopMonitor:
-					return
-				case <-ticker.C:
-				}
-			}
-		}()
-	}
+	releasePriority := jobs.EnterMediaScanPriority()
+	defer releasePriority()
 	runID, err := s.DB.StartScanRun(ctx, string(req.task))
 	if err != nil {
 		logger.Error("start scan run failed", "error", err)
@@ -743,7 +759,12 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 			if ctx.Err() != nil {
 				break
 			}
-			walkErr := s.walkRoot(ctx, root, state)
+			var walkErr error
+			if req.excludeRootFiles {
+				walkErr = s.walkNestedRoot(ctx, root, state)
+			} else {
+				walkErr = s.walkRoot(ctx, root, state)
+			}
 			if ctx.Err() != nil {
 				break
 			}
@@ -778,6 +799,9 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 			if !inScanScope {
 				continue
 			}
+			if req.excludeRootFiles && assetDirectlyInScanRoots(rel, scanRoots) {
+				continue
+			}
 			if assetUnderFailedRoot(rel, failedRoots) {
 				continue
 			}
@@ -794,6 +818,7 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 			}
 		}
 	}
+	s.updateProgressPhase("finalizing")
 	if err := s.DB.RefreshFolders(ctx); err != nil {
 		counts.recordError("更新文件夹统计失败", err)
 		logger.Warn("refresh folders failed", "error", err)
@@ -814,7 +839,43 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 	}); err != nil {
 		logger.Error("finish scan run failed", "error", err)
 	}
+	if req.task == scanTaskMediaScan {
+		if counts.assetsAdded > 0 || counts.assetsUpdated > 0 {
+			state.enqueueDeferredWork()
+		}
+		if req.reason == globalScanReason {
+			s.enqueueGlobalRepair(ctx, scanRoots, logger)
+		}
+	}
 	logger.Info("scan finished", "seen", counts.totalSeen, "added", counts.assetsAdded, "updated", counts.assetsUpdated, "deleted", counts.assetsDeleted, "errors", counts.errors)
+}
+
+// enqueueGlobalRepair restores only unfinished work after a full discovery pass.
+// Ready media and completed cache products remain untouched.
+func (s *Scanner) enqueueGlobalRepair(ctx context.Context, roots []string, logger *slog.Logger) {
+	metadataPaths, err := s.DB.MetadataWorkPathsForRoots(ctx, roots)
+	if err != nil {
+		logger.Warn("load global scan metadata repair work failed", "error", err)
+	} else if len(metadataPaths) > 0 {
+		result := s.RequestMetadataScanPaths("auto_global_scan_repair", roots, metadataPaths)
+		if !result.Accepted {
+			logger.Warn("queue global scan metadata repair failed", "count", len(metadataPaths), "state", result.State)
+		}
+	}
+
+	if s.Jobs == nil {
+		return
+	}
+	for _, taskType := range []string{"thumb", "video_poster", "preview", "storyboard"} {
+		items, workErr := s.DB.ContinueWorkForRoots(ctx, taskType, roots)
+		if workErr != nil {
+			logger.Warn("load global scan repair work failed", "type", taskType, "error", workErr)
+			continue
+		}
+		for _, item := range items {
+			s.Jobs.Enqueue(jobs.Task{Type: item.Type, AssetID: item.AssetID, Priority: 50})
+		}
+	}
 }
 
 func (s *Scanner) runReconcile(ctx context.Context, runID int64, scanRoots []string, logger *slog.Logger) {
@@ -983,7 +1044,7 @@ func (s *Scanner) runCount(ctx context.Context, runID int64, scanRoots []string,
 		countedAnyLibrary = true
 		s.updateCountProgress(total, estimatedTotal)
 		if strings.HasPrefix(reason, "auto_count") && library.DiscoveredAt != nil && library.DiscoveredFiles != count && s.Jobs != nil {
-			s.Jobs.Enqueue(jobs.Task{Type: "scan_metadata", Reason: "count_changed:" + library.Name, Roots: append([]string(nil), library.Roots...)})
+			s.Jobs.Enqueue(jobs.Task{Type: "scan_media", Reason: "task:media_scan:auto_count:" + library.Name, Roots: append([]string(nil), library.Roots...), Priority: 10})
 		}
 	}
 	if !countedAnyLibrary {
@@ -1010,11 +1071,6 @@ func (s *Scanner) runCount(ctx context.Context, runID int64, scanRoots []string,
 	}
 	_ = s.DB.FinishScanRun(ctx, runID, db.ScanFinish{Status: status, TotalSeen: total, Errors: errors, LastError: lastError})
 	logger.Info("file count scan finished", "total", total, "errors", errors)
-	if errors == 0 && strings.HasPrefix(reason, "task:media_scan") && s.Jobs != nil {
-		s.Jobs.Enqueue(jobs.Task{
-			Type: "scan_metadata", Reason: "media_scan_completed", Roots: append([]string(nil), scanRoots...), Priority: 10,
-		})
-	}
 }
 
 func (s *Scanner) runThumbnailRebuild(ctx context.Context, runID int64, scanRoots []string, logger *slog.Logger) {
@@ -1274,6 +1330,61 @@ func (s *Scanner) walkRoot(ctx context.Context, rootRel string, state *scanState
 	return s.walkDir(ctx, rootPath, state)
 }
 
+func (s *Scanner) walkNestedRoot(ctx context.Context, rootRel string, state *scanState) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	s.updateProgressRoot(rootRel)
+	rootPath, err := s.Store.PhotoPath(rootRel)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(rootPath)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	state.submitFolder(rootRel)
+	entries, readErr := util.ReadDirPartial(rootPath)
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() {
+			continue
+		}
+		absPath := filepath.Join(rootPath, entry.Name())
+		if err := s.ensureFolderForPath(ctx, absPath, state); err != nil {
+			continue
+		}
+		if err := s.walkDir(ctx, absPath, state); err != nil {
+			readErr = err
+		}
+	}
+	return readErr
+}
+
+func assetDirectlyInScanRoots(relPath string, roots []string) bool {
+	relPath = strings.Trim(strings.TrimSpace(filepath.ToSlash(relPath)), "/")
+	for _, root := range roots {
+		root = strings.Trim(strings.TrimSpace(filepath.ToSlash(root)), "/")
+		remaining := relPath
+		if root != "" {
+			prefix := root + "/"
+			if !strings.HasPrefix(relPath, prefix) {
+				continue
+			}
+			remaining = strings.TrimPrefix(relPath, prefix)
+		}
+		if remaining != "" && !strings.Contains(remaining, "/") {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Scanner) walkDir(ctx context.Context, dirPath string, state *scanState) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -1453,14 +1564,16 @@ func (s *Scanner) ensureFolderForPath(ctx context.Context, absPath string, state
 
 func (s *Scanner) newScanState(ctx context.Context, seen map[string]struct{}, counts *counters, roots []string, task scanTask) *scanState {
 	return &scanState{
-		scanner: s,
-		ctx:     ctx,
-		files:   make(chan scanFile, maxInt(64, s.scanWorkerCount()*4)),
-		writes:  make(chan scanWrite, maxInt(64, s.scanWorkerCount()*4)),
-		seen:    seen,
-		counts:  counts,
-		roots:   append([]string(nil), roots...),
-		task:    task,
+		scanner:      s,
+		ctx:          ctx,
+		files:        make(chan scanFile, maxInt(64, s.scanWorkerCount()*4)),
+		writes:       make(chan scanWrite, maxInt(64, s.scanWorkerCount()*4)),
+		seen:         seen,
+		counts:       counts,
+		roots:        append([]string(nil), roots...),
+		task:         task,
+		deferWork:    task == scanTaskMediaScan,
+		deferredWork: make(map[int64]scanDeferredWork),
 	}
 }
 
@@ -1632,8 +1745,10 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 				}
 			}
 			st.markSeen(rel)
-			if asset, err := s.DB.GetAsset(ctx, signature.ID); err == nil {
-				s.enqueuePendingWork(asset)
+			if !st.deferWork {
+				if asset, err := s.DB.GetAsset(ctx, signature.ID); err == nil {
+					s.enqueuePendingWork(asset)
+				}
 			}
 			st.updateProgress(rel)
 			return
@@ -1644,7 +1759,7 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 	}
 	importedAt := util.UnixNow()
 	mtime := info.ModTime().Unix()
-	meta := s.Extractor.Extract(ctx, absPath, detection, mtime, importedAt)
+	meta := extractMetadataWithAutomaticRetry(ctx, s.Extractor, absPath, detection, mtime, importedAt)
 	if detection.MediaType == model.MediaTypeVideo && !meta.HasVideo && meta.HasAudio {
 		detection.MediaType = model.MediaTypeAudio
 		detection.MimeType = media.AudioMimeType(detection.Ext)
@@ -1698,6 +1813,22 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 	}:
 	case <-ctx.Done():
 	}
+}
+
+func extractMetadataWithAutomaticRetry(ctx context.Context, extractor media.Extractor, path string, detection media.Detection, mtime, importedAt int64) media.Metadata {
+	meta := extractor.Extract(ctx, path, detection, mtime, importedAt)
+	for attempt := 1; meta.Err != nil && attempt <= jobs.MaxAutomaticRetries && ctx.Err() == nil; attempt++ {
+		delay := time.Duration(attempt*attempt) * 250 * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return meta
+		case <-timer.C:
+		}
+		meta = extractor.Extract(ctx, path, detection, mtime, importedAt)
+	}
+	return meta
 }
 
 func (st *scanState) writeFolder(rel string) {
@@ -1798,11 +1929,23 @@ func (st *scanState) writeAsset(write scanWrite) {
 	}
 	st.updateProgress(rel)
 	if result.Added || result.Updated {
-		s.enqueueWork(result.ID, write.detection.MediaType, write.previewStatus, false)
+		if st.deferWork {
+			st.deferredWork[result.ID] = scanDeferredWork{assetID: result.ID, mediaType: write.detection.MediaType, previewStatus: write.previewStatus}
+		} else {
+			s.enqueueWork(result.ID, write.detection.MediaType, write.previewStatus, false)
+		}
 		return
 	}
-	if asset, err := s.DB.GetAsset(ctx, result.ID); err == nil {
-		s.enqueuePendingWork(asset)
+	if !st.deferWork {
+		if asset, err := s.DB.GetAsset(ctx, result.ID); err == nil {
+			s.enqueuePendingWork(asset)
+		}
+	}
+}
+
+func (st *scanState) enqueueDeferredWork() {
+	for _, work := range st.deferredWork {
+		st.scanner.enqueueWork(work.assetID, work.mediaType, work.previewStatus, false)
 	}
 }
 
@@ -2103,7 +2246,7 @@ func (s *Scanner) enqueuePendingWork(asset model.Asset) {
 }
 
 func recoverableWorkStatus(status string) bool {
-	return status == model.StatusPending || status == model.StatusProcessing || status == model.StatusError
+	return status == model.StatusPending || status == model.StatusProcessing
 }
 
 func (c *counters) recordError(publicMessage string, err error) {

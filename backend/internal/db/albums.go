@@ -665,13 +665,9 @@ func albumAssetFilterSQL(album model.Album, opts AssetListOptions) (string, []an
 	}
 	memberRules = append(memberRules, memberWhere)
 	args = append(args, album.ID)
-	where := []string{"is_live = true", "(" + strings.Join(memberRules, " OR ") + ")"}
-	if !opts.IncludeHidden {
-		where = append(where, "hidden = false")
-	}
-	if opts.VisibleOnly {
-		where = append(where, "(thumb_status = 'ready' OR media_type = 'audio')")
-	}
+	filterWhere, filterArgs := assetFilterSQL(opts, false)
+	where := []string{"(" + filterWhere + ")", "(" + strings.Join(memberRules, " OR ") + ")"}
+	args = append(filterArgs, args...)
 	mediaFilter := normalizeAlbumMediaFilter(album.MediaTypeFilter)
 	if opts.Type == model.MediaTypeImage || opts.Type == model.MediaTypeVideo || opts.Type == model.MediaTypeAudio {
 		mediaFilter = opts.Type
@@ -679,20 +675,6 @@ func albumAssetFilterSQL(album model.Album, opts AssetListOptions) (string, []an
 	if mediaFilter == model.MediaTypeImage || mediaFilter == model.MediaTypeVideo || mediaFilter == model.MediaTypeAudio {
 		where = append(where, "assets.id IN (SELECT id FROM media_asset WHERE media_type = ?)")
 		args = append(args, mediaTypeCode(mediaFilter))
-	}
-	if opts.Query != "" {
-		where = append(where, "lower(filename) LIKE ? ESCAPE '\\'")
-		args = append(args, "%"+escapeLike(strings.ToLower(opts.Query))+"%")
-	}
-	if opts.Rating != nil {
-		where = append(where, assetRatingSQL("assets")+" = ?")
-		args = append(args, NormalizeRating(*opts.Rating))
-	}
-	switch normalizeAlbumOrientationFilter(opts.Orientation) {
-	case AlbumOrientationWide:
-		where = append(where, "orientation = 1")
-	case AlbumOrientationTall:
-		where = append(where, "orientation = 2")
 	}
 	switch normalizeAlbumOrientationFilter(album.OrientationFilter) {
 	case AlbumOrientationWide:

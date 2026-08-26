@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -145,6 +146,9 @@ func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *j
 	if err := database.ResetBackgroundVideoProxyWork(ctx); err != nil {
 		logger.Warn("reset background video proxy work failed", "error", err)
 	}
+	if _, err := database.SetAIAutoAnalyze(ctx, true); err != nil {
+		logger.Warn("enable automatic AI analysis failed", "error", err)
+	}
 	enqueuePendingWork(ctx, database, queue, logger)
 	queue.Start(ctx, jobs.WorkerConfig{
 		Image:       cfg.ThumbWorkers,
@@ -152,8 +156,68 @@ func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *j
 		AI:          1,
 	})
 	go enqueueAIBackfill(ctx, database, queue, sources, aiStager, logger)
+	go superviseAutomaticTasks(ctx, database, queue, logger)
 	go monitorSourceRecovery(ctx, scan, sources, logger)
 	aiworker.StartHealthMonitor(ctx, database, cfg.AIURL, logger)
+}
+
+func superviseAutomaticTasks(ctx context.Context, database *db.DB, queue *jobs.Manager, logger *slog.Logger) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		health := queue.ExecutorHealth(ctx)
+		status, message := "success", "任务执行器正常"
+		if !health.Healthy {
+			status = "failed"
+			message = fmt.Sprintf("队列中有 %d 项，但 %d 秒内没有执行器取出任务", health.Queued, health.StalledSeconds)
+			if logger != nil {
+				logger.Error("task executor stalled", "queued", health.Queued, "stalledSeconds", health.StalledSeconds)
+			}
+		} else if health.Active > 0 {
+			message = fmt.Sprintf("%d 个任务正在处理，%d 项等待", health.Active, health.Queued)
+		} else if health.BlockedReason != "" {
+			status = "pending"
+			message = automaticBlockerMessage(health.BlockedReason, health.Queued)
+		} else if health.Queued > 0 {
+			status = "pending"
+			message = fmt.Sprintf("%d 项正在等待执行器调度", health.Queued)
+		}
+		_ = database.BeginSystemTask(ctx, db.SystemTaskExecutorHealth)
+		_ = database.FinishSystemTask(ctx, db.SystemTaskExecutorHealth, status, message)
+
+		stats := queue.Stats()
+		backgroundQueued := stats.ThumbQueued + stats.PreviewQueued + stats.VideoPosterQueued + stats.StoryboardQueued
+		backgroundActive := stats.ActiveThumb + stats.ActivePreview + stats.ActiveVideoPoster + stats.ActiveStoryboard
+		if backgroundQueued+backgroundActive == 0 {
+			enqueuePendingWork(ctx, database, queue, logger)
+		}
+		settings, err := database.GetAISettings(ctx)
+		if err == nil && !settings.AutoAnalyze {
+			_, _ = database.SetAIAutoAnalyze(ctx, true)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func automaticBlockerMessage(reason string, queued int) string {
+	switch reason {
+	case "media_scan":
+		return fmt.Sprintf("媒体扫描优先，%d 项自动等待", queued)
+	case "playback", "foreground":
+		return fmt.Sprintf("当前播放优先，%d 项自动等待", queued)
+	case "storyboard":
+		return fmt.Sprintf("进度预览图优先，%d 项自动等待", queued)
+	case "load":
+		return fmt.Sprintf("系统负载较高，%d 项自动等待", queued)
+	case "memory":
+		return fmt.Sprintf("可用内存不足，%d 项自动等待", queued)
+	default:
+		return fmt.Sprintf("%d 项自动等待", queued)
+	}
 }
 
 func monitorSourceRecovery(ctx context.Context, scan *scanner.Scanner, sources *storage.SourceHealth, logger *slog.Logger) {
@@ -197,6 +261,14 @@ func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager
 		if settingsErr != nil {
 			logger.Warn("load AI settings failed", "error", settingsErr)
 		} else if settings.AutoAnalyze || settings.ManualRun {
+			if active, activeErr := queue.MediaCachePriorityActive(ctx); activeErr == nil && active {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					continue
+				}
+			}
 			items, err := database.AIBackfillBatch(ctx, 1000)
 			if err != nil {
 				logger.Warn("load AI backfill failed", "error", err)
@@ -249,6 +321,10 @@ func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager
 								continue
 							}
 						}
+						if jobs.MediaScanPriorityActive() {
+							stageBatchErr = jobs.ErrMediaScanPriority
+							break
+						}
 						if active, _ := queue.PlaybackPriorityActive(ctx); active {
 							break
 						}
@@ -297,7 +373,9 @@ func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager
 				}
 				if stageBatchID > 0 {
 					state, message := "success", ""
-					if errors.Is(stageBatchErr, jobs.ErrPlaybackPriority) {
+					if errors.Is(stageBatchErr, jobs.ErrMediaScanPriority) {
+						state, message = "preempted", "媒体扫描已抢占 AI 输入准备"
+					} else if errors.Is(stageBatchErr, jobs.ErrPlaybackPriority) {
 						state, message = "preempted", "当前媒体播放已抢占 NAS 读取"
 					} else if stageBatchErr != nil {
 						state, message = "failed", stageBatchErr.Error()
@@ -333,6 +411,10 @@ func prepareAIStageWithPlayback(ctx context.Context, queue *jobs.Manager, stager
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
+			if jobs.MediaScanPriorityActive() {
+				cancel(jobs.ErrMediaScanPriority)
+				return
+			}
 			active, _ := queue.PlaybackPriorityActive(stageCtx)
 			if active {
 				cancel(jobs.ErrPlaybackPriority)
@@ -361,7 +443,21 @@ func scanTaskHandler(scan *scanner.Scanner) jobs.Handler {
 		_ = ctx
 		switch task.Type {
 		case "scan", "scan_metadata":
-			scan.RequestMetadataScan(defaultReason(task.Reason, "manual"))
+			reason := defaultReason(task.Reason, "manual")
+			if len(task.Roots) > 0 {
+				scan.RequestMetadataScanRoots(reason, task.Roots)
+			} else {
+				scan.RequestMetadataScan(reason)
+			}
+		case "scan_media":
+			reason := defaultReason(task.Reason, "task:media_scan")
+			if strings.HasPrefix(reason, "fsnotify_remote_recovery") && len(task.Roots) > 0 {
+				scan.RequestMediaScanNestedRoots(reason, task.Roots)
+			} else if len(task.Roots) > 0 {
+				scan.RequestMediaScanRoots(reason, task.Roots)
+			} else {
+				scan.RequestMediaScan(reason)
+			}
 		case "scan_reconcile":
 			if len(task.Roots) > 0 {
 				scan.RequestReconcileScanRoots(defaultReason(task.Reason, "manual_reconcile"), task.Roots)

@@ -1,0 +1,35 @@
+services:
+  watcher:
+    build: .
+    image: lpicto-nas-watcher:local
+    container_name: lpicto-nas-watcher
+    restart: unless-stopped
+    user: "1000:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LPICTO_URL: ${LPICTO_URL:-http://192.168.2.97:18080}
+      LPICTO_WATCHER_TOKEN: ${LPICTO_WATCHER_TOKEN}
+      WATCH_ROOTS: ${WATCH_ROOTS:-PIC=/watch/PIC;VID=/watch/VID}
+      STABLE_SECONDS: ${STABLE_SECONDS:-3}
+      HEARTBEAT_SECONDS: ${HEARTBEAT_SECONDS:-30}
+    volumes:
+      - type: bind
+        source: ${PIC_PATH:-/vol2/1000/pic}
+        target: /watch/PIC
+        read_only: true
+      - type: bind
+        source: ${VID_PATH:-/vol2/1000/vid}
+        target: /watch/VID
+        read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"

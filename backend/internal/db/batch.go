@@ -186,7 +186,7 @@ WHERE deleted_at IS NULL AND id IN (`+strings.Join(placeholders, ",")+`)`, args.
 	}
 	if _, err := d.conn.ExecContext(ctx, `
 UPDATE media_asset
-SET deleted = true, deleted_at = ?, updated_at = ?
+SET deleted = true, deleted_at = ?, sha256 = NULL, updated_at = ?
 WHERE deleted = false AND id IN (`+strings.Join(updatePlaceholders, ",")+`)`, updateArgs...); err != nil {
 		return nil, err
 	}

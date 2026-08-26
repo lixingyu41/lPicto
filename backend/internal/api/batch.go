@@ -179,7 +179,7 @@ func (s *Server) batchDelete(w http.ResponseWriter, r *http.Request) {
 			result.Failures = append(result.Failures, AssetDeleteFailureDTO{RelPath: asset.RelPath, Message: err.Error()})
 			continue
 		}
-		deleted := s.executeAssetDeletePlan(r.Context(), plan)
+		deleted := s.executeAssetDeletePlan(r.Context(), plan, false)
 		result.DeletedAssetIDs = append(result.DeletedAssetIDs, deleted.DeletedAssetIDs...)
 		result.UpdatedAssetIDs = append(result.UpdatedAssetIDs, deleted.DeletedAssetIDs...)
 		result.Failures = append(result.Failures, deleted.Failures...)
@@ -197,6 +197,7 @@ func (s *Server) batchDelete(w http.ResponseWriter, r *http.Request) {
 	result.DeletedAssetIDs = uniqueInt64s(result.DeletedAssetIDs)
 	result.UpdatedAssetIDs = uniqueInt64s(result.UpdatedAssetIDs)
 	if payload.RefreshCollectionCounts {
+		s.refreshFoldersAfterBatchDelete()
 		if _, err := s.db.RefreshSystemCollectionCounts(r.Context()); err != nil && s.logger != nil {
 			s.logger.Warn("refresh system collection counts after batch delete failed", "error", err)
 		}

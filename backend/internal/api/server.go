@@ -44,7 +44,11 @@ type Server struct {
 	sourceHealth *storage.SourceHealth
 	cachePolicy  *cachepolicy.Manager
 	aiStager     *aiworker.Stager
-	cacheCopyMu  sync.Mutex
+	mediaIO      *mediaIOScheduler
+	nasWatcher   *nasWatcherIntegration
+	previewMu    sync.Mutex
+	previewCalls map[string]*viewerPreviewCall
+	previewSlots chan struct{}
 
 	cacheMu         sync.Mutex
 	cacheStats      CacheStatsDTO
@@ -62,6 +66,8 @@ type Server struct {
 	duplicateScanMu     sync.Mutex
 	duplicateScanCancel context.CancelFunc
 	duplicateScanFailed int
+	duplicateAutoTries  int
+	duplicateScanErrors []SystemTaskFailureDTO
 	mediaResetMu        sync.Mutex
 	mediaResetting      bool
 
@@ -80,6 +86,8 @@ type Server struct {
 	videoSegmentIgnoreEditList map[string]bool
 	videoSegmentSequence       uint64
 	videoProxySlots            chan struct{}
+	videoFullWarmMu            sync.Mutex
+	videoFullWarmJobs          map[string]*videoFullWarmJob
 	audioProxyMu               sync.Mutex
 	audioProxyStates           map[string]*audioProxyRuntime
 	audioProxySlot             chan struct{}
@@ -100,6 +108,9 @@ type ScanController interface {
 	RequestMetadataScan(reason string) scanner.CommandResult
 	RequestMetadataScanRoots(reason string, roots []string) scanner.CommandResult
 	RequestMetadataScanPaths(reason string, roots []string, paths []string) scanner.CommandResult
+	RequestMediaScan(reason string) scanner.CommandResult
+	RequestMediaScanRoots(reason string, roots []string) scanner.CommandResult
+	RequestMediaScanNestedRoots(reason string, roots []string) scanner.CommandResult
 	RequestThumbnailContinue(reason string) scanner.CommandResult
 	RequestThumbnailContinueRoots(reason string, roots []string) scanner.CommandResult
 	RequestThumbnailRebuild(reason string) scanner.CommandResult
@@ -125,10 +136,15 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 		sourceHealth:               storage.NewSourceHealth(store, 15*time.Second, cfg.RedisURL),
 		cachePolicy:                cachePolicy,
 		aiStager:                   &aiworker.Stager{DB: database, Store: store, Policy: cachePolicy},
+		mediaIO:                    &mediaIOScheduler{},
+		nasWatcher:                 newNASWatcherIntegration(strings.TrimSpace(cfg.NASWatcherToken) != "", cfg.NASWatcherOfflineAfter),
+		previewCalls:               map[string]*viewerPreviewCall{},
+		previewSlots:               make(chan struct{}, 2),
 		videoProxyStates:           map[string]*videoProxyRuntime{},
 		videoSegmentStates:         map[string]*videoSegmentRuntime{},
 		videoSegmentIgnoreEditList: map[string]bool{},
 		videoProxySlots:            make(chan struct{}, liveVideoProxyMaxActive),
+		videoFullWarmJobs:          map[string]*videoFullWarmJob{},
 		audioProxyStates:           map[string]*audioProxyRuntime{},
 		audioProxySlot:             make(chan struct{}, 1),
 		folderRefreshSem:           make(chan struct{}, 4),
@@ -147,12 +163,16 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	s.startUnifiedCacheSweeper()
 	s.startCacheCleanupScheduler()
 	s.startStorageHealthScheduler()
+	s.startAutomaticDuplicateScanScheduler()
 	r := chi.NewRouter()
+	r.Use(mediaTransferCORS)
 	r.Use(requestLogger(logger))
 	r.Use(middleware.Compress(5))
 	r.Use(foregroundActivity)
 	r.Get("/api/health", s.health)
 	r.Get("/api/storage/status", s.storageStatus)
+	r.Get("/api/integrations/nas-watcher/status", s.nasWatcherStatus)
+	r.Post("/api/integrations/nas-watcher/events", s.nasWatcherEvents)
 	r.Get("/api/config/public", s.publicConfig)
 	r.Get("/api/events", s.eventStream)
 	r.Post("/api/scan", s.triggerScan)
@@ -316,7 +336,31 @@ func isForegroundRequest(path string) bool {
 }
 
 func isStreamingAssetRequest(path string) bool {
-	return strings.HasSuffix(path, "/video") || strings.HasSuffix(path, "/video-proxy") || strings.HasSuffix(path, "/audio") || strings.Contains(path, "/hls/")
+	return strings.HasSuffix(path, "/video") ||
+		strings.HasSuffix(path, "/video-proxy") ||
+		strings.HasSuffix(path, "/audio") ||
+		strings.HasSuffix(path, "/original") ||
+		strings.HasSuffix(path, "/thumb") ||
+		strings.HasSuffix(path, "/preview") ||
+		strings.HasSuffix(path, "/video-poster") ||
+		strings.Contains(path, "/storyboard") ||
+		strings.Contains(path, "/hls/")
+}
+
+func mediaTransferCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isStreamingAssetRequest(r.URL.Path) || strings.HasSuffix(r.URL.Path, "/original") {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Range, X-LPicto-Segment-Priority")
+			w.Header().Set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range, ETag")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -356,6 +400,7 @@ func (s *Server) publicConfig(w http.ResponseWriter, r *http.Request) {
 		"previewLongEdge":         s.cfg.PreviewLongEdge,
 		"videoProxyEnabled":       s.cfg.VideoProxyEnabled,
 		"liveVideoProxyMaxActive": s.cfg.LiveVideoProxyMaxActive,
+		"mediaOriginPorts":        s.cfg.MediaOriginPorts,
 		"videoProxyMaxHeight":     s.cfg.VideoProxyMaxHeight,
 		"videoSegmentSeconds":     s.cfg.VideoSegmentSeconds,
 		"videoPreloadSegments":    s.cfg.VideoPreloadSegments,
@@ -743,7 +788,7 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		Context: contextName, AssetID: id, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), FolderID: folderID,
 		CombinedQuery: strings.TrimSpace(r.URL.Query().Get("combinedQuery")),
-		From:          int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: 5, Recursive: boolQuery(r, "recursive", false),
+		From:          int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: 12, Recursive: boolQuery(r, "recursive", false),
 		NFOQuery:      strings.TrimSpace(r.URL.Query().Get("nfo")),
 		NFOActor:      strings.TrimSpace(r.URL.Query().Get("nfoActor")),
 		NFOID:         strings.TrimSpace(r.URL.Query().Get("nfoId")),
@@ -833,11 +878,7 @@ func (s *Server) assetPosition(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "album_required", "相册 ID 缺失")
 			return
 		}
-		result, err = s.db.AlbumAssetPosition(r.Context(), *albumID, id, db.AssetListOptions{
-			PageSize: pageSize, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
-			Query: strings.TrimSpace(r.URL.Query().Get("q")), VisibleOnly: visibleOnly(r), Rating: ratingQueryPtr(r, "rating"),
-			ManualTag: strings.TrimSpace(r.URL.Query().Get("manualTag")), Orientation: searchOrientation(r),
-		})
+		result, err = s.db.AlbumAssetPosition(r.Context(), *albumID, id, s.libraryAssetOptions(r, 1, pageSize))
 	case "collection":
 		collectionID := strings.TrimSpace(r.URL.Query().Get("collectionId"))
 		if collectionID == "" {
@@ -941,7 +982,25 @@ func serveMissingThumbPlaceholder(w http.ResponseWriter, cacheKey string) {
 }
 
 func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
-	s.serveCache(w, r, "previews", "webp", "image/webp", "preview")
+	asset, ok := s.assetByParam(w, r)
+	if !ok {
+		return
+	}
+	if asset.MediaType != model.MediaTypeImage {
+		writeError(w, http.StatusBadRequest, "not_image", "资源不是图片")
+		return
+	}
+	if err := s.ensureViewerPreview(r.Context(), asset); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		if s.logger != nil {
+			s.logger.Warn("prepare viewer preview failed", "assetID", asset.ID, "error", err)
+		}
+		writeError(w, http.StatusInternalServerError, "preview_failed", "生成浏览预览失败")
+		return
+	}
+	s.serveCacheAsset(w, r, asset, "previews", "webp", "image/webp", "preview")
 }
 
 func (s *Server) videoPoster(w http.ResponseWriter, r *http.Request) {
@@ -1039,8 +1098,6 @@ func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, 
 		s.markPlaybackPriority(r.Context())
 	}
 	if asset.MediaType == model.MediaTypeVideo {
-		done := jobs.EnterForeground()
-		defer done()
 		s.markPlaybackPriority(r.Context())
 		if s.serveChunkCachedVideo(w, r, asset) {
 			return
@@ -1083,7 +1140,7 @@ func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, 
 		w.Header().Set("Content-Type", mt)
 	}
 	w.Header().Set("ETag", fmt.Sprintf(`W/"asset-%d-%s"`, asset.ID, asset.CacheKey))
-	w.Header().Set("Content-Disposition", contentDisposition(asset.Filename))
+	w.Header().Set("Content-Disposition", assetContentDisposition(r, asset.Filename))
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	if asset.MediaType == model.MediaTypeVideo {
 		w.Header().Set("Accept-Ranges", "bytes")
@@ -1394,11 +1451,23 @@ func (s *Server) invalidateProcessingProgress() {
 }
 
 func contentDisposition(filename string) string {
+	return namedContentDisposition("inline", filename)
+}
+
+func assetContentDisposition(r *http.Request, filename string) string {
+	disposition := "inline"
+	if r != nil && r.URL.Query().Get("download") == "1" {
+		disposition = "attachment"
+	}
+	return namedContentDisposition(disposition, filename)
+}
+
+func namedContentDisposition(disposition, filename string) string {
 	safe := strings.ReplaceAll(filename, `"`, "")
 	if safe == "" {
 		safe = "asset"
 	}
-	return `inline; filename="` + safe + `"; filename*=UTF-8''` + urlPathEscape(filename)
+	return disposition + `; filename="` + safe + `"; filename*=UTF-8''` + urlPathEscape(filename)
 }
 
 func urlPathEscape(value string) string {

@@ -2,14 +2,10 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -123,9 +119,6 @@ func (s *Server) collectionAssets(w http.ResponseWriter, r *http.Request) {
 	var pageResult model.Page[model.Asset]
 	var err error
 	if db.IsSystemCollectionKind(id) {
-		if id == db.SystemCollectionDuplicates {
-			_ = s.ensureDuplicateHashes(r.Context())
-		}
 		pageResult, err = s.db.ListSystemCollectionAssets(r.Context(), id, opts)
 	} else if aiTag, ok := parseAITagCollectionID(id); ok {
 		opts.AITag = aiTag
@@ -205,9 +198,6 @@ func (s *Server) collectionAnchors(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) collectionNeighborsForAsset(ctx context.Context, collectionID string, assetID int64, opts db.AssetListOptions, limit int) (db.Neighbors, error) {
 	if db.IsSystemCollectionKind(collectionID) {
-		if collectionID == db.SystemCollectionDuplicates {
-			_ = s.ensureDuplicateHashes(ctx)
-		}
 		return s.db.SystemCollectionNeighbors(ctx, collectionID, assetID, opts, limit)
 	}
 	resolved, err := s.resolveDynamicCollectionOptions(ctx, collectionID, opts)
@@ -219,9 +209,6 @@ func (s *Server) collectionNeighborsForAsset(ctx context.Context, collectionID s
 
 func (s *Server) collectionPositionForAsset(ctx context.Context, collectionID string, assetID int64, opts db.AssetListOptions) (db.AssetPosition, error) {
 	if db.IsSystemCollectionKind(collectionID) {
-		if collectionID == db.SystemCollectionDuplicates {
-			_ = s.ensureDuplicateHashes(ctx)
-		}
 		return s.db.SystemCollectionAssetPosition(ctx, collectionID, assetID, opts)
 	}
 	resolved, err := s.resolveDynamicCollectionOptions(ctx, collectionID, opts)
@@ -254,7 +241,6 @@ func (s *Server) resolveDynamicCollectionOptions(ctx context.Context, collection
 }
 
 func (s *Server) duplicateGroups(w http.ResponseWriter, r *http.Request) {
-	_ = s.ensureDuplicateHashes(r.Context())
 	groups, err := s.db.DuplicateGroups(r.Context(), intQuery(r, "limit", 50))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "duplicate_groups_failed", "读取重复文件失败")
@@ -264,7 +250,6 @@ func (s *Server) duplicateGroups(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) duplicateSelection(w http.ResponseWriter, r *http.Request) {
-	_ = s.ensureDuplicateHashes(r.Context())
 	ids, err := s.db.DuplicateDeleteCandidateIDs(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "duplicate_selection_failed", "生成重复文件选择失败")
@@ -275,45 +260,6 @@ func (s *Server) duplicateSelection(w http.ResponseWriter, r *http.Request) {
 		"keepPolicy": "oldest_imported",
 	})
 }
-
-func (s *Server) ensureDuplicateHashes(ctx context.Context) error {
-	if s.duplicateScanIsRunning() {
-		return nil
-	}
-	candidates, err := s.db.DuplicateHashCandidates(ctx, 200)
-	if err != nil {
-		return err
-	}
-	for _, asset := range candidates {
-		if asset.SHA256 != nil && *asset.SHA256 != "" {
-			continue
-		}
-		absPath, err := s.store.PhotoPath(asset.RelPath)
-		if err != nil {
-			continue
-		}
-		hash, err := fileSHA256Hex(absPath)
-		if err != nil {
-			continue
-		}
-		_ = s.db.SetAssetSHA256Hex(ctx, asset.ID, hash)
-	}
-	return nil
-}
-
-func fileSHA256Hex(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
-}
-
 func (s *Server) collectionAssetOptions(r *http.Request, page int, pageSize int) db.AssetListOptions {
 	typeFilter := safeType(r.URL.Query().Get("type"))
 	if typeFilter == "all" {

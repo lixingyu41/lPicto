@@ -8,7 +8,10 @@ import (
 	"lpicto/backend/internal/util"
 )
 
-const SystemTaskAIHealth = "ai_health_check"
+const (
+	SystemTaskAIHealth       = "ai_health_check"
+	SystemTaskExecutorHealth = "task_executor_health"
+)
 
 type SystemTaskState struct {
 	TaskKey        string

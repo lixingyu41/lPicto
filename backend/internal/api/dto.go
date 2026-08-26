@@ -148,6 +148,7 @@ type VideoSegmentStatusDTO struct {
 	Progress            float64 `json:"progress"`
 	SecondsDone         float64 `json:"secondsDone"`
 	Duration            float64 `json:"duration"`
+	SegmentSeconds      float64 `json:"segmentSeconds"`
 	Bytes               int64   `json:"bytes"`
 	CachedBytes         int64   `json:"cachedBytes"`
 	CachedSegments      int     `json:"cachedSegments"`

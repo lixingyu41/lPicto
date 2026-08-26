@@ -19,6 +19,10 @@ const directMediaChunkBytes int64 = 8 << 20
 const directVideoChunkBytes int64 = directMediaChunkBytes
 const directVideoSourceOpenTimeout = 10 * time.Second
 
+type videoFullWarmJob struct {
+	cancel context.CancelFunc
+}
+
 func (s *Server) serveCachedOriginalImage(w http.ResponseWriter, r *http.Request, asset model.Asset) bool {
 	ext := strings.TrimPrefix(strings.ToLower(asset.Ext), ".")
 	if ext == "" || strings.ContainsAny(ext, `/\`) {
@@ -36,8 +40,13 @@ func (s *Server) serveCachedOriginalImage(w http.ResponseWriter, r *http.Request
 	if r.Method == http.MethodHead {
 		return false
 	}
-	s.cacheCopyMu.Lock()
-	defer s.cacheCopyMu.Unlock()
+	releaseIO, err := s.mediaIO.acquire(r.Context(), mediaIOPriorityFromRequest(r, mediaIOPriorityCurrent))
+	if err != nil {
+		return false
+	}
+	defer releaseIO()
+	stopPriority := s.holdPlaybackPriority(r.Context())
+	defer stopPriority()
 	if info, err := os.Stat(dest); err == nil && info.Mode().IsRegular() && info.Size() == asset.Size {
 		s.cachePolicy.Touch(r.Context(), "originals", asset.CacheKey, dest)
 		s.serveCachedMediaFile(w, r, asset, dest, info)
@@ -102,7 +111,7 @@ func (s *Server) serveCachedMediaFile(w http.ResponseWriter, r *http.Request, as
 		w.Header().Set("Content-Type", value)
 	}
 	w.Header().Set("ETag", fmt.Sprintf(`W/"asset-%d-%s"`, asset.ID, asset.CacheKey))
-	w.Header().Set("Content-Disposition", contentDisposition(asset.Filename))
+	w.Header().Set("Content-Disposition", assetContentDisposition(r, asset.Filename))
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	http.ServeContent(w, r, asset.Filename, info.ModTime(), file)
 }
@@ -122,6 +131,7 @@ func (s *Server) serveChunkCachedMedia(w http.ResponseWriter, r *http.Request, a
 	reader := &chunkedVideoReader{
 		server: s, ctx: r.Context(), asset: asset, size: asset.Size,
 		cacheKind: cacheKind, sourceReason: sourceReason,
+		priority: mediaIOPriorityFromRequest(r, mediaIOPriorityCurrent),
 	}
 	defer reader.Close()
 	if asset.MimeType != nil && *asset.MimeType != "" {
@@ -130,7 +140,7 @@ func (s *Server) serveChunkCachedMedia(w http.ResponseWriter, r *http.Request, a
 		w.Header().Set("Content-Type", value)
 	}
 	w.Header().Set("ETag", fmt.Sprintf(`W/"asset-%d-%s"`, asset.ID, asset.CacheKey))
-	w.Header().Set("Content-Disposition", contentDisposition(asset.Filename))
+	w.Header().Set("Content-Disposition", assetContentDisposition(r, asset.Filename))
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -238,35 +248,123 @@ func (s *Server) prewarmDirectVideo(w http.ResponseWriter, r *http.Request) {
 	if start < 0 {
 		start = 0
 	}
+	if queryBool(r.URL.Query().Get("all")) {
+		first, last := directVideoChunkRange(asset, start, true)
+		started := s.startDirectVideoFullWarm(asset, first, last)
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"accepted": true,
+			"chunks":   int(last-first) + 1,
+			"full":     true,
+			"started":  started,
+		})
+		return
+	}
+	first, last := directVideoChunkRange(asset, start, false)
+	chunks := int(last-first) + 1
+	go s.warmDirectVideoChunks(context.Background(), asset, first, last)
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "chunks": chunks, "full": false})
+}
+
+func directVideoChunkRange(asset model.Asset, start float64, full bool) (int64, int64) {
 	bytesPerSecond := float64(asset.Size) / *asset.Duration
 	startByte := int64(start * bytesPerSecond)
-	endByte := int64((start + 50) * bytesPerSecond)
-	if endByte > asset.Size {
+	if startByte >= asset.Size {
+		startByte = asset.Size - 1
+	}
+	aheadSeconds := float64(8)
+	endByte := int64((start + aheadSeconds) * bytesPerSecond)
+	if full || endByte > asset.Size {
 		endByte = asset.Size
 	}
 	first := startByte / directMediaChunkBytes
 	last := endByte / directMediaChunkBytes
-	if last > first+15 {
-		last = first + 15
+	if endByte == asset.Size && endByte > 0 && endByte%directMediaChunkBytes == 0 {
+		last--
 	}
-	chunks := int(last-first) + 1
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		defer cancel()
-		stopPriority := s.holdPlaybackPriority(ctx)
-		defer stopPriority()
-		reader := &chunkedVideoReader{server: s, ctx: ctx, asset: asset, size: asset.Size, cacheKind: "video-chunks", sourceReason: "video_playback"}
-		defer reader.Close()
-		for index := first; index <= last; index++ {
-			if _, err := reader.ensureChunk(index); err != nil {
-				if s.logger != nil {
-					s.logger.Warn("direct video read-ahead stopped", "assetID", asset.ID, "chunk", index, "error", err)
-				}
-				return
-			}
+	if last > first+15 {
+		if !full {
+			last = first + 15
 		}
+	}
+	if last < first {
+		last = first
+	}
+	return first, last
+}
+
+func (s *Server) startDirectVideoFullWarm(asset model.Asset, first, last int64) bool {
+	key := "direct:" + asset.CacheKey
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &videoFullWarmJob{cancel: cancel}
+	if !s.registerVideoFullWarmJob(key, job) {
+		cancel()
+		return false
+	}
+	go func() {
+		defer s.finishVideoFullWarmJob(key, job)
+		s.warmDirectVideoChunks(ctx, asset, first, last)
 	}()
-	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "chunks": chunks})
+	return true
+}
+
+func (s *Server) warmDirectVideoChunks(ctx context.Context, asset model.Asset, first, last int64) {
+	stopPriority := s.holdPlaybackPriority(ctx)
+	defer stopPriority()
+	reader := &chunkedVideoReader{server: s, ctx: ctx, asset: asset, size: asset.Size, cacheKind: "video-chunks", sourceReason: "video_playback", priority: mediaIOPriorityAhead}
+	defer reader.Close()
+	for index := first; index <= last; index++ {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := reader.ensureChunk(index); err != nil {
+			if ctx.Err() == nil && s.logger != nil {
+				s.logger.Warn("direct video read-ahead stopped", "assetID", asset.ID, "chunk", index, "error", err)
+			}
+			return
+		}
+	}
+}
+
+func (s *Server) registerVideoFullWarmJob(key string, job *videoFullWarmJob) bool {
+	s.videoFullWarmMu.Lock()
+	defer s.videoFullWarmMu.Unlock()
+	if s.videoFullWarmJobs == nil {
+		s.videoFullWarmJobs = map[string]*videoFullWarmJob{}
+	}
+	if _, exists := s.videoFullWarmJobs[key]; exists {
+		return false
+	}
+	s.videoFullWarmJobs[key] = job
+	return true
+}
+
+func (s *Server) finishVideoFullWarmJob(key string, job *videoFullWarmJob) {
+	s.videoFullWarmMu.Lock()
+	if s.videoFullWarmJobs[key] == job {
+		delete(s.videoFullWarmJobs, key)
+	}
+	s.videoFullWarmMu.Unlock()
+}
+
+func (s *Server) cancelVideoFullWarm(assetCacheKey string) {
+	keys := []string{"direct:" + assetCacheKey, "hls:" + assetCacheKey}
+	s.videoFullWarmMu.Lock()
+	for _, key := range keys {
+		if job := s.videoFullWarmJobs[key]; job != nil {
+			job.cancel()
+			delete(s.videoFullWarmJobs, key)
+		}
+	}
+	s.videoFullWarmMu.Unlock()
+}
+
+func queryBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 type chunkedVideoReader struct {
@@ -281,6 +379,8 @@ type chunkedVideoReader struct {
 	readErr      error
 	cacheKind    string
 	sourceReason string
+	priority     mediaIOPriority
+	lastPriority time.Time
 }
 
 func (r *chunkedVideoReader) Seek(offset int64, whence int) (int64, error) {
@@ -305,6 +405,10 @@ func (r *chunkedVideoReader) Seek(offset int64, whence int) (int64, error) {
 func (r *chunkedVideoReader) Read(target []byte) (int, error) {
 	if r.offset >= r.size {
 		return 0, io.EOF
+	}
+	if r.server != nil && time.Since(r.lastPriority) >= time.Second {
+		r.server.markPlaybackPriority(r.ctx)
+		r.lastPriority = time.Now()
 	}
 	total := 0
 	for len(target) > 0 && r.offset < r.size {
@@ -361,8 +465,15 @@ func (r *chunkedVideoReader) ensureChunk(index int64) (string, error) {
 		r.server.cachePolicy.Touch(r.ctx, r.cacheKind, key, path)
 		return path, nil
 	}
-	r.server.cacheCopyMu.Lock()
-	defer r.server.cacheCopyMu.Unlock()
+	priority := r.priority
+	if priority == 0 {
+		priority = mediaIOPriorityCurrent
+	}
+	releaseIO, err := r.server.mediaIO.acquire(r.ctx, priority)
+	if err != nil {
+		return "", err
+	}
+	defer releaseIO()
 	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Size() == length {
 		return path, nil
 	}
@@ -399,6 +510,19 @@ func (r *chunkedVideoReader) ensureChunk(index int64) (string, error) {
 	assetID := r.asset.ID
 	r.server.cachePolicy.Register(context.Background(), r.cacheKind, key, path, &assetID, 10*time.Minute)
 	return path, nil
+}
+
+func mediaIOPriorityFromRequest(r *http.Request, fallback mediaIOPriority) mediaIOPriority {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("priority"))) {
+	case "preload", "neighbor":
+		return mediaIOPriorityPreload
+	case "ahead", "critical":
+		return mediaIOPriorityAhead
+	case "current", "playback":
+		return mediaIOPriorityCurrent
+	default:
+		return fallback
+	}
 }
 
 func expectedVideoChunkBytes(size, index int64) int64 {

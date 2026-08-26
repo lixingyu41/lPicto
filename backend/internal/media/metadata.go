@@ -64,7 +64,7 @@ func TimelineAt(takenAt, videoCreatedAt *int64, mtime, importedAt int64) int64 {
 
 func (e Extractor) extractImage(ctx context.Context, path string, detection Detection, mtime, importedAt int64) Metadata {
 	meta := Metadata{MimeType: detection.MimeType}
-	data, err := e.run(ctx, "exiftool", "-json", "-n", "-MIMEType", "-ImageWidth", "-ImageHeight", "-DateTimeOriginal", "-CreateDate", "-Title", "-ObjectName", "-XPTitle", "-Headline", path)
+	data, err := e.run(ctx, "exiftool", "-json", "-n", "-MIMEType", "-ImageWidth", "-ImageHeight", "-Orientation", "-DateTimeOriginal", "-CreateDate", "-Title", "-ObjectName", "-XPTitle", "-Headline", path)
 	if err != nil {
 		meta.TimelineAt = TimelineAt(nil, nil, mtime, importedAt)
 		meta.Err = err
@@ -83,10 +83,23 @@ func (e Extractor) extractImage(ctx context.Context, path string, detection Dete
 	}
 	meta.Width = intPtrValue(doc["ImageWidth"])
 	meta.Height = intPtrValue(doc["ImageHeight"])
+	meta.Width, meta.Height = displayImageDimensions(meta.Width, meta.Height, intPtrValue(doc["Orientation"]))
 	taken := firstUnixTime(doc["DateTimeOriginal"], doc["CreateDate"])
 	meta.TakenAt = taken
 	meta.TimelineAt = TimelineAt(taken, nil, mtime, importedAt)
 	return meta
+}
+
+func displayImageDimensions(width, height, orientation *int) (*int, *int) {
+	if width == nil || height == nil || orientation == nil {
+		return width, height
+	}
+	switch *orientation {
+	case 5, 6, 7, 8:
+		return height, width
+	default:
+		return width, height
+	}
 }
 
 func (e Extractor) extractVideo(ctx context.Context, path string, detection Detection, mtime, importedAt int64) Metadata {

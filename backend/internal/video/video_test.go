@@ -62,7 +62,7 @@ func TestStreamProxyArgsUseVAAPIEncoder(t *testing.T) {
 
 func TestStreamSegmentArgsUseBoundedMpegTS(t *testing.T) {
 	got := StreamSegmentArgs("in.mkv", 1080, 23, "none", "", 80, 10)
-	for _, want := range []string{"-ss", "80.000", "-t", "10.000", "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"} {
+	for _, want := range []string{"-ss", "80.000", "-t", "10.000", "-threads", "4", "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"} {
 		if !slices.Contains(got, want) {
 			t.Fatalf("segment args = %#v, missing %q", got, want)
 		}

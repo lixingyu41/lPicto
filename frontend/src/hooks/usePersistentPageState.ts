@@ -26,8 +26,14 @@ export function usePersistentPageState(saveCurrentState: () => void, delay = 150
   }, [delay]);
 
   useEffect(() => {
-    scheduleSave();
-  }, [saveCurrentState, scheduleSave]);
+    flushSave();
+  }, [saveCurrentState, flushSave]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    window.addEventListener('pagehide', flushSave);
+    return () => window.removeEventListener('pagehide', flushSave);
+  }, [flushSave]);
 
   useEffect(() => () => flushSave(), [flushSave]);
 

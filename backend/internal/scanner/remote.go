@@ -135,6 +135,24 @@ func (c RemoteController) RequestMetadataScanPaths(reason string, roots []string
 	return CommandResult{Accepted: true, Started: false, State: "queued"}
 }
 
+func (c RemoteController) RequestMediaScan(reason string) CommandResult {
+	c.setQueuedScanStatus(reason, scanTaskMediaScan, nil)
+	c.Jobs.Enqueue(jobs.Task{Type: "scan_media", Reason: reason, Priority: 10})
+	return CommandResult{Accepted: true, Started: false, State: "queued"}
+}
+
+func (c RemoteController) RequestMediaScanRoots(reason string, roots []string) CommandResult {
+	c.setQueuedScanStatus(reason, scanTaskMediaScan, roots)
+	c.Jobs.Enqueue(jobs.Task{Type: "scan_media", Reason: reason, Roots: append([]string(nil), roots...), Priority: 10})
+	return CommandResult{Accepted: true, Started: false, State: "queued"}
+}
+
+func (c RemoteController) RequestMediaScanNestedRoots(reason string, roots []string) CommandResult {
+	c.setQueuedScanStatus(reason, scanTaskMediaScan, roots)
+	c.Jobs.Enqueue(jobs.Task{Type: "scan_media", Reason: reason, Roots: append([]string(nil), roots...), Priority: 10})
+	return CommandResult{Accepted: true, Started: false, State: "queued"}
+}
+
 func (c RemoteController) RequestThumbnailRebuild(reason string) CommandResult {
 	c.setQueuedScanStatus(reason, scanTaskThumbRebuild, nil)
 	c.Jobs.Enqueue(jobs.Task{Type: "thumb_rebuild", Reason: reason, Priority: 10})

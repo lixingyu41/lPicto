@@ -82,7 +82,7 @@ func (s *Server) deleteAsset(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, AssetDeleteConflictDTO{Stale: true, Plan: assetDeletePlanDTO(plan)})
 		return
 	}
-	result := s.executeAssetDeletePlan(r.Context(), plan)
+	result := s.executeAssetDeletePlan(r.Context(), plan, true)
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -502,7 +502,7 @@ func assetDeleteEntryDTO(item assetDeleteEntry) AssetDeleteEntryDTO {
 	}
 }
 
-func (s *Server) executeAssetDeletePlan(ctx context.Context, plan assetDeletePlanInternal) AssetDeleteResultDTO {
+func (s *Server) executeAssetDeletePlan(ctx context.Context, plan assetDeletePlanInternal, refreshFolders bool) AssetDeleteResultDTO {
 	result := AssetDeleteResultDTO{Deleted: true, DeletedAssetIDs: []int64{}, Failures: []AssetDeleteFailureDTO{}}
 	deletedAt := util.UnixNow()
 	var deletedAssets []db.DeletedAsset
@@ -577,7 +577,7 @@ func (s *Server) executeAssetDeletePlan(ctx context.Context, plan assetDeletePla
 			s.publishAssetDeletedEvents(purged)
 		}
 	}
-	if len(deletedAssets) > 0 || plan.mode == assetDeleteModeFolder && len(result.Failures) == 0 {
+	if refreshFolders && (len(deletedAssets) > 0 || plan.mode == assetDeleteModeFolder && len(result.Failures) == 0) {
 		s.refreshFoldersAfterExplicitDelete(plan.asset)
 	}
 	return result
@@ -640,9 +640,19 @@ func (s *Server) publishAssetDeletedEvents(items []db.DeletedAsset) {
 }
 
 func (s *Server) refreshFoldersAfterExplicitDelete(asset model.Asset) {
+	s.refreshFoldersAfterDelete(asset.ID, asset.RelPath, "explicit_delete")
+}
+
+func (s *Server) refreshFoldersAfterBatchDelete() {
+	s.refreshFoldersAfterDelete(0, "", "batch_delete")
+}
+
+func (s *Server) refreshFoldersAfterDelete(assetID int64, relPath string, reason string) {
 	go func() {
+		s.folderRefreshSem <- struct{}{}
+		defer func() { <-s.folderRefreshSem }()
 		if err := s.db.RefreshFolders(context.Background()); err != nil {
-			s.logger.Warn("refresh folders after explicit asset deletion failed", "assetID", asset.ID, "relPath", asset.RelPath, "error", err)
+			s.logger.Warn("refresh folders after asset deletion failed", "assetID", assetID, "relPath", relPath, "reason", reason, "error", err)
 		}
 	}()
 }

@@ -1,7 +1,8 @@
 export type MediaViewMode = 'waterfall' | 'list' | 'grid';
 
 export type MediaColumnId =
-  | 'media'
+  | 'thumbnail'
+  | 'name'
   | 'path'
   | 'mediaType'
   | 'resolution'
@@ -70,7 +71,8 @@ export const mediaLayoutDefinitions: MediaLayoutDefinition[] = [
 ];
 
 export const mediaColumnDefinitions: MediaColumnDefinition[] = [
-  { id: 'media', label: '媒体', defaultWidth: 300, minWidth: 220, maxWidth: 640 },
+  { id: 'thumbnail', label: '缩略图', defaultWidth: 180, minWidth: 88, maxWidth: 480 },
+  { id: 'name', label: '名称', defaultWidth: 280, minWidth: 120, maxWidth: 640 },
   { id: 'path', label: '路径', defaultWidth: 320, minWidth: 160, maxWidth: 640 },
   { id: 'mediaType', label: '类型', defaultWidth: 110, minWidth: 72, maxWidth: 240 },
   { id: 'resolution', label: '分辨率', defaultWidth: 120, minWidth: 92, maxWidth: 240 },
@@ -94,10 +96,10 @@ export const mediaColumnDefinitions: MediaColumnDefinition[] = [
 
 const storageKey = 'lpicto.mediaViewPreferences.v1';
 const defaultOrder = mediaColumnDefinitions.map((column) => column.id);
-const defaultVisible: MediaColumnId[] = ['media', 'timeline', 'size', 'rating'];
+const defaultVisible: MediaColumnId[] = ['thumbnail', 'name', 'timeline', 'size', 'rating'];
 
 export const defaultMediaViewPreferences: MediaViewPreferences = {
-  version: 4,
+  version: 5,
   mode: 'waterfall',
   videoHoverPreview: true,
   visibleColumns: defaultVisible,
@@ -122,23 +124,38 @@ export function saveMediaViewPreferences(preferences: MediaViewPreferences) {
 
 export function normalizeMediaViewPreferences(value: Partial<MediaViewPreferences> | null | undefined): MediaViewPreferences {
   const known = new Set<MediaColumnId>(defaultOrder);
-  const requestedOrder = Array.isArray(value?.columnOrder) ? value.columnOrder.filter((id): id is MediaColumnId => known.has(id as MediaColumnId)) : [];
+  const migrateColumns = (columns: unknown[]) => {
+    const migrated: MediaColumnId[] = [];
+    columns.forEach((column) => {
+      const candidates: unknown[] = column === 'media' ? ['thumbnail', 'name'] : [column];
+      candidates.forEach((candidate) => {
+        if (known.has(candidate as MediaColumnId) && !migrated.includes(candidate as MediaColumnId)) {
+          migrated.push(candidate as MediaColumnId);
+        }
+      });
+    });
+    return migrated;
+  };
+  const requestedOrder = Array.isArray(value?.columnOrder) ? migrateColumns(value.columnOrder) : [];
   const columnOrder = [...requestedOrder, ...defaultOrder.filter((id) => !requestedOrder.includes(id))];
-  const requestedVisible = Array.isArray(value?.visibleColumns) ? value.visibleColumns.filter((id): id is MediaColumnId => known.has(id as MediaColumnId)) : [];
-  if (value?.version !== 3 && value?.version !== 4) {
+  const hasVisibleColumns = Array.isArray(value?.visibleColumns);
+  const requestedVisible = hasVisibleColumns ? migrateColumns(value.visibleColumns!) : [...defaultVisible];
+  if (value?.version !== 3 && value?.version !== 4 && value?.version !== 5) {
     if (!requestedVisible.includes('aiTags')) requestedVisible.push('aiTags');
     if (!requestedVisible.includes('palette')) requestedVisible.push('palette');
   }
-  const visibleColumns = Array.from(new Set<MediaColumnId>(['media', ...(requestedVisible.length > 0 ? requestedVisible : defaultVisible)]));
+  const visibleColumns = Array.from(new Set<MediaColumnId>(requestedVisible));
   const columnWidths: Partial<Record<MediaColumnId, number>> = {};
+  const rawWidths = (value?.columnWidths ?? {}) as Record<string, unknown>;
   mediaColumnDefinitions.forEach((definition) => {
-    const width = Number(value?.columnWidths?.[definition.id]);
+    const legacyWidth = definition.id === 'name' ? rawWidths.media : undefined;
+    const width = Number(rawWidths[definition.id] ?? legacyWidth);
     if (Number.isFinite(width)) {
       columnWidths[definition.id] = Math.round(Math.min(definition.maxWidth, Math.max(definition.minWidth, width)));
     }
   });
   return {
-    version: 4,
+    version: 5,
     mode: value?.mode === 'list' || value?.mode === 'grid' ? value.mode : 'waterfall',
     videoHoverPreview: value?.videoHoverPreview !== false,
     visibleColumns,

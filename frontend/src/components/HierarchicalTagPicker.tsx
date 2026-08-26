@@ -83,7 +83,6 @@ export default function HierarchicalTagPicker({ selected, onChange, compact = fa
     return false;
   };
   const toggle = (node: AITagTreeNode) => {
-    if (node.id === 'manual') return;
     const next = draft.includes(node.id)
       ? draft.filter((id) => id !== node.id)
       : [...draft.filter((id) => !isDescendant(id, node.id) && !isDescendant(node.id, id)), node.id].slice(0, 32);
@@ -116,6 +115,13 @@ export default function HierarchicalTagPicker({ selected, onChange, compact = fa
       return { subject, dimensions };
     }).filter((group) => group.dimensions.length > 0 || !normalized);
   }, [activeRoot, byId, children, query]);
+  const manualValues = useMemo(() => {
+    if (activeRoot !== 'manual') return [];
+    const normalized = query.trim().toLocaleLowerCase();
+    return [...(children.get('manual') ?? [])]
+      .filter((node) => !normalized || node.label.toLocaleLowerCase().includes(normalized))
+      .sort(stableNodeOrder);
+  }, [activeRoot, children, query]);
   const nodeDisabled = (node: AITagTreeNode) => {
     if (draft.includes(node.id) || node.count > 0) return false;
     return !draft.some((id) => byId.get(id)?.facetKey === node.facetKey);
@@ -152,7 +158,18 @@ export default function HierarchicalTagPicker({ selected, onChange, compact = fa
         ))}
       </div>
       <div className="compact-tag-groups">
-        {groups.map(({ subject, dimensions }) => (
+        {activeRoot === 'manual' ? (
+          <section className="compact-tag-group compact-tag-manual-group">
+            <div className="compact-tag-values">
+              {manualValues.map((node) => (
+                <button className={draft.includes(node.id) ? 'selected' : ''} disabled={nodeDisabled(node)} key={node.id} type="button" onClick={() => toggle(node)}>
+                  {node.label}<small>{node.count}</small>
+                </button>
+              ))}
+            </div>
+            {manualValues.length === 0 && <span className="asset-tag-filter-empty">没有匹配自标</span>}
+          </section>
+        ) : groups.map(({ subject, dimensions }) => (
           <section className="compact-tag-group" key={subject.id}>
             <div className="compact-tag-group-title">
               <strong>{subject.label}</strong>
@@ -176,7 +193,7 @@ export default function HierarchicalTagPicker({ selected, onChange, compact = fa
             ))}
           </section>
         ))}
-        {groups.length === 0 && <span className="asset-tag-filter-empty">没有匹配标签</span>}
+        {activeRoot !== 'manual' && groups.length === 0 && <span className="asset-tag-filter-empty">没有匹配标签</span>}
       </div>
       <div className="asset-tag-filter-actions">
         <button type="button" onClick={() => { setDraft([]); onChange([]); }}>清除全部</button>

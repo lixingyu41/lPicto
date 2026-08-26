@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-// AIMaxAttempts is the initial attempt plus one automatic retry. Manual retry
-// resets the counter and starts a new two-attempt cycle.
-const AIMaxAttempts = 2
+// AIMaxAttempts is the initial attempt plus three automatic retries. A final
+// failure remains visible with its diagnostic output instead of looping forever.
+const AIMaxAttempts = 4
 
 var (
 	ErrEmptyAITag = errors.New("AI tag is empty")

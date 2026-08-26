@@ -63,6 +63,11 @@ interface APIErrorBody {
 }
 
 const requestTimeoutMs = 30_000;
+let mediaOriginPorts: number[] = [];
+
+export function configureMediaOrigins(ports: number[] | undefined) {
+  mediaOriginPorts = Array.from(new Set((ports ?? []).filter((port) => Number.isInteger(port) && port > 0 && port <= 65535)));
+}
 
 export interface VideoProxySessionContext {
   clientId?: string;
@@ -276,17 +281,10 @@ export const api = {
     id: number,
     page: number,
     pageSize: number,
-    sort: SortKey,
-    q: string,
-    group?: AssetServerGroup,
-    rating?: AssetRating,
-    orientation?: OrientationFilter,
-    type?: AssetKind,
-    combinedTags?: string,
-    tagNodes?: string,
-  ) => request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, sort, q, group, rating, orientation, type, combinedTags, tagNodes, includeAiSummary: includeAISummary() })}`),
-  albumAnchors: (id: number, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags?: string, tagNodes?: string) =>
-    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, sort, q, group, rating, orientation, type, combinedTags, tagNodes })}`),
+    params: LibraryFilterParams,
+  ) => request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, ...params, includeAiSummary: includeAISummary() })}`),
+  albumAnchors: (id: number, pageSize: number, params: LibraryFilterParams) =>
+    request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, ...params })}`),
   albumSourceFolders: (parentRelPath: string) =>
     request<SourceFoldersResponse>(`/api/albums/source-folders${qs({ parentRelPath })}`),
   libraryAssets: (page: number, pageSize: number, params: LibraryFilterParams) =>
@@ -472,17 +470,28 @@ export const api = {
   videoSegmentStatus: (id: number, session?: VideoProxySessionContext) =>
     request<VideoSegmentStatus>(`/api/assets/${id}/hls/status${videoSessionQuery(session)}`),
   prewarmVideoSegments: (id: number, from: number, count: number, priority: 'playback' | 'critical' | 'balanced', session?: VideoProxySessionContext, signal?: AbortSignal) =>
-    request<{ cachedSegments: number; required: boolean }>(`/api/assets/${id}/hls/prewarm${qs({
+    request<{ cachedSegments: number; required: boolean; segmentSeconds?: number }>(`/api/assets/${id}/hls/prewarm${qs({
       from: Math.max(0, Math.floor(from)),
       count: Math.max(1, Math.floor(count)),
       priority,
       clientId: session?.clientId,
       sessionId: session?.sessionId,
     })}`, { method: 'POST', signal }),
+  prewarmAllVideoSegments: (id: number, from: number, session?: VideoProxySessionContext, signal?: AbortSignal) =>
+    request<{ accepted: boolean; queuedSegments: number; required: boolean; segmentSeconds?: number; started: boolean }>(`/api/assets/${id}/hls/prewarm${qs({
+      from: Math.max(0, Math.floor(from)),
+      all: 1,
+      priority: 'balanced',
+      clientId: session?.clientId,
+      sessionId: session?.sessionId,
+    })}`, { method: 'POST', signal }),
   stopVideoSegmentSession: (id: number, session?: VideoProxySessionContext) =>
     request<{ cancelled: number }>(`/api/assets/${id}/hls/session/stop${videoSessionQuery(session)}`, { method: 'POST' }),
-  prewarmDirectVideo: (id: number, startSeconds = 0) =>
-    request<{ accepted: boolean; chunks: number }>(`/api/assets/${id}/video/cache/prewarm?start=${Math.max(0, startSeconds)}`, { method: 'POST' }),
+  prewarmDirectVideo: (id: number, startSeconds = 0, full = false) =>
+    request<{ accepted: boolean; chunks: number; full?: boolean; started?: boolean }>(`/api/assets/${id}/video/cache/prewarm${qs({
+      start: Math.max(0, startSeconds),
+      all: full ? 1 : undefined,
+    })}`, { method: 'POST' }),
   startAudioProxy: (id: number, priority: 'current' | 'preload', signal?: AbortSignal) =>
     request<AudioProxyRuntime>(`/api/assets/${id}/audio-proxy?priority=${priority}`, { method: 'POST', signal }),
   audioProxyStatus: (id: number, signal?: AbortSignal) =>
@@ -502,31 +511,32 @@ export function assetThumbUrl(asset: Asset): string {
   return `/api/cache/thumbs/${asset.cacheKey}.webp`;
 }
 
-export function assetPreviewUrl(asset: Asset): string {
+export function assetPreviewUrl(asset: Asset, priority?: 'current' | 'preload'): string {
   if (asset.mediaType === 'audio') return audioCoverUrl;
   if (asset.mediaType === 'video') {
     return assetThumbUrl(asset);
   }
-  if (asset.browserPlayable) {
-    return assetOriginalUrl(asset);
-  }
-  return `/api/assets/${asset.id}/preview?v=${asset.cacheKey}`;
+  return `/api/assets/${asset.id}/preview${qs({ v: asset.cacheKey, priority })}`;
 }
 
 export function assetAudioCoverUrl(): string {
   return audioCoverUrl;
 }
 
-export function assetAudioUrl(asset: Asset): string {
-  return `/api/assets/${asset.id}/audio?v=${asset.cacheKey}`;
+export function assetAudioUrl(asset: Asset, priority?: 'current' | 'preload'): string {
+  return mediaTransferUrl(asset.id, `/api/assets/${asset.id}/audio${qs({ v: asset.cacheKey, priority })}`);
 }
 
-export function assetOriginalUrl(asset: Asset): string {
-  return `/api/assets/${asset.id}/original?v=${asset.cacheKey}`;
+export function assetOriginalUrl(asset: Asset, priority?: 'current' | 'preload'): string {
+  return mediaTransferUrl(asset.id, `/api/assets/${asset.id}/original${qs({ v: asset.cacheKey, priority })}`);
 }
 
-export function assetVideoUrl(asset: Asset): string {
-  return `/api/assets/${asset.id}/video?v=${asset.cacheKey}#t=0.001`;
+export function assetDownloadUrl(asset: Asset): string {
+  return mediaTransferUrl(asset.id, `/api/assets/${asset.id}/original${qs({ v: asset.cacheKey, priority: 'current', download: 1 })}`);
+}
+
+export function assetVideoUrl(asset: Asset, priority?: 'current' | 'preload'): string {
+  return `${mediaTransferUrl(asset.id, `/api/assets/${asset.id}/video${qs({ v: asset.cacheKey, priority })}`)}#t=0.001`;
 }
 
 export function assetStoryboardSheetUrl(asset: Asset, sheet: number): string {
@@ -544,7 +554,7 @@ export function assetVideoProxyUrl(asset: Asset, startSeconds = 0, session?: Vid
   if (session?.sessionId) {
     query.set('sessionId', session.sessionId);
   }
-  return `/api/assets/${asset.id}/video-proxy?${query.toString()}`;
+  return mediaTransferUrl(asset.id, `/api/assets/${asset.id}/video-proxy?${query.toString()}`);
 }
 
 export function assetVideoHlsPlaylistUrl(asset: Asset, session?: VideoProxySessionContext): string {
@@ -556,7 +566,7 @@ export function assetVideoHlsPlaylistUrl(asset: Asset, session?: VideoProxySessi
     query.set('sessionId', session.sessionId);
   }
   query.set('priority', session?.priority ?? 'preload');
-  return `/api/assets/${asset.id}/hls/playlist.m3u8?${query.toString()}`;
+  return mediaTransferUrl(asset.id, `/api/assets/${asset.id}/hls/playlist.m3u8?${query.toString()}`);
 }
 
 export function assetVideoHlsSegmentUrl(asset: Asset, segmentIndex: number, session?: VideoProxySessionContext): string {
@@ -567,7 +577,15 @@ export function assetVideoHlsSegmentUrl(asset: Asset, segmentIndex: number, sess
   if (session?.sessionId) {
     query.set('sessionId', session.sessionId);
   }
-  return `/api/assets/${asset.id}/hls/segments/${Math.max(0, Math.floor(segmentIndex))}.ts?${query.toString()}`;
+  return mediaTransferUrl(asset.id, `/api/assets/${asset.id}/hls/segments/${Math.max(0, Math.floor(segmentIndex))}.ts?${query.toString()}`);
+}
+
+function mediaTransferUrl(assetId: number, path: string) {
+  if (mediaOriginPorts.length === 0 || typeof window === 'undefined' || window.location.protocol === 'https:') return path;
+  const port = mediaOriginPorts[Math.abs(Math.trunc(assetId)) % mediaOriginPorts.length];
+  const url = new URL(path, window.location.origin);
+  url.port = String(port);
+  return url.toString();
 }
 
 function videoProxyQuery(startSeconds: number, session?: VideoProxySessionContext) {

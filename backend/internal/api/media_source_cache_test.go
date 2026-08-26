@@ -1,7 +1,10 @@
 package api
 
 import (
+	"context"
 	"testing"
+
+	"lpicto/backend/internal/model"
 )
 
 func TestBoundedByteRange(t *testing.T) {
@@ -58,5 +61,37 @@ func TestExpectedVideoChunkBytes(t *testing.T) {
 				t.Fatalf("got %d bytes, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+func TestDirectVideoChunkRangeFullWarmsRemainder(t *testing.T) {
+	duration := 100.0
+	asset := model.Asset{Size: 20 << 20, Duration: &duration}
+	first, last := directVideoChunkRange(asset, 50, true)
+	if first != 1 || last != 2 {
+		t.Fatalf("full range = %d-%d, want 1-2", first, last)
+	}
+	first, last = directVideoChunkRange(asset, 50, false)
+	if first != 1 || last != 1 {
+		t.Fatalf("short range = %d-%d, want 1-1", first, last)
+	}
+}
+
+func TestVideoFullWarmJobDeduplicatesAndCancelsByAsset(t *testing.T) {
+	server := &Server{videoFullWarmJobs: map[string]*videoFullWarmJob{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &videoFullWarmJob{cancel: cancel}
+	if !server.registerVideoFullWarmJob("direct:asset", job) {
+		t.Fatal("first job should register")
+	}
+	if server.registerVideoFullWarmJob("direct:asset", &videoFullWarmJob{cancel: func() {}}) {
+		t.Fatal("duplicate job should be rejected")
+	}
+	server.cancelVideoFullWarm("asset")
+	if ctx.Err() == nil {
+		t.Fatal("asset warm job was not cancelled")
+	}
+	if len(server.videoFullWarmJobs) != 0 {
+		t.Fatalf("jobs remain after cancellation: %d", len(server.videoFullWarmJobs))
 	}
 }

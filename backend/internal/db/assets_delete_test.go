@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"lpicto/backend/internal/model"
@@ -150,6 +151,50 @@ func TestMarkDeletedUnderReturnsNestedAssets(t *testing.T) {
 	}
 	if _, ok := active["other.jpg"]; !ok || len(active) != 1 {
 		t.Fatalf("active = %#v, want only other.jpg", active)
+	}
+}
+
+func TestMarkMissingUnderKeepsRecordsAndMatchesPathBoundary(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	for _, relPath := range []string{"dir/a.jpg", "dir/sub/b.jpg", "directory/c.jpg"} {
+		if _, _, _, err := database.UpsertAsset(ctx, AssetUpsert{
+			RelPath: relPath, ParentRelPath: ParentFolderRel(relPath), Filename: filepath.Base(relPath), Ext: "jpg", MediaType: model.MediaTypeImage,
+			Size: 10, Mtime: 10, ImportedAt: 10, TimelineAt: 10, CacheKey: strings.ReplaceAll(relPath, "/", "-"),
+			ThumbStatus: model.StatusReady, PreviewStatus: model.StatusNotRequired,
+			VideoPosterStatus: model.StatusNotRequired, VideoProxyStatus: model.StatusNotRequired,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	marked, err := database.MarkMissingUnder(ctx, "dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked != 2 {
+		t.Fatalf("marked = %d, want 2", marked)
+	}
+	var missingDir, missingOther int
+	if err := database.Conn().QueryRowContext(ctx, `SELECT COUNT(*) FROM file_instance WHERE rel_path LIKE 'dir/%' AND missing`).Scan(&missingDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Conn().QueryRowContext(ctx, `SELECT COUNT(*) FROM file_instance WHERE rel_path LIKE 'directory/%' AND missing`).Scan(&missingOther); err != nil {
+		t.Fatal(err)
+	}
+	if missingDir != 2 || missingOther != 0 {
+		t.Fatalf("missing dir=%d directory=%d, want 2 and 0", missingDir, missingOther)
+	}
+	active, err := database.ActiveRelPaths(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 3 {
+		t.Fatalf("active records = %d, want 3", len(active))
 	}
 }
 

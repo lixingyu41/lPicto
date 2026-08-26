@@ -37,6 +37,22 @@ func TestTimelineAtFallback(t *testing.T) {
 	}
 }
 
+func TestDisplayImageDimensionsAppliesEXIFOrientation(t *testing.T) {
+	width, height := 1824, 2736
+	for _, orientation := range []int{5, 6, 7, 8} {
+		gotWidth, gotHeight := displayImageDimensions(&width, &height, &orientation)
+		if gotWidth == nil || gotHeight == nil || *gotWidth != 2736 || *gotHeight != 1824 {
+			t.Fatalf("orientation %d dimensions = %v x %v, want 2736 x 1824", orientation, gotWidth, gotHeight)
+		}
+	}
+	for _, orientation := range []int{1, 2, 3, 4} {
+		gotWidth, gotHeight := displayImageDimensions(&width, &height, &orientation)
+		if gotWidth == nil || gotHeight == nil || *gotWidth != 1824 || *gotHeight != 2736 {
+			t.Fatalf("orientation %d dimensions = %v x %v, want 1824 x 2736", orientation, gotWidth, gotHeight)
+		}
+	}
+}
+
 func TestBrowserVideoPlayable(t *testing.T) {
 	if !BrowserVideoPlayable("mp4", "h264", "aac") {
 		t.Fatal("expected h264/aac mp4 playable")

@@ -139,6 +139,7 @@ export interface VideoSegmentStatus {
   progress: number;
   secondsDone: number;
   duration: number;
+  segmentSeconds: number;
   bytes: number;
   cachedBytes: number;
   cachedSegments: number;
@@ -678,6 +679,7 @@ export interface PublicConfig {
   previewLongEdge: number;
   videoProxyEnabled: boolean;
   liveVideoProxyMaxActive: number;
+  mediaOriginPorts: number[];
   videoProxyMaxHeight: number;
   videoSegmentSeconds: number;
   videoPreloadSegments: number;

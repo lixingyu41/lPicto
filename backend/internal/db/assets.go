@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -1017,6 +1018,29 @@ WHERE ma.id = fi.asset_id
 	return total, nil
 }
 
+// MarkMissingUnder marks one file or every file below a removed directory as
+// unavailable while retaining media records and generated previews.
+func (d *DB) MarkMissingUnder(ctx context.Context, relPath string) (int, error) {
+	relPath = strings.Trim(strings.TrimSpace(filepath.ToSlash(relPath)), "/")
+	if relPath == "" {
+		return 0, errors.New("missing path is empty")
+	}
+	result, err := d.conn.ExecContext(ctx, `
+UPDATE file_instance fi
+SET missing = true
+FROM media_asset ma
+WHERE ma.id = fi.asset_id
+  AND ma.deleted_at IS NULL
+  AND fi.missing = false
+  AND (fi.rel_path = ? OR fi.rel_path LIKE ? ESCAPE '\')`,
+		relPath, escapeLike(relPath)+"/%")
+	if err != nil {
+		return 0, err
+	}
+	updated, err := result.RowsAffected()
+	return int(updated), err
+}
+
 func (d *DB) MarkDeletedWithCache(ctx context.Context, relPath string, deletedAt int64) (*DeletedAsset, error) {
 	var asset DeletedAsset
 	err := d.conn.QueryRowContext(ctx, `
@@ -1204,9 +1228,9 @@ func (d *DB) PendingWork(ctx context.Context) ([]WorkItem, error) {
 SELECT id, media_type, thumb_status, preview_status, video_poster_status, video_proxy_status, browser_playable
 FROM assets
 WHERE deleted_at IS NULL AND (
-  thumb_status IN ('pending','processing','error') OR
-  preview_status IN ('pending','processing','error') OR
-  video_poster_status IN ('pending','processing','error')
+  thumb_status IN ('pending','processing') OR
+  preview_status IN ('pending','processing') OR
+  video_poster_status IN ('pending','processing')
 )`)
 	if err != nil {
 		return nil, err
@@ -1237,7 +1261,7 @@ WHERE deleted_at IS NULL AND (
 }
 
 func recoverableWorkStatus(status string) bool {
-	return status == model.StatusPending || status == model.StatusProcessing || status == model.StatusError
+	return status == model.StatusPending || status == model.StatusProcessing
 }
 
 func (d *DB) Neighbors(ctx context.Context, opts NeighborOptions) (Neighbors, error) {

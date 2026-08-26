@@ -1351,7 +1351,7 @@ function AssetListHeader({
   const definition = mediaColumnDefinition(column);
   const width = mediaColumnWidth(preferences, column);
   const field = sortFieldForColumn(column);
-  const sortable = column !== 'palette';
+  const sortable = column !== 'palette' && column !== 'thumbnail';
   const active = sortable && (sort === field || sort.startsWith(`${field}_`));
   const direction = active && sort.endsWith('_asc') ? 'asc' : 'desc';
 
@@ -1382,7 +1382,7 @@ function AssetListHeader({
 
   return (
     <div
-      className={column === 'media' ? 'asset-list-head-cell media-column' : 'asset-list-head-cell'}
+      className={`asset-list-head-cell ${column}-column`}
       style={{ width, minWidth: width }}
     >
       <button
@@ -1415,22 +1415,30 @@ function AssetListCell({
 }) {
   const width = mediaColumnWidth(preferences, column);
   const style = { width, minWidth: width };
-  if (column === 'media') {
-    const thumbHeight = Math.max(64, rowHeight - 16);
-    const thumbWidth = Math.min(128, Math.max(88, Math.round(thumbHeight * 1.25)));
-    const textLines = listTextLines(thumbHeight);
+  if (column === 'thumbnail') {
+    const availableWidth = Math.max(1, width - 16);
+    const availableHeight = Math.max(1, rowHeight - 16);
+    const aspect = Math.max(0.05, effectiveAspect(asset));
+    const thumbWidth = Math.max(1, Math.min(availableWidth, availableHeight * aspect));
+    const thumbHeight = Math.max(1, Math.min(availableHeight, availableWidth / aspect));
     return (
-      <div className="asset-list-cell media-column" style={style}>
-        <div className="asset-list-thumb" style={{ width: thumbWidth, height: thumbHeight }}>
-          <AssetTileMedia asset={asset} rowHeight={thumbHeight} tileWidth={thumbWidth} />
+      <div className="asset-list-cell thumbnail-column" style={style}>
+        <div className="asset-list-thumb" style={{ width: Math.round(thumbWidth), height: Math.round(thumbHeight) }}>
+          <AssetTileMedia asset={asset} rowHeight={Math.round(thumbHeight)} tileWidth={Math.round(thumbWidth)} />
           {asset.mediaType === 'video' && <span className="asset-list-video"><Play size={12} fill="currentColor" /></span>}
           {asset.mediaType === 'audio' && <span className="asset-list-video asset-list-audio"><Music size={12} /></span>}
         </div>
-        <ListText value={asset.filename} expandable maxLines={textLines} />
       </div>
     );
   }
   const textLines = listTextLines(rowHeight - 16);
+  if (column === 'name') {
+    return (
+      <div className="asset-list-cell name-column" style={style}>
+        <ListText value={asset.displayTitle || asset.filename} expandable maxLines={textLines} />
+      </div>
+    );
+  }
   if (column === 'aiTags') {
     return (
       <div className="asset-list-cell asset-list-cell-tags" style={style}>
@@ -1658,7 +1666,8 @@ function trimNumber(value: number) {
 
 function sortFieldForColumn(column: MediaColumnId): SortField {
   const fields: Record<MediaColumnId, SortField> = {
-    media: 'filename',
+    thumbnail: 'timeline',
+    name: 'filename',
     path: 'path',
     mediaType: 'media_type',
     resolution: 'resolution',

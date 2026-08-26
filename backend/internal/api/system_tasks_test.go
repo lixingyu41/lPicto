@@ -53,8 +53,8 @@ func TestMediaScanTaskUsesIndependentDiscoveryProgress(t *testing.T) {
 	if got := taskActionIDs(item.Actions); got != "continue,rebuild" {
 		t.Fatalf("media scan actions = %q", got)
 	}
-	running := mediaScanSystemTask(nil, scanner.Status{Running: true, Progress: scanner.Progress{Task: "count", TotalFiles: 30, ScannedFiles: 12}})
-	if running.Status != "running" || running.Progress == nil || running.Progress.Completed != 12 || running.Progress.Pending != 18 {
+	running := mediaScanSystemTask(nil, scanner.Status{Running: true, Progress: scanner.Progress{Task: "media_scan", TotalFiles: 30, ScannedFiles: 12}})
+	if running.Status != "running" || running.Progress == nil || running.Progress.Completed != 12 || running.Progress.Pending != 17 || running.Progress.Processing != 1 {
 		t.Fatalf("running media scan task = %#v", running)
 	}
 }
@@ -66,10 +66,17 @@ func TestMediaScanTaskDoesNotKeepStaleRunningState(t *testing.T) {
 	}
 }
 
+func TestMediaScanTaskIncludesAutomaticMetadataIngestion(t *testing.T) {
+	item := mediaScanSystemTask(nil, scanner.Status{Running: true, Progress: scanner.Progress{Task: "metadata", TotalFiles: 30, ScannedFiles: 12, AssetsAdded: 12}})
+	if item.Status != "running" || item.Progress == nil || item.Progress.Completed != 12 || item.Progress.Processing != 1 {
+		t.Fatalf("metadata ingestion task = %#v", item)
+	}
+}
+
 func TestMediaScanTaskShowsPlaybackPauseAndKeepsAutomaticResumePending(t *testing.T) {
 	item := mediaScanSystemTask(
 		&model.ScanRun{Status: "paused", TotalSeen: 12},
-		scanner.Status{Progress: scanner.Progress{State: "paused", Task: "count", PauseReason: "playback", TotalFiles: 30, ScannedFiles: 12}},
+		scanner.Status{Progress: scanner.Progress{State: "paused", Task: "media_scan", PauseReason: "playback", TotalFiles: 30, ScannedFiles: 12}},
 	)
 	if item.Status != "pending" || !strings.Contains(item.BlockedReason, "播放结束后将自动继续") {
 		t.Fatalf("paused media scan task = %#v", item)
@@ -219,58 +226,29 @@ func TestThumbnailTaskUsesAggregateQueueState(t *testing.T) {
 	if item.Status != "success" || item.Succeeded == nil || !*item.Succeeded {
 		t.Fatalf("completed thumbnail task = %#v", item)
 	}
-	if got := taskActionIDs(item.Actions); got != "rebuild" {
-		t.Fatalf("completed thumbnail should hide start and stop: %#v", item.Actions)
+	if len(item.Actions) != 0 {
+		t.Fatalf("completed thumbnail actions = %#v, want none", item.Actions)
 	}
 }
 
-func TestStandardTaskActions(t *testing.T) {
+func TestAutomaticMediaTasksExposeNoManualActions(t *testing.T) {
 	thumbnail := thumbnailSystemTask(db.WorkStatusCounts{Total: 10, Ready: 3, Pending: 5, Error: 2}, 0, 0)
-	if got := taskActionIDs(thumbnail.Actions); got != "start,retry_failed,rebuild" {
-		t.Fatalf("thumbnail actions = %#v", thumbnail.Actions)
-	}
-	if thumbnail.Actions[0].Label != "手动开始" {
-		t.Fatalf("thumbnail start label = %#v", thumbnail.Actions[0])
-	}
-	if thumbnail.Actions[1].Label != "重试失败（2）" || thumbnail.Actions[2].Label != "全部重建" || !thumbnail.Actions[2].RequiresConfirmation {
-		t.Fatalf("thumbnail labels = %#v", thumbnail.Actions)
+	if len(thumbnail.Actions) != 0 {
+		t.Fatalf("thumbnail actions = %#v, want none", thumbnail.Actions)
 	}
 	aiTask := aiAnalysisSystemTask(db.AIStatus{Total: 10, Pending: 7, Failed: 2, Ready: 1}, db.AIActivity{}, 0, 0, false)
-	if got := taskActionIDs(aiTask.Actions); got != "continue,retry_failed,rebuild" {
-		t.Fatalf("AI actions = %#v", aiTask.Actions)
-	}
-	failedOnly := thumbnailSystemTask(db.WorkStatusCounts{Total: 2, Error: 2}, 0, 0)
-	if got := taskActionIDs(failedOnly.Actions); got != "retry_failed,rebuild" {
-		t.Fatalf("failed-only thumbnail actions = %#v", failedOnly.Actions)
-	}
-	failedAIOnly := aiAnalysisSystemTask(db.AIStatus{Total: 2, Failed: 2}, db.AIActivity{}, 0, 0, false)
-	if got := taskActionIDs(failedAIOnly.Actions); got != "retry_failed,rebuild" {
-		t.Fatalf("failed-only AI actions = %#v", failedAIOnly.Actions)
-	}
-	running := thumbnailSystemTask(db.WorkStatusCounts{Total: 10, Pending: 10}, 1, 0)
-	for _, action := range running.Actions {
-		if action.Enabled != (action.ID == "stop") {
-			t.Fatalf("running action %q enabled = %v", action.ID, action.Enabled)
-		}
-	}
-	runningWithFailures := thumbnailSystemTask(db.WorkStatusCounts{Total: 10, Pending: 7, Error: 3}, 1, 0)
-	for _, action := range runningWithFailures.Actions {
-		wantEnabled := action.ID == "retry_failed" || action.ID == "stop"
-		if action.Enabled != wantEnabled {
-			t.Fatalf("running task with failures action %q enabled = %v, want %v", action.ID, action.Enabled, wantEnabled)
-		}
+	if len(aiTask.Actions) != 0 {
+		t.Fatalf("AI actions = %#v, want none", aiTask.Actions)
 	}
 }
 
 func TestAIAnalysisTaskShowsRequestedRunWhilePreparing(t *testing.T) {
 	item := aiAnalysisSystemTask(db.AIStatus{Total: 10, Pending: 10}, db.AIActivity{}, 0, 0, true)
-	if item.Status != "running" {
-		t.Fatalf("requested AI analysis status = %q, want running", item.Status)
+	if item.Status != "pending" {
+		t.Fatalf("requested AI analysis status = %q, want pending", item.Status)
 	}
-	for _, action := range item.Actions {
-		if action.Enabled != (action.ID == "stop") {
-			t.Fatalf("preparing action %q enabled = %v", action.ID, action.Enabled)
-		}
+	if len(item.Actions) != 0 {
+		t.Fatalf("preparing AI actions = %#v, want none", item.Actions)
 	}
 }
 

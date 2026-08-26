@@ -205,7 +205,7 @@ func (p *Processor) interrupt(assetID int64, cacheKey string, cause error) error
 	if cause == nil {
 		cause = context.Canceled
 	}
-	if errors.Is(cause, jobs.ErrPlaybackPriority) {
+	if errors.Is(cause, jobs.ErrPlaybackPriority) || errors.Is(cause, jobs.ErrMediaScanPriority) || errors.Is(cause, jobs.ErrMediaCachePriority) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(p.BaseURL, "/")+"/pause", nil)
 		if err == nil {

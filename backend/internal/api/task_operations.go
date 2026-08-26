@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,11 +65,14 @@ func (s *Server) runSystemTask(w http.ResponseWriter, r *http.Request) {
 
 	switch taskID {
 	case "media_scan":
-		if action != "continue" && action != "start" && action != "retry_failed" && action != "rebuild" {
+		if action != "continue" && action != "start" && action != "retry_failed" && action != "rebuild" && action != "scan" {
 			systemTaskActionError(w)
 			return
 		}
-		result := s.scanner.RequestCountScanRoots(reason, roots)
+		if action == "scan" {
+			reason = "global_scan"
+		}
+		result := s.scanner.RequestMediaScanRoots(reason, roots)
 		writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 	case "library_scan":
 		if action != "reconcile" && action != "scan" {
@@ -132,8 +137,17 @@ func (s *Server) systemTaskRunning(ctx context.Context, taskID string) bool {
 	}
 	if taskID == "media_scan" || taskID == "library_scan" || taskID == "metadata_extraction" || taskID == "thumbnail_creation" {
 		status, _ := s.scanner.Status(ctx)
-		if status.Running && (taskID != "media_scan" || status.Progress.Task == "count") {
-			return true
+		if status.Running {
+			switch taskID {
+			case "media_scan":
+				return status.Progress.Task == "media_scan"
+			case "library_scan":
+				return status.Progress.Task == "reconcile"
+			case "metadata_extraction":
+				return status.Progress.Task == "metadata"
+			case "thumbnail_creation":
+				return status.Progress.Task == "thumb_continue" || status.Progress.Task == "thumb_rebuild"
+			}
 		}
 	}
 	if taskID == taskDuplicateScan {
@@ -245,6 +259,54 @@ func (s *Server) duplicateScanFailureCount() int {
 	return s.duplicateScanFailed
 }
 
+func (s *Server) duplicateScanFailures() []SystemTaskFailureDTO {
+	s.duplicateScanMu.Lock()
+	defer s.duplicateScanMu.Unlock()
+	return append([]SystemTaskFailureDTO(nil), s.duplicateScanErrors...)
+}
+
+func (s *Server) startAutomaticDuplicateScanScheduler() {
+	go func() {
+		timer := time.NewTimer(30 * time.Second)
+		defer timer.Stop()
+		for {
+			<-timer.C
+			s.tryStartAutomaticDuplicateScan()
+			timer.Reset(time.Minute)
+		}
+	}()
+}
+
+func (s *Server) tryStartAutomaticDuplicateScan() {
+	s.duplicateScanMu.Lock()
+	running := s.duplicateScanCancel != nil
+	tries := s.duplicateAutoTries
+	s.duplicateScanMu.Unlock()
+	if running || tries >= jobs.MaxAutomaticRetries+1 {
+		return
+	}
+	total, completed, err := s.db.DuplicateHashProgress(context.Background())
+	if err != nil || total == 0 || completed >= total {
+		return
+	}
+	if status, statusErr := s.scanner.Status(context.Background()); statusErr == nil && status.Running {
+		return
+	}
+	if s.jobs != nil {
+		stats := s.jobs.Stats()
+		queued := stats.ThumbQueued + stats.PreviewQueued + stats.VideoPosterQueued + stats.StoryboardQueued + stats.AIQueued
+		active := stats.ActiveThumb + stats.ActivePreview + stats.ActiveVideoPoster + stats.ActiveStoryboard + stats.ActiveAI
+		if queued+active > 0 || s.jobs.BackgroundBlocker(context.Background()) != "" {
+			return
+		}
+	}
+	if s.startDuplicateScan() {
+		s.duplicateScanMu.Lock()
+		s.duplicateAutoTries++
+		s.duplicateScanMu.Unlock()
+	}
+}
+
 func (s *Server) startDuplicateScan() bool {
 	s.duplicateScanMu.Lock()
 	if s.duplicateScanCancel != nil {
@@ -254,6 +316,7 @@ func (s *Server) startDuplicateScan() bool {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.duplicateScanCancel = cancel
 	s.duplicateScanFailed = 0
+	s.duplicateScanErrors = nil
 	s.duplicateScanMu.Unlock()
 
 	_ = s.db.BeginSystemTask(context.Background(), taskDuplicateScan)
@@ -280,6 +343,9 @@ func (s *Server) runDuplicateScan(ctx context.Context) {
 		s.duplicateScanMu.Lock()
 		s.duplicateScanCancel = nil
 		s.duplicateScanFailed = failed
+		if failed == 0 {
+			s.duplicateAutoTries = 0
+		}
 		s.duplicateScanMu.Unlock()
 	}()
 
@@ -324,12 +390,28 @@ func (s *Server) runDuplicateScan(ctx context.Context) {
 				failed++
 				s.duplicateScanMu.Lock()
 				s.duplicateScanFailed = failed
+				if len(s.duplicateScanErrors) < 100 {
+					s.duplicateScanErrors = append(s.duplicateScanErrors, SystemTaskFailureDTO{AssetID: asset.ID, Path: asset.RelPath, Reason: readableTaskError(err.Error())})
+				}
 				s.duplicateScanMu.Unlock()
 				continue
 			}
 			processed++
 		}
 	}
+}
+
+func fileSHA256Hex(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func (s *Server) runMetadataTask(w http.ResponseWriter, r *http.Request, action string, roots []string, reason string, running bool) {

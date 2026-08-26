@@ -17,8 +17,8 @@ const (
 	DefaultVideoProxyCacheTTL   = 72 * time.Hour
 	MinVideoProxyCacheTTL       = time.Minute
 	MaxVideoProxyCacheTTL       = 30 * 24 * time.Hour
-	DefaultVideoSegmentSeconds  = 10
-	DefaultVideoPreloadSegments = 5
+	DefaultVideoSegmentSeconds  = 4
+	DefaultVideoPreloadSegments = 2
 )
 
 type Config struct {
@@ -45,11 +45,15 @@ type Config struct {
 	PageSizeDefault              int                  `json:"pageSizeDefault"`
 	PageSizeMax                  int                  `json:"pageSizeMax"`
 	EnableFSWatch                bool                 `json:"enableFsWatch"`
+	NASWatcherToken              string               `json:"-"`
+	NASWatcherRoots              map[string]string    `json:"-"`
+	NASWatcherOfflineAfter       time.Duration        `json:"-"`
 	ThumbLongEdge                int                  `json:"thumbLongEdge"`
 	PreviewLongEdge              int                  `json:"previewLongEdge"`
 	PreviewQuality               int                  `json:"previewQuality"`
 	VideoProxyEnabled            bool                 `json:"videoProxyEnabled"`
 	LiveVideoProxyMaxActive      int                  `json:"liveVideoProxyMaxActive"`
+	MediaOriginPorts             []int                `json:"mediaOriginPorts"`
 	VideoProxyMaxHeight          int                  `json:"videoProxyMaxHeight"`
 	VideoProxyCRF                int                  `json:"videoProxyCrf"`
 	VideoProxyCacheTTL           time.Duration        `json:"-"`
@@ -109,11 +113,15 @@ func Load() (Config, error) {
 		PageSizeDefault:              intEnv("PAGE_SIZE_DEFAULT", 100),
 		PageSizeMax:                  intEnv("PAGE_SIZE_MAX", 500),
 		EnableFSWatch:                boolEnv("ENABLE_FS_WATCH", false),
+		NASWatcherToken:              stringEnv("NAS_WATCHER_TOKEN", ""),
+		NASWatcherRoots:              stringMapEnv("NAS_WATCHER_ROOTS", "PIC=nas/PIC;VID=nas/VID"),
+		NASWatcherOfflineAfter:       durationSecondsEnv("NAS_WATCHER_OFFLINE_SECONDS", 90*time.Second),
 		ThumbLongEdge:                intEnv("THUMB_LONG_EDGE", 320),
 		PreviewLongEdge:              intEnv("PREVIEW_LONG_EDGE", 2560),
 		PreviewQuality:               intEnv("PREVIEW_QUALITY", 82),
 		VideoProxyEnabled:            boolEnv("VIDEO_PROXY_ENABLED", true),
-		LiveVideoProxyMaxActive:      intEnv("LIVE_VIDEO_PROXY_MAX_ACTIVE", 1),
+		LiveVideoProxyMaxActive:      intEnv("LIVE_VIDEO_PROXY_MAX_ACTIVE", 2),
+		MediaOriginPorts:             intListEnv("MEDIA_ORIGIN_PORTS", nil),
 		VideoProxyMaxHeight:          intEnv("VIDEO_PROXY_MAX_HEIGHT", 0),
 		VideoProxyCRF:                intEnv("VIDEO_PROXY_CRF", 23),
 		VideoProxyCacheTTL:           videoProxyCacheTTL,
@@ -195,6 +203,7 @@ func (c Config) Log(logger *slog.Logger) {
 		"previewQuality", c.PreviewQuality,
 		"videoProxyEnabled", c.VideoProxyEnabled,
 		"liveVideoProxyMaxActive", c.LiveVideoProxyMaxActive,
+		"mediaOriginPorts", c.MediaOriginPorts,
 		"videoProxyMaxHeight", c.VideoProxyMaxHeight,
 		"videoProxyCrf", c.VideoProxyCRF,
 		"videoProxyCacheTtlSeconds", c.VideoProxyCacheTTLSeconds,
@@ -262,6 +271,30 @@ func intEnv(key string, fallback int) int {
 	return parsed
 }
 
+func intListEnv(key string, fallback []int) []int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return append([]int(nil), fallback...)
+	}
+	seen := map[int]struct{}{}
+	result := make([]int, 0, 4)
+	for _, field := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ';' || r == ' ' }) {
+		port, err := strconv.Atoi(strings.TrimSpace(field))
+		if err != nil || port < 1 || port > 65535 {
+			continue
+		}
+		if _, exists := seen[port]; exists {
+			continue
+		}
+		seen[port] = struct{}{}
+		result = append(result, port)
+	}
+	if len(result) == 0 {
+		return append([]int(nil), fallback...)
+	}
+	return result
+}
+
 func int64Env(key string, fallback int64) int64 {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
@@ -303,6 +336,26 @@ func boolEnv(key string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+func stringMapEnv(key string, fallback string) map[string]string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		value = fallback
+	}
+	result := map[string]string{}
+	for _, entry := range strings.FieldsFunc(value, func(r rune) bool { return r == ';' || r == '\n' }) {
+		name, pathValue, ok := strings.Cut(strings.TrimSpace(entry), "=")
+		if !ok {
+			continue
+		}
+		name = strings.ToUpper(strings.TrimSpace(name))
+		pathValue = strings.ReplaceAll(strings.Trim(strings.TrimSpace(pathValue), "/"), `\`, "/")
+		if name != "" && pathValue != "" {
+			result[name] = pathValue
+		}
+	}
+	return result
 }
 
 func photoRootsEnv(key string, legacyRoot string) ([]storage.RootConfig, error) {

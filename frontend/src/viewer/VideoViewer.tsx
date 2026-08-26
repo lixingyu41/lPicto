@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import Hls, { type Fragment } from 'hls.js';
 import { Check, ChevronDown, Database, Maximize2, Minimize2, Pause, PictureInPicture2, Play, RotateCw, Settings, SkipBack, SkipForward, Trash2, Volume2, VolumeX } from 'lucide-react';
 import type { Asset, SubtitleInfo, VideoProxyHeartbeat, VideoProxyRuntime, VideoSegmentStatus, VideoStoryboard } from '../types/api';
@@ -13,6 +13,7 @@ import {
 import { formatDuration } from '../utils/format';
 import { isSafariBrowser } from '../utils/browser';
 import { normalizeRotation, rotatedContainStyle } from '../utils/rotation';
+import { setViewerMediaZoomActive } from '../utils/viewerInteractionState';
 import {
   playbackRates,
   playbackModeOptions,
@@ -23,9 +24,11 @@ import {
 import DanmakuLayer from './DanmakuLayer';
 import { viewerAudioOutputBridge } from './audioOutputBridge';
 import type { ViewerMediaLayerMode } from './mediaLayer';
+import type { ViewerMediaPlaybackController } from './mediaPlaybackController';
 import MediaProgressSlider, { mediaBufferedRangesEqual, readMediaBufferedRanges, type MediaBufferedRange } from './MediaProgressSlider';
 
 export interface VideoPlaybackInfo {
+  audioNetworkBytesPerSecond: number;
   browserCachedBytes: number;
   bufferedEnd: number;
   buffering: boolean;
@@ -43,6 +46,7 @@ export interface VideoPlaybackInfo {
   hasPlaybackStarted: boolean;
   networkState: number;
   networkBytesPerSecond: number;
+  separateAVTransfers: boolean;
   notPlayingDetail: string | null;
   notPlayingReason: string | null;
   paused: boolean;
@@ -55,6 +59,7 @@ export interface VideoPlaybackInfo {
   seeking: boolean;
   sourceFailed: boolean;
   totalFrames: number;
+  videoNetworkBytesPerSecond: number;
 }
 
 interface Props {
@@ -67,15 +72,15 @@ interface Props {
   subtitlesEnabled: boolean;
   deleting: boolean;
   layerMode: ViewerMediaLayerMode;
-  mediaDetailsOpen: boolean;
-  preloadEnabled: boolean;
   onDanmakuPrefChange: (key: DanmakuPrefKey, value: number) => void;
   onDelete: () => void;
   onDeleteRecord: () => void;
   onMediaError: (assetId: number, cacheKey: string, message: string) => void;
   onMediaReady: (assetId: number, cacheKey: string) => void;
+  onPosterReady: (assetId: number, cacheKey: string) => void;
   onPriorityPreloadComplete: (assetId: number, cacheKey: string) => void;
   onPlaybackInfoChange?: (info: VideoPlaybackInfo | null) => void;
+  onPlaybackControllerChange?: (assetId: number, controller: ViewerMediaPlaybackController | null) => void;
   onPlaybackEnded: () => void;
   onPrevious: () => void;
   onNext: () => void;
@@ -86,7 +91,6 @@ interface Props {
   onRotate: () => void;
   onSelectedSubtitleChange: (value: string) => void;
   onSubtitlesEnabledChange: (value: boolean) => void;
-  onToggleMediaDetails: () => void;
   onToggleFullscreen: () => void;
   onProxyRuntimeChange?: (runtime: VideoSegmentStatus | null) => void;
 }
@@ -95,9 +99,9 @@ type DanmakuPrefKey = 'danmakuDensity' | 'danmakuFontScale' | 'danmakuOpacity' |
 
 const proxyPollMs = 3000;
 const proxyKeepaliveMs = 15000;
-const hlsSegmentSeconds = 10;
-const hlsPreloadSegments = 5;
-const hlsCriticalPreloadSegments = 3;
+const hlsFallbackSegmentSeconds = 4;
+const hlsFirstSegmentSeconds = 2;
+const hlsAheadSegments = 5;
 const volumeStep = 0.05;
 const danmakuDensitySteps = [0.25, 0.5, 0.75, 1, 1.25, 1.5] as const;
 const danmakuOpacitySteps = [0.15, 0.35, 0.55, 0.75, 0.95, 1] as const;
@@ -114,11 +118,16 @@ interface VideoAudioPreference {
 }
 
 interface VideoNetworkMetrics {
+  audioNetworkBytesPerSecond: number;
   browserCachedBytes: number;
   currentSegmentBytes: number;
   currentSegmentTotalBytes: number;
   networkBytesPerSecond: number;
+  separateAVTransfers: boolean;
+  videoNetworkBytesPerSecond: number;
 }
+
+type NetworkStreamKind = 'combined' | 'video' | 'audio';
 
 type VideoRuntimeStatus = VideoProxyRuntime | VideoSegmentStatus;
 
@@ -132,6 +141,9 @@ interface PresentationVideoElement extends HTMLVideoElement {
 
 const videoHoldZoomDelayMs = 220;
 const videoHoldClickSuppressMs = 350;
+const mobileFastForwardDelayMs = 420;
+const mobileFastForwardRate = 2;
+const mobilePressMoveTolerancePx = 12;
 
 let sharedVideoAudio: VideoAudioPreference | null = null;
 
@@ -145,15 +157,15 @@ export default function VideoViewer({
   subtitlesEnabled,
   deleting,
   layerMode,
-  mediaDetailsOpen,
-  preloadEnabled,
   onDanmakuPrefChange,
   onDelete,
   onDeleteRecord,
   onMediaError,
   onMediaReady,
+  onPosterReady,
   onPriorityPreloadComplete,
   onPlaybackInfoChange,
+  onPlaybackControllerChange,
   onPlaybackEnded,
   onPrevious,
   onNext,
@@ -164,13 +176,13 @@ export default function VideoViewer({
   onRotate,
   onSelectedSubtitleChange,
   onSubtitlesEnabledChange,
-  onToggleMediaDetails,
   onToggleFullscreen,
   onProxyRuntimeChange,
 }: Props) {
   const ref = useRef<HTMLVideoElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
   const mediaReadyKeyRef = useRef('');
+  const fullWarmKeyRef = useRef('');
   const settingsRef = useRef<HTMLDivElement | null>(null);
   const autoplayTimer = useRef<number | null>(null);
   const resumeTimer = useRef<number | null>(null);
@@ -182,6 +194,7 @@ export default function VideoViewer({
   const layerModeRef = useRef(layerMode);
   const preloadSegmentReadyRef = useRef(false);
   const priorityPreloadKeyRef = useRef('');
+  const aheadPreloadIndexRef = useRef(-1);
   const hlsLoadStopped = useRef(false);
   const skipNextAudioPreferenceSave = useRef(false);
   const wantsPlaying = useRef(false);
@@ -198,13 +211,22 @@ export default function VideoViewer({
   const networkResourceBytes = useRef(new Map<string, number>());
   const networkIdleTimer = useRef<number | null>(null);
   const networkProgressTimer = useRef<number | null>(null);
-  const activeNetworkFragment = useRef<Fragment | null>(null);
+  const activeNetworkFragment = useRef<{ fragment: Fragment; kind: NetworkStreamKind } | null>(null);
+  const separateAVTransfersRef = useRef(false);
   const storyboardLoadingRef = useRef(false);
   const storyboardUnavailableKeyRef = useRef('');
   const holdZoomTimer = useRef(0);
   const holdZoomActiveRef = useRef(false);
   const suppressVideoClickUntil = useRef(0);
   const holdZoomPointer = useRef({ clientX: 0, clientY: 0 });
+  const mobileFastForwardTimer = useRef<number | null>(null);
+  const mobilePressGesture = useRef<{
+    fastForwarding: boolean;
+    pointerId: number;
+    restoreRate: number;
+    startX: number;
+    startY: number;
+  } | null>(null);
   const [liveAsset, setLiveAsset] = useState(asset);
   const [audio, setAudio] = useState<VideoAudioPreference>(() => loadVideoAudioPreference());
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -236,6 +258,8 @@ export default function VideoViewer({
   const [proxySessionId] = useState(() => createVideoProxySessionId());
   const [proxyStartTime, setProxyStartTime] = useState(0);
   const [proxyRuntime, setProxyRuntime] = useState<VideoSegmentStatus | null>(null);
+  const [plannedSegmentSeconds, setPlannedSegmentSeconds] = useState(hlsFallbackSegmentSeconds);
+  const [sourcePriority, setSourcePriority] = useState<'current' | 'preload'>(() => layerMode === 'active' ? 'current' : 'preload');
   const [directReloadNonce, setDirectReloadNonce] = useState(0);
   const [duration, setDuration] = useState(asset.duration ?? 0);
   const [currentTime, setCurrentTime] = useState(0);
@@ -245,6 +269,9 @@ export default function VideoViewer({
   const [loadedStoryboardSheets, setLoadedStoryboardSheets] = useState<Set<string>>(() => new Set());
   const [frameSize, setFrameSize] = useState({ width: 0, height: 0 });
   const [holdZoom, setHoldZoom] = useState({ active: false, originX: 50, originY: 50 });
+  const zoomActivityOwner = useRef<object>({});
+  const [mobileControlsVisible, setMobileControlsVisible] = useState(false);
+  const [mobileFastForwarding, setMobileFastForwarding] = useState(false);
   const [videoMetrics, setVideoMetrics] = useState({
     decodedHeight: 0,
     decodedWidth: 0,
@@ -256,46 +283,58 @@ export default function VideoViewer({
     totalFrames: 0,
   });
   const [networkMetrics, setNetworkMetrics] = useState<VideoNetworkMetrics>({
+    audioNetworkBytesPerSecond: 0,
     browserCachedBytes: 0,
     currentSegmentBytes: 0,
     currentSegmentTotalBytes: 0,
     networkBytesPerSecond: 0,
+    separateAVTransfers: false,
+    videoNetworkBytesPerSecond: 0,
   });
+
+  useEffect(() => {
+    const active = layerMode === 'active' && holdZoom.active;
+    setViewerMediaZoomActive(zoomActivityOwner.current, active);
+    return () => setViewerMediaZoomActive(zoomActivityOwner.current, false);
+  }, [holdZoom.active, layerMode]);
   const playbackAsset = liveAsset.id === asset.id && liveAsset.cacheKey === asset.cacheKey ? liveAsset : asset;
   const browserFirst = viewerPrefs.videoProcessingMode === 'browser';
   const usesProxy = !playbackAsset.browserPlayable && (!browserFirst || browserDirectFailed) && !proxyFailed;
-  // Keep the real player attached for prepared neighbours as well.  A completed
-  // standalone fetch is not enough: hls.js would otherwise create a new media
-  // pipeline after navigation and request the first segment again.
-  const mediaLoadEnabled = layerMode === 'active' || preloadEnabled;
+  // Neighbour videos keep only their poster in the DOM. The real media pipeline
+  // is created only after the video becomes the active viewer item.
+  const mediaLoadEnabled = layerMode === 'active';
   const source = useMemo(() => {
     if (!mediaLoadEnabled) return '';
     if (usesProxy) {
       return assetVideoHlsPlaylistUrl(playbackAsset, {
         clientId: proxyClientId.current,
         sessionId: proxySessionId,
-        priority: 'preload',
+        priority: 'playback',
       });
     }
-    const directSource = assetVideoUrl(playbackAsset);
+    const directSource = assetVideoUrl(playbackAsset, layerMode === 'active' ? 'current' : sourcePriority);
     if (directReloadNonce <= 0) return directSource;
     const fragmentIndex = directSource.indexOf('#');
     const requestSource = fragmentIndex >= 0 ? directSource.slice(0, fragmentIndex) : directSource;
     const fragment = fragmentIndex >= 0 ? directSource.slice(fragmentIndex) : '';
     return `${requestSource}&reload=${directReloadNonce}${fragment}`;
-  }, [directReloadNonce, mediaLoadEnabled, playbackAsset, proxySessionId, usesProxy]);
+  }, [directReloadNonce, layerMode, mediaLoadEnabled, playbackAsset, proxySessionId, sourcePriority, usesProxy]);
 
   const subtitleSource = subtitlesEnabled && selectedSubtitleId ? assetSubtitleUrl(asset, selectedSubtitleId) : '';
   const canPlay = !sourceFailed && Boolean(source);
   const posterSource = asset.thumbStatus === 'ready' ? assetPreviewUrl(asset) : '';
   const showPosterLayer = Boolean(posterSource) && (!canPlay || !firstFrameReady);
   const statusLabel = videoStatusLabel(playbackAsset, sourceFailed, proxyRuntime);
-  const directPrewarmStart = Math.floor(Math.max(0, currentTime) / 20) * 20;
+  const directPrewarmStart = Math.floor(Math.max(0, currentTime) / plannedSegmentSeconds) * plannedSegmentSeconds;
 
   useEffect(() => {
     if (layerMode !== 'active' || usesProxy || !playbackAsset.browserPlayable) return;
     void api.prewarmDirectVideo(playbackAsset.id, directPrewarmStart).catch(() => undefined);
   }, [directPrewarmStart, layerMode, playbackAsset.browserPlayable, playbackAsset.id, source, usesProxy]);
+
+  useEffect(() => {
+    if (layerMode === 'active' && !preloadSegmentReady && sourcePriority !== 'current') setSourcePriority('current');
+  }, [layerMode, preloadSegmentReady, sourcePriority]);
   const displayedTime = scrubTime ?? currentTime;
   const storyboardCandidate = useMemo(() => {
     if (!storyboard || !storyboardHover || storyboard.interval <= 0 || storyboard.cacheKey !== asset.cacheKey) return null;
@@ -342,13 +381,22 @@ export default function VideoViewer({
   function updateBackgroundPreloadProgress(video: HTMLVideoElement) {
     if (layerModeRef.current === 'active' || preloadSegmentReadyRef.current) return;
     const mediaDuration = video.duration || asset.duration || 0;
-    const target = Math.min(10, mediaDuration > 0 ? mediaDuration : 10);
+    const target = Math.min(plannedSegmentSeconds, mediaDuration > 0 ? mediaDuration : plannedSegmentSeconds);
     let bufferedThrough = 0;
     for (let index = 0; index < video.buffered.length; index += 1) {
       if (video.buffered.start(index) <= 0.25) bufferedThrough = Math.max(bufferedThrough, video.buffered.end(index));
     }
+    if (usesProxy && bufferedThrough > 0.05) {
+      video.pause();
+      video.currentTime = 0;
+      currentTimeRef.current = 0;
+      setCurrentTime(0);
+      preloadSegmentReadyRef.current = true;
+      setPreloadSegmentReady(true);
+      notifyPreparedMedia();
+      return;
+    }
     if (bufferedThrough + 0.25 < target) {
-      if (usesProxy) return;
       const probeTime = Math.min(Math.max(0, target - 0.05), Math.max(0, bufferedThrough - 0.05));
       if (!video.seeking && probeTime > 0 && Math.abs(video.currentTime - probeTime) > 0.2) video.currentTime = probeTime;
       return;
@@ -364,8 +412,10 @@ export default function VideoViewer({
 
   useLayoutEffect(() => {
     mediaReadyKeyRef.current = '';
+    fullWarmKeyRef.current = '';
     preloadSegmentReadyRef.current = false;
     priorityPreloadKeyRef.current = '';
+    aheadPreloadIndexRef.current = -1;
     setFirstFrameReady(false);
     setPreloadSegmentReady(false);
 	storyboardLoadingRef.current = false;
@@ -453,18 +503,11 @@ export default function VideoViewer({
     const controller = new AbortController();
     const session = { clientId: proxyClientId.current, sessionId: proxySessionId };
     void (async () => {
-      await api.prewarmVideoSegments(asset.id, 0, hlsCriticalPreloadSegments, 'critical', session, controller.signal);
+      const first = await api.prewarmVideoSegments(asset.id, 0, 1, 'playback', session, controller.signal);
+      if (first.segmentSeconds && first.segmentSeconds > 0) setPlannedSegmentSeconds(first.segmentSeconds);
+      await api.prewarmVideoSegments(asset.id, 1, 1, 'critical', session, controller.signal);
       if (controller.signal.aborted || layerModeRef.current !== 'active') return;
       onPriorityPreloadComplete(asset.id, asset.cacheKey);
-      await api.prewarmVideoSegments(
-        asset.id,
-        hlsCriticalPreloadSegments,
-        hlsPreloadSegments - hlsCriticalPreloadSegments,
-        'balanced',
-        session,
-        controller.signal,
-      );
-      if (controller.signal.aborted || layerModeRef.current !== 'active') return;
       priorityPreloadKeyRef.current = key;
     })().catch((err: unknown) => {
       if (controller.signal.aborted) return;
@@ -472,6 +515,49 @@ export default function VideoViewer({
     });
     return () => controller.abort();
   }, [asset.cacheKey, asset.id, layerMode, onMediaError, onPriorityPreloadComplete, proxySessionId, usesProxy]);
+
+  useEffect(() => {
+    if (layerMode !== 'active' || !usesProxy || plannedSegmentSeconds <= 0) return;
+    const currentSegment = hlsSegmentIndexForTime(currentTime, plannedSegmentSeconds);
+    const nextSegment = currentSegment + 1;
+    if (aheadPreloadIndexRef.current === nextSegment) return;
+    aheadPreloadIndexRef.current = nextSegment;
+    void api.prewarmVideoSegments(
+      asset.id,
+      nextSegment,
+      1,
+      'critical',
+      { clientId: proxyClientId.current, sessionId: proxySessionId },
+    ).catch(() => undefined);
+  }, [asset.id, currentTime, layerMode, plannedSegmentSeconds, proxySessionId, usesProxy]);
+
+  useEffect(() => {
+    if (layerMode !== 'active' || !hasPlaybackStarted) return;
+    const totalDuration = duration || asset.duration || 0;
+    if (totalDuration <= 0) return;
+    const fullWarmThreshold = Math.min(120, totalDuration * 0.1);
+    if (currentTime + 0.05 < fullWarmThreshold) return;
+    const key = `${asset.id}:${asset.cacheKey}`;
+    if (fullWarmKeyRef.current === key) return;
+    if (!usesProxy && !playbackAsset.browserPlayable) return;
+    fullWarmKeyRef.current = key;
+    if (usesProxy) {
+      const from = hlsSegmentIndexForTime(currentTime, plannedSegmentSeconds);
+      void api.prewarmAllVideoSegments(
+        asset.id,
+        from,
+        { clientId: proxyClientId.current, sessionId: proxySessionId },
+      ).catch(() => {
+        if (fullWarmKeyRef.current === key) fullWarmKeyRef.current = '';
+      });
+      return;
+    }
+    if (playbackAsset.browserPlayable) {
+      void api.prewarmDirectVideo(asset.id, currentTime, true).catch(() => {
+        if (fullWarmKeyRef.current === key) fullWarmKeyRef.current = '';
+      });
+    }
+  }, [asset.cacheKey, asset.duration, asset.id, currentTime, duration, hasPlaybackStarted, layerMode, plannedSegmentSeconds, playbackAsset.browserPlayable, proxySessionId, usesProxy]);
 
   const stopHLSSession = () => {
     if (!usesProxy) return;
@@ -486,10 +572,6 @@ export default function VideoViewer({
     if (previousLayerMode.current === 'active' && layerMode !== 'active') stopHLSSession();
     previousLayerMode.current = layerMode;
   }, [asset.id, layerMode, proxySessionId, usesProxy]);
-
-  useEffect(() => {
-    if (layerMode === 'prepare' && !preloadEnabled) stopHLSSession();
-  }, [asset.id, layerMode, preloadEnabled, proxySessionId, usesProxy]);
 
   useEffect(() => () => stopHLSSession(), [asset.id, proxySessionId, usesProxy]);
 
@@ -538,6 +620,62 @@ export default function VideoViewer({
     holdZoomTimer.current = 0;
   };
 
+  const clearMobileFastForwardTimer = () => {
+    if (mobileFastForwardTimer.current === null) return;
+    window.clearTimeout(mobileFastForwardTimer.current);
+    mobileFastForwardTimer.current = null;
+  };
+
+  const endMobileFastForward = () => {
+    clearMobileFastForwardTimer();
+    const gesture = mobilePressGesture.current;
+    mobilePressGesture.current = null;
+    if (!gesture?.fastForwarding) return;
+    const video = ref.current;
+    if (video) video.playbackRate = gesture.restoreRate;
+    suppressVideoClickUntil.current = Date.now() + videoHoldClickSuppressMs;
+    setMobileFastForwarding(false);
+  };
+
+  const handleMobilePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!isMobileViewerInteraction() || !event.isPrimary || layerMode !== 'active') return;
+    clearMobileFastForwardTimer();
+    mobilePressGesture.current = {
+      fastForwarding: false,
+      pointerId: event.pointerId,
+      restoreRate: ref.current?.playbackRate || playbackRate,
+      startX: event.clientX,
+      startY: event.clientY,
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    mobileFastForwardTimer.current = window.setTimeout(() => {
+      mobileFastForwardTimer.current = null;
+      const gesture = mobilePressGesture.current;
+      const video = ref.current;
+      if (!gesture || gesture.pointerId !== event.pointerId || !video || video.paused || video.ended) return;
+      gesture.fastForwarding = true;
+      gesture.restoreRate = video.playbackRate;
+      video.playbackRate = Math.max(mobileFastForwardRate, video.playbackRate);
+      suppressVideoClickUntil.current = Date.now() + 1000;
+      setMobileFastForwarding(true);
+      setMobileControlsVisible(false);
+    }, mobileFastForwardDelayMs);
+  };
+
+  const handleMobilePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = mobilePressGesture.current;
+    if (!gesture || gesture.pointerId !== event.pointerId || gesture.fastForwarding) return;
+    if (
+      Math.abs(event.clientX - gesture.startX) > mobilePressMoveTolerancePx
+      || Math.abs(event.clientY - gesture.startY) > mobilePressMoveTolerancePx
+    ) clearMobileFastForwardTimer();
+  };
+
+  const handleMobilePointerEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (mobilePressGesture.current?.pointerId !== event.pointerId) return;
+    endMobileFastForward();
+  };
+
   const updateHoldZoomOrigin = (clientX: number, clientY: number) => {
     const frame = frameRef.current;
     if (!frame) return;
@@ -557,7 +695,7 @@ export default function VideoViewer({
   };
 
   const handleVideoMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
-    if (event.button !== 0 || layerMode !== 'active' || (!firstFrameReady && !posterSource)) return;
+    if (isMobileViewerInteraction() || event.button !== 0 || layerMode !== 'active' || (!firstFrameReady && !posterSource)) return;
     clearHoldZoomTimer();
     holdZoomPointer.current = { clientX: event.clientX, clientY: event.clientY };
     holdZoomTimer.current = window.setTimeout(() => {
@@ -570,6 +708,7 @@ export default function VideoViewer({
   };
 
   const handleVideoMouseMove = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (isMobileViewerInteraction()) return;
     holdZoomPointer.current = { clientX: event.clientX, clientY: event.clientY };
     if (!holdZoomActiveRef.current) return;
     if (event.buttons !== 1) {
@@ -586,6 +725,15 @@ export default function VideoViewer({
       suppressVideoClickUntil.current = 0;
       return;
     }
+    if (isMobileViewerInteraction()) {
+      event.preventDefault();
+      event.stopPropagation();
+      setMobileControlsVisible((visible) => {
+        if (visible) closeSettings();
+        return !visible;
+      });
+      return;
+    }
     togglePlay();
   };
 
@@ -595,6 +743,7 @@ export default function VideoViewer({
     return () => {
       window.removeEventListener('mouseup', handleWindowMouseUp);
       clearHoldZoomTimer();
+      endMobileFastForward();
     };
   }, []);
 
@@ -603,6 +752,8 @@ export default function VideoViewer({
     holdZoomActiveRef.current = false;
     suppressVideoClickUntil.current = 0;
     setHoldZoom({ active: false, originX: 50, originY: 50 });
+    endMobileFastForward();
+    setMobileControlsVisible(false);
   }, [asset.cacheKey, asset.id, layerMode]);
 
   const startProxyPlayback = () => {
@@ -617,7 +768,7 @@ export default function VideoViewer({
 
   const promoteCurrentPlaybackSegment = (time = currentTimeRef.current) => {
     if (!usesProxy) return;
-    const segmentIndex = Math.max(0, Math.floor(time / hlsSegmentSeconds));
+    const segmentIndex = hlsSegmentIndexForTime(time, plannedSegmentSeconds);
     void api.prewarmVideoSegments(
       asset.id,
       segmentIndex,
@@ -675,6 +826,38 @@ export default function VideoViewer({
     }
   };
 
+  useEffect(() => {
+    if (layerMode !== 'active') return;
+    const pause = () => {
+      wantsPlaying.current = false;
+      proxyPlayPending.current = false;
+      setPlayRequested(false);
+      clearAutoplayTimer();
+      clearResumeTimer();
+      ref.current?.pause();
+    };
+    const controller: ViewerMediaPlaybackController = {
+      play: () => {
+        const video = ref.current;
+        if (!video || !canPlay) return;
+        viewerAudioOutputBridge.prime();
+        void startPlayback(video);
+      },
+      pause,
+      stop: () => {
+        pause();
+        const video = ref.current;
+        if (!video) return;
+        video.currentTime = 0;
+        currentTimeRef.current = 0;
+        setCurrentTime(0);
+        setEnded(false);
+      },
+    };
+    onPlaybackControllerChange?.(asset.id, controller);
+    return () => onPlaybackControllerChange?.(asset.id, null);
+  }, [asset.id, canPlay, layerMode, onPlaybackControllerChange]);
+
   const toggleMute = () => {
     const video = ref.current;
     if (!video) return;
@@ -695,7 +878,7 @@ export default function VideoViewer({
     video.muted = next === 0;
   };
 
-  const recordNetworkProgress = (key: string, loaded: number, total: number, startedAt: number, transferred = loaded) => {
+  const recordNetworkProgress = (key: string, loaded: number, total: number, startedAt: number, transferred = loaded, kind: NetworkStreamKind = 'combined') => {
     const safeLoaded = Math.max(0, Number.isFinite(loaded) ? loaded : 0);
     const safeTotal = Math.max(safeLoaded, Number.isFinite(total) ? total : 0);
     const previous = networkResourceBytes.current.get(key) ?? 0;
@@ -705,15 +888,24 @@ export default function VideoViewer({
     const safeTransferred = Math.max(0, Number.isFinite(transferred) ? transferred : 0);
     const speed = safeTransferred > 0 ? safeTransferred * 1000 / elapsedMs : 0;
     setNetworkMetrics((current) => ({
+      ...current,
+      audioNetworkBytesPerSecond: kind === 'audio' ? speed : current.audioNetworkBytesPerSecond,
       browserCachedBytes: current.browserCachedBytes + added,
       currentSegmentBytes: safeLoaded,
       currentSegmentTotalBytes: safeTotal,
-      networkBytesPerSecond: speed || current.networkBytesPerSecond,
+      networkBytesPerSecond: kind === 'combined' ? speed : current.networkBytesPerSecond,
+      separateAVTransfers: current.separateAVTransfers || kind !== 'combined',
+      videoNetworkBytesPerSecond: kind === 'video' ? speed : current.videoNetworkBytesPerSecond,
     }));
     if (networkIdleTimer.current !== null) window.clearTimeout(networkIdleTimer.current);
     networkIdleTimer.current = window.setTimeout(() => {
       networkIdleTimer.current = null;
-      setNetworkMetrics((current) => ({ ...current, networkBytesPerSecond: 0 }));
+      setNetworkMetrics((current) => ({
+        ...current,
+        audioNetworkBytesPerSecond: 0,
+        networkBytesPerSecond: 0,
+        videoNetworkBytesPerSecond: 0,
+      }));
     }, 2500);
   };
 
@@ -724,14 +916,22 @@ export default function VideoViewer({
     networkProgressTimer.current = null;
   };
 
-  const startFragmentNetworkProgress = (fragment: Fragment) => {
+  const fragmentNetworkKind = (fragment: Fragment): NetworkStreamKind => {
+    if (String(fragment.type) === 'audio') {
+      separateAVTransfersRef.current = true;
+      return 'audio';
+    }
+    return separateAVTransfersRef.current ? 'video' : 'combined';
+  };
+
+  const startFragmentNetworkProgress = (fragment: Fragment, kind: NetworkStreamKind) => {
     stopFragmentNetworkProgress();
-    activeNetworkFragment.current = fragment;
+    activeNetworkFragment.current = { fragment, kind };
     const update = () => {
       const current = activeNetworkFragment.current;
       if (!current) return;
-      const stats = current.stats;
-      recordNetworkProgress(current.url, stats.loaded, stats.total, stats.loading.start);
+      const stats = current.fragment.stats;
+      recordNetworkProgress(current.fragment.url, stats.loaded, stats.total, stats.loading.start, stats.loaded, current.kind);
     };
     update();
     networkProgressTimer.current = window.setInterval(update, 250);
@@ -816,8 +1016,8 @@ export default function VideoViewer({
       video.volume = savedAudio.volume;
       video.muted = savedAudio.muted;
       if (hlsRef.current) {
-        hlsRef.current.config.maxBufferLength = hlsSegmentSeconds * hlsCriticalPreloadSegments;
-        hlsRef.current.config.maxMaxBufferLength = hlsSegmentSeconds * hlsCriticalPreloadSegments;
+        hlsRef.current.config.maxBufferLength = plannedSegmentSeconds * hlsAheadSegments;
+        hlsRef.current.config.maxMaxBufferLength = plannedSegmentSeconds * hlsAheadSegments;
         hlsRef.current.startLoad(currentTimeRef.current);
         hlsLoadStopped.current = false;
       }
@@ -907,15 +1107,15 @@ export default function VideoViewer({
       return undefined;
     }
     const hls = new Hls({
-      backBufferLength: hlsSegmentSeconds,
+      backBufferLength: plannedSegmentSeconds,
       fragLoadingMaxRetry: 2,
       lowLatencyMode: false,
-      maxBufferLength: hlsSegmentSeconds * hlsCriticalPreloadSegments,
-      maxMaxBufferLength: hlsSegmentSeconds * hlsCriticalPreloadSegments,
+      maxBufferLength: plannedSegmentSeconds * hlsAheadSegments,
+      maxMaxBufferLength: plannedSegmentSeconds * hlsAheadSegments,
       startFragPrefetch: layerModeRef.current !== 'active',
       xhrSetup: (xhr, url) => {
         if (!url.includes('/hls/segments/')) return;
-        const priority = layerModeRef.current === 'active' && wantsPlaying.current ? 'playback' : 'preload';
+        const priority = layerModeRef.current === 'active' ? 'playback' : 'preload';
         xhr.setRequestHeader('X-LPicto-Segment-Priority', priority);
       },
     });
@@ -933,7 +1133,7 @@ export default function VideoViewer({
     hls.on(Hls.Events.FRAG_LOADING, (_event, data) => {
       setHlsPhase('segment');
       setBuffering(true);
-      startFragmentNetworkProgress(data.frag);
+      startFragmentNetworkProgress(data.frag, fragmentNetworkKind(data.frag));
     });
     hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
       setHlsPhase('ready');
@@ -941,7 +1141,9 @@ export default function VideoViewer({
       const stats = data.frag.stats;
       const payloadBytes = data.payload.byteLength;
       const loaded = Math.max(stats.loaded, payloadBytes);
-      recordNetworkProgress(data.frag.url, loaded, Math.max(stats.total, loaded), stats.loading.start, stats.loaded);
+      const active = activeNetworkFragment.current;
+      const kind = active?.fragment.url === data.frag.url ? active.kind : fragmentNetworkKind(data.frag);
+      recordNetworkProgress(data.frag.url, loaded, Math.max(stats.total, loaded), stats.loading.start, stats.loaded, kind);
       stopFragmentNetworkProgress();
       void pollVideoSegmentStatus(asset.id, proxySessionId);
     });
@@ -967,21 +1169,29 @@ export default function VideoViewer({
       video.removeAttribute('src');
       video.load();
     };
-  }, [asset.id, onMediaError, proxySessionId, source, usesProxy]);
+  }, [asset.id, onMediaError, plannedSegmentSeconds, proxySessionId, source, usesProxy]);
 
   useEffect(() => {
     networkResourceBytes.current.clear();
-    setNetworkMetrics({ browserCachedBytes: 0, currentSegmentBytes: 0, currentSegmentTotalBytes: 0, networkBytesPerSecond: 0 });
+    separateAVTransfersRef.current = false;
+    setNetworkMetrics({
+      audioNetworkBytesPerSecond: 0,
+      browserCachedBytes: 0,
+      currentSegmentBytes: 0,
+      currentSegmentTotalBytes: 0,
+      networkBytesPerSecond: 0,
+      separateAVTransfers: false,
+      videoNetworkBytesPerSecond: 0,
+    });
+    if (usesProxy) return undefined;
     if (typeof PerformanceObserver === 'undefined') return undefined;
     const startedAt = performance.now();
-    const pathMarkers = usesProxy
-      ? [`/api/assets/${asset.id}/hls/segments/`, `/api/assets/${asset.id}/hls/playlist.m3u8`]
-      : [`/api/assets/${asset.id}/video`];
+    const pathMarkers = [`/api/assets/${asset.id}/video`];
     const observer = new PerformanceObserver((list) => {
       list.getEntries().forEach((entry) => {
         if (!(entry instanceof PerformanceResourceTiming) || entry.startTime < startedAt || !pathMarkers.some((marker) => entry.name.includes(marker))) return;
         const bytes = entry.decodedBodySize || entry.encodedBodySize || entry.transferSize || 0;
-        const key = usesProxy ? entry.name : `${entry.name}:${entry.startTime}`;
+        const key = `${entry.name}:${entry.startTime}`;
         recordNetworkProgress(key, bytes, bytes, entry.startTime, entry.transferSize);
       });
     });
@@ -1032,6 +1242,7 @@ export default function VideoViewer({
 
   const playbackInfo = useMemo<VideoPlaybackInfo>(
     () => ({
+      audioNetworkBytesPerSecond: networkMetrics.audioNetworkBytesPerSecond,
       browserCachedBytes: networkMetrics.browserCachedBytes,
       bufferedEnd,
       buffering,
@@ -1049,6 +1260,7 @@ export default function VideoViewer({
       hasPlaybackStarted,
       networkState: videoMetrics.networkState,
       networkBytesPerSecond: networkMetrics.networkBytesPerSecond,
+      separateAVTransfers: networkMetrics.separateAVTransfers,
       notPlayingDetail: playbackDiagnosis.detail,
       notPlayingReason: playbackDiagnosis.reason,
       paused,
@@ -1061,6 +1273,7 @@ export default function VideoViewer({
       seeking,
       sourceFailed,
       totalFrames: videoMetrics.totalFrames,
+      videoNetworkBytesPerSecond: networkMetrics.videoNetworkBytesPerSecond,
     }),
     [bufferedEnd, buffering, canPlay, currentTime, duration, ended, frameSize, hasPlaybackStarted, networkMetrics, paused, playError, playbackDiagnosis, playbackRate, seeking, sourceFailed, videoMetrics],
   );
@@ -1172,6 +1385,8 @@ export default function VideoViewer({
     setProxyStreamEnabled(false);
     setProxyStartTime(0);
     setProxyRuntime(null);
+    setPlannedSegmentSeconds(hlsFallbackSegmentSeconds);
+    setSourcePriority(layerModeRef.current === 'active' ? 'current' : 'preload');
     setDirectReloadNonce(0);
     proxyPlayPending.current = false;
     wantsPlaying.current = false;
@@ -1204,6 +1419,7 @@ export default function VideoViewer({
         });
         if (!active || !videoSegmentStatusMatches(runtime, pollAssetId, pollSessionId)) return;
         setProxyRuntime(runtime);
+        if (runtime.segmentSeconds > 0) setPlannedSegmentSeconds(runtime.segmentSeconds);
       } catch {
         // Playback owns segment requests; status polling should not interrupt it.
       } finally {
@@ -1334,24 +1550,23 @@ export default function VideoViewer({
     const mediaDuration = duration || asset.duration || video.duration || 0;
     const ranges = readMediaBufferedRanges(video, mediaDuration);
     setBufferedRanges((current) => mediaBufferedRangesEqual(current, ranges) ? current : ranges);
-    let next = 0;
+    let next = video.currentTime;
     for (let index = 0; index < video.buffered.length; index++) {
       const start = video.buffered.start(index);
       const end = video.buffered.end(index);
-      if (start <= video.currentTime && end >= video.currentTime) {
+      if (start <= video.currentTime + 0.05 && end >= video.currentTime - 0.05) {
         next = end;
         break;
       }
-      next = Math.max(next, end);
     }
     setBufferedEnd(clampTime(next, duration || asset.duration || next));
     const hls = hlsRef.current;
     if (!hls || layerModeRef.current !== 'active') return;
     const forwardSeconds = Math.max(0, next - video.currentTime);
-    if (forwardSeconds >= hlsSegmentSeconds * hlsCriticalPreloadSegments && !hlsLoadStopped.current) {
+    if (forwardSeconds >= plannedSegmentSeconds * hlsAheadSegments && !hlsLoadStopped.current) {
       hls.stopLoad();
       hlsLoadStopped.current = true;
-    } else if (forwardSeconds < hlsSegmentSeconds * Math.max(1, hlsCriticalPreloadSegments - 1) && hlsLoadStopped.current) {
+    } else if (forwardSeconds < plannedSegmentSeconds && hlsLoadStopped.current) {
       hls.startLoad();
       hlsLoadStopped.current = false;
     }
@@ -1427,13 +1642,17 @@ export default function VideoViewer({
   }
 
   return (
-    <div className={`${canPlay ? 'video-stage' : 'video-stage video-stage-pending'}${holdZoom.active ? ' video-hold-zoom-active' : ''}`}>
+    <div className={`${canPlay ? 'video-stage' : 'video-stage video-stage-pending'}${holdZoom.active ? ' video-hold-zoom-active' : ''}${mobileControlsVisible ? ' mobile-controls-visible' : ''}${mobileFastForwarding ? ' mobile-fast-forward-active' : ''}`}>
       <div
         className={holdZoom.active ? 'video-frame video-hold-zooming' : 'video-frame'}
         ref={frameRef}
         onMouseDown={handleVideoMouseDown}
         onMouseMove={handleVideoMouseMove}
         onMouseUp={endHoldZoom}
+        onPointerCancel={handleMobilePointerEnd}
+        onPointerDown={handleMobilePointerDown}
+        onPointerMove={handleMobilePointerMove}
+        onPointerUp={handleMobilePointerEnd}
         onMouseLeave={() => {
           if (!holdZoomActiveRef.current) clearHoldZoomTimer();
         }}
@@ -1595,24 +1814,33 @@ export default function VideoViewer({
           source={subtitleSource}
           speed={viewerPrefs.danmakuSpeed}
         />
-        {showPosterLayer && (
+        {posterSource && (
           <button
-            className={canPlay ? 'video-poster-layer playable' : 'video-poster-layer'}
+            className={`${canPlay ? 'video-poster-layer playable' : 'video-poster-layer'}${firstFrameReady ? ' video-poster-layer-ready' : ''}`}
             type="button"
-            disabled={!canPlay}
+            disabled={!canPlay || firstFrameReady}
+            aria-hidden={firstFrameReady}
+            tabIndex={firstFrameReady ? -1 : undefined}
             onClick={handleVideoSurfaceClick}
           >
-            <img src={posterSource} alt={asset.filename} style={zoomedMediaStyle} />
-            {canPlay && !holdZoom.active ? (
+            <img
+              src={posterSource}
+              alt={asset.filename}
+              style={zoomedMediaStyle}
+              onLoad={() => {
+                if (layerModeRef.current !== 'active') onPosterReady(asset.id, asset.cacheKey);
+              }}
+            />
+            {!firstFrameReady && canPlay && !holdZoom.active ? (
               <>
                 <span className="video-big-play">
                   <Play size={34} fill="currentColor" />
                 </span>
                 {playError && <span className="video-play-error">{playError}</span>}
               </>
-            ) : (
+            ) : !firstFrameReady ? (
               <span className="video-status-badge">{statusLabel}</span>
-            )}
+            ) : null}
           </button>
         )}
         {!posterSource && !canPlay && <div className="video-pending">{statusLabel}</div>}
@@ -1622,6 +1850,7 @@ export default function VideoViewer({
             <span>点击播放开始转码</span>
           </button>
         )}
+        {mobileFastForwarding && <div className="video-mobile-fast-forward" role="status">{Math.max(mobileFastForwardRate, playbackRate)}× 快进</div>}
       </div>
       <div
         className={settingsOpen ? 'video-control-zone settings-open' : 'video-control-zone'}
@@ -1864,18 +2093,6 @@ export default function VideoViewer({
                   <span>视频旋转</span>
                   <span><output>{asset.rotation || 0}°</output><RotateCw size={16} /></span>
                 </button>
-                <label className="video-settings-row video-settings-toggle-row">
-                  <span>媒体详情</span>
-                  <span className="video-settings-switch">
-                    <input
-                      aria-label="媒体详情"
-                      type="checkbox"
-                      checked={mediaDetailsOpen}
-                      onChange={onToggleMediaDetails}
-                    />
-                    <span aria-hidden="true" />
-                  </span>
-                </label>
                 <button
                   className="video-settings-action danger"
                   type="button"
@@ -2005,6 +2222,14 @@ function videoProxyRuntimeMatches(runtime: VideoProxyRuntime, assetId: number, s
 
 function videoSegmentStatusMatches(runtime: VideoSegmentStatus, assetId: number, sessionId: string) {
   return runtime.assetId === assetId && runtime.sessionId === sessionId;
+}
+
+function hlsSegmentIndexForTime(time: number, segmentSeconds: number) {
+  const normalizedTime = Math.max(0, time);
+  const normalizedSegmentSeconds = Math.max(hlsFirstSegmentSeconds, segmentSeconds);
+  const firstDuration = Math.min(hlsFirstSegmentSeconds, normalizedSegmentSeconds);
+  if (normalizedTime < firstDuration) return 0;
+  return 1 + Math.floor((normalizedTime - firstDuration) / normalizedSegmentSeconds);
 }
 
 function videoMetricsEqual(
@@ -2261,6 +2486,10 @@ function createVideoProxySessionId() {
 function clampVolume(value: number) {
   if (!Number.isFinite(value)) return 1;
   return Math.min(1, Math.max(0, value));
+}
+
+function isMobileViewerInteraction() {
+  return typeof window !== 'undefined' && window.matchMedia('(hover: none) and (pointer: coarse)').matches;
 }
 
 function clampTime(value: number, max: number) {

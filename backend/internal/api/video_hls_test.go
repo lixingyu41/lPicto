@@ -15,22 +15,6 @@ import (
 	"lpicto/backend/internal/storage"
 )
 
-func TestPlaybackSegmentPreemptsBalancedAndKeepsPeerPlaybackRunning(t *testing.T) {
-	warmupCtx, cancelWarmup := context.WithCancelCause(context.Background())
-	oldViewerCtx, cancelOldViewer := context.WithCancelCause(context.Background())
-	server := &Server{videoSegmentStates: map[string]*videoSegmentRuntime{
-		"warmup": {CacheKey: "warmup", SessionID: "same", Priority: videoSegmentPriorityBalanced, Transcoding: true, Cancel: cancelWarmup},
-		"old":    {CacheKey: "old", SessionID: "old", Priority: videoSegmentPriorityPlayback, Transcoding: true, Cancel: cancelOldViewer},
-	}}
-	server.preemptVideoSegmentsLocked("playing", videoSegmentPriorityPlayback)
-	if !errors.Is(context.Cause(warmupCtx), errVideoSegmentPreempted) {
-		t.Fatalf("warmup cause = %v", context.Cause(warmupCtx))
-	}
-	if context.Cause(oldViewerCtx) != nil {
-		t.Fatalf("peer playback was cancelled: %v", context.Cause(oldViewerCtx))
-	}
-}
-
 func TestVideoSegmentQueueUsesPriorityThenFIFO(t *testing.T) {
 	server := &Server{videoSegmentStates: map[string]*videoSegmentRuntime{
 		"tail":     {CacheKey: "tail", Priority: videoSegmentPriorityBalanced, QueueOrder: 2, Queued: true, Cancel: func(error) {}},
@@ -48,6 +32,17 @@ func TestVideoSegmentQueueUsesPriorityThenFIFO(t *testing.T) {
 	server.videoSegmentStates["playing-1"] = &videoSegmentRuntime{CacheKey: "playing-1", Priority: videoSegmentPriorityPlayback, QueueOrder: 4, Queued: true, Cancel: func(error) {}}
 	if got := server.videoSegmentQueueHeadLocked(); got == nil || got.CacheKey != "playing-1" {
 		t.Fatalf("playback queue head = %#v, want oldest playback request", got)
+	}
+}
+
+func TestVideoSegmentQueueSpreadsSlotsAcrossPlaybackSessions(t *testing.T) {
+	server := &Server{videoSegmentStates: map[string]*videoSegmentRuntime{
+		"running-a": {CacheKey: "running-a", SessionID: "viewer-a", Priority: videoSegmentPriorityPlayback, Transcoding: true},
+		"next-a":    {CacheKey: "next-a", SessionID: "viewer-a", Priority: videoSegmentPriorityPlayback, QueueOrder: 1, Queued: true, Cancel: func(error) {}},
+		"next-b":    {CacheKey: "next-b", SessionID: "viewer-b", Priority: videoSegmentPriorityPlayback, QueueOrder: 2, Queued: true, Cancel: func(error) {}},
+	}}
+	if got := server.videoSegmentQueueHeadLocked(); got == nil || got.CacheKey != "next-b" {
+		t.Fatalf("queue head = %#v, want idle playback session", got)
 	}
 }
 
@@ -92,6 +87,19 @@ func TestSharedVideoSegmentSurvivesUntilLastSessionStops(t *testing.T) {
 	}
 	if !errors.Is(context.Cause(ctx), errVideoSegmentSessionStop) {
 		t.Fatalf("last stop cause = %v", context.Cause(ctx))
+	}
+}
+
+func TestStopVideoSegmentSessionLetsStartedSegmentFinish(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	server := &Server{videoSegmentStates: map[string]*videoSegmentRuntime{
+		"running": {AssetID: 7, SessionID: "viewer", Transcoding: true, Cancel: cancel},
+	}}
+	if got := server.stopVideoSegmentSession(7, "viewer"); got != 0 {
+		t.Fatalf("cancelled = %d, want 0", got)
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		t.Fatalf("started segment was discarded: %v", cause)
 	}
 }
 
@@ -178,12 +186,51 @@ func TestVideoSegmentStatusPrefersPlaybackOverQueuedWarmup(t *testing.T) {
 	}
 }
 
-func TestVideoSegmentCountAndTailDuration(t *testing.T) {
-	if got := videoSegmentCount(25.2, 10); got != 3 {
-		t.Fatalf("segment count = %d, want 3", got)
+func TestVideoSegmentStatusWithoutSessionReportsActiveServerTask(t *testing.T) {
+	duration := 60.0
+	server := &Server{
+		cfg:   config.Config{VideoSegmentSeconds: 10, VideoProxyCRF: 23},
+		store: storage.Store{CacheRoot: t.TempDir()},
+		videoSegmentStates: map[string]*videoSegmentRuntime{
+			"viewer-a": {AssetID: 7, SessionID: "viewer-a", SegmentIndex: 4, Priority: videoSegmentPriorityBalanced, Queued: true, UpdatedAt: time.Now()},
+			"viewer-b": {AssetID: 7, SessionID: "viewer-b", SegmentIndex: 2, Priority: videoSegmentPriorityPlayback, Transcoding: true, Progress: 0.4, UpdatedAt: time.Now().Add(-time.Second)},
+		},
 	}
-	if got := videoSegmentDuration(25.2, 10, 2); got < 5.19 || got > 5.21 {
-		t.Fatalf("tail duration = %.3f, want about 5.2", got)
+	dto := server.videoSegmentStatus(model.Asset{ID: 7, CacheKey: "asset", Duration: &duration}, "legacy")
+	if dto.SegmentIndex != 2 || !dto.Transcoding || dto.SegmentCount != 16 {
+		t.Fatalf("global status did not report active playback task: %#v", dto)
+	}
+}
+
+func TestVideoSegmentCountAndTailDuration(t *testing.T) {
+	if got := videoSegmentCount(25.2, 10); got != 4 {
+		t.Fatalf("segment count = %d, want 4", got)
+	}
+	if got := videoSegmentDuration(25.2, 10, 0); got != 2 {
+		t.Fatalf("first duration = %.3f, want 2", got)
+	}
+	if got := videoSegmentDuration(25.2, 10, 3); got < 3.19 || got > 3.21 {
+		t.Fatalf("tail duration = %.3f, want about 3.2", got)
+	}
+}
+
+func TestAdaptiveVideoSegmentSeconds(t *testing.T) {
+	server := &Server{cfg: config.Config{VideoSegmentSeconds: 10}}
+	shortDuration := 3.2
+	if got := server.adaptiveVideoSegmentSeconds(model.Asset{Duration: &shortDuration}); got != shortDuration {
+		t.Fatalf("short video segment = %.2f, want %.2f", got, shortDuration)
+	}
+	duration := 600.0
+	width, height := 3840, 2160
+	metadata := `{"streams":[{"codec_type":"video","codec_name":"hevc","width":3840,"height":2160,"avg_frame_rate":"60/1","bit_rate":"250000000"}],"format":{"bit_rate":"300000000"}}`
+	asset := model.Asset{Duration: &duration, Width: &width, Height: &height, MetadataJSON: &metadata, Size: 25 << 30}
+	if got := server.adaptiveVideoSegmentSeconds(asset); got != 2 {
+		t.Fatalf("complex video segment = %.2f, want 2.00", got)
+	}
+	normalWidth, normalHeight := 1280, 720
+	normal := model.Asset{Duration: &duration, Width: &normalWidth, Height: &normalHeight, Size: 300 << 20}
+	if got := server.adaptiveVideoSegmentSeconds(normal); got != 4 {
+		t.Fatalf("normal video segment = %.2f, want 4.00", got)
 	}
 }
 
@@ -235,13 +282,13 @@ func TestVideoSegmentEditListFallbackExtensions(t *testing.T) {
 func TestVideoSegmentCacheSummary(t *testing.T) {
 	cacheRoot := t.TempDir()
 	server := &Server{
-		cfg:   config.Config{VideoSegmentSeconds: 10, VideoProxyCRF: 23, FFmpegHWAccel: "vaapi"},
+		cfg:   config.Config{VideoSegmentSeconds: 4, VideoProxyCRF: 23, FFmpegHWAccel: "vaapi"},
 		store: storage.Store{CacheRoot: cacheRoot},
 	}
 	duration := 25.0
 	asset := model.Asset{CacheKey: "abcdef0123456789", Duration: &duration, Size: 1000}
 	for index, size := range []int{12, 18} {
-		key := videoSegmentCacheKey(asset.CacheKey, 10, 0, 23, "vaapi", index)
+		key := videoSegmentCacheKey(asset.CacheKey, 4, 0, 23, "vaapi", index)
 		path, err := server.store.CachePath("video-proxies", key, "ts")
 		if err != nil {
 			t.Fatal(err)
@@ -250,7 +297,7 @@ func TestVideoSegmentCacheSummary(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	staleKey := videoSegmentCacheKey(asset.CacheKey, 10, 0, 24, "vaapi", 0)
+	staleKey := videoSegmentCacheKey(asset.CacheKey, 4, 0, 24, "vaapi", 0)
 	stalePath, err := server.store.CachePath("video-proxies", staleKey, "ts")
 	if err != nil {
 		t.Fatal(err)
@@ -259,7 +306,7 @@ func TestVideoSegmentCacheSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	summary := server.videoSegmentCacheSummary(asset)
-	if summary.CachedBytes != 30 || summary.CachedSegments != 2 || summary.SegmentCount != 3 || summary.EstimatedTotalBytes != 45 {
+	if summary.CachedBytes != 30 || summary.CachedSegments != 2 || summary.SegmentCount != 7 || summary.EstimatedTotalBytes != 105 {
 		t.Fatalf("summary = %#v", summary)
 	}
 	if _, err := os.Stat(filepath.Join(cacheRoot, "video-proxies")); err != nil {

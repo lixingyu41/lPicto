@@ -1,18 +1,12 @@
-import { useCallback, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { useLocation, type Location } from 'react-router-dom';
-import Sidebar from './Sidebar';
+import ImmersiveTopbar from './ImmersiveTopbar';
 import { api } from '../api/client';
 import type { StorageStatus } from '../types/api';
 import { SidebarPanelProvider, type SidebarPanelTarget } from './SidebarContext';
 import {
   isPrimarySidebarPanelTarget,
-  loadSidebarSecondaryExpanded,
-  loadSidebarWidths,
-  normalizeSidebarWidths,
   primaryTargetForPath,
-  saveSidebarSecondaryExpanded,
-  saveSidebarWidths,
-  type SidebarWidths,
 } from '../utils/sidebarPrefs';
 
 interface Props {
@@ -24,38 +18,31 @@ interface Props {
 export default function Layout({ children, overlay = null, routeLocation }: Props) {
   const location = useLocation();
   const effectivePathname = routeLocation?.pathname ?? location.pathname;
-  const [sidebarWidths, setSidebarWidths] = useState<SidebarWidths>(() => loadSidebarWidths());
   const [routeEntering, setRouteEntering] = useState(false);
   const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
   const [viewerInfoVisible, setViewerInfoVisible] = useState(true);
+  const [topbarPinned, setTopbarPinned] = useState(false);
+  const [pinnedMenuOpen, setPinnedMenuOpen] = useState(false);
   const viewerActive = Boolean(overlay) || location.pathname.startsWith('/viewer/');
   const routeTarget = primaryTargetForPath(effectivePathname);
-  const [sidebarExpanded, setSidebarExpandedState] = useState<SidebarPanelTarget | null>(() =>
-    routeTarget && loadSidebarSecondaryExpanded() ? routeTarget : null,
-  );
+  const [sidebarExpanded, setSidebarExpandedState] = useState<SidebarPanelTarget | null>(null);
   const sidebarPanelOpen = sidebarExpanded !== null && sidebarExpanded === routeTarget;
-  const shellClass = [
-    'app-shell',
-    sidebarPanelOpen ? 'sidebar-panel-open' : 'sidebar-panel-closed',
-  ]
+  const shellClass = ['app-shell', routeTarget === 'settings' ? 'standard-shell' : 'media-browse-shell', sidebarPanelOpen ? 'browse-panel-open' : 'browse-panel-closed', topbarPinned ? 'topbar-pinned' : '', pinnedMenuOpen ? 'pinned-menu-open' : '']
     .filter(Boolean)
     .join(' ');
   const setSidebarExpanded = useCallback(
     (target: SidebarPanelTarget | null) => {
       if (target === null) {
-        saveSidebarSecondaryExpanded(false);
         setSidebarExpandedState(null);
         return;
       }
-      if (isPrimarySidebarPanelTarget(target)) {
-        saveSidebarSecondaryExpanded(true);
-      }
+      if (!isPrimarySidebarPanelTarget(target) && target !== 'viewer') return;
       setSidebarExpandedState(target);
     },
     [],
   );
   useEffect(() => {
-    setSidebarExpandedState(routeTarget && loadSidebarSecondaryExpanded() ? routeTarget : null);
+    setSidebarExpandedState(null);
   }, [routeTarget]);
 
   useEffect(() => {
@@ -83,18 +70,6 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
     };
   }, []);
 
-  const updateSidebarWidth = useCallback((kind: keyof SidebarWidths, width: number) => {
-    setSidebarWidths((current) => {
-      const next = normalizeSidebarWidths({ ...current, [kind]: width });
-      saveSidebarWidths(next);
-      return next;
-    });
-  }, []);
-
-  const shellStyle = {
-    '--sidebar-secondary-width': `${sidebarWidths.secondary}px`,
-  } as CSSProperties;
-
   return (
     <SidebarPanelProvider
       sidebarExpanded={sidebarExpanded}
@@ -103,16 +78,15 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
       setSidebarExpanded={setSidebarExpanded}
       setViewerInfoVisible={setViewerInfoVisible}
     >
-      <div className={shellClass} style={shellStyle}>
-        <aside className="sidebar">
-          <Sidebar
-            expanded={sidebarExpanded}
-            routePathname={effectivePathname}
-            secondaryWidth={sidebarWidths.secondary}
-            onToggleExpanded={setSidebarExpanded}
-            onSecondaryWidthChange={(width) => updateSidebarWidth('secondary', width)}
-          />
-        </aside>
+      <div className={shellClass}>
+        <ImmersiveTopbar
+          expanded={sidebarExpanded}
+          pinned={topbarPinned}
+          routePathname={effectivePathname}
+          onPinnedChange={setTopbarPinned}
+          onPinnedMenuOpenChange={setPinnedMenuOpen}
+          onToggleExpanded={setSidebarExpanded}
+        />
         <main className={[
           'main-panel',
           routeEntering ? 'route-entering' : '',

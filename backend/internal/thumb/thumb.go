@@ -41,7 +41,9 @@ func (p Processor) Handle(ctx context.Context, task jobs.Task) error {
 	var runErr error
 	defer func() {
 		state, message := "success", ""
-		if errors.Is(runErr, jobs.ErrPlaybackPriority) || ctx.Err() != nil {
+		if errors.Is(runErr, jobs.ErrMediaScanPriority) {
+			state, message = "preempted", "媒体扫描已抢占后台处理"
+		} else if errors.Is(runErr, jobs.ErrPlaybackPriority) || ctx.Err() != nil {
 			state, message = "preempted", "当前媒体播放已抢占 NAS 读取"
 		} else if runErr != nil {
 			state, message = "failed", runErr.Error()
@@ -58,10 +60,42 @@ func (p Processor) Handle(ctx context.Context, task jobs.Task) error {
 	case "storyboard":
 		runErr = p.processStoryboard(ctx, task.AssetID)
 	}
+	if shouldAutomaticallyRetry(runErr) && task.Attempt < jobs.MaxAutomaticRetries {
+		p.resetForAutomaticRetry(task)
+		runErr = errors.Join(jobs.ErrRetryable, runErr)
+	}
 	return runErr
 }
 
+func shouldAutomaticallyRetry(err error) bool {
+	return err != nil &&
+		!errors.Is(err, jobs.ErrMediaScanPriority) &&
+		!errors.Is(err, jobs.ErrMediaCachePriority) &&
+		!errors.Is(err, jobs.ErrPlaybackPriority) &&
+		!errors.Is(err, jobs.ErrTaskStopped) &&
+		!errors.Is(err, context.Canceled)
+}
+
+func (p Processor) resetForAutomaticRetry(task jobs.Task) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	switch task.Type {
+	case "thumb":
+		_ = p.DB.SetAssetWorkStatus(ctx, task.AssetID, "thumb_status", model.StatusPending, nil)
+	case "preview":
+		_ = p.DB.SetAssetWorkStatus(ctx, task.AssetID, "preview_status", model.StatusPending, nil)
+	case "video_poster":
+		_ = p.DB.SetAssetWorkStatus(ctx, task.AssetID, "thumb_status", model.StatusPending, nil)
+		_ = p.DB.SetAssetWorkStatus(ctx, task.AssetID, "video_poster_status", model.StatusPending, nil)
+	case "storyboard":
+		_ = p.DB.SetStoryboardJobStatus(ctx, task.AssetID, model.StatusPending, nil)
+	}
+}
+
 func interruptedTaskError(ctx context.Context) error {
+	if errors.Is(context.Cause(ctx), jobs.ErrMediaScanPriority) {
+		return jobs.ErrMediaScanPriority
+	}
 	if errors.Is(context.Cause(ctx), jobs.ErrTaskStopped) {
 		return jobs.ErrTaskStopped
 	}

@@ -51,3 +51,24 @@ func TestPhotoRootsEnv(t *testing.T) {
 		t.Fatalf("second root = %#v", cfg.PhotoRoots[1])
 	}
 }
+
+func TestStringMapEnvNormalizesWatcherRoots(t *testing.T) {
+	t.Setenv("NAS_WATCHER_ROOTS", "pic=/nas/PIC/; VID=nas\\VID")
+	values := stringMapEnv("NAS_WATCHER_ROOTS", "")
+	if values["PIC"] != "nas/PIC" || values["VID"] != "nas/VID" {
+		t.Fatalf("values = %#v", values)
+	}
+}
+
+func TestMediaOriginPortsAreValidatedAndDeduplicated(t *testing.T) {
+	t.Setenv("MEDIA_ROOT", t.TempDir())
+	t.Setenv("DATA_ROOT", t.TempDir())
+	t.Setenv("MEDIA_ORIGIN_PORTS", "18081, 18082;18081,0,70000,bad")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.MediaOriginPorts) != 2 || cfg.MediaOriginPorts[0] != 18081 || cfg.MediaOriginPorts[1] != 18082 {
+		t.Fatalf("MediaOriginPorts = %#v", cfg.MediaOriginPorts)
+	}
+}

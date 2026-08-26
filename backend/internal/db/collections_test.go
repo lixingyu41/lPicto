@@ -169,3 +169,81 @@ func TestDuplicateCollectionKeepsHashGroupsContiguous(t *testing.T) {
 		t.Fatalf("cached duplicate count = %d, want 4", cached[SystemCollectionDuplicates])
 	}
 }
+
+func TestDuplicateCollectionUsesPersistedHashesAndDropsPurgedRecords(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, testDatabaseURL(t, ctx), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ids := make([]int64, 0, 2)
+	for _, relPath := range []string{"copy-a.jpg", "copy-b.jpg"} {
+		asset := testSearchAsset(relPath, model.MediaTypeImage)
+		asset.Size = 12345
+		id, _, _, err := database.UpsertAsset(ctx, asset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+
+	page, err := database.ListSystemCollectionAssets(ctx, SystemCollectionDuplicates, AssetListOptions{Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 0 {
+		t.Fatalf("unhashed duplicate items = %d, want 0", len(page.Items))
+	}
+
+	hash := strings.Repeat("c", 64)
+	for _, id := range ids {
+		if err := database.SetAssetSHA256Hex(ctx, id, hash); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err = database.ListSystemCollectionAssets(ctx, SystemCollectionDuplicates, AssetListOptions{Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("persisted duplicate items = %d, want 2", len(page.Items))
+	}
+	marked, err := database.MarkDeletedAssetIDs(ctx, []int64{ids[1]}, 123456)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(marked) != 1 || marked[0].ID != ids[1] {
+		t.Fatalf("marked deleted assets = %#v, want id %d", marked, ids[1])
+	}
+	var storedHash []byte
+	if err := database.conn.QueryRowContext(ctx, `SELECT sha256 FROM media_asset WHERE id = ?`, ids[1]).Scan(&storedHash); err != nil {
+		t.Fatal(err)
+	}
+	if len(storedHash) != 0 {
+		t.Fatalf("deleted asset hash length = %d, want 0", len(storedHash))
+	}
+	page, err = database.ListSystemCollectionAssets(ctx, SystemCollectionDuplicates, AssetListOptions{Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 0 {
+		t.Fatalf("duplicate items after file deletion = %d, want 0", len(page.Items))
+	}
+
+	deleted, err := database.PurgeAssetIDs(ctx, []int64{ids[1]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 1 || deleted[0].ID != ids[1] {
+		t.Fatalf("purged assets = %#v, want id %d", deleted, ids[1])
+	}
+	page, err = database.ListSystemCollectionAssets(ctx, SystemCollectionDuplicates, AssetListOptions{Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 0 {
+		t.Fatalf("duplicate items after purge = %d, want 0", len(page.Items))
+	}
+}

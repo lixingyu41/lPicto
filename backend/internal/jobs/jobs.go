@@ -21,6 +21,7 @@ type Task struct {
 	Paths    []string `json:"paths,omitempty"`
 	Rebuild  bool     `json:"rebuild,omitempty"`
 	Priority int      `json:"priority,omitempty"`
+	Attempt  int      `json:"attempt,omitempty"`
 }
 
 type Handler func(ctx context.Context, task Task) error
@@ -36,20 +37,35 @@ const (
 	redisPlaybackPriorityKey = "lpicto:playback:priority"
 )
 
+const MaxAutomaticRetries = 3
+
+var automaticRetryDelay = func(attempt int) time.Duration {
+	switch attempt {
+	case 1:
+		return 10 * time.Second
+	case 2:
+		return time.Minute
+	default:
+		return 5 * time.Minute
+	}
+}
+
 var (
-	ErrPlaybackPriority = errors.New("playback requires CPU priority")
-	ErrRetryable        = errors.New("task should be retried")
-	ErrTaskStopped      = errors.New("task stopped by user")
+	ErrPlaybackPriority   = errors.New("playback requires CPU priority")
+	ErrMediaScanPriority  = errors.New("media scan requires highest priority")
+	ErrMediaCachePriority = errors.New("media cache work requires priority over AI")
+	ErrRetryable          = errors.New("task should be retried")
+	ErrTaskStopped        = errors.New("task stopped by user")
 )
 
 var (
-	redisControlTaskTypes  = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild"}
+	redisControlTaskTypes  = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_media", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild"}
 	redisImageTaskTypes    = []string{"thumb", "preview"}
 	redisPosterTaskTypes   = []string{"video_poster"}
 	redisStoryboardTypes   = []string{"storyboard"}
 	redisAITaskTypes       = []string{"ai_analyze"}
 	redisMediaTaskTypes    = []string{"thumb", "preview", "video_poster", "storyboard", "video_proxy", "ai_analyze"}
-	redisAllTaskTypes      = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "thumb", "preview", "video_poster", "storyboard", "ai_analyze"}
+	redisAllTaskTypes      = []string{"scan_stop", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_media", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "thumb", "preview", "video_poster", "storyboard", "ai_analyze"}
 	redisPromoteTaskScript = redis.NewScript(`
 local items = redis.call('LRANGE', KEYS[1], 0, -1)
 for _, member in ipairs(items) do
@@ -103,6 +119,14 @@ type QueueStats struct {
 	ActiveAI          int `json:"activeAi"`
 }
 
+type ExecutorHealth struct {
+	Queued         int
+	Active         int
+	BlockedReason  string
+	StalledSeconds int64
+	Healthy        bool
+}
+
 type WorkerConfig struct {
 	Image       int
 	VideoPoster int
@@ -125,6 +149,8 @@ type Manager struct {
 	active           map[string]int
 	activeCancels    map[string]map[uint64]context.CancelCauseFunc
 	activeCancelID   uint64
+	healthMu         sync.Mutex
+	stalledSince     time.Time
 	wg               sync.WaitGroup
 }
 
@@ -224,11 +250,10 @@ func (m *Manager) Start(ctx context.Context, cfg WorkerConfig) {
 		m.startRedisWorkers(ctx, "control", 1, redisControlTaskTypes, nil)
 		m.startRedisWorkers(ctx, "image", cfg.Image, redisImageTaskTypes, nil)
 		m.startRedisWorkers(ctx, "video_poster", cfg.VideoPoster, redisPosterTaskTypes, redisImageTaskTypes)
-		// Storyboards have their own serial worker. Viewer-triggered work must be
-		// able to start immediately instead of waiting behind bulk thumbnails or
-		// posters, and an active storyboard is deliberately allowed to finish.
-		m.startRedisWorkers(ctx, "storyboard", 1, redisStoryboardTypes, nil)
-		m.startRedisWorkers(ctx, "ai", cfg.AI, redisAITaskTypes, nil)
+		mediaCacheTasks := append(append([]string{}, redisImageTaskTypes...), redisPosterTaskTypes...)
+		m.startRedisWorkers(ctx, "storyboard", 1, redisStoryboardTypes, mediaCacheTasks)
+		mediaCacheTasks = append(mediaCacheTasks, redisStoryboardTypes...)
+		m.startRedisWorkers(ctx, "ai", cfg.AI, redisAITaskTypes, mediaCacheTasks)
 		return
 	}
 	for i := 0; i < cfg.Image; i++ {
@@ -342,6 +367,9 @@ func (m *Manager) BackgroundBlocker(ctx context.Context) string {
 	if m == nil {
 		return ""
 	}
+	if MediaScanPriorityActive() {
+		return "media_scan"
+	}
 	if active, err := m.PlaybackPriorityActive(ctx); err == nil && active {
 		return "playback"
 	}
@@ -355,6 +383,31 @@ func (m *Manager) BackgroundBlocker(ctx context.Context) string {
 		return "foreground"
 	}
 	return ""
+}
+
+func (m *Manager) ExecutorHealth(ctx context.Context) ExecutorHealth {
+	if m == nil {
+		return ExecutorHealth{Healthy: false}
+	}
+	stats := m.Stats()
+	health := ExecutorHealth{
+		Queued: stats.ThumbQueued + stats.PreviewQueued + stats.VideoPosterQueued + stats.StoryboardQueued + stats.AIQueued,
+		Active: stats.ActiveThumb + stats.ActivePreview + stats.ActiveVideoPoster + stats.ActiveStoryboard + stats.ActiveAI,
+	}
+	health.BlockedReason = m.BackgroundBlocker(ctx)
+	m.healthMu.Lock()
+	defer m.healthMu.Unlock()
+	if health.Queued == 0 || health.Active > 0 || health.BlockedReason != "" {
+		m.stalledSince = time.Time{}
+		health.Healthy = true
+		return health
+	}
+	if m.stalledSince.IsZero() {
+		m.stalledSince = time.Now()
+	}
+	health.StalledSeconds = int64(time.Since(m.stalledSince).Seconds())
+	health.Healthy = health.StalledSeconds < 30
+	return health
 }
 
 // StoryboardPriorityActive reports whether progress-preview generation is
@@ -376,6 +429,23 @@ func (m *Manager) StoryboardPriorityActive(ctx context.Context) (bool, error) {
 	}
 	activeCount, _ := strconv.Atoi(active.Val())
 	return queued.Val() > 0 || activeCount > 0, nil
+}
+
+func (m *Manager) MediaCachePriorityActive(ctx context.Context) (bool, error) {
+	if m == nil {
+		return false, nil
+	}
+	if m.redis == nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for _, taskType := range []string{"thumb", "preview", "video_poster", "storyboard"} {
+			if m.queued[taskType]+m.active[taskType] > 0 {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	return m.redisQueuesHaveBacklog(ctx, []string{"thumb", "preview", "video_poster", "storyboard"})
 }
 
 func (m *Manager) Stop() {
@@ -491,9 +561,7 @@ func (m *Manager) Enqueue(task Task) {
 	case "ai_analyze":
 		if m.ai != nil {
 			go func() {
-				if err := m.runTask(context.Background(), "ai", task); errors.Is(err, ErrRetryable) {
-					m.Enqueue(task)
-				}
+				m.requeueAfterResult(context.Background(), task, m.runTask(context.Background(), "ai", task))
 			}()
 		}
 		return
@@ -508,7 +576,7 @@ func (m *Manager) Enqueue(task Task) {
 
 func knownQueueTask(taskType string) bool {
 	switch taskType {
-	case "thumb", "preview", "video_poster", "storyboard", "ai_analyze", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "scan_stop":
+	case "thumb", "preview", "video_poster", "storyboard", "ai_analyze", "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_media", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "scan_stop":
 		return true
 	default:
 		return false
@@ -558,6 +626,12 @@ func (m *Manager) redisWorker(ctx context.Context, name string, keys []string, b
 			return
 		default:
 		}
+		if resourceManaged && MediaScanPriorityActive() {
+			if err := sleepContext(ctx, 200*time.Millisecond); err != nil {
+				return
+			}
+			continue
+		}
 		if name == "ai" {
 			active, err := m.PlaybackPriorityActive(ctx)
 			if err != nil {
@@ -599,7 +673,7 @@ func (m *Manager) redisWorker(ctx context.Context, name string, keys []string, b
 				continue
 			}
 		}
-		if resourceManaged && name != "storyboard" && m.resources != nil {
+		if resourceManaged && m.resources != nil {
 			if err := m.resources.Wait(ctx); err != nil {
 				return
 			}
@@ -626,9 +700,7 @@ func (m *Manager) redisWorker(ctx context.Context, name string, keys []string, b
 		}
 		runErr := m.runTask(ctx, name, queued.Task)
 		m.releaseRedisDedupe(queued.Task)
-		if errors.Is(runErr, ErrPlaybackPriority) || errors.Is(runErr, ErrRetryable) {
-			m.Enqueue(queued.Task)
-		}
+		m.requeueAfterResult(ctx, queued.Task, runErr)
 	}
 }
 
@@ -650,7 +722,7 @@ func (m *Manager) runTask(ctx context.Context, worker string, task Task) error {
 		}()
 	}
 	stopPriorityMonitor := func() {}
-	if resourceManagedTask(task.Type) && task.Type != "storyboard" && m.redis != nil {
+	if resourceManagedTask(task.Type) {
 		done := make(chan struct{})
 		stopPriorityMonitor = func() {
 			select {
@@ -663,7 +735,7 @@ func (m *Manager) runTask(ctx context.Context, worker string, task Task) error {
 		defer stopPriorityMonitor()
 	}
 	release := func() {}
-	if resourceManagedTask(task.Type) && task.Type != "storyboard" && m.resources != nil {
+	if resourceManagedTask(task.Type) && m.resources != nil {
 		var err error
 		release, err = m.resources.Acquire(taskCtx)
 		if err != nil {
@@ -672,7 +744,7 @@ func (m *Manager) runTask(ctx context.Context, worker string, task Task) error {
 	}
 	m.markStarted(task.Type)
 	err := handler(taskCtx, task)
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrPlaybackPriority) && !errors.Is(err, ErrTaskStopped) {
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrMediaScanPriority) && !errors.Is(err, ErrMediaCachePriority) && !errors.Is(err, ErrPlaybackPriority) && !errors.Is(err, ErrTaskStopped) {
 		m.logger.Warn("job failed", "worker", worker, "type", task.Type, "assetID", task.AssetID, "error", err)
 	}
 	release()
@@ -684,12 +756,21 @@ func (m *Manager) cancelForHigherPriorityWork(ctx context.Context, taskType stri
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if MediaScanPriorityActive() {
+			cancel(ErrMediaScanPriority)
+			return
+		}
 		active, err := m.PlaybackPriorityActive(ctx)
 		if err == nil && active {
 			cancel(ErrPlaybackPriority)
 			return
 		}
 		if taskType == "ai_analyze" {
+			mediaCacheActive, mediaCacheErr := m.MediaCachePriorityActive(ctx)
+			if mediaCacheErr == nil && mediaCacheActive {
+				cancel(ErrMediaCachePriority)
+				return
+			}
 			storyboardActive, storyboardErr := m.StoryboardPriorityActive(ctx)
 			if storyboardErr == nil && storyboardActive {
 				cancel(ErrPlaybackPriority)
@@ -792,7 +873,7 @@ func (m *Manager) releaseRedisDedupe(task Task) {
 
 func redisDedupeKey(task Task) string {
 	switch task.Type {
-	case "scan_count", "scan_reconcile", "scan_metadata", "thumb_continue", "thumb_rebuild":
+	case "scan_count", "scan_reconcile", "scan_media", "scan_metadata", "thumb_continue", "thumb_rebuild":
 		return task.Type + ":" + strings.Join(task.Roots, "\x00")
 	case "scan_metadata_paths":
 		return task.Type + ":" + strings.Join(task.Paths, "\x00")
@@ -821,13 +902,44 @@ func resourceManagedTask(taskType string) bool {
 	}
 }
 
+func (m *Manager) requeueAfterResult(ctx context.Context, task Task, runErr error) {
+	if runErr == nil || errors.Is(runErr, ErrTaskStopped) || errors.Is(runErr, context.Canceled) {
+		return
+	}
+	if errors.Is(runErr, ErrMediaScanPriority) || errors.Is(runErr, ErrMediaCachePriority) || errors.Is(runErr, ErrPlaybackPriority) {
+		m.Enqueue(task)
+		return
+	}
+	if !errors.Is(runErr, ErrRetryable) && !resourceManagedTask(task.Type) {
+		return
+	}
+	if task.Attempt >= MaxAutomaticRetries {
+		return
+	}
+	task.Attempt++
+	delay := automaticRetryDelay(task.Attempt)
+	if m.logger != nil {
+		m.logger.Info("scheduled automatic task retry", "type", task.Type, "assetID", task.AssetID, "attempt", task.Attempt, "delay", delay)
+	}
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			m.Enqueue(task)
+		}
+	}()
+}
+
 func (m *Manager) handlerFor(taskType string) Handler {
 	switch taskType {
 	case "thumb", "preview", "video_poster", "storyboard":
 		return m.thumb
 	case "ai_analyze":
 		return m.ai
-	case "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "scan_stop":
+	case "scan", "scan_roots", "scan_rebuild", "scan_count", "scan_reconcile", "scan_media", "scan_metadata", "scan_metadata_paths", "thumb_continue", "thumb_rebuild", "scan_stop":
 		return m.scan
 	default:
 		return nil
@@ -842,7 +954,7 @@ func (m *Manager) worker(ctx context.Context, name string, queue <-chan Task, ha
 		case <-ctx.Done():
 			return
 		case task := <-queue:
-			_ = m.runTask(ctx, name, task)
+			m.requeueAfterResult(ctx, task, m.runTask(ctx, name, task))
 		}
 	}
 }

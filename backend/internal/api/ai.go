@@ -237,6 +237,8 @@ func (s *Server) aiPauseReason(ctx context.Context, status db.AIStatus, settings
 	}
 	if s.jobs != nil {
 		switch s.jobs.BackgroundBlocker(ctx) {
+		case "media_scan":
+			return "媒体扫描优先执行，AI 暂时暂停"
 		case "playback", "foreground":
 			return "正在播放或加载媒体，AI 暂时暂停"
 		case "storyboard":

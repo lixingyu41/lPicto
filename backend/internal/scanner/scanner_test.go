@@ -38,6 +38,29 @@ func TestSourceFileExistsOnlyChecksPathPresence(t *testing.T) {
 	}
 }
 
+func TestAutomaticScanRequestMergeKeepsEveryPath(t *testing.T) {
+	queue := []scanRequest{}
+	wantPaths := make([]string, 0, 1000)
+	for index := 0; index < 1000; index++ {
+		relPath := "Y/bulk/" + strconv.Itoa(index) + ".jpg"
+		wantPaths = append(wantPaths, relPath)
+		queue = enqueueScanRequest(queue, scanRequest{reason: "fsnotify_remote", roots: []string{"Y"}, paths: []string{relPath}, hasOverride: true, task: scanTaskMetadata}, true)
+	}
+	if len(queue) != 1 {
+		t.Fatalf("coalesced queue length = %d", len(queue))
+	}
+	merged := queue[0]
+	if !equalStringSet(merged.paths, wantPaths) {
+		t.Fatalf("merged path count = %d, want %d", len(merged.paths), len(wantPaths))
+	}
+	if !equalStringSet(merged.roots, []string{"Y"}) {
+		t.Fatalf("merged roots = %#v", merged.roots)
+	}
+	if !assetDirectlyInScanRoots("Y/root.jpg", []string{"Y"}) || assetDirectlyInScanRoots("Y/folder/nested.jpg", []string{"Y"}) {
+		t.Fatal("nested recovery root-file boundary is incorrect")
+	}
+}
+
 func TestLibraryScansDoNotDeleteOtherRoots(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -119,7 +142,44 @@ func TestStopThenStartRunsLatestRequest(t *testing.T) {
 	assertActiveRelPaths(t, ctx, database, []string{"Z/latest.jpg"})
 }
 
-func TestPlaybackPauseAutomaticallyResumesScan(t *testing.T) {
+func TestAutomaticPathScansCoalesceWithoutDroppingEarlierBatches(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	installSlowExifTool(t, 200*time.Millisecond)
+	scan, database := newTestScanner(t, ctx)
+	scan.Extractor = media.Extractor{CommandTimeout: 2 * time.Second}
+
+	paths := []string{"Y/one.jpg", "Y/two.jpg", "Y/three.jpg", "Y/four.jpg"}
+	for _, relPath := range paths {
+		writeTestFile(t, scan.Store, relPath)
+	}
+	for _, relPath := range paths {
+		result := scan.RequestMetadataScanPaths("fsnotify_remote", []string{"Y"}, []string{relPath})
+		if !result.Accepted {
+			t.Fatalf("automatic path scan %q was rejected: %#v", relPath, result)
+		}
+	}
+
+	waitScannerIdle(t, ctx, scan)
+	assertActiveRelPaths(t, ctx, database, paths)
+}
+
+func TestNestedRecoveryScanExcludesFilesDirectlyUnderWatchedRoot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	scan, database := newTestScanner(t, ctx)
+
+	writeTestFile(t, scan.Store, "Y/root.jpg")
+	writeTestFile(t, scan.Store, "Y/folder/nested.jpg")
+	result := scan.RequestMediaScanNestedRoots("fsnotify_remote_recovery", []string{"Y"})
+	if !result.Accepted {
+		t.Fatalf("nested recovery scan result = %#v", result)
+	}
+	waitScannerIdle(t, ctx, scan)
+	assertActiveRelPaths(t, ctx, database, []string{"Y/folder/nested.jpg"})
+}
+
+func TestMediaScanKeepsRunningWhilePlaybackIsActive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	installSlowExifTool(t, 500*time.Millisecond)
@@ -129,39 +189,78 @@ func TestPlaybackPauseAutomaticallyResumesScan(t *testing.T) {
 
 	writeTestFile(t, scan.Store, "Y/resume.jpg")
 	jobs.MarkForegroundActive(700 * time.Millisecond)
-	if result := scan.RequestMetadataScanRoots("task:media_scan", []string{"Y"}); !result.Accepted {
+	if result := scan.RequestMediaScanRoots("task:media_scan", []string{"Y"}); !result.Accepted {
 		t.Fatalf("scan start result = %#v", result)
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
-	observedPause := false
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		status, err := scan.Status(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if status.Progress.PauseReason == "playback" {
-			observedPause = true
-			break
+			t.Fatal("media scan was incorrectly paused by playback")
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !observedPause {
-		t.Fatal("scan did not expose playback pause reason")
-	}
-
-	deadline = time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		status, err := scan.Status(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !status.Running && status.Progress.State == "idle" && status.Progress.PauseReason == "" {
+		if !status.Running && status.Progress.State == "idle" {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	assertActiveRelPaths(t, ctx, database, []string{"Y/resume.jpg"})
+}
+
+func TestMediaScanOnlyQueuesDownstreamWorkForAddedMedia(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	scan, _ := newTestScanner(t, ctx)
+
+	writeTestFile(t, scan.Store, "Y/existing.jpg")
+	if result := scan.RequestMediaScanRoots("task:media_scan", []string{"Y"}); !result.Accepted {
+		t.Fatalf("initial media scan result = %#v", result)
+	}
+	waitScannerIdle(t, ctx, scan)
+
+	queue := jobs.New(slog.Default(), nil)
+	scan.Jobs = queue
+	if result := scan.RequestMediaScanRoots("task:media_scan", []string{"Y"}); !result.Accepted {
+		t.Fatalf("unchanged media scan result = %#v", result)
+	}
+	waitScannerIdle(t, ctx, scan)
+	if stats := queue.Stats(); stats.ThumbQueued != 0 || stats.VideoPosterQueued != 0 || stats.StoryboardQueued != 0 {
+		t.Fatalf("unchanged media unexpectedly queued downstream work: %#v", stats)
+	}
+
+	writeTestFile(t, scan.Store, "Y/added.jpg")
+	if result := scan.RequestMediaScanRoots("task:media_scan", []string{"Y"}); !result.Accepted {
+		t.Fatalf("incremental media scan result = %#v", result)
+	}
+	waitScannerIdle(t, ctx, scan)
+	if stats := queue.Stats(); stats.ThumbQueued != 1 {
+		t.Fatalf("added media did not queue thumbnail work after scan: %#v", stats)
+	}
+}
+
+func TestGlobalMediaScanQueuesOnlyIncompleteExistingWork(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	scan, _ := newTestScanner(t, ctx)
+
+	writeTestFile(t, scan.Store, "Y/incomplete.jpg")
+	if result := scan.RequestMediaScanRoots("task:media_scan", []string{"Y"}); !result.Accepted {
+		t.Fatalf("initial media scan result = %#v", result)
+	}
+	waitScannerIdle(t, ctx, scan)
+
+	queue := jobs.New(slog.Default(), nil)
+	scan.Jobs = queue
+	if result := scan.RequestMediaScanRoots(globalScanReason, []string{"Y"}); !result.Accepted {
+		t.Fatalf("global media scan result = %#v", result)
+	}
+	waitScannerIdle(t, ctx, scan)
+	if stats := queue.Stats(); stats.ThumbQueued == 0 {
+		t.Fatalf("global scan did not restore incomplete downstream work: %#v", stats)
+	}
 }
 
 func TestMetadataPathScanProcessesUnchangedPendingAsset(t *testing.T) {

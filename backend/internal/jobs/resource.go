@@ -28,6 +28,22 @@ type ResourceLimiter struct {
 
 var foregroundActive int64
 var foregroundUntil atomic.Int64
+var mediaScanActive int64
+
+// EnterMediaScanPriority marks a media-library scan as the highest-priority
+// storage task. Playback remains responsive, while queued and active background
+// media work yields until the scan finishes.
+func EnterMediaScanPriority() func() {
+	atomic.AddInt64(&mediaScanActive, 1)
+	var once sync.Once
+	return func() {
+		once.Do(func() { atomic.AddInt64(&mediaScanActive, -1) })
+	}
+}
+
+func MediaScanPriorityActive() bool {
+	return atomic.LoadInt64(&mediaScanActive) > 0
+}
 
 func EnterForeground() func() {
 	atomic.AddInt64(&foregroundActive, 1)
@@ -162,6 +178,9 @@ func (l *ResourceLimiter) canStart() bool {
 func (l *ResourceLimiter) blockedReason() string {
 	if l == nil {
 		return ""
+	}
+	if MediaScanPriorityActive() {
+		return "media_scan"
 	}
 	if ForegroundActive() {
 		return "foreground"

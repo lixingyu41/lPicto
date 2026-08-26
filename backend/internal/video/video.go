@@ -96,7 +96,7 @@ func StreamProxyArgs(source string, maxHeight int, crf int, hwAccel string, hwDe
 		args = append(args, inputArgs...)
 		return append(args,
 			"-map", "0:v:0", "-map", "0:a?",
-			"-c:v", "libx264", "-preset", "veryfast", "-crf", strconv.Itoa(crf),
+			"-c:v", "libx264", "-preset", "veryfast", "-threads", "4", "-crf", strconv.Itoa(crf),
 			"-g", "48", "-keyint_min", "24", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)",
 			"-vf", cpuProxyFilter(maxHeight), "-pix_fmt", "yuv420p",
 			"-c:a", "aac", "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "-max_muxing_queue_size", "1024", "pipe:1",
@@ -146,7 +146,7 @@ func streamSegmentArgs(source string, maxHeight int, crf int, hwAccel string, hw
 		args = append(args, durationArgs...)
 		return append(args,
 			"-map", "0:v:0", "-map", "0:a?",
-			"-c:v", "libx264", "-preset", "veryfast", "-crf", strconv.Itoa(crf),
+			"-c:v", "libx264", "-preset", "veryfast", "-threads", "4", "-crf", strconv.Itoa(crf),
 			"-g", "48", "-keyint_min", "24", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)",
 			"-vf", cpuProxyFilter(maxHeight), "-pix_fmt", "yuv420p",
 			"-c:a", "aac", "-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0",

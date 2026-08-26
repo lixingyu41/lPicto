@@ -11,7 +11,7 @@ import NFOSearchFilters from '../components/NFOSearchFilters';
 import PressPreviewOverlay from '../components/PressPreviewOverlay';
 import { SidebarAlbumList, SidebarFilterIconRow, SidebarMediaTypeList, SidebarOrientationFilter, SidebarRatingFilter } from '../components/SidebarControls';
 import { CompactSortControls, isSortKey } from '../components/SortControls';
-import { useSidebarPanel, useSidebarReturnState } from '../components/SidebarContext';
+import { useSidebarBrowseTools, useSidebarPanel, useSidebarQueryChips, useSidebarReturnState, useSidebarScopeTitle, type BrowseQueryChip, type BrowseTools } from '../components/SidebarContext';
 import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
@@ -155,6 +155,7 @@ export default function LibraryPage({ mode = 'library' }: { mode?: 'library' | '
   const location = useLocation();
   const navigate = useNavigate();
   const recentMode = mode === 'recent';
+  useSidebarScopeTitle(recentMode ? 'recent' : 'library', recentMode ? '最近播放' : '图库', [recentMode]);
   const pageStateKey = recentMode ? 'recent' : 'library';
   const defaultPageState = useMemo<LibraryPageState>(
     () => (recentMode ? { ...defaultLibraryState, sort: 'last_played_desc' } : defaultLibraryState),
@@ -637,6 +638,54 @@ export default function LibraryPage({ mode = 'library' }: { mode?: 'library' | '
     }
   }, []);
 
+  const clearURLFilter = useCallback((key: string) => {
+    const next = new URLSearchParams(location.search);
+    next.delete(key);
+    navigate({ pathname: location.pathname, search: next.toString() ? `?${next.toString()}` : '' }, { replace: true, state: location.state });
+  }, [location.pathname, location.search, location.state, navigate]);
+  const queryChips = useMemo<BrowseQueryChip[]>(() => {
+    const chips: BrowseQueryChip[] = [];
+    if (query.trim()) chips.push({ id: 'filename', label: `文件名: ${query.trim()}`, onRemove: () => setQuery('') });
+    if (aiDescriptionQuery.trim()) chips.push({ id: 'ai-description', label: `AI: ${aiDescriptionQuery.trim()}`, onRemove: () => setAIDescriptionQuery('') });
+    if (tagFilters.length > 0) chips.push({ id: 'tags', label: `标签 ${tagFilters.length}`, onRemove: () => setTagFilters([]) });
+    if (resolutionXRange || resolutionYRange) chips.push({ id: 'resolution', label: '分辨率', onRemove: () => { setResolutionXRange(''); setResolutionYRange(''); } });
+    if (dateFrom || dateTo) chips.push({ id: 'date', label: '日期范围', onRemove: () => { setDateFrom(''); setDateTo(''); } });
+    if (durationMinMinutes || durationMaxMinutes) chips.push({ id: 'duration', label: '时长范围', onRemove: () => { setDurationMinMinutes(''); setDurationMaxMinutes(''); } });
+    if (sizeMinMB || sizeMaxMB) chips.push({ id: 'size', label: '文件大小', onRemove: () => { setSizeMinMB(''); setSizeMaxMB(''); } });
+    const nfoCount = [nfoQuery, nfoActorQuery, nfoIDQuery, nfoTagQuery, nfoTitleQuery, nfoYearQuery].filter((value) => value.trim()).length;
+    if (nfoCount > 0) chips.push({ id: 'nfo', label: `元数据 ${nfoCount}`, onRemove: () => { setNFOQuery(''); setNFOActorQuery(''); setNFOIDQuery(''); setNFOTagQuery(''); setNFOTitleQuery(''); setNFOYearQuery(''); } });
+    if (includeUnavailable) chips.push({ id: 'visible', label: '包含不可访问', onRemove: () => clearURLFilter('visible') });
+    const aiTag = searchParams.get('aiTag')?.trim();
+    if (aiTag) chips.push({ id: 'ai-tag', label: `AI 标签: ${aiTag}`, onRemove: () => clearURLFilter('aiTag') });
+    return chips;
+  }, [aiDescriptionQuery, clearURLFilter, dateFrom, dateTo, durationMaxMinutes, durationMinMinutes, includeUnavailable, nfoActorQuery, nfoIDQuery, nfoQuery, nfoTagQuery, nfoTitleQuery, nfoYearQuery, query, resolutionXRange, resolutionYRange, searchParams, sizeMaxMB, sizeMinMB, tagFilters]);
+  useSidebarQueryChips(recentMode ? 'recent' : 'library', queryChips, [queryChips]);
+  const albumFilterLabel = useMemo(() => {
+    if (albumFilterMode === 'none') return '未加入';
+    if (albumFilterMode !== 'albums' || activeAlbumIds.length === 0) return undefined;
+    const names = activeAlbumIds.map((id) => albums.find((album) => album.id === id)?.name).filter((name): name is string => Boolean(name));
+    if (names.length === 0) return `已选 ${activeAlbumIds.length}`;
+    return names.length === 1 ? names[0] : `${names[0]} +${names.length - 1}`;
+  }, [activeAlbumIds, albumFilterMode, albums]);
+  const browseTools = useMemo<BrowseTools>(() => ({
+    albumFilterActive: albumFilterMode !== 'all',
+    albumFilterLabel,
+    groupMode,
+    onGroupChange: setGroupMode,
+    onOrientationChange: setOrientation,
+    onRatingChange: handleRatingChange,
+    onSortChange: setSort,
+    onTagFilterChange: setTagFilters,
+    onTypeChange: setType,
+    orientation,
+    panelModes: ['albums', 'search', 'filters'],
+    rating,
+    sort,
+    tagFilters,
+    type,
+  }), [albumFilterLabel, albumFilterMode, groupMode, handleRatingChange, orientation, rating, sort, tagFilters, type]);
+  useSidebarBrowseTools(recentMode ? 'recent' : 'library', browseTools, [browseTools]);
+
   useSidebarPanel(
     recentMode ? 'recent' : 'library',
     <div className="sidebar-control-stack sidebar-library-panel">
@@ -647,7 +696,7 @@ export default function LibraryPage({ mode = 'library' }: { mode?: 'library' | '
         <CompactAssetGroupingControls groupMode={groupMode} sort={sort} onChange={setGroupMode} />
         <CompactSortControls sort={sort} onChange={setSort} />
       </SidebarFilterIconRow>
-      <section className="sidebar-filter-card sidebar-album-filter-card" aria-labelledby="library-album-filter-title">
+      <section className="sidebar-filter-card sidebar-album-filter-card sidebar-panel-section sidebar-panel-albums" aria-labelledby="library-album-filter-title">
         <button
           aria-expanded={!albumFilterCardCollapsed}
           className="sidebar-filter-card-toggle"
@@ -676,109 +725,65 @@ export default function LibraryPage({ mode = 'library' }: { mode?: 'library' | '
           />
         )}
       </section>
-      <section className="sidebar-filter-card sidebar-search-card" aria-labelledby="library-search-title">
-            <button
-              aria-expanded={!searchCardCollapsed}
-              className="sidebar-filter-card-toggle"
-              type="button"
-              onClick={toggleSearchCard}
-            >
-              {searchCardCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
-              <span className="sidebar-control-title" id="library-search-title">搜索</span>
-            </button>
-            {!searchCardCollapsed && (
-              <>
-            <div className="sidebar-reset-row">
-              <button className="sidebar-command" type="button" title="重置" aria-label="重置" onClick={resetFilters}>
-                <RotateCcw size={15} />
-                <span>重置</span>
-              </button>
-            </div>
-            <label className="sidebar-field">
-              <span>文件名</span>
-              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="文件名" />
-            </label>
-			<label className="sidebar-field">
-			  <span>AI 描述</span>
-			  <input value={aiDescriptionQuery} onChange={(event) => setAIDescriptionQuery(event.target.value)} placeholder="包含或模糊匹配" />
-			</label>
-            <NFOSearchFilters
-              nfoQuery={nfoQuery}
-              nfoOptionQueries={nfoOptionQueries}
-              onNFOQueryChange={setNFOQuery}
-              onNFOFieldQueryChange={setNFOFieldQuery}
-            />
-            <label className="sidebar-field">
-              <span>分辨率</span>
-              <div className="sidebar-field-grid">
-                <input value={resolutionXRange} onChange={(event) => setResolutionXRange(event.target.value)} placeholder="X 100-4000" />
-                <input value={resolutionYRange} onChange={(event) => setResolutionYRange(event.target.value)} placeholder="Y 100-3000" />
-              </div>
-            </label>
-            <div className="sidebar-field-grid">
-              <label className="sidebar-field">
-                <span>起始时间</span>
-                <input type="datetime-local" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} />
-              </label>
-              <label className="sidebar-field">
-                <span>结束时间</span>
-                <input type="datetime-local" value={dateTo} onChange={(event) => setDateTo(event.target.value)} />
-              </label>
-            </div>
-            <div className="sidebar-field">
-              <span>时长单位</span>
-              <div className="sidebar-segmented" role="group" aria-label="视频时长单位">
-                {([
-                  ['seconds', '秒'],
-                  ['minutes', '分钟'],
-                  ['hours', '小时'],
-                ] as const).map(([unit, label]) => (
-                  <button
-                    className={durationUnit === unit ? 'active' : ''}
-                    type="button"
-                    aria-pressed={durationUnit === unit}
-                    key={unit}
-                    onClick={() => handleDurationUnitChange(unit)}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div className="sidebar-field-grid">
-              <label className="sidebar-field">
-                <span>最短时长</span>
-                <input inputMode="decimal" value={durationMinMinutes} onChange={(event) => setDurationMinMinutes(event.target.value)} />
-              </label>
-              <label className="sidebar-field">
-                <span>最长时长</span>
-                <input inputMode="decimal" value={durationMaxMinutes} onChange={(event) => setDurationMaxMinutes(event.target.value)} />
-              </label>
-            </div>
-            <div className="sidebar-field-grid">
-              <label className="sidebar-field">
-                <span>最小 MB</span>
-                <input inputMode="decimal" value={sizeMinMB} onChange={(event) => setSizeMinMB(event.target.value)} />
-              </label>
-              <label className="sidebar-field">
-                <span>最大 MB</span>
-                <input inputMode="decimal" value={sizeMaxMB} onChange={(event) => setSizeMaxMB(event.target.value)} />
-              </label>
-            </div>
-            <div className="sidebar-group-section">
-              <div className="sidebar-control-subtitle">智能相册</div>
-              <label className="sidebar-field">
-                <span>保存当前搜索</span>
-                <input value={smartCollectionName} onChange={(event) => setSmartCollectionName(event.target.value)} placeholder="智能相册名称" />
-              </label>
-              <button className="sidebar-command" disabled={!smartCollectionName.trim() || savingSmartCollection} type="button" onClick={() => void saveSmartCollection()}>
-                <Save size={15} />
-                <span>{savingSmartCollection ? '保存中' : '保存'}</span>
-              </button>
-              {smartCollectionError && <div className="error-line">{smartCollectionError}</div>}
-            </div>
-              </>
-            )}
+      <section className="sidebar-filter-card sidebar-search-card sidebar-panel-section sidebar-panel-search" aria-labelledby="library-search-title">
+        <div className="sidebar-panel-card-title" id="library-search-title">搜索</div>
+        <label className="sidebar-field">
+          <span>文件名</span>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="文件名" />
+        </label>
+        <label className="sidebar-field">
+          <span>AI 描述</span>
+          <input value={aiDescriptionQuery} onChange={(event) => setAIDescriptionQuery(event.target.value)} placeholder="包含或模糊匹配" />
+        </label>
+        <NFOSearchFilters
+          nfoQuery={nfoQuery}
+          nfoOptionQueries={nfoOptionQueries}
+          onNFOQueryChange={setNFOQuery}
+          onNFOFieldQueryChange={setNFOFieldQuery}
+        />
+      </section>
+      <section className="sidebar-filter-card sidebar-panel-section sidebar-panel-filters" aria-labelledby="library-filter-title">
+        <div className="sidebar-panel-card-title" id="library-filter-title">范围筛选</div>
+        <div className="sidebar-reset-row">
+          <button className="sidebar-command" type="button" title="重置" aria-label="重置" onClick={resetFilters}>
+            <RotateCcw size={15} /><span>重置</span>
+          </button>
+        </div>
+        <label className="sidebar-field">
+          <span>分辨率</span>
+          <div className="sidebar-field-grid">
+            <input value={resolutionXRange} onChange={(event) => setResolutionXRange(event.target.value)} placeholder="X 100-4000" />
+            <input value={resolutionYRange} onChange={(event) => setResolutionYRange(event.target.value)} placeholder="Y 100-3000" />
+          </div>
+        </label>
+        <div className="sidebar-field-grid">
+          <label className="sidebar-field"><span>起始时间</span><input type="datetime-local" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /></label>
+          <label className="sidebar-field"><span>结束时间</span><input type="datetime-local" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /></label>
+        </div>
+        <div className="sidebar-field">
+          <span>时长单位</span>
+          <div className="sidebar-segmented" role="group" aria-label="视频时长单位">
+            {([['seconds', '秒'], ['minutes', '分钟'], ['hours', '小时']] as const).map(([unit, label]) => (
+              <button className={durationUnit === unit ? 'active' : ''} type="button" aria-pressed={durationUnit === unit} key={unit} onClick={() => handleDurationUnitChange(unit)}>{label}</button>
+            ))}
+          </div>
+        </div>
+        <div className="sidebar-field-grid">
+          <label className="sidebar-field"><span>最短时长</span><input inputMode="decimal" value={durationMinMinutes} onChange={(event) => setDurationMinMinutes(event.target.value)} /></label>
+          <label className="sidebar-field"><span>最长时长</span><input inputMode="decimal" value={durationMaxMinutes} onChange={(event) => setDurationMaxMinutes(event.target.value)} /></label>
+        </div>
+        <div className="sidebar-field-grid">
+          <label className="sidebar-field"><span>最小 MB</span><input inputMode="decimal" value={sizeMinMB} onChange={(event) => setSizeMinMB(event.target.value)} /></label>
+          <label className="sidebar-field"><span>最大 MB</span><input inputMode="decimal" value={sizeMaxMB} onChange={(event) => setSizeMaxMB(event.target.value)} /></label>
+        </div>
+        <div className="sidebar-group-section">
+          <div className="sidebar-control-subtitle">智能相册</div>
+          <label className="sidebar-field"><span>保存当前搜索</span><input value={smartCollectionName} onChange={(event) => setSmartCollectionName(event.target.value)} placeholder="智能相册名称" /></label>
+          <button className="sidebar-command" disabled={!smartCollectionName.trim() || savingSmartCollection} type="button" onClick={() => void saveSmartCollection()}>
+            <Save size={15} /><span>{savingSmartCollection ? '保存中' : '保存'}</span>
+          </button>
+          {smartCollectionError && <div className="error-line">{smartCollectionError}</div>}
+        </div>
       </section>
     </div>,
     [
@@ -838,7 +843,7 @@ export default function LibraryPage({ mode = 'library' }: { mode?: 'library' | '
   return (
     <section className="page media-page">
       {error && <div className="error-line">{error}</div>}
-      {items.length === 0 && !loading ? (
+      {items.length === 0 && !loading && !error ? (
         <EmptyState text={recentMode ? '暂无播放记录' : '没有匹配资源'} />
       ) : (
         <div className="library-grid-shell">
