@@ -251,6 +251,50 @@ ORDER BY a.timeline_at DESC,a.id DESC`, args...)
 	return paths, rows.Err()
 }
 
+// RepairVideoDisplayMetadataDimensions corrects old video records whose stored
+// dimensions ignored a quarter-turn display matrix. The original ffprobe JSON
+// is sufficient, so this does not read source media or rebuild cached posters.
+func (d *DB) RepairVideoDisplayMetadataDimensions(ctx context.Context) (int64, error) {
+	result, err := d.conn.ExecContext(ctx, `
+WITH video_streams AS (
+  SELECT ma.id,ma.width AS display_width,ma.height AS display_height,stream
+  FROM media_asset ma
+  CROSS JOIN LATERAL jsonb_array_elements(COALESCE(ma.metadata_json->'streams','[]'::jsonb)) AS stream
+  WHERE ma.media_type=2 AND ma.deleted_at IS NULL AND stream->>'codec_type'='video'
+), rotated_streams AS (
+  SELECT id,display_width,display_height,stream,
+    NULLIF(COALESCE(
+      (SELECT side_data->>'rotation'
+       FROM jsonb_array_elements(COALESCE(stream->'side_data_list','[]'::jsonb)) AS side_data
+       WHERE side_data->'rotation' IS NOT NULL LIMIT 1),
+      stream->'tags'->>'rotate'
+    ),'')::double precision AS rotation
+  FROM video_streams
+), repairs AS (
+  SELECT DISTINCT ON (rs.id) rs.id,
+    (rs.stream->>'height')::int AS target_width,
+    (rs.stream->>'width')::int AS target_height
+  FROM rotated_streams rs
+  WHERE rs.rotation IS NOT NULL
+    AND ((ROUND(rs.rotation)::int % 360 + 360) % 360) IN (90,270)
+    AND NULLIF(rs.stream->>'width','') IS NOT NULL
+    AND NULLIF(rs.stream->>'height','') IS NOT NULL
+    AND EXISTS (SELECT 1 FROM file_instance fi WHERE fi.asset_id=rs.id AND fi.missing=false)
+)
+UPDATE media_asset ma SET
+  width=repairs.target_width,
+  height=repairs.target_height,
+  aspect_ratio=repairs.target_width::double precision / NULLIF(repairs.target_height,0),
+  updated_at=now()
+FROM repairs
+WHERE ma.id=repairs.id
+  AND (ma.width IS DISTINCT FROM repairs.target_width OR ma.height IS DISTINCT FROM repairs.target_height)`)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (d *DB) RetryFailedMetadataPathsForRoots(ctx context.Context, roots []string) ([]string, error) {
 	where, args, err := taskRootsWhere(roots)
 	if err != nil {

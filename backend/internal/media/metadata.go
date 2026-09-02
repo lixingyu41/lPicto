@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -123,11 +124,12 @@ func (e Extractor) extractVideo(ctx context.Context, path string, detection Dete
 		switch stream.CodecType {
 		case "video":
 			meta.HasVideo = true
-			if meta.Width == nil && stream.Width > 0 {
-				meta.Width = &stream.Width
+			displayWidth, displayHeight := displayVideoDimensions(stream.Width, stream.Height, stream.Tags, stream.SideDataList)
+			if meta.Width == nil && displayWidth > 0 {
+				meta.Width = &displayWidth
 			}
-			if meta.Height == nil && stream.Height > 0 {
-				meta.Height = &stream.Height
+			if meta.Height == nil && displayHeight > 0 {
+				meta.Height = &displayHeight
 			}
 			if videoCodec == "" {
 				videoCodec = strings.ToLower(stream.CodecName)
@@ -238,6 +240,7 @@ type ffprobeResult struct {
 		Width        int               `json:"width"`
 		Height       int               `json:"height"`
 		Tags         map[string]string `json:"tags"`
+		SideDataList []ffprobeSideData `json:"side_data_list"`
 	} `json:"streams"`
 	Format struct {
 		Duration   string            `json:"duration"`
@@ -245,6 +248,40 @@ type ffprobeResult struct {
 		BitRate    string            `json:"bit_rate"`
 		Tags       map[string]string `json:"tags"`
 	} `json:"format"`
+}
+
+type ffprobeSideData struct {
+	Rotation *float64 `json:"rotation"`
+}
+
+func displayVideoDimensions(width, height int, tags map[string]string, sideData []ffprobeSideData) (int, int) {
+	rotation, ok := videoRotationDegrees(tags, sideData)
+	if !ok {
+		return width, height
+	}
+	normalized := int(math.Round(rotation)) % 360
+	if normalized < 0 {
+		normalized += 360
+	}
+	if normalized == 90 || normalized == 270 {
+		return height, width
+	}
+	return width, height
+}
+
+func videoRotationDegrees(tags map[string]string, sideData []ffprobeSideData) (float64, bool) {
+	for _, item := range sideData {
+		if item.Rotation != nil {
+			return *item.Rotation, true
+		}
+	}
+	if value := strings.TrimSpace(tags["rotate"]); value != "" {
+		rotation, err := strconv.ParseFloat(value, 64)
+		if err == nil {
+			return rotation, true
+		}
+	}
+	return 0, false
 }
 
 func codecDisplayName(codec, profile string) string {

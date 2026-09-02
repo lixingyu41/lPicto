@@ -95,6 +95,53 @@ func TestMetadataContinueIncludesPendingAndFailedWork(t *testing.T) {
 	}
 }
 
+func TestRepairVideoDisplayMetadataDimensionsOnlyUpdatesStaleQuarterTurns(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, testDatabaseURL(t, ctx), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	rotatedMetadata := `{"streams":[{"codec_type":"video","width":3840,"height":2160,"side_data_list":[{"rotation":-90}]}]}`
+	unrotatedMetadata := `{"streams":[{"codec_type":"video","width":1920,"height":1080}]}`
+	var staleID int64
+	for _, item := range []struct {
+		path     string
+		width    int
+		height   int
+		metadata string
+	}{
+		{path: "VID/stale.mov", width: 3840, height: 2160, metadata: rotatedMetadata},
+		{path: "VID/repaired.mov", width: 2160, height: 3840, metadata: rotatedMetadata},
+		{path: "VID/landscape.mp4", width: 1920, height: 1080, metadata: unrotatedMetadata},
+	} {
+		asset := testSearchAsset(item.path, model.MediaTypeVideo)
+		asset.Width = &item.width
+		asset.Height = &item.height
+		asset.MetadataJSON = &item.metadata
+		id := insertTaskWorkAsset(t, database, asset)
+		if item.path == "VID/stale.mov" {
+			staleID = id
+		}
+	}
+
+	updated, err := database.RepairVideoDisplayMetadataDimensions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 1 {
+		t.Fatalf("updated records = %d, want 1", updated)
+	}
+	stale, err := database.GetAsset(ctx, staleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.Width == nil || stale.Height == nil || *stale.Width != 2160 || *stale.Height != 3840 {
+		t.Fatalf("repaired dimensions = %v x %v, want 2160 x 3840", stale.Width, stale.Height)
+	}
+}
+
 func insertTaskWorkAsset(t *testing.T, database *DB, asset AssetUpsert) int64 {
 	t.Helper()
 	id, _, _, err := database.UpsertAsset(context.Background(), asset)

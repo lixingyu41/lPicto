@@ -53,6 +53,25 @@ func TestDisplayImageDimensionsAppliesEXIFOrientation(t *testing.T) {
 	}
 }
 
+func TestDisplayVideoDimensionsAppliesRotationMetadata(t *testing.T) {
+	minusNinety := -90.0
+	width, height := displayVideoDimensions(3840, 2160, nil, []ffprobeSideData{{Rotation: &minusNinety}})
+	if width != 2160 || height != 3840 {
+		t.Fatalf("display matrix dimensions = %d x %d, want 2160 x 3840", width, height)
+	}
+
+	width, height = displayVideoDimensions(1920, 1080, map[string]string{"rotate": "90"}, nil)
+	if width != 1080 || height != 1920 {
+		t.Fatalf("rotate tag dimensions = %d x %d, want 1080 x 1920", width, height)
+	}
+
+	oneEighty := 180.0
+	width, height = displayVideoDimensions(3840, 2160, nil, []ffprobeSideData{{Rotation: &oneEighty}})
+	if width != 3840 || height != 2160 {
+		t.Fatalf("half-turn dimensions = %d x %d, want 3840 x 2160", width, height)
+	}
+}
+
 func TestBrowserVideoPlayable(t *testing.T) {
 	if !BrowserVideoPlayable("mp4", "h264", "aac") {
 		t.Fatal("expected h264/aac mp4 playable")
