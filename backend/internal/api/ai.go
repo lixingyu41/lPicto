@@ -224,8 +224,8 @@ func (s *Server) aiStatus(w http.ResponseWriter, r *http.Request) {
 	status.Queued = stats.AIQueued
 	status.Active = stats.ActiveAI
 	status.Staged, status.StagedBytes, _ = s.db.AIStageStats(r.Context())
-	if batch, batchErr := s.db.LatestSourceIOBatch(r.Context()); batchErr == nil && batch != nil && batch.State == "running" {
-		status.SourceReading = true
+	if running, batchErr := s.db.HasRunningSourceIOBatch(r.Context(), "ai_stage_batch"); batchErr == nil {
+		status.SourceReading = running
 	}
 	settings, _ := s.db.GetAISettings(r.Context())
 	status.PausedReason = s.aiPauseReason(r.Context(), status, settings)

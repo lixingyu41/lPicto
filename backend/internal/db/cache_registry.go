@@ -205,6 +205,13 @@ FROM source_io_batch ORDER BY started_at DESC LIMIT 1`).Scan(
 	return &item, nil
 }
 
+func (d *DB) HasRunningSourceIOBatch(ctx context.Context, reason string) (bool, error) {
+	var running bool
+	err := d.Conn().QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM source_io_batch WHERE reason=$1 AND state='running')`, reason).Scan(&running)
+	return running, err
+}
+
 func valueOrZero(value *int64) int64 {
 	if value == nil {
 		return 0

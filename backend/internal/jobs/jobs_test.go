@@ -213,6 +213,61 @@ func TestAIQueueRetriesRetryableFailureOnce(t *testing.T) {
 	}
 }
 
+func TestClearAIQueueInvalidatesDelayedRetry(t *testing.T) {
+	previousRetryDelay := automaticRetryDelay
+	automaticRetryDelay = func(int) time.Duration { return 100 * time.Millisecond }
+	defer func() { automaticRetryDelay = previousRetryDelay }()
+
+	var attempts atomic.Int32
+	firstDone := make(chan struct{})
+	manager := New(slog.Default(), func(context.Context, Task) error { return nil })
+	manager.SetAIHandler(func(context.Context, Task) error {
+		if attempts.Add(1) == 1 {
+			close(firstDone)
+		}
+		return ErrRetryable
+	})
+	manager.Enqueue(Task{Type: "ai_analyze", AssetID: 80, Priority: 100})
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("initial AI attempt did not run")
+	}
+	if err := manager.ClearAIQueue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts after clear = %d, want 1", got)
+	}
+}
+
+func TestOneShotAIRequestDoesNotCreateDelayedRetry(t *testing.T) {
+	previousRetryDelay := automaticRetryDelay
+	automaticRetryDelay = func(int) time.Duration { return 10 * time.Millisecond }
+	defer func() { automaticRetryDelay = previousRetryDelay }()
+
+	var attempts atomic.Int32
+	firstDone := make(chan struct{})
+	manager := New(slog.Default(), func(context.Context, Task) error { return nil })
+	manager.SetAIHandler(func(context.Context, Task) error {
+		if attempts.Add(1) == 1 {
+			close(firstDone)
+		}
+		return ErrRetryable
+	})
+	manager.Enqueue(Task{Type: "ai_analyze", AssetID: 81, Priority: 1})
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("one-shot AI attempt did not run")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("one-shot attempts = %d, want 1", got)
+	}
+}
+
 func TestAutomaticRetryStopsAfterThreeRetries(t *testing.T) {
 	previousRetryDelay := automaticRetryDelay
 	automaticRetryDelay = func(int) time.Duration { return 5 * time.Millisecond }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"lpicto/backend/internal/cachepolicy"
@@ -18,11 +19,15 @@ import (
 )
 
 const (
-	StageBatchLimit          = 100
-	StageBatchMaxBytes int64 = 3 << 30
-	StageMaxIdle             = 24 * time.Hour
-	StageOrphanGrace         = 10 * time.Minute
+	StageLowWater             = 16
+	StageBatchLimit           = 32
+	StageBatchMaxBytes  int64 = 512 << 20
+	StageMaxBundleBytes int64 = 16 << 20
+	StageMaxIdle              = 24 * time.Hour
+	StageOrphanGrace          = 10 * time.Minute
 )
+
+var stagePrepareLocks [64]sync.Mutex
 
 type Stager struct {
 	DB     *db.DB
@@ -31,6 +36,9 @@ type Stager struct {
 }
 
 func (s Stager) Prepare(ctx context.Context, asset model.Asset) (*db.AIStage, error) {
+	lock := &stagePrepareLocks[stageLockIndex(asset.CacheKey)]
+	lock.Lock()
+	defer lock.Unlock()
 	if existing, err := s.DB.AIStageForAsset(ctx, asset.ID, asset.CacheKey); err != nil {
 		return nil, err
 	} else if existing != nil && existing.State == "ready" {
@@ -92,6 +100,10 @@ func (s Stager) Prepare(ctx context.Context, asset model.Asset) (*db.AIStage, er
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
+	if size > StageMaxBundleBytes {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("AI 暂存输入大小 %d 超出 16 MiB 限制", size)
+	}
 	rel, _ := filepath.Rel(s.Store.CacheRoot, dir)
 	expires := time.Now().Add(StageMaxIdle).Unix()
 	stage := db.AIStage{
@@ -103,8 +115,16 @@ func (s Stager) Prepare(ctx context.Context, asset model.Asset) (*db.AIStage, er
 		return nil, err
 	}
 	assetID := asset.ID
-	s.Policy.Register(context.Background(), "ai-staging", asset.CacheKey, filepath.Join(dir, "meta.json"), &assetID, 0)
+	s.Policy.Register(context.Background(), "ai-staging", asset.CacheKey, filepath.Join(dir, "meta.json"), &assetID, 10*time.Minute)
 	return &stage, nil
+}
+
+func stageLockIndex(cacheKey string) uint8 {
+	var value uint8
+	for index := 0; index < len(cacheKey); index++ {
+		value = value*33 + cacheKey[index]
+	}
+	return value % uint8(len(stagePrepareLocks))
 }
 
 func (s Stager) Remove(ctx context.Context, stage *db.AIStage) {

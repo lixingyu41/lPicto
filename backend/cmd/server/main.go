@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -100,7 +101,8 @@ func main() {
 	}
 	queue.SetScanHandler(scanTaskHandler(scan))
 	aiStager := &aiworker.Stager{DB: database, Store: store, Policy: cachePolicy}
-	queue.SetAIHandler((&aiworker.Processor{DB: database, BaseURL: cfg.AIURL, ExternalToken: cfg.ExternalAIToken, Logger: logger, Sources: sources, Stager: aiStager}).Handle)
+	aiProcessor := &aiworker.Processor{DB: database, BaseURL: cfg.AIURL, ExternalToken: cfg.ExternalAIToken, Logger: logger, Sources: sources, Stager: aiStager}
+	queue.SetAIHandler(aiProcessor.Handle)
 
 	role := ""
 	if len(os.Args) > 1 {
@@ -115,10 +117,10 @@ func main() {
 	}
 	switch role {
 	case "worker":
-		runWorker(rootCtx, cfg, database, queue, scan, sources, aiStager, logger)
+		runWorker(rootCtx, cfg, database, queue, scan, sources, aiStager, aiProcessor, logger)
 		<-rootCtx.Done()
 	case "all":
-		runWorker(rootCtx, cfg, database, queue, scan, sources, aiStager, logger)
+		runWorker(rootCtx, cfg, database, queue, scan, sources, aiStager, aiProcessor, logger)
 		handler := api.NewServer(cfg, database, store, scan, queue, eventBus, logger)
 		if err := api.Start(rootCtx, cfg.HTTPAddr, handler, logger); err != nil {
 			logger.Error("server stopped with error", "error", err)
@@ -134,7 +136,7 @@ func main() {
 	}
 }
 
-func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *jobs.Manager, scan *scanner.Scanner, sources *storage.SourceHealth, aiStager *aiworker.Stager, logger *slog.Logger) {
+func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *jobs.Manager, scan *scanner.Scanner, sources *storage.SourceHealth, aiStager *aiworker.Stager, aiProcessor *aiworker.Processor, logger *slog.Logger) {
 	scan.Start(ctx)
 	if cfg.EnableFSWatch {
 		scan.StartWatcher(ctx, 3*time.Second)
@@ -165,6 +167,7 @@ func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *j
 		AI:          2,
 	})
 	go enqueueAIBackfill(ctx, database, queue, sources, aiStager, logger)
+	go maintainExternalAIPrefetch(ctx, database, queue, aiProcessor, logger)
 	go superviseAutomaticTasks(ctx, database, queue, logger)
 	go monitorSourceRecovery(ctx, database, scan, sources, logger)
 	aiworker.StartHealthMonitor(ctx, database, cfg.AIURL, cfg.ExternalAIToken, logger)
@@ -283,7 +286,7 @@ func sourceStatusesUnavailable(statuses []storage.SourceHealthStatus) bool {
 }
 
 func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager, sources *storage.SourceHealth, stager *aiworker.Stager, logger *slog.Logger) {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
 		if debugcontrol.BackgroundProcessingPaused() {
@@ -306,114 +309,159 @@ func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager
 					continue
 				}
 			}
-			items, err := database.AIBackfillBatch(ctx, 1000)
+			items, err := database.AIBackfillBatch(ctx, 128)
 			if err != nil {
 				logger.Warn("load AI backfill failed", "error", err)
 			} else {
 				if len(items) > 0 {
 					_ = database.EnsureSystemTaskRunning(ctx, "ai_analysis")
 				}
-				type stagedBackfillItem struct {
-					item  db.AIBackfillItem
-					stage *db.AIStage
-				}
-				stagedItems := make([]stagedBackfillItem, 0, len(items))
-				stagedReady := 0
-				for _, item := range items {
-					stage, stageErr := database.AIStageForAsset(ctx, item.AssetID, item.CacheKey)
-					if stageErr != nil {
-						logger.Warn("load AI staging failed", "assetID", item.AssetID, "error", stageErr)
-						continue
-					}
-					if stage != nil && stage.State == "ready" {
-						stagedReady++
-					}
-					stagedItems = append(stagedItems, stagedBackfillItem{item: item, stage: stage})
+				stages, stageQueryErr := database.AIStagesForBackfill(ctx, items)
+				if stageQueryErr != nil {
+					logger.Warn("load AI staging failed", "error", stageQueryErr)
+					stages = make(map[int64]*db.AIStage)
 				}
 				queueStats := queue.Stats()
+				readyCount, readyBytes, stageStatsErr := database.AIStageStats(ctx)
+				if stageStatsErr != nil {
+					logger.Warn("load AI staging stats failed", "error", stageStatsErr)
+				}
+				enqueueBudget := aiworker.StageBatchLimit - queueStats.AIQueued - queueStats.ActiveAI
+				if enqueueBudget < 0 {
+					enqueueBudget = 0
+				}
 				prepareBudget := 0
-				if stagedReady == 0 && queueStats.AIQueued+queueStats.ActiveAI == 0 {
-					prepareBudget = aiworker.StageBatchLimit
+				if stageStatsErr == nil && readyCount+queueStats.ActiveAI <= aiworker.StageLowWater {
+					prepareBudget = aiworker.StageBatchLimit - readyCount - queueStats.ActiveAI
+					if prepareBudget > aiworker.StageBatchLimit {
+						prepareBudget = aiworker.StageBatchLimit
+					}
 				}
 				var preparedBytes int64
 				preparedCount := 0
 				var stageBatchID int64
 				var stageBatchErr error
 				if prepareBudget > 0 {
-					stageBatchID, _ = database.BeginSourceIOBatch(ctx, "ai_stage_batch", 100)
+					stageBatchID, _ = database.BeginSourceIOBatch(ctx, "ai_stage_batch", prepareBudget)
 				}
-				for _, stagedItem := range stagedItems {
-					item, stage := stagedItem.item, stagedItem.stage
-					enabled, enabledErr := database.AIExecutionEnabled(ctx)
-					if enabledErr != nil {
-						stageBatchErr = enabledErr
-						break
-					}
-					if !enabled {
-						break
-					}
-					if (stage == nil || stage.State != "ready") && stager != nil && prepareBudget > 0 && preparedBytes < aiworker.StageBatchMaxBytes {
-						if sources != nil {
-							if available, _ := sources.CachedAvailableForRel(item.RelPath); !available {
-								continue
-							}
-						}
-						if jobs.MediaScanPriorityActive() {
-							stageBatchErr = jobs.ErrMediaScanPriority
-							break
-						}
-						if active, _ := queue.PlaybackPriorityActive(ctx); active {
-							break
-						}
-						asset, assetErr := database.GetAsset(ctx, item.AssetID)
-						if assetErr == nil {
-							var stageErr error
-							stage, stageErr = prepareAIStageWithPlayback(ctx, queue, stager, asset)
-							if stageErr != nil {
-								if errors.Is(stageErr, jobs.ErrPlaybackPriority) || ctx.Err() != nil {
-									stageBatchErr = jobs.ErrPlaybackPriority
-									break
-								}
-								logger.Warn("prepare AI staging failed", "assetID", item.AssetID, "error", stageErr)
-								sourceUnavailable := storage.IsSourceUnavailable(stageErr)
-								if sources != nil {
-									libraryRoot, _ := database.ScanLibraryRootForPath(ctx, item.RelPath)
-									sourceUnavailable = sources.AssetReadErrorIsSourceUnavailable(item.RelPath, stageErr, libraryRoot)
-								}
-								if sourceUnavailable {
-									stageBatchErr = stageErr
-									break
-								}
-								_ = database.EnsureAIQueued(ctx, item.AssetID, item.CacheKey, false)
-								_, _ = database.MarkAIProcessing(ctx, item.AssetID, item.CacheKey)
-								_, _ = database.MarkAIFailed(ctx, item.AssetID, item.CacheKey, "AI 输入准备失败："+stageErr.Error())
-								prepareBudget--
-								continue
-							}
-							enabled, enabledErr = database.AIExecutionEnabled(ctx)
-							if enabledErr != nil || !enabled {
-								stager.Remove(context.Background(), stage)
-								if enabledErr != nil {
-									stageBatchErr = enabledErr
-								}
-								break
-							}
-							preparedBytes += stage.SizeBytes
-							preparedCount++
-							prepareBudget--
-						}
-					}
-					if stage == nil || stage.State != "ready" {
-						continue
+				enqueueStage := func(item db.AIBackfillItem, stage *db.AIStage) {
+					if enqueueBudget <= 0 {
+						return
 					}
 					if err := database.EnsureAIQueued(ctx, item.AssetID, item.CacheKey, false); err == nil {
 						queue.Enqueue(jobs.Task{Type: "ai_analyze", AssetID: item.AssetID, Priority: 100})
+						enqueueBudget--
 					}
+				}
+				type stageCandidate struct{ item db.AIBackfillItem }
+				candidates := make([]stageCandidate, 0, prepareBudget)
+				for _, item := range items {
+					stage := stages[item.AssetID]
+					if stage != nil && stage.State == "ready" {
+						enqueueStage(item, stage)
+						continue
+					}
+					if stager == nil || len(candidates) >= prepareBudget {
+						continue
+					}
+					if sources != nil {
+						if available, _ := sources.CachedAvailableForRel(item.RelPath); !available {
+							continue
+						}
+					}
+					candidates = append(candidates, stageCandidate{item: item})
+				}
+				if len(candidates) > 0 {
+					type stageResult struct {
+						item  db.AIBackfillItem
+						stage *db.AIStage
+						err   error
+					}
+					batchCtx, cancelBatch := context.WithCancelCause(ctx)
+					work := make(chan stageCandidate)
+					results := make(chan stageResult)
+					var workers sync.WaitGroup
+					for range min(2, len(candidates)) {
+						workers.Add(1)
+						go func() {
+							defer workers.Done()
+							for candidate := range work {
+								asset, assetErr := database.GetAsset(batchCtx, candidate.item.AssetID)
+								if assetErr != nil {
+									results <- stageResult{item: candidate.item, err: assetErr}
+									continue
+								}
+								stage, stageErr := prepareAIStageWithPlayback(batchCtx, queue, stager, asset)
+								results <- stageResult{item: candidate.item, stage: stage, err: stageErr}
+							}
+						}()
+					}
+					go func() {
+						defer close(work)
+						for _, candidate := range candidates {
+							select {
+							case work <- candidate:
+							case <-batchCtx.Done():
+								return
+							}
+						}
+					}()
+					go func() {
+						workers.Wait()
+						close(results)
+					}()
+					for result := range results {
+						if result.err != nil {
+							if errors.Is(result.err, context.Canceled) || errors.Is(result.err, jobs.ErrTaskStopped) || errors.Is(result.err, jobs.ErrPlaybackPriority) || errors.Is(result.err, jobs.ErrMediaScanPriority) || errors.Is(result.err, jobs.ErrMediaCachePriority) || ctx.Err() != nil {
+								if stageBatchErr == nil {
+									stageBatchErr = result.err
+								}
+								cancelBatch(result.err)
+								continue
+							}
+							logger.Warn("prepare AI staging failed", "assetID", result.item.AssetID, "error", result.err)
+							sourceUnavailable := storage.IsSourceUnavailable(result.err)
+							if sources != nil {
+								libraryRoot, _ := database.ScanLibraryRootForPath(ctx, result.item.RelPath)
+								sourceUnavailable = sources.AssetReadErrorIsSourceUnavailable(result.item.RelPath, result.err, libraryRoot)
+							}
+							if sourceUnavailable {
+								if stageBatchErr == nil {
+									stageBatchErr = result.err
+								}
+								cancelBatch(result.err)
+								continue
+							}
+							_ = database.EnsureAIQueued(ctx, result.item.AssetID, result.item.CacheKey, false)
+							_, _ = database.MarkAIProcessing(ctx, result.item.AssetID, result.item.CacheKey)
+							_, _ = database.MarkAIFailed(ctx, result.item.AssetID, result.item.CacheKey, "AI 输入准备失败："+result.err.Error())
+							continue
+						}
+						enabled, enabledErr := database.AIExecutionEnabled(ctx)
+						if enabledErr != nil || !enabled {
+							stager.Remove(context.Background(), result.stage)
+							if enabledErr != nil && stageBatchErr == nil {
+								stageBatchErr = enabledErr
+							}
+							cancelBatch(context.Canceled)
+							continue
+						}
+						if readyBytes+preparedBytes+result.stage.SizeBytes > aiworker.StageBatchMaxBytes {
+							stager.Remove(context.Background(), result.stage)
+							continue
+						}
+						preparedBytes += result.stage.SizeBytes
+						preparedCount++
+						enqueueStage(result.item, result.stage)
+					}
+					cancelBatch(nil)
 				}
 				if stageBatchID > 0 {
 					state, message := "success", ""
 					if errors.Is(stageBatchErr, jobs.ErrMediaScanPriority) {
 						state, message = "preempted", "媒体扫描已抢占 AI 输入准备"
+					} else if errors.Is(stageBatchErr, jobs.ErrMediaCachePriority) {
+						state, message = "preempted", "缩略图或视频缓存已抢占 AI 输入准备"
 					} else if errors.Is(stageBatchErr, jobs.ErrPlaybackPriority) {
 						state, message = "preempted", "当前媒体播放已抢占 NAS 读取"
 					} else if stageBatchErr != nil {
@@ -443,9 +491,99 @@ func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager
 	}
 }
 
+func maintainExternalAIPrefetch(ctx context.Context, database *db.DB, queue *jobs.Manager, processor *aiworker.Processor, logger *slog.Logger) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		settings, err := database.GetAISettings(ctx)
+		if err == nil && (settings.AutoAnalyze || settings.ManualRun) && !debugcontrol.BackgroundProcessingPaused() {
+			mediaCacheActive, _ := queue.MediaCachePriorityActive(ctx)
+			playbackActive, _ := queue.PlaybackPriorityActive(ctx)
+			if !jobs.MediaScanPriorityActive() && !mediaCacheActive && !playbackActive {
+				nodes, nodeErr := aiworker.ComputeNodes(settings, processor.BaseURL, processor.ExternalToken)
+				node, hasExternal := processor.ExternalNode(nodes)
+				if nodeErr == nil && hasExternal {
+					prefetchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+					status, statusErr := processor.PrefetchStatus(prefetchCtx, node)
+					cancel()
+					if statusErr == nil {
+						items, itemsErr := database.AIBackfillBatch(ctx, 64)
+						if itemsErr == nil {
+							stages, stagesErr := database.AIStagesForBackfill(ctx, items)
+							if stagesErr == nil {
+								eligible := make(map[string]struct{}, len(items))
+								for _, item := range items {
+									stage := stages[item.AssetID]
+									if stage != nil && stage.State == "ready" {
+										eligible[item.CacheKey] = struct{}{}
+									}
+								}
+								present := make(map[string]struct{}, len(status.CacheKeys))
+								for _, key := range status.CacheKeys {
+									if _, ok := eligible[key]; ok {
+										present[key] = struct{}{}
+										continue
+									}
+									discardCtx, discardCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+									_ = processor.DiscardPrefetchedBundleAt(discardCtx, node, key)
+									discardCancel()
+								}
+								for _, item := range items {
+									if len(present) >= status.Capacity {
+										break
+									}
+									stage := stages[item.AssetID]
+									if stage == nil || stage.State != "ready" {
+										continue
+									}
+									if _, exists := present[item.CacheKey]; exists {
+										continue
+									}
+									if enabled, enabledErr := database.AIExecutionEnabled(ctx); enabledErr != nil || !enabled {
+										break
+									}
+									uploadCtx, uploadCancel := context.WithTimeout(ctx, 2*time.Minute)
+									uploadErr := processor.PrefetchStage(uploadCtx, node, item.AssetID, item.CacheKey, stage)
+									uploadCancel()
+									if uploadErr != nil {
+										if logger != nil {
+											logger.Debug("prefetch external AI input failed", "assetID", item.AssetID, "error", uploadErr)
+										}
+										break
+									}
+									present[item.CacheKey] = struct{}{}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func prepareAIStageWithPlayback(ctx context.Context, queue *jobs.Manager, stager *aiworker.Stager, asset model.Asset) (*db.AIStage, error) {
 	if debugcontrol.BackgroundProcessingPaused() {
 		return nil, debugcontrol.ErrBackgroundProcessingPaused
+	}
+	if jobs.MediaScanPriorityActive() {
+		return nil, jobs.ErrMediaScanPriority
+	}
+	if active, _ := queue.MediaCachePriorityActive(ctx); active {
+		return nil, jobs.ErrMediaCachePriority
+	}
+	if active, _ := queue.PlaybackPriorityActive(ctx); active {
+		return nil, jobs.ErrPlaybackPriority
+	}
+	if enabled, err := stager.DB.AIExecutionEnabled(ctx); err != nil {
+		return nil, err
+	} else if !enabled {
+		return nil, jobs.ErrTaskStopped
 	}
 	stageCtx, cancel := context.WithCancelCause(ctx)
 	done := make(chan struct{})
@@ -453,12 +591,22 @@ func prepareAIStageWithPlayback(ctx context.Context, queue *jobs.Manager, stager
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
+			enabled, enabledErr := stager.DB.AIExecutionEnabled(stageCtx)
+			if enabledErr == nil && !enabled {
+				cancel(jobs.ErrTaskStopped)
+				return
+			}
 			if debugcontrol.BackgroundProcessingPaused() {
 				cancel(debugcontrol.ErrBackgroundProcessingPaused)
 				return
 			}
 			if jobs.MediaScanPriorityActive() {
 				cancel(jobs.ErrMediaScanPriority)
+				return
+			}
+			mediaCacheActive, mediaCacheErr := queue.MediaCachePriorityActive(stageCtx)
+			if mediaCacheErr == nil && mediaCacheActive {
+				cancel(jobs.ErrMediaCachePriority)
 				return
 			}
 			active, _ := queue.PlaybackPriorityActive(stageCtx)

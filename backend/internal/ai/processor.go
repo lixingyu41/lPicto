@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -39,6 +40,8 @@ type Processor struct {
 	nextNode            uint64
 }
 
+var errRetainAIStage = errors.New("retain AI staging input")
+
 type analyzeRequest struct {
 	AssetID      int64     `json:"assetId"`
 	RelPath      string    `json:"relPath"`
@@ -62,7 +65,7 @@ type analyzeResponse struct {
 	Palette                 []db.AIColor    `json:"palette"`
 }
 
-func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
+func (p *Processor) Handle(ctx context.Context, task jobs.Task) (resultErr error) {
 	if task.Type != "ai_analyze" {
 		return nil
 	}
@@ -143,7 +146,15 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 			}
 			releaseStage := p.Stager.Pin(stage)
 			defer releaseStage()
-			defer p.Stager.Remove(context.Background(), stage)
+			defer func() {
+				if shouldRetainAIStage(resultErr) {
+					if err := p.DB.RestoreAIStageReady(context.Background(), asset.ID, asset.CacheKey); err != nil {
+						resultErr = errors.Join(resultErr, err)
+					}
+					return
+				}
+				p.Stager.Remove(context.Background(), stage)
+			}()
 		}
 	}
 	stagedPath := ""
@@ -151,15 +162,10 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 		stagedPath = stage.StagePath
 	}
 	payload := analyzeRequest{AssetID: asset.ID, RelPath: asset.RelPath, MediaType: asset.MediaType, CacheKey: asset.CacheKey, Duration: asset.Duration, Focus: focus, StagedPath: stagedPath}
-	req, err := p.newAnalyzeHTTPRequest(ctx, node, payload, stage)
-	if err != nil {
-		return p.fail(ctx, asset.ID, asset.CacheKey, err, true)
+	if !node.External {
+		go p.DiscardPrefetchedBundle(nodes, asset.CacheKey)
 	}
-	client := p.Client
-	if client == nil {
-		client = &http.Client{Timeout: 20 * time.Minute}
-	}
-	resp, err := client.Do(req)
+	resp, err := p.sendAnalyzeRequest(ctx, node, payload, stage)
 	if err != nil {
 		if ctx.Err() != nil {
 			return p.interrupt(asset.ID, asset.CacheKey, context.Cause(ctx), node)
@@ -208,7 +214,20 @@ func (p *Processor) Handle(ctx context.Context, task jobs.Task) error {
 	if err != nil && ctx.Err() != nil {
 		return p.interrupt(asset.ID, asset.CacheKey, context.Cause(ctx), node)
 	}
-	return err
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return p.interrupt(asset.ID, asset.CacheKey, errors.Join(jobs.ErrRetryable, err), node)
+	}
+	return nil
+}
+
+func shouldRetainAIStage(err error) bool {
+	return err != nil && (errors.Is(err, jobs.ErrRetryable) || errors.Is(err, errRetainAIStage) ||
+		errors.Is(err, jobs.ErrMediaScanPriority) || errors.Is(err, jobs.ErrMediaCachePriority) ||
+		errors.Is(err, jobs.ErrPlaybackPriority) || errors.Is(err, jobs.ErrTaskStopped) ||
+		errors.Is(err, context.Canceled))
 }
 
 func (p *Processor) acquireHealthyNode(ctx context.Context, nodes []ComputeNode) (ComputeNode, func(), error) {
@@ -325,6 +344,10 @@ func (p *Processor) newAnalyzeHTTPRequest(ctx context.Context, node ComputeNode,
 	if stage == nil || p.Stager == nil {
 		return nil, errors.New("外部 AI 需要已暂存的媒体输入")
 	}
+	return p.newExternalBundleHTTPRequest(ctx, node, payload, stage, "/analyze-bundle")
+}
+
+func (p *Processor) newExternalBundleHTTPRequest(ctx context.Context, node ComputeNode, payload analyzeRequest, stage *db.AIStage, endpoint string) (*http.Request, error) {
 	ratios, framePaths, err := p.stageBundle(stage)
 	if err != nil {
 		return nil, err
@@ -365,7 +388,7 @@ func (p *Processor) newAnalyzeHTTPRequest(ctx context.Context, node ComputeNode,
 	if err := writer.Close(); err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(node.BaseURL, "/")+"/analyze-bundle", bytes.NewReader(body.Bytes()))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(node.BaseURL, "/")+endpoint, bytes.NewReader(body.Bytes()))
 	if err == nil {
 		request.Header.Set("Content-Type", writer.FormDataContentType())
 		setComputeNodeAuth(request, node)
@@ -373,9 +396,142 @@ func (p *Processor) newAnalyzeHTTPRequest(ctx context.Context, node ComputeNode,
 	return request, err
 }
 
+func (p *Processor) sendAnalyzeRequest(ctx context.Context, node ComputeNode, payload analyzeRequest, stage *db.AIStage) (*http.Response, error) {
+	client := p.Client
+	if client == nil {
+		client = &http.Client{Timeout: 20 * time.Minute}
+	}
+	if node.External {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(node.BaseURL, "/")+"/analyze-prefetched", bytes.NewReader(encoded))
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		setComputeNodeAuth(request, node)
+		response, err := client.Do(request)
+		if err != nil {
+			return nil, err
+		}
+		if response.StatusCode != http.StatusNotFound {
+			return response, nil
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+		response.Body.Close()
+	}
+	request, err := p.newAnalyzeHTTPRequest(ctx, node, payload, stage)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(request)
+}
+
+type PrefetchStatus struct {
+	Capacity  int      `json:"capacity"`
+	CacheKeys []string `json:"cacheKeys"`
+}
+
+func (p *Processor) ExternalNode(nodes []ComputeNode) (ComputeNode, bool) {
+	for _, node := range nodes {
+		if node.External {
+			return node, true
+		}
+	}
+	return ComputeNode{}, false
+}
+
+func (p *Processor) PrefetchStatus(ctx context.Context, node ComputeNode) (PrefetchStatus, error) {
+	var status PrefetchStatus
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(node.BaseURL, "/")+"/prefetch-status", nil)
+	if err != nil {
+		return status, err
+	}
+	setComputeNodeAuth(request, node)
+	client := p.Client
+	if client == nil {
+		client = &http.Client{Timeout: 3 * time.Second}
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return status, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return status, fmt.Errorf("AI prefetch status: %s", response.Status)
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&status); err != nil {
+		return status, err
+	}
+	if status.Capacity < 1 || status.Capacity > 5 {
+		return status, fmt.Errorf("AI prefetch capacity %d outside 1..5", status.Capacity)
+	}
+	return status, nil
+}
+
+func (p *Processor) PrefetchStage(ctx context.Context, node ComputeNode, assetID int64, cacheKey string, stage *db.AIStage) error {
+	asset, err := p.DB.GetAsset(ctx, assetID)
+	if err != nil {
+		return err
+	}
+	payload := analyzeRequest{AssetID: asset.ID, RelPath: asset.RelPath, MediaType: asset.MediaType, CacheKey: cacheKey, Duration: asset.Duration}
+	request, err := p.newExternalBundleHTTPRequest(ctx, node, payload, stage, "/prefetch-bundle")
+	if err != nil {
+		return err
+	}
+	client := p.Client
+	if client == nil {
+		client = &http.Client{Timeout: 2 * time.Minute}
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 16<<10))
+		return fmt.Errorf("AI prefetch upload %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func (p *Processor) DiscardPrefetchedBundle(nodes []ComputeNode, cacheKey string) {
+	node, ok := p.ExternalNode(nodes)
+	if !ok {
+		return
+	}
+	discardCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_ = p.DiscardPrefetchedBundleAt(discardCtx, node, cacheKey)
+}
+
+func (p *Processor) DiscardPrefetchedBundleAt(ctx context.Context, node ComputeNode, cacheKey string) error {
+	endpoint := strings.TrimRight(node.BaseURL, "/") + "/prefetch-bundle?cacheKey=" + url.QueryEscape(cacheKey)
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	setComputeNodeAuth(request, node)
+	client := p.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("AI prefetch discard: %s", response.Status)
+	}
+	return nil
+}
+
 func (p *Processor) stageBundle(stage *db.AIStage) ([]float64, []string, error) {
-	if stage.SizeBytes <= 0 || stage.SizeBytes > 64<<20 {
-		return nil, nil, fmt.Errorf("AI 暂存输入大小 %d 超出 64 MiB 限制", stage.SizeBytes)
+	if stage.SizeBytes <= 0 || stage.SizeBytes > StageMaxBundleBytes {
+		return nil, nil, fmt.Errorf("AI 暂存输入大小 %d 超出 16 MiB 限制", stage.SizeBytes)
 	}
 	root := filepath.Clean(filepath.Join(p.Stager.Store.CacheRoot, filepath.FromSlash(stage.StagePath)))
 	if !storage.IsWithinRoot(p.Stager.Store.CacheRoot, root) {
@@ -449,7 +605,7 @@ func (p *Processor) interrupt(assetID int64, cacheKey string, cause error, node 
 	if err := p.DB.RequeueAIInterrupted(dbCtx, assetID, cacheKey); err != nil {
 		return errors.Join(cause, err)
 	}
-	return cause
+	return errors.Join(errRetainAIStage, cause)
 }
 
 func (p *Processor) requeueNodeFailure(assetID int64, cacheKey, baseURL string, cause error) error {
@@ -573,7 +729,7 @@ func isMediaAnalysisError(err error) bool {
 }
 
 func isComputeNodeFailure(statusCode int, body []byte) bool {
-	if statusCode == http.StatusBadGateway || statusCode == http.StatusServiceUnavailable || statusCode == http.StatusGatewayTimeout {
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || statusCode == http.StatusBadGateway || statusCode == http.StatusServiceUnavailable || statusCode == http.StatusGatewayTimeout {
 		return true
 	}
 	raw := strings.ToLower(string(body))

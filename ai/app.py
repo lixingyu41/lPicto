@@ -1,4 +1,5 @@
 import base64
+from collections import OrderedDict
 import io
 import json
 import logging
@@ -44,6 +45,17 @@ LOGGER = logging.getLogger("lpicto.ai")
 EXTERNAL_AI_TOKEN = os.getenv("EXTERNAL_AI_TOKEN", "").strip()
 SERVICE_ID = "lpicto-ai"
 PROTOCOL_VERSION = 1
+PREFETCH_CAPACITY = 5
+PREFETCH_TTL_SECONDS = 120
+PREFETCH_LOCK = threading.Lock()
+PREFETCH_BUNDLES = OrderedDict()
+
+
+def _prune_prefetch_locked():
+    now = time.monotonic()
+    expired = [key for key, (expires_at, _) in PREFETCH_BUNDLES.items() if expires_at <= now]
+    for key in expired:
+        PREFETCH_BUNDLES.pop(key, None)
 
 ANALYSIS_JSON_SCHEMA = {
     "type": "object",
@@ -415,8 +427,11 @@ def _palette(frames):
 
 @app.get("/health")
 def health():
+    with PREFETCH_LOCK:
+        _prune_prefetch_locked()
+        prefetch_queued = len(PREFETCH_BUNDLES)
     if PAUSED.is_set():
-        return {"status": "paused", "taxonomyCount": len(LABELS), "taxonomyVersion": TAXONOMY_VERSION}
+        return {"status": "paused", "taxonomyCount": len(LABELS), "taxonomyVersion": TAXONOMY_VERSION, "prefetchQueued": prefetch_queued, "prefetchCapacity": PREFETCH_CAPACITY}
     try:
         response = httpx.get("http://127.0.0.1:8091/health", timeout=2)
         response.raise_for_status()
@@ -429,6 +444,8 @@ def health():
         "onnxProviders": session.get_providers(),
         "gpuLayers": int(os.getenv("LLAMA_GPU_LAYERS", "0")),
         "gpuActive": _llama_gpu_active(),
+        "prefetchQueued": prefetch_queued,
+        "prefetchCapacity": PREFETCH_CAPACITY,
     }
 
 @app.get("/ready")
@@ -442,13 +459,15 @@ def ready():
 def pause():
     global ANALYSIS_EPOCH
     PAUSED.set()
-    ANALYSIS_EPOCH += 1
     with CONTROL_LOCK:
+        ANALYSIS_EPOCH += 1
         media_processes = list(ACTIVE_MEDIA_PROCESSES)
     for process in media_processes:
         if process.poll() is None:
             process.terminate()
     _stop_llama()
+    with PREFETCH_LOCK:
+        PREFETCH_BUNDLES.clear()
     return {"accepted": True, "status": "paused"}
 
 @app.post("/resume", status_code=202)
@@ -474,7 +493,7 @@ def analyze(request: AnalyzeRequest):
 def analyze_bundle(metadata: str = Form(...), frames: list[UploadFile] = File(...)):
     try:
         request = AnalyzeRequest.model_validate_json(metadata)
-        loaded_frames = _load_uploaded_frames(request, frames)
+        loaded_frames = _decode_uploaded_bundle(_read_uploaded_bundle(request, frames))
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(400, str(exc)) from exc
     finally:
@@ -483,23 +502,85 @@ def analyze_bundle(metadata: str = Form(...), frames: list[UploadFile] = File(..
     return _run_analyze(request, loaded_frames)
 
 
-def _load_uploaded_frames(request, uploads):
+@app.get("/prefetch-status")
+def prefetch_status():
+    with PREFETCH_LOCK:
+        _prune_prefetch_locked()
+        return {"capacity": PREFETCH_CAPACITY, "cacheKeys": list(PREFETCH_BUNDLES.keys())}
+
+
+@app.post("/prefetch-bundle", status_code=201)
+def prefetch_bundle(metadata: str = Form(...), frames: list[UploadFile] = File(...)):
+    try:
+        with CONTROL_LOCK:
+            if PAUSED.is_set():
+                raise HTTPException(409, "AI analysis paused for media playback")
+            epoch = ANALYSIS_EPOCH
+        request = AnalyzeRequest.model_validate_json(metadata)
+        if not request.cacheKey or len(request.cacheKey) > 256:
+            raise ValueError("invalid cache key")
+        raw_frames = _read_uploaded_bundle(request, frames)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        for upload in frames:
+            upload.file.close()
+    with CONTROL_LOCK:
+        if PAUSED.is_set() or epoch != ANALYSIS_EPOCH:
+            raise HTTPException(409, "AI analysis paused for media playback")
+        with PREFETCH_LOCK:
+            _prune_prefetch_locked()
+            PREFETCH_BUNDLES.pop(request.cacheKey, None)
+            while len(PREFETCH_BUNDLES) >= PREFETCH_CAPACITY:
+                PREFETCH_BUNDLES.popitem(last=False)
+            PREFETCH_BUNDLES[request.cacheKey] = (time.monotonic() + PREFETCH_TTL_SECONDS, raw_frames)
+    return {"accepted": True, "cacheKey": request.cacheKey}
+
+
+@app.delete("/prefetch-bundle")
+def discard_prefetched_bundle(cacheKey: str):
+    with PREFETCH_LOCK:
+        removed = PREFETCH_BUNDLES.pop(cacheKey, None) is not None
+    return {"removed": removed, "cacheKey": cacheKey}
+
+
+@app.post("/analyze-prefetched")
+def analyze_prefetched(request: AnalyzeRequest):
+    with PREFETCH_LOCK:
+        _prune_prefetch_locked()
+        entry = PREFETCH_BUNDLES.pop(request.cacheKey, None)
+    if entry is None:
+        raise HTTPException(404, "prefetched bundle not found")
+    _, raw_frames = entry
+    request.sampleRatios = [ratio for ratio, _ in raw_frames]
+    return _run_analyze(request, _decode_uploaded_bundle(raw_frames))
+
+
+def _read_uploaded_bundle(request, uploads):
     if not 1 <= len(uploads) <= 10:
         raise ValueError("bundle frame count must be between 1 and 10")
     if len(request.sampleRatios) != len(uploads):
         raise ValueError("bundle frame ratios do not match files")
-    loaded = []
+    raw_frames = []
     total = 0
     for index, upload in enumerate(uploads):
-        remaining = (64 << 20) - total
+        remaining = (16 << 20) - total
         raw = upload.file.read(remaining + 1)
         total += len(raw)
-        if total > 64 << 20:
-            raise ValueError("bundle exceeds 64 MiB")
+        if total > 16 << 20:
+            raise ValueError("bundle exceeds 16 MiB")
         with Image.open(io.BytesIO(raw)) as image:
             if image.width > 4096 or image.height > 4096 or image.width * image.height > 16_777_216:
                 raise ValueError("bundle frame dimensions exceed limit")
-            loaded.append((float(request.sampleRatios[index]), ImageOps.exif_transpose(image).convert("RGB").copy()))
+        raw_frames.append((float(request.sampleRatios[index]), raw))
+    return raw_frames
+
+
+def _decode_uploaded_bundle(raw_frames):
+    loaded = []
+    for ratio, raw in raw_frames:
+        with Image.open(io.BytesIO(raw)) as image:
+            loaded.append((ratio, ImageOps.exif_transpose(image).convert("RGB").copy()))
     return loaded
 
 

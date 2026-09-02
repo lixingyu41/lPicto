@@ -141,8 +141,8 @@ func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
 	aiStatus.Queued = queue.AIQueued
 	aiStatus.Active = queue.ActiveAI
 	aiStatus.Staged, aiStatus.StagedBytes, _ = s.db.AIStageStats(r.Context())
-	if sourceIO != nil && sourceIO.State == "running" {
-		aiStatus.SourceReading = true
+	if running, batchErr := s.db.HasRunningSourceIOBatch(r.Context(), "ai_stage_batch"); batchErr == nil {
+		aiStatus.SourceReading = running
 	}
 	aiTask.BlockedReason = s.aiPauseReason(r.Context(), aiStatus, aiSettings)
 	applyAIExecutionState(&aiTask, aiStatus, aiSettings, aiTask.BlockedReason)

@@ -56,6 +56,52 @@ WHERE asset_id=$1 AND cache_key=$2`, assetID, cacheKey)
 	return err
 }
 
+func (d *DB) RestoreAIStageReady(ctx context.Context, assetID int64, cacheKey string) error {
+	_, err := d.Conn().ExecContext(ctx, `
+UPDATE asset_ai_stage SET state='ready',expires_at=now()+interval '24 hours',updated_at=now()
+WHERE asset_id=$1 AND cache_key=$2 AND state='processing'`, assetID, cacheKey)
+	return err
+}
+
+func (d *DB) AIStagesForBackfill(ctx context.Context, items []AIBackfillItem) (map[int64]*AIStage, error) {
+	result := make(map[int64]*AIStage)
+	if len(items) == 0 {
+		return result, nil
+	}
+	ids := make([]int64, 0, len(items))
+	cacheKeys := make(map[int64]string, len(items))
+	for _, item := range items {
+		ids = append(ids, item.AssetID)
+		cacheKeys[item.AssetID] = item.CacheKey
+	}
+	rows, err := d.Conn().QueryContext(ctx, `
+SELECT asset_id,cache_key,state,stage_path,size_bytes,expires_at
+FROM asset_ai_stage WHERE asset_id=ANY($1::bigint[])`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item AIStage
+		var path sql.NullString
+		var expires sql.NullTime
+		if err := rows.Scan(&item.AssetID, &item.CacheKey, &item.State, &path, &item.SizeBytes, &expires); err != nil {
+			return nil, err
+		}
+		if cacheKeys[item.AssetID] != item.CacheKey {
+			continue
+		}
+		item.StagePath = path.String
+		if expires.Valid {
+			value := expires.Time.Unix()
+			item.ExpiresAt = &value
+		}
+		copy := item
+		result[item.AssetID] = &copy
+	}
+	return result, rows.Err()
+}
+
 func (d *DB) DeleteAIStage(ctx context.Context, assetID int64) error {
 	_, err := d.Conn().ExecContext(ctx, `DELETE FROM asset_ai_stage WHERE asset_id=$1`, assetID)
 	return err

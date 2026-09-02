@@ -16,14 +16,15 @@ import (
 )
 
 type Task struct {
-	Type     string   `json:"type"`
-	AssetID  int64    `json:"assetId,omitempty"`
-	Reason   string   `json:"reason,omitempty"`
-	Roots    []string `json:"roots,omitempty"`
-	Paths    []string `json:"paths,omitempty"`
-	Rebuild  bool     `json:"rebuild,omitempty"`
-	Priority int      `json:"priority,omitempty"`
-	Attempt  int      `json:"attempt,omitempty"`
+	Type         string   `json:"type"`
+	AssetID      int64    `json:"assetId,omitempty"`
+	Reason       string   `json:"reason,omitempty"`
+	Roots        []string `json:"roots,omitempty"`
+	Paths        []string `json:"paths,omitempty"`
+	Rebuild      bool     `json:"rebuild,omitempty"`
+	Priority     int      `json:"priority,omitempty"`
+	Attempt      int      `json:"attempt,omitempty"`
+	AIGeneration uint64   `json:"aiGeneration,omitempty"`
 }
 
 type Handler func(ctx context.Context, task Task) error
@@ -137,24 +138,25 @@ type WorkerConfig struct {
 }
 
 type Manager struct {
-	imageQueue       chan Task
-	videoPosterQueue chan Task
-	storyboardQueue  chan Task
-	thumb            Handler
-	scan             Handler
-	ai               Handler
-	redis            *redis.Client
-	redisQueue       string
-	resources        *ResourceLimiter
-	logger           *slog.Logger
-	mu               sync.Mutex
-	queued           map[string]int
-	active           map[string]int
-	activeCancels    map[string]map[uint64]context.CancelCauseFunc
-	activeCancelID   uint64
-	healthMu         sync.Mutex
-	stalledSince     time.Time
-	wg               sync.WaitGroup
+	imageQueue        chan Task
+	videoPosterQueue  chan Task
+	storyboardQueue   chan Task
+	thumb             Handler
+	scan              Handler
+	ai                Handler
+	redis             *redis.Client
+	redisQueue        string
+	resources         *ResourceLimiter
+	logger            *slog.Logger
+	mu                sync.Mutex
+	queued            map[string]int
+	active            map[string]int
+	activeCancels     map[string]map[uint64]context.CancelCauseFunc
+	activeCancelID    uint64
+	aiRetryGeneration uint64
+	healthMu          sync.Mutex
+	stalledSince      time.Time
+	wg                sync.WaitGroup
 }
 
 type queuedTask struct {
@@ -168,15 +170,16 @@ func New(logger *slog.Logger, thumb Handler, policies ...ResourcePolicy) *Manage
 		resources = NewResourceLimiter(policies[0])
 	}
 	return &Manager{
-		imageQueue:       make(chan Task, imageQueueCapacity),
-		videoPosterQueue: make(chan Task, videoPosterQueueCapacity),
-		storyboardQueue:  make(chan Task, storyboardQueueCapacity),
-		thumb:            thumb,
-		resources:        resources,
-		logger:           logger,
-		queued:           map[string]int{},
-		active:           map[string]int{},
-		activeCancels:    map[string]map[uint64]context.CancelCauseFunc{},
+		imageQueue:        make(chan Task, imageQueueCapacity),
+		videoPosterQueue:  make(chan Task, videoPosterQueueCapacity),
+		storyboardQueue:   make(chan Task, storyboardQueueCapacity),
+		thumb:             thumb,
+		resources:         resources,
+		logger:            logger,
+		queued:            map[string]int{},
+		active:            map[string]int{},
+		activeCancels:     map[string]map[uint64]context.CancelCauseFunc{},
+		aiRetryGeneration: 1,
 	}
 }
 
@@ -278,7 +281,13 @@ func (m *Manager) ResetRuntimeState(ctx context.Context) {
 }
 
 func (m *Manager) ClearAIQueue(ctx context.Context) error {
-	if m == nil || m.redis == nil {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	m.aiRetryGeneration++
+	m.mu.Unlock()
+	if m.redis == nil {
 		return nil
 	}
 	members, err := m.redis.SMembers(ctx, redisDedupSet).Result()
@@ -553,6 +562,11 @@ func (m *Manager) Enqueue(task Task) {
 	if !knownQueueTask(task.Type) {
 		m.logger.Warn("unknown task type", "type", task.Type, "assetID", task.AssetID)
 		return
+	}
+	if task.Type == "ai_analyze" && task.AIGeneration == 0 {
+		m.mu.Lock()
+		task.AIGeneration = m.aiRetryGeneration
+		m.mu.Unlock()
 	}
 	if m.redis != nil {
 		m.enqueueRedis(task)
@@ -927,6 +941,12 @@ func (m *Manager) requeueAfterResult(ctx context.Context, task Task, runErr erro
 		m.Enqueue(task)
 		return
 	}
+	if task.Type == "ai_analyze" && !errors.Is(runErr, ErrRetryable) {
+		return
+	}
+	if task.Type == "ai_analyze" && task.Priority == 1 {
+		return
+	}
 	if !errors.Is(runErr, ErrRetryable) && !resourceManagedTask(task.Type) {
 		return
 	}
@@ -935,6 +955,14 @@ func (m *Manager) requeueAfterResult(ctx context.Context, task Task, runErr erro
 	}
 	task.Attempt++
 	delay := automaticRetryDelay(task.Attempt)
+	if task.Type == "ai_analyze" {
+		m.mu.Lock()
+		stale := task.AIGeneration != m.aiRetryGeneration
+		m.mu.Unlock()
+		if stale {
+			return
+		}
+	}
 	if m.logger != nil {
 		m.logger.Info("scheduled automatic task retry", "type", task.Type, "assetID", task.AssetID, "attempt", task.Attempt, "delay", delay)
 	}
@@ -945,6 +973,14 @@ func (m *Manager) requeueAfterResult(ctx context.Context, task Task, runErr erro
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			if task.Type == "ai_analyze" {
+				m.mu.Lock()
+				stale := task.AIGeneration != m.aiRetryGeneration
+				m.mu.Unlock()
+				if stale {
+					return
+				}
+			}
 			m.Enqueue(task)
 		}
 	}()

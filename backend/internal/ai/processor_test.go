@@ -123,3 +123,24 @@ func TestExternalAnalyzeRequestContainsOnlyStagedFrames(t *testing.T) {
 		t.Fatalf("frame files = %d, want 2", len(files))
 	}
 }
+
+func TestExternalPrefetchStatusUsesAuthentication(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/prefetch-status" {
+			t.Fatalf("request path = %q", request.URL.Path)
+		}
+		if token := request.Header.Get("X-LPicto-AI-Token"); token != "secret" {
+			t.Fatalf("token = %q", token)
+		}
+		_, _ = w.Write([]byte(`{"capacity":5,"cacheKeys":["a","b"]}`))
+	}))
+	defer server.Close()
+	processor := Processor{}
+	status, err := processor.PrefetchStatus(context.Background(), ComputeNode{BaseURL: server.URL, External: true, Token: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Capacity != 5 || len(status.CacheKeys) != 2 {
+		t.Fatalf("status = %#v", status)
+	}
+}
