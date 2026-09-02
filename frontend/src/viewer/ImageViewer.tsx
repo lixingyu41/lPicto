@@ -1,13 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Database, Maximize2, Minimize2, RotateCw, Settings, Trash2 } from 'lucide-react';
 import type { Asset } from '../types/api';
 import {
   loadViewerPrefs,
   playbackModeOptions,
   saveViewerPrefs,
+  stepViewerZoomPrefs,
   viewerPrefsChanged,
-  zoomPixelAreaRange,
-  zoomScaleRange,
   type ViewerPlaybackMode,
   type ViewerPrefs,
 } from '../utils/viewerPrefs';
@@ -29,6 +28,7 @@ interface Props {
   onDeleteRecord: () => void;
   onMediaError: (assetId: number, cacheKey: string, message: string) => void;
   onMediaReady: (assetId: number, cacheKey: string) => void;
+  onPosterReady: (assetId: number, cacheKey: string) => void;
   onPlaybackEnded: () => void;
   onPlaybackModeChange: (value: ViewerPlaybackMode) => void;
   onRotate: () => void;
@@ -37,10 +37,11 @@ interface Props {
 
 interface ZoomState {
   active: boolean;
-  backgroundHeight: number;
-  backgroundWidth: number;
-  backgroundX: number;
-  backgroundY: number;
+  height: number;
+  scale: number;
+  width: number;
+  x: number;
+  y: number;
 }
 
 interface DecodedImageSize {
@@ -49,29 +50,32 @@ interface DecodedImageSize {
   width: number;
 }
 
-export default function ImageViewer({ asset, deleting, fullscreen, layerMode, preloadEnabled, playbackMode, slideshowSeconds, onDelete, onDeleteRecord, onMediaError, onMediaReady, onPlaybackEnded, onPlaybackModeChange, onRotate, onToggleFullscreen }: Props) {
+export default function ImageViewer({ asset, deleting, fullscreen, layerMode, preloadEnabled, playbackMode, slideshowSeconds, onDelete, onDeleteRecord, onMediaError, onMediaReady, onPosterReady, onPlaybackEnded, onPlaybackModeChange, onRotate, onToggleFullscreen }: Props) {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const thumbnailRef = useRef<HTMLImageElement | null>(null);
+  const zoomImageRef = useRef<HTMLImageElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const settingsRef = useRef<HTMLDivElement | null>(null);
+  const readyPaintFrameRef = useRef<number | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [prefs, setPrefs] = useState<ViewerPrefs>(() => loadViewerPrefs());
   const [zoom, setZoom] = useState<ZoomState>({
     active: false,
-    backgroundHeight: 0,
-    backgroundWidth: 0,
-    backgroundX: 0,
-    backgroundY: 0,
+    height: 0,
+    scale: 1,
+    width: 0,
+    x: 0,
+    y: 0,
   });
   const [stageSize, setStageSize] = useState({ height: 0, width: 0 });
   const [readyImageKey, setReadyImageKey] = useState('');
-  const [decodedImageKey, setDecodedImageKey] = useState('');
+  const [preRenderedImageKey, setPreRenderedImageKey] = useState('');
   const [decodedImageSize, setDecodedImageSize] = useState<DecodedImageSize | null>(null);
-  const src = viewerImageUrl(asset);
+  const [requestPriority, setRequestPriority] = useState<'current' | 'preload'>(() => layerMode === 'active' ? 'current' : 'preload');
+  const src = viewerImageUrl(asset, requestPriority);
   const thumbnailSrc = assetThumbUrl(asset);
   const imageKey = `${asset.id}:${asset.cacheKey}:${src}`;
   const mainImageReady = readyImageKey === imageKey;
-  const finalImageDecoded = decodedImageKey === imageKey;
   const displayTier = mainImageReady ? 'original' : 'thumbnail';
   const displayedAsset = useMemo(
     () => mainImageReady && decodedImageSize?.key === imageKey
@@ -85,6 +89,8 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
   );
   const zoomPointer = useRef({ clientX: 0, clientY: 0 });
   const zoomActiveRef = useRef(false);
+  const zoomFrameRef = useRef<number | null>(null);
+  const pendingZoomRef = useRef<Omit<ZoomState, 'active'> | null>(null);
   const zoomActivityOwner = useRef<object>({});
 
   useEffect(() => {
@@ -148,19 +154,34 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
     return () => window.removeEventListener('mouseup', endZoom);
   }, [zoom.active]);
 
+  useEffect(() => () => {
+    if (zoomFrameRef.current !== null) window.cancelAnimationFrame(zoomFrameRef.current);
+    if (readyPaintFrameRef.current !== null) window.cancelAnimationFrame(readyPaintFrameRef.current);
+  }, []);
+
   useEffect(() => {
-    if (zoom.active || !finalImageDecoded) return;
+    if (zoom.active || preRenderedImageKey !== imageKey) return;
     setReadyImageKey(imageKey);
-  }, [finalImageDecoded, imageKey, zoom.active]);
+  }, [imageKey, preRenderedImageKey, zoom.active]);
+
+  useLayoutEffect(() => {
+    if (layerMode !== 'active' || mainImageReady || requestPriority === 'current') return;
+    setRequestPriority('current');
+  }, [layerMode, mainImageReady, requestPriority]);
 
   useEffect(() => {
     zoomActiveRef.current = false;
+    if (readyPaintFrameRef.current !== null) {
+      window.cancelAnimationFrame(readyPaintFrameRef.current);
+      readyPaintFrameRef.current = null;
+    }
     setZoom({
       active: false,
-      backgroundHeight: 0,
-      backgroundWidth: 0,
-      backgroundX: 0,
-      backgroundY: 0,
+      height: 0,
+      scale: 1,
+      width: 0,
+      x: 0,
+      y: 0,
     });
     setDecodedImageSize(null);
   }, [src]);
@@ -178,10 +199,10 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
     return () => observer.disconnect();
   }, []);
 
-  function updateZoom(clientX: number, clientY: number, nextPrefs = prefs) {
+  function calculateZoom(clientX: number, clientY: number, nextPrefs = prefs): Omit<ZoomState, 'active'> | null {
     const image = mainImageReady ? imageRef.current : thumbnailRef.current;
     const stage = stageRef.current;
-    if (!image || !stage) return;
+    if (!image || !stage) return null;
     zoomPointer.current = { clientX, clientY };
     const stageRect = stage.getBoundingClientRect();
     const naturalWidth = mainImageReady
@@ -191,7 +212,7 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
       ? image.naturalHeight || asset.height || stageRect.height
       : asset.height || image.naturalHeight || stageRect.height;
     const imageRect = containRect(stageRect, naturalWidth, naturalHeight);
-    if (naturalWidth <= 0 || naturalHeight <= 0 || imageRect.width <= 0 || imageRect.height <= 0) return;
+    if (naturalWidth <= 0 || naturalHeight <= 0 || imageRect.width <= 0 || imageRect.height <= 0) return null;
 
     const imageX = clampNumber(clientX - imageRect.left, 0, imageRect.width);
     const imageY = clampNumber(clientY - imageRect.top, 0, imageRect.height);
@@ -203,16 +224,34 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
       nextPrefs.zoomMode === 'pixels'
         ? Math.min(stageRect.width, stageRect.height) / nextPrefs.zoomPixelArea
         : (imageRect.width * nextPrefs.zoomScale) / naturalWidth;
-    const backgroundWidth = naturalWidth * pixelsPerSourcePixel;
-    const backgroundHeight = naturalHeight * pixelsPerSourcePixel;
+    return {
+      height: naturalHeight,
+      scale: pixelsPerSourcePixel,
+      width: naturalWidth,
+      x: stageX - sourceX * pixelsPerSourcePixel,
+      y: stageY - sourceY * pixelsPerSourcePixel,
+    };
+  }
 
-    setZoom((current) => ({
-      ...current,
-      backgroundHeight,
-      backgroundWidth,
-      backgroundX: stageX - sourceX * pixelsPerSourcePixel,
-      backgroundY: stageY - sourceY * pixelsPerSourcePixel,
-    }));
+  function applyZoom(geometry: Omit<ZoomState, 'active'>) {
+    const image = zoomImageRef.current;
+    if (!image) return;
+    image.style.width = `${geometry.width}px`;
+    image.style.height = `${geometry.height}px`;
+    image.style.transform = `translate3d(${geometry.x}px, ${geometry.y}px, 0) scale(${geometry.scale})`;
+  }
+
+  function scheduleZoom(clientX: number, clientY: number, nextPrefs = prefs) {
+    const geometry = calculateZoom(clientX, clientY, nextPrefs);
+    if (!geometry) return;
+    pendingZoomRef.current = geometry;
+    if (zoomFrameRef.current !== null) return;
+    zoomFrameRef.current = window.requestAnimationFrame(() => {
+      zoomFrameRef.current = null;
+      const pending = pendingZoomRef.current;
+      pendingZoomRef.current = null;
+      if (pending && zoomActiveRef.current) applyZoom(pending);
+    });
   }
 
   const adjustZoomByWheel = useCallback((event: WheelEvent) => {
@@ -222,19 +261,15 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
     event.stopPropagation();
     const direction = event.deltaY < 0 ? 1 : -1;
     const currentPrefs = loadViewerPrefs();
-    const nextPrefs =
-      currentPrefs.zoomMode === 'pixels'
-        ? {
-            ...currentPrefs,
-            zoomPixelArea: clampNumber(currentPrefs.zoomPixelArea - direction * 50, zoomPixelAreaRange.min, zoomPixelAreaRange.max),
-          }
-        : {
-            ...currentPrefs,
-            zoomScale: roundNumber(clampNumber(currentPrefs.zoomScale + direction * 0.2, zoomScaleRange.min, zoomScaleRange.max), 1),
-          };
+    const nextPrefs = stepViewerZoomPrefs(currentPrefs, direction);
     saveViewerPrefs(nextPrefs);
     setPrefs(nextPrefs);
-    updateZoom(zoomPointer.current.clientX, zoomPointer.current.clientY, nextPrefs);
+    const geometry = calculateZoom(zoomPointer.current.clientX, zoomPointer.current.clientY, nextPrefs);
+    if (geometry) {
+      pendingZoomRef.current = null;
+      applyZoom(geometry);
+      setZoom({ active: true, ...geometry });
+    }
   }, [asset.height, asset.width, prefs, zoom.active]);
 
   useEffect(() => {
@@ -255,8 +290,9 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
         if (!mainImageReady && !(thumbnailRef.current?.complete && thumbnailRef.current.naturalWidth > 0)) return;
         event.preventDefault();
         zoomActiveRef.current = true;
-        updateZoom(event.clientX, event.clientY);
-        setZoom((current) => ({ ...current, active: true }));
+        const geometry = calculateZoom(event.clientX, event.clientY);
+        if (!geometry) return;
+        setZoom({ active: true, ...geometry });
       }}
       onMouseMove={(event) => {
         if (isMobileViewerInteraction()) return;
@@ -266,7 +302,7 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
           setZoom((current) => ({ ...current, active: false }));
           return;
         }
-        updateZoom(event.clientX, event.clientY);
+        scheduleZoom(event.clientX, event.clientY);
       }}
       onMouseUp={() => {
         zoomActiveRef.current = false;
@@ -291,9 +327,19 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
             .then(() => {
               if (imageRef.current !== image || image.getAttribute('src') !== src || !image.complete || image.naturalWidth <= 0) return;
               setDecodedImageSize({ key: imageKey, width: image.naturalWidth, height: image.naturalHeight });
-              setDecodedImageKey(imageKey);
-              if (!zoomActiveRef.current) setReadyImageKey(imageKey);
-              onMediaReady(asset.id, asset.cacheKey);
+              // A decoded image is not necessarily rasterized while its media
+              // layer is hidden. Keep the neighbour layer paintable and only
+              // expose the green ready state after the browser has had two
+              // frame opportunities to build its display/compositor surface.
+              readyPaintFrameRef.current = window.requestAnimationFrame(() => {
+                readyPaintFrameRef.current = window.requestAnimationFrame(() => {
+                  readyPaintFrameRef.current = null;
+                  if (imageRef.current !== image || image.getAttribute('src') !== src || !image.complete) return;
+                  setPreRenderedImageKey(imageKey);
+                  if (!zoomActiveRef.current) setReadyImageKey(imageKey);
+                  onMediaReady(asset.id, asset.cacheKey);
+                });
+              });
             });
         }}
         onError={() => onMediaError(asset.id, asset.cacheKey, '图片加载失败')}
@@ -309,18 +355,27 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
           fetchPriority={layerMode === 'active' ? 'high' : 'low'}
           draggable={false}
           style={imageStyle}
+          onLoad={() => onPosterReady(asset.id, asset.cacheKey)}
           onDragStart={(event) => event.preventDefault()}
         />
       )}
       {zoom.active && (
-        <div
-          className="image-zoom-layer image-zoom-layer-preview"
-          style={{
-            backgroundImage: `url("${mainImageReady ? src : thumbnailSrc}")`,
-            backgroundPosition: `${zoom.backgroundX}px ${zoom.backgroundY}px`,
-            backgroundSize: `${zoom.backgroundWidth}px ${zoom.backgroundHeight}px`,
-          }}
-        />
+        <div className="image-zoom-layer image-zoom-layer-preview">
+          <img
+            ref={zoomImageRef}
+            className="image-zoom-layer-content"
+            src={mainImageReady ? src : thumbnailSrc}
+            alt=""
+            decoding="async"
+            draggable={false}
+            style={{
+              height: zoom.height,
+              transform: `translate3d(${zoom.x}px, ${zoom.y}px, 0) scale(${zoom.scale})`,
+              width: zoom.width,
+            }}
+            onDragStart={(event) => event.preventDefault()}
+          />
+        </div>
       )}
       <div className="image-control-zone" onClick={(event) => event.stopPropagation()} onMouseDown={(event) => event.stopPropagation()}>
         <div className="image-controls">
@@ -404,11 +459,6 @@ export default function ImageViewer({ asset, deleting, fullscreen, layerMode, pr
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
-}
-
-function roundNumber(value: number, decimals: number) {
-  const scale = 10 ** decimals;
-  return Math.round(value * scale) / scale;
 }
 
 function isMobileViewerInteraction() {

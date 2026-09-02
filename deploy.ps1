@@ -29,6 +29,7 @@ $remoteScript = "${remoteHome}/lpicto-deploy-run.sh"
 $archive = Join-Path $PSScriptRoot 'lpicto-deploy.tgz'
 $localRunner = Join-Path ([System.IO.Path]::GetTempPath()) 'lpicto-deploy-run.sh'
 $localAIModels = Join-Path $env:LOCALAPPDATA 'lPicto\ai-models'
+$externalAITokenPath = Join-Path $env:LOCALAPPDATA 'lPicto\external-ai-token'
 $aiModelFiles = @(
     @{ Rel = 'Qwen3VL-8B-Instruct-Q4_K_M.gguf'; Size = 5027784800L; SHA = '67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2'; URL = 'https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/Qwen3VL-8B-Instruct-Q4_K_M.gguf' },
     @{ Rel = 'mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf'; Size = 752289728L; SHA = 'c6ba85508d82f42590e6eb77d5340369ab6fecf107a7561d809523d8aa5f3bfd'; URL = 'https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf' },
@@ -64,11 +65,23 @@ function Prepare-LocalAIModels {
         Invoke-WebRequest -Uri "$clipBase/$rel" -OutFile $target -MaximumRedirection 8
     }
 }
+function Get-ExternalAIToken {
+    New-Item -ItemType Directory -Force (Split-Path $externalAITokenPath) | Out-Null
+    if (-not (Test-Path -LiteralPath $externalAITokenPath -PathType Leaf)) {
+        $bytes = New-Object byte[] 32
+        [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+        [IO.File]::WriteAllText($externalAITokenPath, [Convert]::ToHexString($bytes).ToLowerInvariant())
+    }
+    $token = ([IO.File]::ReadAllText($externalAITokenPath)).Trim()
+    if ($token -notmatch '^[0-9a-f]{64}$') { Stop-Deploy "外部 AI 认证密钥无效：$externalAITokenPath" }
+    return $token
+}
 $remoteRunner = @'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 read -r SUDO_PASS
+read -r EXTERNAL_AI_TOKEN
 
 PROJECT=$HOME/lpicto
 MODEL_UPLOAD=$HOME/lpicto-ai-models-upload
@@ -77,7 +90,7 @@ TS=$(date +%Y%m%d%H%M%S)
 STAGING=$HOME/lpicto.next.$TS
 BACKUP=$HOME/lpicto.backup.$TS
 BUILD_LOG=$HOME/lpicto-deploy-build.log
-COMPOSE_FILES=(-f docker-compose.yml)
+COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.gpu.yml)
 export COMPOSE_PROJECT_NAME=lpicto
 export COMPOSE_PROGRESS=plain
 export DOCKER_BUILDKIT=1
@@ -114,7 +127,7 @@ trap cleanup_staging EXIT
 echo "部署时间：$TS"
 test -f "$ARCHIVE" || { echo "错误：找不到上传归档 $ARCHIVE"; exit 10; }
 docker_cmd info --format 'Docker 服务端版本：{{.ServerVersion}}'
-echo '媒体转码：CPU（libx264）'
+echo '媒体转码：CPU / GPU 可按播放会话选择（GPU 使用 VAAPI）'
 
 rm -rf "$STAGING"
 mkdir -p "$STAGING"
@@ -141,7 +154,11 @@ upsert_env LPICTO_PORT 18080 "$STAGING/.env"
 upsert_env LPICTO_MEDIA /mnt "$STAGING/.env"
 upsert_env LPICTO_DATA ./data/app "$STAGING/.env"
 upsert_env LPICTO_CACHE ./data/cache "$STAGING/.env"
-upsert_env FFMPEG_HWACCEL none "$STAGING/.env"
+upsert_env FFMPEG_HWACCEL auto "$STAGING/.env"
+test -e /dev/dri/card0 || { echo '错误：找不到核显设备 /dev/dri/card0'; exit 14; }
+test -e /dev/dri/renderD128 || { echo '错误：找不到核显渲染设备 /dev/dri/renderD128'; exit 14; }
+upsert_env LPICTO_VIDEO_GID "$(stat -c %g /dev/dri/card0)" "$STAGING/.env"
+upsert_env LPICTO_RENDER_GID "$(stat -c %g /dev/dri/renderD128)" "$STAGING/.env"
 upsert_env LIVE_VIDEO_PROXY_MAX_ACTIVE 2 "$STAGING/.env"
 upsert_env VIDEO_PRELOAD_SEGMENTS 2 "$STAGING/.env"
 upsert_env ENABLE_FS_WATCH false "$STAGING/.env"
@@ -149,6 +166,7 @@ upsert_env FILE_COUNT_SCAN_INTERVAL_MINUTES 0 "$STAGING/.env"
 upsert_env SCAN_INTERVAL_MINUTES 0 "$STAGING/.env"
 upsert_env NAS_WATCHER_ROOTS 'PIC=nas/PIC;VID=nas/VID' "$STAGING/.env"
 upsert_env NAS_WATCHER_OFFLINE_SECONDS 90 "$STAGING/.env"
+upsert_env EXTERNAL_AI_TOKEN "$EXTERNAL_AI_TOKEN" "$STAGING/.env"
 mkdir -p "$STAGING/data/app" "$STAGING/data/cache"
 
 echo '校验本机上传的锁定版本 AI 模型（旧服务保持运行）'
@@ -263,9 +281,9 @@ fi
 echo
 curl -fsS http://127.0.0.1:18080/api/ai/status
 echo
-echo '检查 CPU 视频编码'
+echo '检查 CPU / GPU 视频编码'
 compose exec -T api sh -lc \
-  'test "$FFMPEG_HWACCEL" = none && ffmpeg -hide_banner -encoders | grep -E "libx264" | head -n 3'
+  'test -r /dev/dri/renderD128 && test "$FFMPEG_HWACCEL" = auto && ffmpeg -hide_banner -encoders | grep -E "libx264|h264_vaapi" | head -n 6'
 
 find "$HOME" -maxdepth 1 -type d -name 'lpicto.backup.*' -printf '%T@ %p\n' \
   | sort -nr \
@@ -294,6 +312,7 @@ try {
 
     Write-Step "准备锁定版本 AI 模型"
     Prepare-LocalAIModels
+    $externalAIToken = Get-ExternalAIToken
     Write-OK "模型文件已通过 SHA-256 校验"
 
     Write-Step "打包当前工作区"
@@ -344,7 +363,7 @@ try {
     Write-OK "文件上传完成"
 
     Write-Step "远端编译并重启服务"
-    $Password | & sshpass -e ssh @sshOptions $remote "bash ${remoteScript}"
+    "$Password`n$externalAIToken" | & sshpass -e ssh @sshOptions $remote "bash ${remoteScript}"
     if ($LASTEXITCODE -ne 0) { Stop-Deploy "远端部署失败" }
 
     Write-Step "检查外部访问地址"

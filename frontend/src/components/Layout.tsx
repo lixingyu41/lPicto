@@ -8,6 +8,12 @@ import {
   isPrimarySidebarPanelTarget,
   primaryTargetForPath,
 } from '../utils/sidebarPrefs';
+import {
+  immersiveChromePinnedChanged,
+  isImmersiveChromePinnedStorageEvent,
+  loadImmersiveChromePinned,
+  saveImmersiveChromePinned,
+} from '../utils/immersiveChromePrefs';
 
 interface Props {
   children: ReactNode;
@@ -21,13 +27,13 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
   const [routeEntering, setRouteEntering] = useState(false);
   const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
   const [viewerInfoVisible, setViewerInfoVisible] = useState(true);
-  const [topbarPinned, setTopbarPinned] = useState(false);
+  const [topbarPinned, setTopbarPinnedState] = useState(() => loadImmersiveChromePinned());
   const [pinnedMenuOpen, setPinnedMenuOpen] = useState(false);
   const viewerActive = Boolean(overlay) || location.pathname.startsWith('/viewer/');
   const routeTarget = primaryTargetForPath(effectivePathname);
   const [sidebarExpanded, setSidebarExpandedState] = useState<SidebarPanelTarget | null>(null);
   const sidebarPanelOpen = sidebarExpanded !== null && sidebarExpanded === routeTarget;
-  const shellClass = ['app-shell', routeTarget === 'settings' ? 'standard-shell' : 'media-browse-shell', sidebarPanelOpen ? 'browse-panel-open' : 'browse-panel-closed', topbarPinned ? 'topbar-pinned' : '', pinnedMenuOpen ? 'pinned-menu-open' : '']
+  const shellClass = ['app-shell', routeTarget === 'settings' ? 'standard-shell' : 'media-browse-shell', sidebarPanelOpen ? 'browse-panel-open' : 'browse-panel-closed', viewerActive ? 'viewer-active' : '', topbarPinned ? 'topbar-pinned' : '', pinnedMenuOpen ? 'pinned-menu-open' : '']
     .filter(Boolean)
     .join(' ');
   const setSidebarExpanded = useCallback(
@@ -41,6 +47,23 @@ export default function Layout({ children, overlay = null, routeLocation }: Prop
     },
     [],
   );
+  const setTopbarPinned = useCallback((pinned: boolean) => {
+    setTopbarPinnedState(pinned);
+    saveImmersiveChromePinned(pinned);
+  }, []);
+
+  useEffect(() => {
+    const syncPinnedState = () => setTopbarPinnedState(loadImmersiveChromePinned());
+    const handleStorage = (event: StorageEvent) => {
+      if (isImmersiveChromePinnedStorageEvent(event)) syncPinnedState();
+    };
+    window.addEventListener(immersiveChromePinnedChanged, syncPinnedState);
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      window.removeEventListener(immersiveChromePinnedChanged, syncPinnedState);
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
   useEffect(() => {
     setSidebarExpandedState(null);
   }, [routeTarget]);

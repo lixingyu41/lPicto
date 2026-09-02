@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"lpicto/backend/internal/debugcontrol"
 )
 
 type Task struct {
@@ -130,6 +132,7 @@ type ExecutorHealth struct {
 type WorkerConfig struct {
 	Image       int
 	VideoPoster int
+	Storyboard  int
 	AI          int
 }
 
@@ -251,7 +254,7 @@ func (m *Manager) Start(ctx context.Context, cfg WorkerConfig) {
 		m.startRedisWorkers(ctx, "image", cfg.Image, redisImageTaskTypes, nil)
 		m.startRedisWorkers(ctx, "video_poster", cfg.VideoPoster, redisPosterTaskTypes, redisImageTaskTypes)
 		mediaCacheTasks := append(append([]string{}, redisImageTaskTypes...), redisPosterTaskTypes...)
-		m.startRedisWorkers(ctx, "storyboard", 1, redisStoryboardTypes, mediaCacheTasks)
+		m.startRedisWorkers(ctx, "storyboard", cfg.Storyboard, redisStoryboardTypes, mediaCacheTasks)
 		mediaCacheTasks = append(mediaCacheTasks, redisStoryboardTypes...)
 		m.startRedisWorkers(ctx, "ai", cfg.AI, redisAITaskTypes, mediaCacheTasks)
 		return
@@ -264,8 +267,10 @@ func (m *Manager) Start(ctx context.Context, cfg WorkerConfig) {
 		m.wg.Add(1)
 		go m.worker(ctx, "video_poster", m.videoPosterQueue, m.thumb)
 	}
-	m.wg.Add(1)
-	go m.worker(ctx, "storyboard", m.storyboardQueue, m.thumb)
+	for i := 0; i < cfg.Storyboard; i++ {
+		m.wg.Add(1)
+		go m.worker(ctx, "storyboard", m.storyboardQueue, m.thumb)
+	}
 }
 
 func (m *Manager) ResetRuntimeState(ctx context.Context) {
@@ -364,6 +369,9 @@ func (m *Manager) PlaybackPriorityActive(ctx context.Context) (bool, error) {
 // BackgroundBlocker reports why background workers currently cannot start.
 // It is read-only and safe for frequently-polled status endpoints.
 func (m *Manager) BackgroundBlocker(ctx context.Context) string {
+	if debugcontrol.BackgroundProcessingPaused() {
+		return "debug_pause"
+	}
 	if m == nil {
 		return ""
 	}
@@ -626,6 +634,12 @@ func (m *Manager) redisWorker(ctx context.Context, name string, keys []string, b
 			return
 		default:
 		}
+		if debugcontrol.BackgroundProcessingPaused() {
+			if err := sleepContext(ctx, 250*time.Millisecond); err != nil {
+				return
+			}
+			continue
+		}
 		if resourceManaged && MediaScanPriorityActive() {
 			if err := sleepContext(ctx, 200*time.Millisecond); err != nil {
 				return
@@ -705,6 +719,9 @@ func (m *Manager) redisWorker(ctx context.Context, name string, keys []string, b
 }
 
 func (m *Manager) runTask(ctx context.Context, worker string, task Task) error {
+	if task.Type != "scan_stop" && debugcontrol.BackgroundProcessingPaused() {
+		return debugcontrol.ErrBackgroundProcessingPaused
+	}
 	handler := m.handlerFor(task.Type)
 	if handler == nil {
 		m.logger.Warn("unknown task type", "type", task.Type, "assetID", task.AssetID)
@@ -906,7 +923,7 @@ func (m *Manager) requeueAfterResult(ctx context.Context, task Task, runErr erro
 	if runErr == nil || errors.Is(runErr, ErrTaskStopped) || errors.Is(runErr, context.Canceled) {
 		return
 	}
-	if errors.Is(runErr, ErrMediaScanPriority) || errors.Is(runErr, ErrMediaCachePriority) || errors.Is(runErr, ErrPlaybackPriority) {
+	if errors.Is(runErr, ErrMediaScanPriority) || errors.Is(runErr, ErrMediaCachePriority) || errors.Is(runErr, ErrPlaybackPriority) || errors.Is(runErr, debugcontrol.ErrBackgroundProcessingPaused) {
 		m.Enqueue(task)
 		return
 	}
@@ -950,6 +967,12 @@ func (m *Manager) worker(ctx context.Context, name string, queue <-chan Task, ha
 	_ = handler
 	defer m.wg.Done()
 	for {
+		if debugcontrol.BackgroundProcessingPaused() {
+			if err := sleepContext(ctx, 250*time.Millisecond); err != nil {
+				return
+			}
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -1016,6 +1039,9 @@ func normalizeWorkerConfig(cfg WorkerConfig) WorkerConfig {
 	}
 	if cfg.VideoPoster < 1 {
 		cfg.VideoPoster = 1
+	}
+	if cfg.Storyboard < 1 {
+		cfg.Storyboard = 1
 	}
 	return cfg
 }

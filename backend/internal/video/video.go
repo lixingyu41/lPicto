@@ -193,6 +193,24 @@ func hwAccelArgs(hwAccel string, hwDevice string) []string {
 	return args
 }
 
+// DecodeInputArgs returns FFmpeg input options for hardware-assisted decoding.
+// keepHardwareFrames is used by filter graphs that can resize on the GPU before
+// downloading a much smaller frame to system memory.
+func DecodeInputArgs(hwAccel string, hwDevice string, keepHardwareFrames bool) []string {
+	args := hwAccelArgs(hwAccel, hwDevice)
+	if !keepHardwareFrames || len(args) == 0 {
+		return args
+	}
+	switch strings.ToLower(strings.TrimSpace(hwAccel)) {
+	case "vaapi":
+		return append(args, "-hwaccel_output_format", "vaapi")
+	case "cuda":
+		return append(args, "-hwaccel_output_format", "cuda")
+	default:
+		return args
+	}
+}
+
 func cpuProxyFilter(maxHeight int) string {
 	if maxHeight > 0 {
 		return fmt.Sprintf("scale=-2:min(%d\\,trunc(ih/2)*2)", maxHeight)

@@ -76,7 +76,7 @@ func (h *SourceHealth) AvailableRoot(root Root) (bool, SourceHealthStatus) {
 		return current.Available, current
 	}
 	status := probeSourceRoot(root)
-	if sample := h.samples[root.ID]; sample != "" {
+	if sample := h.samples[root.ID]; status.Available && sample != "" {
 		status = probeSourceFile(root, sample)
 	}
 	h.entries[root.ID] = status
@@ -136,6 +136,50 @@ func (h *SourceHealth) RecordSourceError(rel string, err error) {
 	h.entries[root.ID] = SourceHealthStatus{RootID: root.ID, Available: false, Message: err.Error(), CheckedAt: time.Now().Unix()}
 	h.mu.Unlock()
 	h.publishUnavailable(root.ID, err.Error())
+}
+
+// AssetReadErrorIsSourceUnavailable distinguishes a missing or unreadable
+// individual media file from an unavailable storage root. Confirmed source
+// failures remain pending instead of being recorded as permanent media errors.
+func (h *SourceHealth) AssetReadErrorIsSourceUnavailable(rel string, readErr error, libraryRoots ...string) bool {
+	if h == nil || readErr == nil {
+		return false
+	}
+	root, err := h.probeRootForRel(rel)
+	if err != nil {
+		return false
+	}
+	probeRoot := root
+	if len(libraryRoots) > 0 && strings.TrimSpace(libraryRoots[0]) != "" {
+		if libraryPath, pathErr := h.store.PhotoPath(libraryRoots[0]); pathErr == nil {
+			probeRoot.Path = libraryPath
+		}
+	}
+	rootStatus := probeSourceRoot(probeRoot)
+	if !rootStatus.Available {
+		rootStatus.RootID = root.ID
+		h.mu.Lock()
+		delete(h.samples, root.ID)
+		h.entries[root.ID] = rootStatus
+		h.mu.Unlock()
+		h.publishUnavailable(root.ID, rootStatus.Message)
+		return true
+	}
+	if !IsSourceUnavailable(readErr) {
+		return false
+	}
+	path, err := h.store.PhotoPath(rel)
+	if err == nil {
+		status := probeSourceFile(root, path)
+		if !status.Available && IsSourceUnavailablePath(status.Message) {
+			h.mu.Lock()
+			h.samples[root.ID] = path
+			h.entries[root.ID] = status
+			h.mu.Unlock()
+			h.publishUnavailable(root.ID, status.Message)
+		}
+	}
+	return true
 }
 
 // ProbeAsset checks a stored media file. Missing files do not make a storage

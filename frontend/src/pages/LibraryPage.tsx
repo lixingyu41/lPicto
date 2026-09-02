@@ -44,6 +44,22 @@ import { removeAssetById } from '../utils/assetSort';
 import { assetRatingParam, currentURLHasParam, currentURLLocation, currentURLPath, replaceURLState } from '../utils/urlState';
 import { waterfallPageSize } from '../utils/waterfallPaging';
 import { parseTagFilters, serializeTagFilters } from '../utils/tagFilters';
+import {
+  bytesParamToMB,
+  convertDurationValue,
+  datetimeLocalToUnix,
+  durationUnitSeconds,
+  formatNumberValue,
+  mbToBytes,
+  parseDurationRange,
+  parseDurationUnit,
+  parseNumberRange,
+  parseResolutionRanges,
+  rangeInputFromParams,
+  secondsParamToDurationValue,
+  unixParamToDatetimeLocal,
+  type DurationUnit,
+} from '../utils/mediaFilterValues';
 
 const pageSize = waterfallPageSize;
 const libraryURLKeys = [
@@ -81,7 +97,6 @@ const libraryURLKeys = [
 ];
 
 type SearchAlbumFilterMode = 'all' | 'none' | 'albums';
-type DurationUnit = 'seconds' | 'minutes' | 'hours';
 
 interface LibraryPageState extends GridReturnState {
 	aiDescriptionQuery: string;
@@ -307,6 +322,7 @@ export default function LibraryPage({ mode = 'library' }: { mode?: 'library' | '
   const searchKey = useMemo(() => JSON.stringify(searchRequest), [searchRequest]);
   const anchorSearchRequest = useMemo<LibraryFilterParams>(() => ({ ...searchRequest }), [searchRequest]);
   const loadAssets = useCallback((page: number) => api.libraryAssets(page, pageSize, searchRequest), [searchRequest]);
+  const selectAllAssetIds = useCallback(async () => (await api.librarySelection(searchRequest)).assetIds, [searchRequest]);
   const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [searchKey]);
   const {
     focusAssetId,
@@ -319,7 +335,6 @@ export default function LibraryPage({ mode = 'library' }: { mode?: 'library' | '
     scrollTarget,
     scrollTopTarget,
     seekIndex,
-    setScrollRatio,
   } = useWaterfallGridState({
     hasMore,
     hasPrevious,
@@ -857,8 +872,8 @@ export default function LibraryPage({ mode = 'library' }: { mode?: 'library' | '
             onOpenAsset={handleOpenAsset}
             onOpenViewer={handleOpenViewer}
             onBatchRemoveAssets={(ids) => mutateItems((current) => current.filter((asset) => !ids.includes(asset.id)))}
+            selectAllAssetIds={selectAllAssetIds}
             onPressPreviewChange={setPressPreviewAsset}
-            onScrollRatioChange={setScrollRatio}
             onScrollStateChange={handlePersistentGridScrollState}
             totalCount={totalCount}
             loadedStartIndex={loadedStartIndex}
@@ -1009,35 +1024,6 @@ function parseSortParam(value: string | null, fallback: SortKey = 'timeline_desc
   return isSortKey(value) ? value : fallback;
 }
 
-function rangeInputFromParams(minValue: string | null, maxValue: string | null) {
-  const min = positiveNumber(minValue ?? '');
-  const max = positiveNumber(maxValue ?? '');
-  if (min === undefined && max === undefined) return '';
-  if (min !== undefined && max !== undefined && min === max) return String(min);
-  return `${min ?? ''}-${max ?? ''}`;
-}
-
-function secondsParamToDurationValue(value: string | null, unit: DurationUnit) {
-  const seconds = positiveNumber(value ?? '');
-  if (seconds === undefined) return '';
-  return formatNumberValue(seconds / durationUnitSeconds(unit));
-}
-
-function bytesParamToMB(value: string | null) {
-  const bytes = positiveNumber(value ?? '');
-  if (bytes === undefined) return '';
-  return formatNumberValue(bytes / (1024 * 1024));
-}
-
-function unixParamToDatetimeLocal(value: string | null) {
-  const seconds = positiveNumber(value ?? '');
-  if (seconds === undefined) return '';
-  const date = new Date(seconds * 1000);
-  if (!Number.isFinite(date.getTime())) return '';
-  const pad = (part: number) => String(part).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
-}
-
 function buildViewerUrl(asset: Asset, params: LibraryFilterParams, state: LibraryPageState, returnPath: string, recentMode: boolean) {
   const query = new URLSearchParams(searchQueryEntries(params));
   query.set('context', recentMode ? 'recent' : 'library');
@@ -1051,65 +1037,6 @@ function searchQueryEntries(params: LibraryFilterParams) {
     entries.push([key, String(value)]);
   });
   return entries;
-}
-
-function parseResolutionRanges(
-  xValue: string,
-  yValue: string,
-  orientation: OrientationFilter,
-): Pick<LibraryFilterParams, 'widthMin' | 'widthMax' | 'heightMin' | 'heightMax' | 'dimensionMode'> {
-  const width = parseNumberRange(xValue);
-  const height = parseNumberRange(yValue);
-  const hasResolutionFilter = width.min !== undefined || width.max !== undefined || height.min !== undefined || height.max !== undefined;
-  return {
-    widthMin: width.min,
-    widthMax: width.max,
-    heightMin: height.min,
-    heightMax: height.max,
-    dimensionMode: hasResolutionFilter && orientation === 'all' ? 'both' : undefined,
-  };
-}
-
-function parseDurationRange(minValue: string, maxValue: string, unit: DurationUnit): Pick<LibraryFilterParams, 'durationMin' | 'durationMax'> {
-  const min = positiveNumber(minValue);
-  const max = positiveNumber(maxValue);
-  const multiplier = durationUnitSeconds(unit);
-  return {
-    durationMin: min === undefined ? undefined : roundDurationSeconds(min * multiplier),
-    durationMax: max === undefined ? undefined : roundDurationSeconds(max * multiplier),
-  };
-}
-
-function parseNumberRange(value: string): { min?: number; max?: number } {
-  const clean = value.trim();
-  if (clean === '') return {};
-  const parts = clean.split('-', 2);
-  if (parts.length === 1) {
-    const exact = positiveNumber(parts[0]);
-    return exact === undefined ? {} : { min: exact, max: exact };
-  }
-  return { min: positiveNumber(parts[0]), max: positiveNumber(parts[1]) };
-}
-
-function positiveNumber(value: string): number | undefined {
-  const clean = value.trim();
-  if (clean === '') return undefined;
-  const parsed = Number(clean);
-  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
-  return parsed;
-}
-
-function datetimeLocalToUnix(value: string): number | undefined {
-  if (!value) return undefined;
-  const parsed = new Date(value).getTime();
-  if (!Number.isFinite(parsed)) return undefined;
-  return Math.floor(parsed / 1000);
-}
-
-function mbToBytes(value: string): number | undefined {
-  const parsed = positiveNumber(value);
-  if (parsed === undefined) return undefined;
-  return Math.round(parsed * 1024 * 1024);
 }
 
 function initialResolutionRanges(state: LibraryPageState): { x: string; y: string } {
@@ -1131,29 +1058,4 @@ function initialDurationRanges(state: LibraryPageState): { min: string; max: str
     min: range.min === undefined ? '' : formatNumberValue(range.min / multiplier),
     max: range.max === undefined ? '' : formatNumberValue(range.max / multiplier),
   };
-}
-
-function formatNumberValue(value: number): string {
-  if (!Number.isFinite(value)) return '';
-  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(9)));
-}
-
-function parseDurationUnit(value: unknown): DurationUnit {
-  return value === 'seconds' || value === 'hours' ? value : 'minutes';
-}
-
-function durationUnitSeconds(unit: DurationUnit) {
-  if (unit === 'seconds') return 1;
-  if (unit === 'hours') return 3600;
-  return 60;
-}
-
-function roundDurationSeconds(value: number) {
-  return Math.round(value * 1000) / 1000;
-}
-
-function convertDurationValue(value: string, from: DurationUnit, to: DurationUnit) {
-  const parsed = positiveNumber(value);
-  if (parsed === undefined) return value.trim() === '' ? '' : value;
-  return formatNumberValue((parsed * durationUnitSeconds(from)) / durationUnitSeconds(to));
 }

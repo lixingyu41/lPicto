@@ -140,7 +140,13 @@ export function readMediaBufferedRanges(media: HTMLMediaElement, duration: numbe
   for (let index = 0; index < media.buffered.length; index += 1) {
     const start = Math.max(0, media.buffered.start(index));
     const end = Math.min(limit, Math.max(start, media.buffered.end(index)));
-    if (end > start) ranges.push({ start, end });
+    if (end <= start) continue;
+    const previous = ranges[ranges.length - 1];
+    if (previous && start - previous.end <= 0.15) {
+      previous.end = Math.max(previous.end, end);
+    } else {
+      ranges.push({ start, end });
+    }
   }
   return ranges;
 }

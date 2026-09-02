@@ -31,6 +31,27 @@ func TestStoryboardTimingPreservesDelayedVideoPosition(t *testing.T) {
 	}
 }
 
+func TestStoryboardVAAPIFilterScalesBeforeDownloadingFrames(t *testing.T) {
+	filter := storyboardVAAPIFilter(model.Asset{}, 60, 3.75)
+	wantOrder := []string{
+		"scale_vaapi=w=160:h=90:force_original_aspect_ratio=decrease",
+		"hwdownload",
+		"format=nv12",
+		"setpts=PTS-STARTPTS",
+		"fps=1/3.750000",
+		"pad=160:90:(ow-iw)/2:(oh-ih)/2:black",
+		"tile=4x4:nb_frames=16",
+	}
+	position := -1
+	for _, want := range wantOrder {
+		found := strings.Index(filter[position+1:], want)
+		if found < 0 {
+			t.Fatalf("filter = %q, missing ordered element %q", filter, want)
+		}
+		position += found + 1
+	}
+}
+
 func TestStoryboardTimingFallsBackToContainerDuration(t *testing.T) {
 	raw := `{"streams":[{"codec_type":"video","duration":"N/A"}]}`
 	timing := storyboardTiming(&raw, 90)
@@ -58,5 +79,28 @@ func TestSalvageStoryboardSheetsRepeatsLastDecodableSheet(t *testing.T) {
 		if err != nil || string(data) != "frame" {
 			t.Fatalf("sheet %d = %q, %v", index, data, err)
 		}
+	}
+}
+
+func TestVideoPosterSeekStaysBeforeShortVideoEnd(t *testing.T) {
+	short := 1.0
+	veryShort := 0.2
+	long := 30.0
+	tests := []struct {
+		name     string
+		duration *float64
+		want     float64
+	}{
+		{name: "unknown", duration: nil, want: 1},
+		{name: "one second", duration: &short, want: 0.5},
+		{name: "very short", duration: &veryShort, want: 0.1},
+		{name: "long", duration: &long, want: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := videoPosterSeekSeconds(test.duration); math.Abs(got-test.want) > 0.0001 {
+				t.Fatalf("seek = %f, want %f", got, test.want)
+			}
+		})
 	}
 }

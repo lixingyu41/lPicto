@@ -46,9 +46,9 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { isViewerMediaZoomActive } from '../utils/viewerInteractionState';
-import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { NavLink } from 'react-router-dom';
-import { useSidebarBrowseToolsValue, useSidebarPanelValue, useSidebarQueryChipsValue, useSidebarScopeTitles, useViewerInfoPanel, type BrowseTools, type SidebarPanelTarget } from './SidebarContext';
+import { useSidebarBrowseToolsValue, useSidebarPanelValue, useSidebarQueryChipsValue, useViewerInfoPanel, type BrowseTools, type SidebarPanelTarget } from './SidebarContext';
 import { primaryTargetForPath, type PrimarySidebarPanelTarget } from '../utils/sidebarPrefs';
 import { loadSettingsSection, settingsSectionPath } from '../utils/settingsRoute';
 import {
@@ -82,6 +82,7 @@ import {
 import type { AssetGroupMode } from '../utils/assetGrouping';
 import type { AssetKind, AssetRatingFilter, OrientationFilter, SortField } from '../types/api';
 import HierarchicalTagPicker from './HierarchicalTagPicker';
+import { preloadRouteModule, type RouteModule } from '../utils/routeModules';
 
 interface Props {
   expanded: SidebarPanelTarget | null;
@@ -114,14 +115,14 @@ const emptyBatchState: AssetGridBatchState = {
 type PanelMode = 'scope' | 'albums' | 'query';
 type ToolMenu = 'tags' | 'type' | 'orientation' | 'rating' | 'sort' | 'group' | 'layout';
 type PinnedMenu = ImmersivePinnedMenu;
-const hoverIntentDelay = 120;
-const menuDismissDelay = 500;
+type ConnectedGlassGeometry = { d: string; height: number; left: number; top: number; width: number };
+const hoverIntentDelay = 0;
+const menuDismissDelay = 0;
 
 export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routePathname, onPinnedChange, onPinnedMenuOpenChange, onToggleExpanded }: Props) {
   const panels = useSidebarPanelValue();
   const browseToolsByTarget = useSidebarBrowseToolsValue();
   const queryChipsByTarget = useSidebarQueryChipsValue();
-  const scopeTitles = useSidebarScopeTitles();
   const viewerInfo = useViewerInfoPanel();
   const routeTarget = primaryTargetForPath(routePathname);
   const mediaRoute = routeTarget !== 'settings' && routeTarget !== null;
@@ -129,7 +130,7 @@ export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routeP
   const panel = routeTarget ? panels[routeTarget] : null;
   const browseTools = routeTarget ? browseToolsByTarget[routeTarget] : undefined;
   const fallbackScope = navItems.find((item) => item.target === routeTarget)?.label ?? 'lPicto';
-  const scopeTitle = routeTarget ? scopeTitles[routeTarget] ?? fallbackScope : fallbackScope;
+  const scopeTitle = fallbackScope;
   const [navOpen, setNavOpen] = useState(false);
   const [panelMode, setPanelMode] = useState<PanelMode>('scope');
   const [toolMenu, setToolMenu] = useState<ToolMenu | null>(null);
@@ -141,6 +142,7 @@ export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routeP
   const [chromeSize, setChromeSize] = useState<ImmersiveChromeSize>(() => loadImmersiveChromeSize());
   const [pinnedMenu, setPinnedMenu] = useState<PinnedMenu | null>(() => loadPinnedMenu());
   const [pinnedMenuWidth, setPinnedMenuWidth] = useState(() => loadPinnedMenuWidth());
+  const [connectedGlass, setConnectedGlass] = useState<ConnectedGlassGeometry | null>(null);
   const hideTimer = useRef<number | null>(null);
   const dismissTimer = useRef<number | null>(null);
   const revealTimer = useRef<number | null>(null);
@@ -150,12 +152,61 @@ export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routeP
   const interactionOpen = chromePinned || interactionPinned || navOpen || toolMenu !== null || panelOpen || (mediaRoute && batchState.selectionMode);
   const queryChips = routeTarget ? queryChipsByTarget[routeTarget] ?? [] : [];
   const queryCount = queryChips.length;
-  const scopeDetail = scopeTitle.includes('/') ? scopeTitle.slice(scopeTitle.lastIndexOf('/') + 1).trim() : undefined;
   const revealZoneHeight = [48, 54, 58, 64, 70][chromeSize - 1] ?? 54;
   const pinnedNavigation = pinnedMenu?.kind === 'navigation';
   const pinnedPanel = pinnedMenu?.kind === 'panel' && pinnedMenu.target === routeTarget ? pinnedMenu : null;
   const pinnedTool = pinnedMenu?.kind === 'tool' && pinnedMenu.target === routeTarget ? pinnedMenu : null;
   const pinnedMenuActive = pinnedNavigation || pinnedPanel !== null || pinnedTool !== null;
+  const activeFloatingCard = navOpen ? 'navigation' : toolMenu ? `tool-${toolMenu}` : panelOpen ? 'panel' : null;
+
+  useLayoutEffect(() => {
+    const chrome = chromeRef.current;
+    if (!chrome || !activeFloatingCard) {
+      setConnectedGlass(null);
+      return undefined;
+    }
+    let frame = 0;
+    const topbar = chrome.querySelector<HTMLElement>('.immersive-topbar');
+    const trigger = topbar?.querySelector<HTMLElement>('.connected');
+    const cardHost = chrome.querySelector<HTMLElement>(`[data-preloaded-card="${activeFloatingCard}"]`);
+    const card = cardHost?.firstElementChild as HTMLElement | null;
+    if (!topbar || !trigger || !card || card.getClientRects().length === 0) {
+      setConnectedGlass(null);
+      return undefined;
+    }
+    const measure = () => {
+      const chromeRect = chrome.getBoundingClientRect();
+      const barRect = topbar.getBoundingClientRect();
+      const triggerRect = trigger.getBoundingClientRect();
+      const cardRect = card.getBoundingClientRect();
+      const left = Math.min(barRect.left, cardRect.left) - chromeRect.left;
+      const top = barRect.top - chromeRect.top;
+      const right = Math.max(barRect.right, cardRect.right) - chromeRect.left;
+      const bottom = cardRect.bottom - chromeRect.top;
+      const width = Math.max(1, right - left);
+      const height = Math.max(1, bottom - top);
+      const connectedRadius = Number.parseFloat(window.getComputedStyle(chrome).getPropertyValue('--immersive-connected-radius')) || 36;
+      const cardRadius = card.classList.contains('immersive-query-sheet') ? 18 : 14;
+      const d = buildConnectedGlassPath({ barRect, cardRadius, cardRect, innerRadius: connectedRadius, left: chromeRect.left + left, top: chromeRect.top + top, triggerRect });
+      setConnectedGlass((current) => current && current.d === d && Math.abs(current.left - left) < 0.1 && Math.abs(current.top - top) < 0.1 && Math.abs(current.width - width) < 0.1 && Math.abs(current.height - height) < 0.1
+        ? current
+        : { d, height, left, top, width });
+    };
+    const scheduleMeasure = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(measure);
+    };
+    measure();
+    const observer = new ResizeObserver(scheduleMeasure);
+    observer.observe(topbar);
+    observer.observe(card);
+    window.addEventListener('resize', scheduleMeasure);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.removeEventListener('resize', scheduleMeasure);
+    };
+  }, [activeFloatingCard, chromePinned, chromeSize, panelMode, toolAnchorLeft]);
 
   const cancelHide = useCallback(() => {
     if (hideTimer.current === null) return;
@@ -201,6 +252,10 @@ export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routeP
     }
     if (interactionPinned) return;
     cancelMenuHover();
+    if (hoverIntentDelay === 0) {
+      action();
+      return;
+    }
     menuHoverTimer.current = window.setTimeout(() => {
       menuHoverTimer.current = null;
       action();
@@ -217,14 +272,21 @@ export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routeP
   const scheduleDismiss = useCallback((delay = menuDismissDelay) => {
     cancelDismiss();
     if (interactionPinned) return;
-    dismissTimer.current = window.setTimeout(() => {
-      dismissTimer.current = null;
+    const dismiss = () => {
       const activeElement = document.activeElement;
       if (activeElement && chromeRef.current?.contains(activeElement) && isEditableTarget(activeElement)) return;
       setNavOpen(false);
       setToolMenu(null);
       onToggleExpanded(null);
       if (mediaRoute && !chromePinned) setVisible(false);
+    };
+    if (delay <= 0) {
+      dismiss();
+      return;
+    }
+    dismissTimer.current = window.setTimeout(() => {
+      dismissTimer.current = null;
+      dismiss();
     }, delay);
   }, [cancelDismiss, chromePinned, interactionPinned, mediaRoute, onToggleExpanded]);
 
@@ -498,6 +560,8 @@ export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routeP
           className={routeTarget === target ? 'active' : ''}
           key={target}
           to={target === 'settings' ? settingsSectionPath(loadSettingsSection()) : to}
+          onFocus={() => preloadRouteModule(target === 'recent' ? 'library' : target as RouteModule)}
+          onMouseEnter={() => preloadRouteModule(target === 'recent' ? 'library' : target as RouteModule)}
           onClick={(event) => {
             setInteractionPinned(false);
             if (routeTarget === target) {
@@ -565,18 +629,33 @@ export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routeP
         {chromePinned || interactionPinned ? <X size={18} /> : <Menu size={18} />}
       </button>
       <div
-        className={`immersive-chrome immersive-chrome-size-${chromeSize}${visible || interactionOpen ? ' visible' : ''}${interactionOpen ? ' locked' : ''}${chromePinned ? ' pinned' : ''}`}
+        className={`immersive-chrome immersive-chrome-size-${chromeSize}${visible || interactionOpen ? ' visible' : ''}${interactionOpen ? ' locked' : ''}${chromePinned ? ' pinned' : ''}${connectedGlass ? ' composite-open' : ''}`}
         ref={chromeRef}
-        style={!chromePinned && pinnedMenuActive ? { left: pinnedMenuWidth + 12 } : undefined}
+        style={{
+          ...(!chromePinned && pinnedMenuActive ? { left: pinnedMenuWidth + 12 } : {}),
+        } as CSSProperties}
         onPointerEnter={() => { cancelDismiss(); cancelMenuHover(); show(); }}
         onPointerLeave={() => { cancelMenuHover(); scheduleDismiss(menuDismissDelay); }}
         onBlurCapture={(event) => {
           if (!event.currentTarget.contains(event.relatedTarget as Node | null)) scheduleDismiss(menuDismissDelay);
         }}
       >
+        {connectedGlass && (
+          <span
+            className="immersive-connected-glass-surface"
+            aria-hidden="true"
+            style={{
+              clipPath: `path("${connectedGlass.d}")`,
+              height: connectedGlass.height,
+              left: connectedGlass.left,
+              top: connectedGlass.top,
+              width: connectedGlass.width,
+            }}
+          />
+        )}
         <header className="immersive-topbar">
           <button
-            className={`immersive-brand-scope${chromePinned ? ' pinned' : ''}`}
+            className={`immersive-brand-scope${chromePinned ? ' pinned' : ''}${navOpen ? ' connected' : ''}`}
             aria-expanded={navOpen}
             aria-label={`${chromePinned ? '取消固定' : '固定'}顶部菜单，当前页面 ${scopeTitle}`}
             aria-pressed={chromePinned}
@@ -589,20 +668,20 @@ export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routeP
             <strong>{scopeTitle}</strong>
           </button>
           <span className="immersive-topbar-spacer" />
-          {routeTarget === 'albums' && <TopbarButton icon={Images} label="相册" detail={scopeDetail} active={(panelOpen && panelMode === 'scope') || pinnedPanel?.mode === 'scope'} onHover={(trigger) => previewPanel('scope', trigger)} onClick={(event) => togglePanel('scope', event.currentTarget)} />}
-          {routeTarget === 'folders' && <TopbarButton icon={FolderTree} label="文件夹" detail={scopeDetail} active={(panelOpen && panelMode === 'scope') || pinnedPanel?.mode === 'scope'} onHover={(trigger) => previewPanel('scope', trigger)} onClick={(event) => togglePanel('scope', event.currentTarget)} />}
-          {routeTarget === 'collections' && <TopbarButton icon={Layers3} label="集合" detail={scopeDetail} active={(panelOpen && panelMode === 'scope') || pinnedPanel?.mode === 'scope'} onHover={(trigger) => previewPanel('scope', trigger)} onClick={(event) => togglePanel('scope', event.currentTarget)} />}
-          {browseTools?.panelModes.includes('albums') && <TopbarButton icon={Images} label="相册" detail={browseTools.albumFilterLabel} active={(panelOpen && panelMode === 'albums') || pinnedPanel?.mode === 'albums' || browseTools.albumFilterActive} onHover={(trigger) => previewPanel('albums', trigger)} onClick={(event) => togglePanel('albums', event.currentTarget)} />}
+          {routeTarget === 'albums' && <TopbarButton icon={Images} label="相册" connected={panelOpen && panelMode === 'scope'} active={(panelOpen && panelMode === 'scope') || pinnedPanel?.mode === 'scope'} onHover={(trigger) => previewPanel('scope', trigger)} onClick={(event) => togglePanel('scope', event.currentTarget)} />}
+          {routeTarget === 'folders' && <TopbarButton icon={FolderTree} label="文件夹" connected={panelOpen && panelMode === 'scope'} active={(panelOpen && panelMode === 'scope') || pinnedPanel?.mode === 'scope'} onHover={(trigger) => previewPanel('scope', trigger)} onClick={(event) => togglePanel('scope', event.currentTarget)} />}
+          {routeTarget === 'collections' && <TopbarButton icon={Layers3} label="集合" connected={panelOpen && panelMode === 'scope'} active={(panelOpen && panelMode === 'scope') || pinnedPanel?.mode === 'scope'} onHover={(trigger) => previewPanel('scope', trigger)} onClick={(event) => togglePanel('scope', event.currentTarget)} />}
+          {browseTools?.panelModes.includes('albums') && <TopbarButton icon={Images} label="相册" connected={panelOpen && panelMode === 'albums'} active={(panelOpen && panelMode === 'albums') || pinnedPanel?.mode === 'albums' || browseTools.albumFilterActive} onHover={(trigger) => previewPanel('albums', trigger)} onClick={(event) => togglePanel('albums', event.currentTarget)} />}
           {browseTools && (browseTools.panelModes.includes('search') || browseTools.panelModes.includes('filters')) && (
-            <TopbarButton icon={Search} label="搜索与筛选" detail={queryCount > 0 ? String(queryCount) : undefined} active={(panelOpen && panelMode === 'query') || pinnedPanel?.mode === 'query' || queryCount > 0} dataAttribute="query" onHover={(trigger) => previewPanel('query', trigger)} onClick={(event) => togglePanel('query', event.currentTarget)} />
+            <TopbarButton icon={Search} label="搜索与筛选" connected={panelOpen && panelMode === 'query'} active={(panelOpen && panelMode === 'query') || pinnedPanel?.mode === 'query' || queryCount > 0} dataAttribute="query" onHover={(trigger) => previewPanel('query', trigger)} onClick={(event) => togglePanel('query', event.currentTarget)} />
           )}
-          {browseTools && <TopbarButton icon={Tags} label="标签" detail={browseTools.tagFilters.length > 0 ? String(browseTools.tagFilters.length) : undefined} active={toolMenu === 'tags' || pinnedTool?.menu === 'tags' || browseTools.tagFilters.length > 0} onHover={(trigger) => previewToolMenu('tags', trigger)} onClick={(event) => toggleToolMenu('tags', event.currentTarget)} />}
-          {browseTools && <TopbarButton icon={mediaTypeIcon(browseTools.type)} label="类型" detail={mediaTypeLabel(browseTools.type)} active={toolMenu === 'type' || pinnedTool?.menu === 'type' || browseTools.type !== 'all'} onHover={(trigger) => previewToolMenu('type', trigger)} onClick={(event) => toggleToolMenu('type', event.currentTarget)} />}
-          {browseTools && <TopbarButton icon={orientationIcon(browseTools.orientation)} label="方向" detail={orientationLabel(browseTools.orientation)} active={toolMenu === 'orientation' || pinnedTool?.menu === 'orientation' || browseTools.orientation !== 'all'} onHover={(trigger) => previewToolMenu('orientation', trigger)} onClick={(event) => toggleToolMenu('orientation', event.currentTarget)} />}
-          {browseTools && <TopbarButton icon={browseTools.rating === 'all' ? Star : browseTools.rating === 0 ? StarOff : Star} label="评分" detail={ratingLabel(browseTools.rating)} active={toolMenu === 'rating' || pinnedTool?.menu === 'rating' || browseTools.rating !== 'all'} onHover={(trigger) => previewToolMenu('rating', trigger)} onClick={(event) => toggleToolMenu('rating', event.currentTarget)} />}
-          {browseTools && <TopbarButton icon={RotateCw} label="排序" active={toolMenu === 'sort' || pinnedTool?.menu === 'sort'} onHover={(trigger) => previewToolMenu('sort', trigger)} onClick={(event) => toggleToolMenu('sort', event.currentTarget)} />}
-          {browseTools && <TopbarButton icon={Layers3} label="分组" active={toolMenu === 'group' || pinnedTool?.menu === 'group' || browseTools.groupMode !== 'none'} onHover={(trigger) => previewToolMenu('group', trigger)} onClick={(event) => toggleToolMenu('group', event.currentTarget)} />}
-          {mediaRoute && <TopbarButton icon={LayoutGrid} label="布局" active={toolMenu === 'layout' || pinnedTool?.menu === 'layout'} onHover={(trigger) => previewToolMenu('layout', trigger)} onClick={(event) => toggleToolMenu('layout', event.currentTarget)} />}
+          {browseTools && <TopbarButton icon={Tags} label="标签" connected={toolMenu === 'tags'} active={toolMenu === 'tags' || pinnedTool?.menu === 'tags' || browseTools.tagFilters.length > 0} onHover={(trigger) => previewToolMenu('tags', trigger)} onClick={(event) => toggleToolMenu('tags', event.currentTarget)} />}
+          {browseTools && <TopbarButton icon={mediaTypeIcon(browseTools.type)} label="类型" detail={mediaTypeLabel(browseTools.type)} connected={toolMenu === 'type'} active={toolMenu === 'type' || pinnedTool?.menu === 'type' || browseTools.type !== 'all'} onHover={(trigger) => previewToolMenu('type', trigger)} onClick={(event) => toggleToolMenu('type', event.currentTarget)} />}
+          {browseTools && <TopbarButton icon={orientationIcon(browseTools.orientation)} label="方向" detail={orientationLabel(browseTools.orientation)} connected={toolMenu === 'orientation'} active={toolMenu === 'orientation' || pinnedTool?.menu === 'orientation' || browseTools.orientation !== 'all'} onHover={(trigger) => previewToolMenu('orientation', trigger)} onClick={(event) => toggleToolMenu('orientation', event.currentTarget)} />}
+          {browseTools && <TopbarButton icon={browseTools.rating === 'all' ? Star : browseTools.rating === 0 ? StarOff : Star} label="评分" detail={ratingLabel(browseTools.rating)} connected={toolMenu === 'rating'} active={toolMenu === 'rating' || pinnedTool?.menu === 'rating' || browseTools.rating !== 'all'} onHover={(trigger) => previewToolMenu('rating', trigger)} onClick={(event) => toggleToolMenu('rating', event.currentTarget)} />}
+          {browseTools && <TopbarButton icon={RotateCw} label="排序" detail={sortLabel(browseTools.sort)} connected={toolMenu === 'sort'} active={toolMenu === 'sort' || pinnedTool?.menu === 'sort'} onHover={(trigger) => previewToolMenu('sort', trigger)} onClick={(event) => toggleToolMenu('sort', event.currentTarget)} />}
+          {browseTools && <TopbarButton icon={Layers3} label="分组" detail={groupLabel(browseTools.groupMode)} connected={toolMenu === 'group'} active={toolMenu === 'group' || pinnedTool?.menu === 'group' || browseTools.groupMode !== 'none'} onHover={(trigger) => previewToolMenu('group', trigger)} onClick={(event) => toggleToolMenu('group', event.currentTarget)} />}
+          {mediaRoute && <TopbarButton icon={LayoutGrid} label="布局" detail={layoutLabel(viewPreferences.mode)} connected={toolMenu === 'layout'} active={toolMenu === 'layout' || pinnedTool?.menu === 'layout'} onHover={(trigger) => previewToolMenu('layout', trigger)} onClick={(event) => toggleToolMenu('layout', event.currentTarget)} />}
           {mediaRoute && batchState.available && !batchState.selectionMode && <TopbarButton icon={ListChecks} label="多选" onHover={previewCloseOpenMenu} onClick={() => dispatchAssetGridBatchCommand('toggle-selection')} />}
           {viewerInfo.active && (
             <TopbarButton
@@ -614,11 +693,15 @@ export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routeP
             />
           )}
         </header>
-        {navOpen && renderNavigationMenu(false)}
-        {toolMenu === 'layout' && renderLayoutMenu(false)}
-        {toolMenu === 'tags' && renderTagMenu(false)}
-        {toolMenu && toolMenu !== 'layout' && toolMenu !== 'tags' && browseTools && routeTarget && <BrowseToolPopover anchorLeft={toolAnchorLeft} menu={toolMenu} pinned={false} tools={browseTools} onPin={() => togglePinnedMenu({ kind: 'tool', menu: toolMenu, target: routeTarget })} />}
-        {panelOpen && renderPanelMenu(panelMode, false)}
+        <PreloadedFloatingCard active={navOpen} cardKey="navigation">{renderNavigationMenu(false)}</PreloadedFloatingCard>
+        {mediaRoute && <PreloadedFloatingCard active={toolMenu === 'layout'} cardKey="tool-layout">{renderLayoutMenu(false)}</PreloadedFloatingCard>}
+        {browseTools && <PreloadedFloatingCard active={toolMenu === 'tags'} cardKey="tool-tags">{renderTagMenu(false)}</PreloadedFloatingCard>}
+        {browseTools && routeTarget && (['type', 'orientation', 'rating', 'sort', 'group'] as const).map((menu) => (
+          <PreloadedFloatingCard active={toolMenu === menu} cardKey={`tool-${menu}`} key={menu}>
+            <BrowseToolPopover anchorLeft={toolAnchorLeft} menu={menu} pinned={false} tools={browseTools} onPin={() => togglePinnedMenu({ kind: 'tool', menu, target: routeTarget })} />
+          </PreloadedFloatingCard>
+        ))}
+        {panel && routeTarget && <PreloadedFloatingCard active={panelOpen} cardKey="panel">{renderPanelMenu(panelMode, false)}</PreloadedFloatingCard>}
       </div>
       {pinnedMenuActive && (
         <aside className="immersive-pinned-sidebar" style={{ width: pinnedMenuWidth }} aria-label="固定菜单">
@@ -635,15 +718,71 @@ export default function ImmersiveTopbar({ expanded, pinned: chromePinned, routeP
   );
 }
 
-function TopbarButton({ active = false, dataAttribute, detail, icon: Icon, label, onClick, onHover }: { active?: boolean; dataAttribute?: 'query'; detail?: string; icon: LucideIcon; label: string; onClick: (event: ReactMouseEvent<HTMLButtonElement>) => void; onHover?: (trigger: HTMLButtonElement) => void }) {
+function TopbarButton({ active = false, connected = false, dataAttribute, detail, icon: Icon, label, onClick, onHover }: { active?: boolean; connected?: boolean; dataAttribute?: 'query'; detail?: string; icon: LucideIcon; label: string; onClick: (event: ReactMouseEvent<HTMLButtonElement>) => void; onHover?: (trigger: HTMLButtonElement) => void }) {
   const title = detail ? `${label}：${detail}` : label;
-  return <button className={`immersive-topbar-button${active ? ' active' : ''}`} data-topbar-query={dataAttribute === 'query' ? '' : undefined} type="button" title={title} onMouseEnter={(event) => onHover?.(event.currentTarget)} onClick={onClick}><Icon size={17} /><span>{label}{detail && <strong>{detail}</strong>}</span></button>;
+  return <button aria-expanded={connected} className={`immersive-topbar-button${active ? ' active' : ''}${connected ? ' connected' : ''}`} data-topbar-query={dataAttribute === 'query' ? '' : undefined} type="button" title={title} onMouseEnter={(event) => onHover?.(event.currentTarget)} onClick={onClick}><Icon size={17} /><span>{detail ?? label}</span></button>;
+}
+
+function PreloadedFloatingCard({ active, cardKey, children }: { active: boolean; cardKey: string; children: ReactNode }) {
+  return <div aria-hidden={!active} className={`immersive-preloaded-card${active ? ' active' : ''}`} data-preloaded-card={cardKey} style={{ display: active ? 'contents' : 'none' }}>{children}</div>;
+}
+
+function buildConnectedGlassPath({ barRect, cardRadius: requestedCardRadius, cardRect, innerRadius: requestedInnerRadius, left, top, triggerRect }: { barRect: DOMRect; cardRadius: number; cardRect: DOMRect; innerRadius: number; left: number; top: number; triggerRect: DOMRect }) {
+  const x = (value: number) => value - left;
+  const y = (value: number) => value - top;
+  const barLeft = x(barRect.left);
+  const barRight = x(barRect.right);
+  const barTop = y(barRect.top);
+  const barBottom = y(barRect.bottom);
+  const cardLeft = x(cardRect.left);
+  const cardRight = x(cardRect.right);
+  const cardTop = y(cardRect.top);
+  const cardBottom = y(cardRect.bottom);
+  const barRadius = Math.min(15, barRect.height / 2, barRect.width / 2);
+  const cardRadius = Math.min(requestedCardRadius, cardRect.height / 2, cardRect.width / 2);
+  const availableShoulder = Math.max(0, (cardRect.width - Math.min(triggerRect.width, cardRect.width)) / 2);
+  // Keep the 36 px circle radius, but expose only a 20 degree (1/18 circle)
+  // segment. Its 2.17 px rise lets the card sit close to the top bar while the
+  // concave connection still reads as a broad-radius curve.
+  const innerArcAngle = Math.PI / 9;
+  const innerRadius = Math.min(requestedInnerRadius, availableShoulder / Math.sin(innerArcAngle));
+  const innerReach = innerRadius * Math.sin(innerArcAngle);
+  const innerRise = Math.min(cardTop - barBottom, innerRadius * (1 - Math.cos(innerArcAngle)));
+  const neckLeft = Math.max(cardLeft + innerReach, Math.min(cardRight - innerReach, x(triggerRect.left)));
+  const neckRight = Math.max(neckLeft, Math.min(cardRight - innerReach, x(triggerRect.right)));
+  const n = (value: number) => Number(value.toFixed(2));
+  return [
+    `M ${n(barLeft + barRadius)} ${n(barTop)}`,
+    `H ${n(barRight - barRadius)}`,
+    `Q ${n(barRight)} ${n(barTop)} ${n(barRight)} ${n(barTop + barRadius)}`,
+    `V ${n(barBottom - barRadius)}`,
+    `Q ${n(barRight)} ${n(barBottom)} ${n(barRight - barRadius)} ${n(barBottom)}`,
+    `H ${n(neckRight)}`,
+    `V ${n(cardTop - innerRise)}`,
+    `A ${n(innerRadius)} ${n(innerRadius)} 0 0 0 ${n(neckRight + innerReach)} ${n(cardTop)}`,
+    `H ${n(cardRight - cardRadius)}`,
+    `Q ${n(cardRight)} ${n(cardTop)} ${n(cardRight)} ${n(cardTop + cardRadius)}`,
+    `V ${n(cardBottom - cardRadius)}`,
+    `Q ${n(cardRight)} ${n(cardBottom)} ${n(cardRight - cardRadius)} ${n(cardBottom)}`,
+    `H ${n(cardLeft + cardRadius)}`,
+    `Q ${n(cardLeft)} ${n(cardBottom)} ${n(cardLeft)} ${n(cardBottom - cardRadius)}`,
+    `V ${n(cardTop + cardRadius)}`,
+    `Q ${n(cardLeft)} ${n(cardTop)} ${n(cardLeft + cardRadius)} ${n(cardTop)}`,
+    `H ${n(neckLeft - innerReach)}`,
+    `A ${n(innerRadius)} ${n(innerRadius)} 0 0 0 ${n(neckLeft)} ${n(cardTop - innerRise)}`,
+    `V ${n(barBottom)}`,
+    `H ${n(barLeft + barRadius)}`,
+    `Q ${n(barLeft)} ${n(barBottom)} ${n(barLeft)} ${n(barBottom - barRadius)}`,
+    `V ${n(barTop + barRadius)}`,
+    `Q ${n(barLeft)} ${n(barTop)} ${n(barLeft + barRadius)} ${n(barTop)}`,
+    'Z',
+  ].join(' ');
 }
 
 function SelectionActionBar({ state }: { state: AssetGridBatchState }) {
   const actions: Array<{ command: AssetGridBatchCommand; Icon: LucideIcon; label: string; danger?: boolean }> = [
     ...(state.canAutoSelect ? [{ command: 'auto-select' as const, Icon: Sparkles, label: '自动选择重复项' }] : []),
-    { command: 'select-all', Icon: ListChecks, label: '全选已加载' },
+    { command: 'select-all', Icon: ListChecks, label: '全选当前筛选' },
     { command: 'clear', Icon: CircleX, label: '清空' },
     { command: 'add-tag', Icon: Tags, label: '标签' },
     { command: 'set-rating', Icon: Star, label: '评分' },
@@ -814,18 +953,53 @@ function mediaTypeLabel(type: AssetKind) {
   if (type === 'image') return '图片';
   if (type === 'video') return '视频';
   if (type === 'audio') return '音频';
-  return undefined;
+  return '全部媒体';
 }
 
 function orientationLabel(orientation: OrientationFilter) {
   if (orientation === 'landscape') return '横屏';
   if (orientation === 'portrait') return '竖屏';
-  return undefined;
+  return '全部方向';
 }
 
 function ratingLabel(rating: AssetRatingFilter) {
-  if (rating === 'all') return undefined;
+  if (rating === 'all') return '全部评分';
   return rating === 0 ? '未评分' : `${rating} 星`;
+}
+
+function sortLabel(sort: BrowseTools['sort']) {
+  const parts = sortPartsFromKey(sort);
+  const fieldLabels: Partial<Record<SortField, string>> = {
+    timeline: '时间',
+    imported: '导入时间',
+    last_played: '最近播放',
+    modified: '修改时间',
+    size: '大小',
+    filename: '文件名',
+    resolution: '分辨率',
+    duration: '时长',
+    rating: '评分',
+    fps: '帧率',
+    bitrate: '码率',
+  };
+  return `${fieldLabels[parts.field] ?? '时间'} · ${parts.direction === 'asc' ? '正序' : '倒序'}`;
+}
+
+function groupLabel(group: AssetGroupMode) {
+  const labels: Record<AssetGroupMode, string> = {
+    none: '不分组',
+    day: '按日',
+    month: '按月',
+    year: '按年',
+    size: '按大小',
+    letter: '按首字母',
+    folder: '按文件夹',
+  };
+  return labels[group];
+}
+
+function layoutLabel(mode: MediaViewMode) {
+  return mediaLayoutDefinitions.find((layout) => layout.id === mode)?.label ?? '瀑布流';
 }
 
 function panelModeLabel(mode: PanelMode) {

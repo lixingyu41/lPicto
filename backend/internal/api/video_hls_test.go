@@ -35,6 +35,15 @@ func TestVideoSegmentQueueUsesPriorityThenFIFO(t *testing.T) {
 	}
 }
 
+func TestVideoFullWarmPriorityStaysBetweenCurrentPlaybackAndReadAhead(t *testing.T) {
+	if videoSegmentPriorityFullWarm <= videoSegmentPriorityCritical {
+		t.Fatalf("full warm priority = %d, want greater than critical %d", videoSegmentPriorityFullWarm, videoSegmentPriorityCritical)
+	}
+	if videoSegmentPriorityFullWarm >= videoSegmentPriorityPlayback {
+		t.Fatalf("full warm priority = %d, want less than playback %d", videoSegmentPriorityFullWarm, videoSegmentPriorityPlayback)
+	}
+}
+
 func TestVideoSegmentQueueSpreadsSlotsAcrossPlaybackSessions(t *testing.T) {
 	server := &Server{videoSegmentStates: map[string]*videoSegmentRuntime{
 		"running-a": {CacheKey: "running-a", SessionID: "viewer-a", Priority: videoSegmentPriorityPlayback, Transcoding: true},
@@ -90,16 +99,16 @@ func TestSharedVideoSegmentSurvivesUntilLastSessionStops(t *testing.T) {
 	}
 }
 
-func TestStopVideoSegmentSessionLetsStartedSegmentFinish(t *testing.T) {
+func TestStopVideoSegmentSessionCancelsStartedSegmentForLastViewer(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	server := &Server{videoSegmentStates: map[string]*videoSegmentRuntime{
 		"running": {AssetID: 7, SessionID: "viewer", Transcoding: true, Cancel: cancel},
 	}}
-	if got := server.stopVideoSegmentSession(7, "viewer"); got != 0 {
-		t.Fatalf("cancelled = %d, want 0", got)
+	if got := server.stopVideoSegmentSession(7, "viewer"); got != 1 {
+		t.Fatalf("cancelled = %d, want 1", got)
 	}
-	if cause := context.Cause(ctx); cause != nil {
-		t.Fatalf("started segment was discarded: %v", cause)
+	if cause := context.Cause(ctx); !errors.Is(cause, errVideoSegmentSessionStop) {
+		t.Fatalf("started segment cause = %v", cause)
 	}
 }
 
@@ -113,10 +122,47 @@ func TestVideoSegmentPriorityHeaderOverridesPlaylistQuery(t *testing.T) {
 
 func TestVideoSegmentQueryPreservesPreloadPriority(t *testing.T) {
 	query := videoSegmentQuery(model.Asset{CacheKey: "asset"}, VideoProxyHeartbeatRequest{
-		ClientID: "browser", SessionID: "viewer",
+		ClientID: "browser", SessionID: "viewer", Transcoder: videoTranscoderGPU,
 	}, "preload")
 	if !strings.Contains(query, "priority=preload") {
 		t.Fatalf("query = %q, want preload priority", query)
+	}
+	if !strings.Contains(query, "transcoder=gpu") {
+		t.Fatalf("query = %q, want gpu transcoder", query)
+	}
+	if strings.Contains(query, "clientId=") || strings.Contains(query, "sessionId=") {
+		t.Fatalf("query = %q, want a browser-cache-stable segment URL", query)
+	}
+}
+
+func TestVideoProxySessionHeadersOverrideStableSegmentQuery(t *testing.T) {
+	request := httptest.NewRequest("GET", "/segment.ts?transcoder=cpu", nil)
+	request.Header.Set(videoClientIDHeader, "browser")
+	request.Header.Set(videoSessionIDHeader, "viewer")
+	request.Header.Set(videoTranscoderHeader, "gpu")
+	session := videoProxySessionFromRequest(request)
+	if session.ClientID != "browser" || session.SessionID != "viewer" || session.Transcoder != "gpu" {
+		t.Fatalf("session = %#v", session)
+	}
+}
+
+func TestVideoSegmentPlanUsesSelectedTranscoder(t *testing.T) {
+	duration := 30.0
+	server := &Server{cfg: config.Config{VideoSegmentSeconds: 4, VideoProxyCRF: 23, FFmpegHWAccel: "vaapi"}}
+	asset := model.Asset{CacheKey: "asset", Duration: &duration}
+	cpu, err := server.videoSegmentPlan(asset, 0, videoTranscoderCPU)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gpu, err := server.videoSegmentPlan(asset, 0, videoTranscoderGPU)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cpu.HWAccel != "none" || gpu.HWAccel != "vaapi" {
+		t.Fatalf("selected accelerators = cpu:%q gpu:%q", cpu.HWAccel, gpu.HWAccel)
+	}
+	if cpu.CacheKey == gpu.CacheKey {
+		t.Fatalf("cpu and gpu cache keys must differ: %q", cpu.CacheKey)
 	}
 }
 
@@ -180,7 +226,7 @@ func TestVideoSegmentStatusPrefersPlaybackOverQueuedWarmup(t *testing.T) {
 			"playing": {AssetID: 7, SessionID: "viewer", SegmentIndex: 1, Priority: videoSegmentPriorityPlayback, Transcoding: true, UpdatedAt: time.Now().Add(-time.Second)},
 		},
 	}
-	dto := server.videoSegmentStatus(model.Asset{ID: 7, CacheKey: "asset", Duration: &duration}, "viewer")
+	dto := server.videoSegmentStatus(model.Asset{ID: 7, CacheKey: "asset", Duration: &duration}, "viewer", videoTranscoderCPU)
 	if dto.SegmentIndex != 1 || !dto.Transcoding || dto.Queued {
 		t.Fatalf("status selected warmup instead of playback: %#v", dto)
 	}
@@ -196,7 +242,7 @@ func TestVideoSegmentStatusWithoutSessionReportsActiveServerTask(t *testing.T) {
 			"viewer-b": {AssetID: 7, SessionID: "viewer-b", SegmentIndex: 2, Priority: videoSegmentPriorityPlayback, Transcoding: true, Progress: 0.4, UpdatedAt: time.Now().Add(-time.Second)},
 		},
 	}
-	dto := server.videoSegmentStatus(model.Asset{ID: 7, CacheKey: "asset", Duration: &duration}, "legacy")
+	dto := server.videoSegmentStatus(model.Asset{ID: 7, CacheKey: "asset", Duration: &duration}, "legacy", videoTranscoderCPU)
 	if dto.SegmentIndex != 2 || !dto.Transcoding || dto.SegmentCount != 16 {
 		t.Fatalf("global status did not report active playback task: %#v", dto)
 	}
@@ -305,7 +351,7 @@ func TestVideoSegmentCacheSummary(t *testing.T) {
 	if err := os.WriteFile(stalePath, make([]byte, 100), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	summary := server.videoSegmentCacheSummary(asset)
+	summary := server.videoSegmentCacheSummary(asset, videoTranscoderGPU)
 	if summary.CachedBytes != 30 || summary.CachedSegments != 2 || summary.SegmentCount != 7 || summary.EstimatedTotalBytes != 105 {
 		t.Fatalf("summary = %#v", summary)
 	}

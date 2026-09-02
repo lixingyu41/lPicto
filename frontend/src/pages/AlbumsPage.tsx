@@ -48,6 +48,19 @@ import { removeAssetById } from '../utils/assetSort';
 import { assetRatingParam, currentURLHasParam, currentURLLocation, currentURLPath, orientationParam, positiveIntParam, replaceURLState } from '../utils/urlState';
 import { waterfallPageSize } from '../utils/waterfallPaging';
 import { parseTagFilters, serializeTagFilters } from '../utils/tagFilters';
+import {
+  bytesParamToMB,
+  convertDurationValue,
+  datetimeLocalToUnix,
+  mbToBytes,
+  parseDurationRange,
+  parseDurationUnit,
+  parseResolutionRanges,
+  rangeInputFromParams,
+  secondsParamToDurationValue,
+  unixParamToDatetimeLocal,
+  type DurationUnit,
+} from '../utils/mediaFilterValues';
 
 const pageSize = waterfallPageSize;
 const albumsStateKey = 'albums';
@@ -60,7 +73,6 @@ const pendingAlbumEditorKey = 'lpicto:pending-album-editor';
 const assetKinds: AssetKind[] = ['all', 'image', 'video', 'audio'];
 
 type PendingAlbumEditor = { mode: 'add' } | { mode: 'edit'; albumId: number };
-type DurationUnit = 'seconds' | 'minutes' | 'hours';
 
 interface AlbumsPageState extends GridReturnState {
   aiDescriptionQuery: string;
@@ -292,6 +304,9 @@ export default function AlbumsPage() {
     },
     [searchRequest, selectedAlbum],
   );
+  const selectAllAssetIds = useCallback(async () => (
+    selectedAlbum ? (await api.albumSelection(selectedAlbum.id, searchRequest)).assetIds : []
+  ), [searchRequest, selectedAlbum?.id]);
 
   const { items, hasMore, hasPrevious, loading, error: loadError, loadMore, loadPrevious, reset, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [selectedAlbum?.id, searchKey]);
   const {
@@ -305,7 +320,6 @@ export default function AlbumsPage() {
     scrollTarget,
     scrollTopTarget,
     seekIndex,
-    setScrollRatio,
   } = useWaterfallGridState({
     hasMore,
     hasPrevious,
@@ -860,8 +874,8 @@ export default function AlbumsPage() {
             onOpenAsset={handleOpenAsset}
             onOpenViewer={handleOpenViewer}
             onBatchRemoveAssets={(ids) => mutateItems((current) => current.filter((asset) => !ids.includes(asset.id)))}
+            selectAllAssetIds={selectAllAssetIds}
             onPressPreviewChange={setPressPreviewAsset}
-            onScrollRatioChange={setScrollRatio}
             onScrollStateChange={handlePersistentGridScrollState}
             totalCount={totalCount}
             loadedStartIndex={loadedStartIndex}
@@ -993,91 +1007,4 @@ function buildAlbumViewerPath(assetId: number, albumId: number, params: LibraryF
     query.set(key, String(value));
   });
   return `/viewer/${assetId}?${query.toString()}`;
-}
-
-function parseResolutionRanges(xValue: string, yValue: string, orientation: OrientationFilter): Pick<LibraryFilterParams, 'widthMin' | 'widthMax' | 'heightMin' | 'heightMax' | 'dimensionMode'> {
-  const width = parseNumberRange(xValue);
-  const height = parseNumberRange(yValue);
-  const active = width.min !== undefined || width.max !== undefined || height.min !== undefined || height.max !== undefined;
-  return { widthMin: width.min, widthMax: width.max, heightMin: height.min, heightMax: height.max, dimensionMode: active && orientation === 'all' ? 'both' : undefined };
-}
-
-function parseDurationRange(minValue: string, maxValue: string, unit: DurationUnit): Pick<LibraryFilterParams, 'durationMin' | 'durationMax'> {
-  const multiplier = durationUnitSeconds(unit);
-  const min = positiveNumber(minValue);
-  const max = positiveNumber(maxValue);
-  return {
-    durationMin: min === undefined ? undefined : Math.round(min * multiplier * 1000) / 1000,
-    durationMax: max === undefined ? undefined : Math.round(max * multiplier * 1000) / 1000,
-  };
-}
-
-function parseNumberRange(value: string): { min?: number; max?: number } {
-  const parts = value.trim().split('-', 2);
-  if (!parts[0] && !parts[1]) return {};
-  if (parts.length === 1) {
-    const exact = positiveNumber(parts[0]);
-    return exact === undefined ? {} : { min: exact, max: exact };
-  }
-  return { min: positiveNumber(parts[0]), max: positiveNumber(parts[1]) };
-}
-
-function positiveNumber(value: string) {
-  if (!value.trim()) return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
-}
-
-function datetimeLocalToUnix(value: string) {
-  if (!value) return undefined;
-  const parsed = new Date(value).getTime();
-  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : undefined;
-}
-
-function mbToBytes(value: string) {
-  const parsed = positiveNumber(value);
-  return parsed === undefined ? undefined : Math.round(parsed * 1024 * 1024);
-}
-
-function rangeInputFromParams(minValue: string | null, maxValue: string | null) {
-  const min = positiveNumber(minValue ?? '');
-  const max = positiveNumber(maxValue ?? '');
-  if (min === undefined && max === undefined) return '';
-  if (min !== undefined && min === max) return String(min);
-  return `${min ?? ''}-${max ?? ''}`;
-}
-
-function unixParamToDatetimeLocal(value: string | null) {
-  const seconds = positiveNumber(value ?? '');
-  if (seconds === undefined) return '';
-  const date = new Date(seconds * 1000);
-  const pad = (part: number) => String(part).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
-}
-
-function secondsParamToDurationValue(value: string | null, unit: DurationUnit) {
-  const seconds = positiveNumber(value ?? '');
-  return seconds === undefined ? '' : formatNumberValue(seconds / durationUnitSeconds(unit));
-}
-
-function bytesParamToMB(value: string | null) {
-  const bytes = positiveNumber(value ?? '');
-  return bytes === undefined ? '' : formatNumberValue(bytes / (1024 * 1024));
-}
-
-function parseDurationUnit(value: unknown): DurationUnit {
-  return value === 'seconds' || value === 'hours' ? value : 'minutes';
-}
-
-function durationUnitSeconds(unit: DurationUnit) {
-  return unit === 'seconds' ? 1 : unit === 'hours' ? 3600 : 60;
-}
-
-function convertDurationValue(value: string, from: DurationUnit, to: DurationUnit) {
-  const parsed = positiveNumber(value);
-  return parsed === undefined ? value : formatNumberValue((parsed * durationUnitSeconds(from)) / durationUnitSeconds(to));
-}
-
-function formatNumberValue(value: number) {
-  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(9)));
 }

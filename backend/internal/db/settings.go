@@ -246,6 +246,27 @@ func (d *DB) AIFocusForPath(ctx context.Context, relPath string) (string, error)
 	return focus, nil
 }
 
+func (d *DB) ScanLibraryRootForPath(ctx context.Context, relPath string) (string, error) {
+	libraries, _, err := d.GetScanLibraries(ctx)
+	if err != nil {
+		return "", err
+	}
+	relPath = strings.Trim(strings.ReplaceAll(relPath, `\`, "/"), "/")
+	bestRoot := ""
+	for _, library := range libraries {
+		for _, root := range library.Roots {
+			root = strings.Trim(strings.ReplaceAll(root, `\`, "/"), "/")
+			if root != "" && relPath != root && !strings.HasPrefix(relPath, root+"/") {
+				continue
+			}
+			if len(root) > len(bestRoot) {
+				bestRoot = root
+			}
+		}
+	}
+	return bestRoot, nil
+}
+
 func (d *DB) GetScanFolders(ctx context.Context) ([]string, bool, error) {
 	libraries, configured, err := d.GetScanLibraries(ctx)
 	if err != nil {

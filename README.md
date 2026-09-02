@@ -107,8 +107,14 @@ curl http://localhost:18080/api/scan/status
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 ```
 
+启用 GPU compose 后，“设置 → 缓存 → 视频播放处理”可按当前浏览器选择 CPU 或 GPU；两种转码结果使用独立缓存键，GPU 编码失败时当前 HLS 分片会自动回退 CPU。
+
 图片缩略图仍由 libvips 处理，不走 GPU。
 `VIDEO_PROXY_MAX_HEIGHT=0` 表示实时 proxy 保持原始分辨率；只有显式设置大于 0 的高度上限时才会降分辨率。
+
+## 外部电脑 AI 节点
+
+Windows 电脑安装 Docker Desktop 与 NVIDIA 驱动后，以管理员身份运行 `Start-ExternalAI.ps1`；脚本使用本机 `%LOCALAPPDATA%\lPicto\ai-models`，启动 CUDA 推理服务并将端口防火墙限制为 Ubuntu 主机。随后在“设置 → AI 分析”填写电脑 IP 和端口，可选择仅 Ubuntu、仅外部电脑或双端并行；停止服务运行 `Stop-ExternalAI.ps1`。
 
 ## 浏览器视频格式限制说明
 

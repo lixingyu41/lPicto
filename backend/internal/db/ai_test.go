@@ -113,7 +113,7 @@ func TestAIResultSearchTagsVersioningAndManualIsolation(t *testing.T) {
 	}
 }
 
-func TestReplaceAITagUsesLastWriterWins(t *testing.T) {
+func TestReplaceAITagPreservesSiblingTags(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
 	if err != nil {
@@ -145,17 +145,25 @@ func TestReplaceAITagUsesLastWriterWins(t *testing.T) {
 	}
 	if err = database.SaveAIResult(ctx, id, asset.CacheKey, "脚部特写。", "clip", "v1", "qwen", "v1", "tax-v1", json.RawMessage(`[]`), []AITag{{
 		Tag: "脚部特写", Confidence: 0.8, CategoryKey: "closeup", CategoryLabel: "特写", SubjectKey: "part", SubjectLabel: "部位",
+	}, {
+		Tag: "脸部特写", Confidence: 0.7, CategoryKey: "closeup", CategoryLabel: "特写", SubjectKey: "part", SubjectLabel: "部位",
 	}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	edited, err := database.ReplaceAITag(ctx, id, asset.CacheKey, "脚部特写", AITag{
+	added, err := database.ReplaceAITag(ctx, id, asset.CacheKey, "", AITag{
 		Tag: "嘴部特写", Confidence: 1, CategoryKey: "closeup", CategoryLabel: "特写", SubjectKey: "part", SubjectLabel: "部位",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(edited.Tags) != 1 || edited.Tags[0].Tag != "嘴部特写" {
-		t.Fatalf("edited tags = %#v", edited.Tags)
+	if len(added.Tags) != 3 {
+		t.Fatalf("adding one closeup tag replaced siblings: %#v", added.Tags)
+	}
+	if err = database.EnsureAIQueued(ctx, id, asset.CacheKey, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.MarkAIProcessing(ctx, id, asset.CacheKey); err != nil {
+		t.Fatal(err)
 	}
 	if err = database.SaveAIResult(ctx, id, asset.CacheKey, "眼部特写。", "clip", "v2", "qwen", "v2", "tax-v2", json.RawMessage(`[]`), []AITag{{
 		Tag: "眼部特写", Confidence: 0.9, CategoryKey: "closeup", CategoryLabel: "特写", SubjectKey: "part", SubjectLabel: "部位",
@@ -278,6 +286,9 @@ func TestAIBackfillPilotStopsQueueingCompletedMediaType(t *testing.T) {
 		if err := database.EnsureAIQueued(ctx, videoID, stored.CacheKey, false); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := database.MarkAIProcessing(ctx, videoID, stored.CacheKey); err != nil {
+			t.Fatal(err)
+		}
 		if err := database.SaveAIResult(ctx, videoID, stored.CacheKey, "视频画面展示一项用于本地试运行的普通媒体内容。", "clip", "v1", "qwen", "v1", "tax-v1", json.RawMessage(`[{"ratio":0.5}]`), nil, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -314,6 +325,9 @@ func TestAIBackfillContinuesAfterVideoOnlyPilot(t *testing.T) {
 			continue
 		}
 		if err := database.EnsureAIQueued(ctx, videoID, stored.CacheKey, false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.MarkAIProcessing(ctx, videoID, stored.CacheKey); err != nil {
 			t.Fatal(err)
 		}
 		if err := database.SaveAIResult(ctx, videoID, stored.CacheKey, "视频画面展示一项用于本地试运行的普通媒体内容。", "clip", "v1", "qwen", "v1", "tax-v1", json.RawMessage(`[{"ratio":0.5}]`), nil, nil); err != nil {

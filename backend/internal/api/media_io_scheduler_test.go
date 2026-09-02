@@ -12,7 +12,7 @@ func TestMediaIOSchedulerUsesPriorityThenFIFO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	order := make(chan string, 3)
+	order := make(chan string, 4)
 	start := func(name string, priority mediaIOPriority) {
 		go func() {
 			release, acquireErr := scheduler.acquire(context.Background(), priority)
@@ -41,10 +41,12 @@ func TestMediaIOSchedulerUsesPriorityThenFIFO(t *testing.T) {
 	waitForQueued(1)
 	start("preload-2", mediaIOPriorityPreload)
 	waitForQueued(2)
-	start("current", mediaIOPriorityCurrent)
+	start("full-warm", mediaIOPriorityFullWarm)
 	waitForQueued(3)
+	start("current", mediaIOPriorityCurrent)
+	waitForQueued(4)
 	releaseActive()
-	for index, want := range []string{"current", "preload-1", "preload-2"} {
+	for index, want := range []string{"current", "full-warm", "preload-1", "preload-2"} {
 		select {
 		case got := <-order:
 			if got != want {

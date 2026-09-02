@@ -6,6 +6,7 @@ export interface ViewerPrefs {
   playbackRate: number;
   playbackMode: ViewerPlaybackMode;
   videoProcessingMode: VideoProcessingMode;
+  videoServerTranscoder: VideoServerTranscoder;
   imageSlideshowSeconds: number;
   subtitlesEnabled: boolean;
   videoAutoplay: boolean;
@@ -18,6 +19,7 @@ export interface ViewerPrefs {
 export type ViewerZoomMode = 'scale' | 'pixels';
 export type ViewerPlaybackMode = 'continuous' | 'single' | 'pause';
 export type VideoProcessingMode = 'browser' | 'server';
+export type VideoServerTranscoder = 'cpu' | 'gpu';
 
 export const playbackRates = [0.5, 1, 1.5, 2, 3] as const;
 export const playbackModeOptions: ReadonlyArray<{ label: string; value: ViewerPlaybackMode }> = [
@@ -31,6 +33,8 @@ export const danmakuOpacityRange = { min: 0.15, max: 1, fallback: 0.95 } as cons
 export const danmakuSpeedRange = { min: 0.5, max: 2, fallback: 1 } as const;
 export const zoomScaleRange = { min: 1.5, max: 8, fallback: 2.6 } as const;
 export const zoomPixelAreaRange = { min: 50, max: 2000, fallback: 300 } as const;
+export const zoomScaleStep = 0.1;
+export const zoomPixelAreaStep = 10;
 export const imageSlideshowSecondsRange = { min: 1, max: 60, fallback: 3 } as const;
 export const videoPlaybackDelaySecondsRange = { min: 0, max: 5, fallback: 0 } as const;
 
@@ -41,6 +45,7 @@ const danmakuSpeedKey = 'lpicto.danmakuSpeed';
 const playbackRateKey = 'lpicto.playbackRate';
 const playbackModeKey = 'lpicto.playbackMode';
 const videoProcessingModeKey = 'lpicto.videoProcessingMode';
+const videoServerTranscoderKey = 'lpicto.videoServerTranscoder';
 const imageSlideshowSecondsKey = 'lpicto.imageSlideshowSeconds';
 const subtitlesEnabledKey = 'lpicto.subtitlesEnabled';
 const zoomModeKey = 'lpicto.zoomMode';
@@ -59,6 +64,7 @@ export function loadViewerPrefs(): ViewerPrefs {
     playbackRate: loadPlaybackRate(),
     playbackMode: loadPlaybackMode(),
     videoProcessingMode: loadVideoProcessingMode(),
+    videoServerTranscoder: loadVideoServerTranscoder(),
     imageSlideshowSeconds: loadNumber(imageSlideshowSecondsKey, imageSlideshowSecondsRange.min, imageSlideshowSecondsRange.max, imageSlideshowSecondsRange.fallback),
     subtitlesEnabled: loadBoolean(subtitlesEnabledKey, true),
     videoAutoplay: localStorage.getItem(videoAutoplayKey) === 'true',
@@ -85,6 +91,7 @@ export function saveViewerPrefs(prefs: ViewerPrefs) {
   localStorage.setItem(playbackRateKey, String(normalizePlaybackRate(prefs.playbackRate)));
   localStorage.setItem(playbackModeKey, prefs.playbackMode);
   localStorage.setItem(videoProcessingModeKey, prefs.videoProcessingMode);
+  localStorage.setItem(videoServerTranscoderKey, prefs.videoServerTranscoder);
   localStorage.setItem(imageSlideshowSecondsKey, String(clampNumber(prefs.imageSlideshowSeconds, imageSlideshowSecondsRange.min, imageSlideshowSecondsRange.max, imageSlideshowSecondsRange.fallback)));
   localStorage.setItem(subtitlesEnabledKey, String(prefs.subtitlesEnabled));
   localStorage.setItem(videoAutoplayKey, String(prefs.videoAutoplay));
@@ -116,6 +123,29 @@ export function normalizePlaybackRate(value: number) {
   return playbackRates.reduce((nearest, rate) => (Math.abs(rate - value) < Math.abs(nearest - value) ? rate : nearest), 1);
 }
 
+export function stepViewerZoomPrefs(prefs: ViewerPrefs, direction: 1 | -1): ViewerPrefs {
+  if (prefs.zoomMode === 'pixels') {
+    return {
+      ...prefs,
+      zoomPixelArea: clampNumber(
+        prefs.zoomPixelArea - direction * zoomPixelAreaStep,
+        zoomPixelAreaRange.min,
+        zoomPixelAreaRange.max,
+        zoomPixelAreaRange.fallback,
+      ),
+    };
+  }
+  return {
+    ...prefs,
+    zoomScale: Math.round(clampNumber(
+      prefs.zoomScale + direction * zoomScaleStep,
+      zoomScaleRange.min,
+      zoomScaleRange.max,
+      zoomScaleRange.fallback,
+    ) * 10) / 10,
+  };
+}
+
 function loadZoomMode(): ViewerZoomMode {
   return localStorage.getItem(zoomModeKey) === 'pixels' ? 'pixels' : 'scale';
 }
@@ -131,6 +161,10 @@ function loadPlaybackMode(): ViewerPlaybackMode {
 
 function loadVideoProcessingMode(): VideoProcessingMode {
   return localStorage.getItem(videoProcessingModeKey) === 'browser' ? 'browser' : 'server';
+}
+
+function loadVideoServerTranscoder(): VideoServerTranscoder {
+  return localStorage.getItem(videoServerTranscoderKey) === 'gpu' ? 'gpu' : 'cpu';
 }
 
 function loadBoolean(key: string, fallback: boolean) {

@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Check, Music, Play, Plus, Square, X } from 'lucide-react';
 import type { Asset, SortField, SortKey, VideoStoryboard } from '../types/api';
 import { api, assetStoryboardSheetUrl, assetThumbUrl } from '../api/client';
-import { effectiveAspect, normalizeRotation, rotatedCoverStyle } from '../utils/rotation';
+import { effectiveAspect, normalizeRotation, rotatedContainStyle, rotatedCoverStyle } from '../utils/rotation';
 import { assetGroupLabel, type AssetGroupMode } from '../utils/assetGrouping';
 import { gridRowHeightChanged, gridRowHeightForLevel, loadGridRowHeightLevel } from '../utils/gridPrefs';
 import { preloadViewerAsset } from '../utils/imagePreload';
@@ -31,6 +31,9 @@ import {
   type MediaColumnId,
   type MediaViewPreferences,
 } from '../utils/mediaViewPrefs';
+import { assetGridScrollRatioEvent, type AssetGridScrollRatioDetail } from '../utils/gridScroll';
+import { assetPosterRevision, subscribeAssetPosterUpdates } from '../utils/posterRevision';
+import { preloadRouteModule } from '../utils/routeModules';
 import HierarchicalTagPicker from './HierarchicalTagPicker';
 
 interface Props {
@@ -44,7 +47,6 @@ interface Props {
   onOpenAsset?: (asset: Asset) => void;
   onOpenViewer?: (asset: Asset, viewerUrl: string) => void;
   onPressPreviewChange?: (asset: Asset | null) => void;
-  onScrollRatioChange?: (ratio: number) => void;
   onScrollStateChange?: (state: { ratio: number; scrollTop: number }) => void;
   totalCount?: number;
   loadedStartIndex?: number;
@@ -63,6 +65,7 @@ interface Props {
   purgeUnavailableOnDelete?: boolean;
   duplicateGrouping?: boolean;
   autoSelectAssetIds?: () => Promise<number[]>;
+  selectAllAssetIds?: () => Promise<number[]>;
 }
 
 interface RowItem {
@@ -147,7 +150,6 @@ export default function AssetGrid({
   onOpenAsset,
   onOpenViewer,
   onPressPreviewChange,
-  onScrollRatioChange,
   onScrollStateChange,
   totalCount = assets.length,
   loadedStartIndex = 0,
@@ -166,6 +168,7 @@ export default function AssetGrid({
   purgeUnavailableOnDelete = false,
   duplicateGrouping = false,
   autoSelectAssetIds,
+  selectAllAssetIds,
 }: Props) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const forwardPageSentinelRef = useRef<HTMLDivElement | null>(null);
@@ -197,7 +200,6 @@ export default function AssetGrid({
   const onPressPreviewChangeRef = useRef(onPressPreviewChange);
   const onOpenAssetRef = useRef(onOpenAsset);
   const onOpenViewerRef = useRef(onOpenViewer);
-  const onScrollRatioChangeRef = useRef(onScrollRatioChange);
   const onScrollStateChangeRef = useRef(onScrollStateChange);
   const suppressClickUntil = useRef(0);
   const resizeSettleTimer = useRef(0);
@@ -205,6 +207,10 @@ export default function AssetGrid({
   const pagingRuntime = useRef({ hasMore, hasPrevious, loading, onLoadMore, onLoadPrevious });
   const batchCommandHandlerRef = useRef<(command: AssetGridBatchCommand) => void>(() => undefined);
   const publishBatchStateRef = useRef<() => void>(() => undefined);
+  const selectionAnchorAssetIdRef = useRef<number | null>(null);
+  const selectionRequestRef = useRef(0);
+  const selectionScopeRef = useRef(selectAllAssetIds);
+  const pendingRotationAnchorRef = useRef<{ assetId: number; offset: number } | null>(null);
   const [viewport, setViewport] = useState({ height: 0, width: 0 });
   const [rowHeight, setRowHeight] = useState(() => gridRowHeightForLevel(loadGridRowHeightLevel()));
   const [mediaViewPrefs, setMediaViewPrefs] = useState<MediaViewPreferences>(() => loadMediaViewPreferences());
@@ -214,7 +220,12 @@ export default function AssetGrid({
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchMessage, setBatchMessage] = useState('');
   const [batchProgress, setBatchProgress] = useState<{ current: number; total: number } | null>(null);
-  const visibleAssets = assets;
+  const [rotationPickerOpen, setRotationPickerOpen] = useState(false);
+  const [rotationOverrides, setRotationOverrides] = useState<Map<number, number>>(() => new Map());
+  const visibleAssets = useMemo(() => assets.map((asset) => {
+    const rotation = rotationOverrides.get(asset.id);
+    return rotation === undefined || rotation === asset.rotation ? asset : { ...asset, rotation };
+  }), [assets, rotationOverrides]);
   const width = viewport.width;
   const selectedIds = useMemo(() => Array.from(selectedAssetIds), [selectedAssetIds]);
   const layoutDriver = mediaLayoutDrivers[mediaViewPrefs.mode];
@@ -260,7 +271,7 @@ export default function AssetGrid({
   }, [visibleAssets]);
 
   useEffect(() => {
-    if (autoSelectAssetIds) return;
+    if (autoSelectAssetIds || selectAllAssetIds) return;
     setSelectedAssetIds((current) => {
       if (current.size === 0) return current;
       const liveIds = new Set(visibleAssets.map((asset) => asset.id));
@@ -275,7 +286,18 @@ export default function AssetGrid({
       });
       return changed ? next : current;
     });
-  }, [autoSelectAssetIds, visibleAssets]);
+  }, [autoSelectAssetIds, selectAllAssetIds, visibleAssets]);
+
+  useEffect(() => {
+    if (selectionScopeRef.current === selectAllAssetIds) return;
+    selectionScopeRef.current = selectAllAssetIds;
+    selectionRequestRef.current += 1;
+    selectionAnchorAssetIdRef.current = null;
+    setSelectedAssetIds(new Set());
+    setBatchBusy(false);
+    setBatchMessage('');
+    setBatchProgress(null);
+  }, [selectAllAssetIds]);
 
   useEffect(() => {
     onOpenAssetRef.current = onOpenAsset;
@@ -288,10 +310,6 @@ export default function AssetGrid({
   useEffect(() => {
     onPressPreviewChangeRef.current = onPressPreviewChange;
   }, [onPressPreviewChange]);
-
-  useEffect(() => {
-    onScrollRatioChangeRef.current = onScrollRatioChange;
-  }, [onScrollRatioChange]);
 
   useEffect(() => {
     onScrollStateChangeRef.current = onScrollStateChange;
@@ -423,6 +441,17 @@ export default function AssetGrid({
     virtualizer.measure();
   }, [gridRows, virtualizer]);
 
+  useLayoutEffect(() => {
+    const anchor = pendingRotationAnchorRef.current;
+    const element = parentRef.current;
+    if (!anchor || !element) return;
+    const top = scrollTopForAssetTop(gridRows, anchor.assetId);
+    pendingRotationAnchorRef.current = null;
+    if (top === null) return;
+    element.scrollTop = Math.max(0, top + anchor.offset);
+    emitScrollState();
+  }, [gridRows]);
+
   useEffect(() => {
     emitScrollState();
   }, [gridRows, loadedStartIndex, totalCount]);
@@ -537,6 +566,8 @@ export default function AssetGrid({
         {rows.map((row) => {
           const gridRow = gridRows[row.index];
           if (!gridRow) return null;
+          const viewportTop = parentRef.current?.scrollTop ?? 0;
+          const imageLoading = row.end > viewportTop && row.start < viewportTop + viewport.height ? 'eager' : 'lazy';
           if (gridRow.type === 'group') {
             return (
               <div
@@ -560,7 +591,7 @@ export default function AssetGrid({
                 key={row.key}
                 style={{ transform: `translateY(${row.start}px)`, height: gridRow.height }}
                 title={asset.filename}
-                onFocus={() => preloadViewerAsset(asset)}
+                onFocus={() => preloadViewer(asset)}
                 onMouseEnter={() => scheduleHoverPreload(asset)}
                 onMouseLeave={clearHoverPreloadTimer}
                 onMouseDown={(event) => startPressPreview(event, asset)}
@@ -574,6 +605,7 @@ export default function AssetGrid({
                     key={column}
                     preferences={mediaViewPrefs}
                     rowHeight={rowHeight}
+                    imageLoading={imageLoading}
                   />
                 ))}
                 {selectionMode && (
@@ -601,7 +633,7 @@ export default function AssetGrid({
                     draggable={false}
                     style={{ width: tileWidth, height: gridRow.height }}
                     title={asset.displayTitle || asset.filename}
-                    onFocus={() => preloadViewerAsset(asset)}
+                    onFocus={() => preloadViewer(asset)}
                     onMouseEnter={() => scheduleHoverPreload(asset)}
                     onMouseLeave={clearHoverPreloadTimer}
                     onMouseDown={(event) => startPressPreview(event, asset)}
@@ -611,7 +643,9 @@ export default function AssetGrid({
                     <div className="asset-fixed-grid-media" style={{ height: thumbnailHeight }}>
                       <AssetTileMedia
                         asset={asset}
+                        fit="contain"
                         hoverStoryboardEnabled={mediaViewPrefs.videoHoverPreview}
+                        imageLoading={imageLoading}
                         rowHeight={thumbnailHeight}
                         tileWidth={tileWidth}
                       />
@@ -659,7 +693,7 @@ export default function AssetGrid({
                     draggable={false}
                     style={{ width: tileWidth, height: gridRow.height }}
                     title={asset.filename}
-                    onFocus={() => preloadViewerAsset(asset)}
+                    onFocus={() => preloadViewer(asset)}
                     onMouseEnter={() => scheduleHoverPreload(asset)}
                     onMouseLeave={clearHoverPreloadTimer}
                     onMouseDown={(event) => startPressPreview(event, asset)}
@@ -669,6 +703,7 @@ export default function AssetGrid({
                     <AssetTileMedia
                       asset={asset}
                       hoverStoryboardEnabled={mediaViewPrefs.videoHoverPreview}
+                      imageLoading={imageLoading}
                       rowHeight={gridRow.height}
                       tileWidth={tileWidth}
                     />
@@ -701,6 +736,31 @@ export default function AssetGrid({
       </div>
       {loading && <div className="grid-loading-dot" aria-label="加载中" />}
       </div>
+      {rotationPickerOpen && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setRotationPickerOpen(false);
+          }}
+        >
+          <div className="asset-delete-dialog batch-rotation-dialog" role="dialog" aria-modal="true" aria-label="选择旋转角度">
+            <div className="modal-title">
+              <span>批量旋转</span>
+              <button type="button" title="关闭" onClick={() => setRotationPickerOpen(false)}>
+                <X size={17} />
+              </button>
+            </div>
+            <div className="batch-rotation-options">
+              {[0, 90, 180, 270].map((rotation) => (
+                <button key={rotation} type="button" onClick={() => void batchRotate(rotation)}>
+                  {rotation}°
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 
@@ -716,7 +776,7 @@ export default function AssetGrid({
     if (selectionMode) {
       event.preventDefault();
       event.stopPropagation();
-      toggleAssetSelection(asset.id);
+      toggleAssetSelection(asset.id, event.shiftKey);
       return;
     }
     if (Date.now() <= suppressClickUntil.current) {
@@ -727,7 +787,7 @@ export default function AssetGrid({
     }
     const viewerUrl = buildViewerUrl(asset);
     event.currentTarget.href = viewerUrl;
-    preloadViewerAsset(asset, 'high');
+    preloadViewer(asset, 'high');
     onOpenAssetRef.current?.(asset);
     if (onOpenViewerRef.current && !usesNativeNavigation(event)) {
       event.preventDefault();
@@ -760,6 +820,8 @@ export default function AssetGrid({
     setSelectionMode((value) => {
       const next = !value;
       if (!next) {
+        selectionRequestRef.current += 1;
+        selectionAnchorAssetIdRef.current = null;
         setSelectedAssetIds(new Set());
         setBatchMessage('');
         setBatchProgress(null);
@@ -768,9 +830,29 @@ export default function AssetGrid({
     });
   }
 
-  function selectAllVisible() {
+  async function selectAllMatching() {
     setSelectionMode(true);
-    setSelectedAssetIds(new Set(visibleAssets.map((asset) => asset.id)));
+    selectionAnchorAssetIdRef.current = null;
+    if (!selectAllAssetIds) {
+      setSelectedAssetIds(new Set(visibleAssets.map((asset) => asset.id)));
+      return;
+    }
+    setBatchBusy(true);
+    setBatchProgress(null);
+    setBatchMessage('正在选择当前筛选结果');
+    const requestID = ++selectionRequestRef.current;
+    try {
+      const ids = await selectAllAssetIds();
+      if (selectionRequestRef.current !== requestID) return;
+      setSelectedAssetIds(new Set(ids));
+      setBatchMessage(`已选择当前筛选的 ${ids.length} 个媒体`);
+    } catch (err) {
+      if (selectionRequestRef.current !== requestID) return;
+      setSelectedAssetIds(new Set());
+      setBatchMessage(err instanceof Error ? err.message : '全选当前筛选失败');
+    } finally {
+      if (selectionRequestRef.current === requestID) setBatchBusy(false);
+    }
   }
 
   function handleBatchCommand(command: AssetGridBatchCommand) {
@@ -778,12 +860,15 @@ export default function AssetGrid({
     switch (command) {
       case 'toggle-selection': toggleSelectionMode(); break;
       case 'auto-select': void autoSelectDuplicates(); break;
-      case 'select-all': selectAllVisible(); break;
-      case 'clear': setSelectedAssetIds(new Set()); break;
+      case 'select-all': void selectAllMatching(); break;
+      case 'clear':
+        selectionAnchorAssetIdRef.current = null;
+        setSelectedAssetIds(new Set());
+        break;
       case 'add-tag': void batchAddTag(); break;
       case 'set-rating': void batchSetRating(); break;
       case 'add-album': void batchAddToAlbum(); break;
-      case 'rotate': void batchRotate(); break;
+      case 'rotate': setRotationPickerOpen(true); break;
       case 'hide': void batchHide(); break;
       case 'delete': void batchDelete(); break;
       case 'delete-records': void batchDeleteRecords(); break;
@@ -798,6 +883,7 @@ export default function AssetGrid({
     setBatchMessage('正在生成选择');
     try {
       const ids = await autoSelectAssetIds();
+      selectionAnchorAssetIdRef.current = null;
       setSelectedAssetIds(new Set(ids));
       setBatchMessage(ids.length > 0 ? `已选择 ${ids.length} 个重复文件` : '没有可自动选择的重复文件');
     } catch (err) {
@@ -807,7 +893,26 @@ export default function AssetGrid({
     }
   }
 
-  function toggleAssetSelection(assetId: number) {
+  function toggleAssetSelection(assetId: number, extendRange: boolean) {
+    const anchorAssetId = selectionAnchorAssetIdRef.current;
+    if (extendRange && anchorAssetId !== null) {
+      const anchorIndex = visibleAssets.findIndex((asset) => asset.id === anchorAssetId);
+      const targetIndex = visibleAssets.findIndex((asset) => asset.id === assetId);
+      if (anchorIndex >= 0 && targetIndex >= 0) {
+        const start = Math.min(anchorIndex, targetIndex);
+        const end = Math.max(anchorIndex, targetIndex);
+        setSelectedAssetIds((current) => {
+          const next = new Set(current);
+          for (let index = start; index <= end; index += 1) {
+            next.add(visibleAssets[index].id);
+          }
+          return next;
+        });
+        return;
+      }
+    }
+
+    selectionAnchorAssetIdRef.current = assetId;
     setSelectedAssetIds((current) => {
       const next = new Set(current);
       if (next.has(assetId)) {
@@ -867,16 +972,20 @@ export default function AssetGrid({
     });
   }
 
-  async function batchRotate() {
-    const input = window.prompt('旋转角度：0 / 90 / 180 / 270');
-    if (input === null) return;
-    const rotation = Number(input);
-    if (![0, 90, 180, 270].includes(rotation)) {
-      setBatchMessage('旋转角度无效');
-      return;
-    }
+  async function batchRotate(rotation: number) {
+    setRotationPickerOpen(false);
     await runBatch('旋转', async () => {
-      await api.batchRotate(selectedIds, rotation);
+      const result = await api.batchRotate(selectedIds, rotation);
+      const updated = new Set(result.updatedAssetIds ?? selectedIds);
+      const element = parentRef.current;
+      if (element) {
+        pendingRotationAnchorRef.current = gridScrollAnchor(gridRowsRef.current, element.scrollTop);
+      }
+      setRotationOverrides((current) => {
+        const next = new Map(current);
+        updated.forEach((id) => next.set(id, rotation));
+        return next;
+      });
     });
   }
 
@@ -937,7 +1046,7 @@ export default function AssetGrid({
   async function batchDeleteRecords() {
     if (!window.confirm(`删除 ${selectedIds.length} 个媒体的全部数据库记录和缓存？源文件不会删除，重新扫描后可恢复。`)) return;
     const ids = [...selectedIds];
-    const chunkSize = 100;
+    const chunkSize = 1000;
     let processed = 0;
     let deleted = 0;
     setBatchBusy(true);
@@ -973,7 +1082,7 @@ export default function AssetGrid({
 
   function startPressPreview(event: ReactMouseEvent<HTMLAnchorElement>, asset: Asset) {
     clearHoverPreloadTimer();
-    preloadViewerAsset(asset, 'high');
+    preloadViewer(asset, 'high');
     if (selectionMode || !onPressPreviewChangeRef.current || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey) {
       return;
     }
@@ -1005,7 +1114,13 @@ export default function AssetGrid({
 
   function scheduleHoverPreload(asset: Asset) {
     clearHoverPreloadTimer();
+    preloadRouteModule('viewer');
     hoverPreloadTimer.current = window.setTimeout(() => preloadViewerAsset(asset), 90);
+  }
+
+  function preloadViewer(asset: Asset, priority?: 'high') {
+    preloadRouteModule('viewer');
+    preloadViewerAsset(asset, priority);
   }
 
   function clearHoverPreloadTimer() {
@@ -1075,7 +1190,8 @@ export default function AssetGrid({
     prependAnchorRef.current.scrollTop = element.scrollTop;
     const ratio = fullScrollRatio(element);
     const clamped = Math.min(1, Math.max(0, ratio));
-    onScrollRatioChangeRef.current?.(clamped);
+    const detail: AssetGridScrollRatioDetail = { ratio: clamped };
+    element.dispatchEvent(new CustomEvent(assetGridScrollRatioEvent, { detail }));
     onScrollStateChangeRef.current?.({ ratio: clamped, scrollTop: element.scrollTop });
   }
 
@@ -1149,16 +1265,21 @@ function desktopHoverAvailable() {
 
 function AssetTileMedia({
   asset,
+  fit = 'cover',
   hoverStoryboardEnabled = false,
+  imageLoading = 'lazy',
   rowHeight,
   tileWidth,
 }: {
   asset: Asset;
+  fit?: 'contain' | 'cover';
   hoverStoryboardEnabled?: boolean;
+  imageLoading?: 'eager' | 'lazy';
   rowHeight: number;
   tileWidth: number;
 }) {
   const [sourceFailed, setSourceFailed] = useState(false);
+  const [posterRevision, setPosterRevision] = useState(() => assetPosterRevision(asset.id));
   const [storyboard, setStoryboard] = useState<VideoStoryboard | null>(null);
   const [hoverRatio, setHoverRatio] = useState<number | null>(null);
   const [loadedStoryboardSheets, setLoadedStoryboardSheets] = useState<Set<string>>(() => new Set());
@@ -1183,6 +1304,15 @@ function AssetTileMedia({
     hoverFrame.current = 0;
   }, [asset.id, asset.cacheKey]);
 
+  useEffect(() => {
+    setPosterRevision(assetPosterRevision(asset.id));
+    return subscribeAssetPosterUpdates((assetId, revision) => {
+      if (assetId !== asset.id) return;
+      setSourceFailed(false);
+      setPosterRevision(revision);
+    });
+  }, [asset.id]);
+
   useEffect(() => () => {
     if (hoverDelayTimer.current) window.clearTimeout(hoverDelayTimer.current);
     if (hoverFrame.current) window.cancelAnimationFrame(hoverFrame.current);
@@ -1196,12 +1326,15 @@ function AssetTileMedia({
   ) : (
     <img
       className="asset-media"
-      src={assetThumbUrl(asset)}
+      src={assetThumbUrl(asset, posterRevision)}
       alt={asset.filename}
-      loading="eager"
+      loading={imageLoading}
+      fetchPriority={imageLoading === 'eager' ? 'high' : 'low'}
       decoding="async"
       draggable={false}
-      style={rotatedCoverStyle(asset, { width: tileWidth, height: rowHeight })}
+      style={fit === 'contain'
+        ? { ...rotatedContainStyle(asset, { width: tileWidth, height: rowHeight }), objectFit: 'contain' }
+        : rotatedCoverStyle(asset, { width: tileWidth, height: rowHeight })}
       onError={() => {
         setSourceFailed(true);
       }}
@@ -1405,11 +1538,13 @@ function AssetListHeader({
 function AssetListCell({
   asset,
   column,
+  imageLoading,
   preferences,
   rowHeight,
 }: {
   asset: Asset;
   column: MediaColumnId;
+  imageLoading: 'eager' | 'lazy';
   preferences: MediaViewPreferences;
   rowHeight: number;
 }) {
@@ -1424,7 +1559,7 @@ function AssetListCell({
     return (
       <div className="asset-list-cell thumbnail-column" style={style}>
         <div className="asset-list-thumb" style={{ width: Math.round(thumbWidth), height: Math.round(thumbHeight) }}>
-          <AssetTileMedia asset={asset} rowHeight={Math.round(thumbHeight)} tileWidth={Math.round(thumbWidth)} />
+          <AssetTileMedia asset={asset} imageLoading={imageLoading} rowHeight={Math.round(thumbHeight)} tileWidth={Math.round(thumbWidth)} />
           {asset.mediaType === 'video' && <span className="asset-list-video"><Play size={12} fill="currentColor" /></span>}
           {asset.mediaType === 'audio' && <span className="asset-list-video asset-list-audio"><Music size={12} /></span>}
         </div>
@@ -1635,11 +1770,13 @@ function listColumnValue(asset: Asset, column: MediaColumnId) {
   }
 }
 
+const listDateFormatter = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+});
+
 function formatListDate(value: number | null | undefined) {
   if (!value) return '';
-  return new Intl.DateTimeFormat('zh-CN', {
-    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
-  }).format(new Date(value * 1000));
+  return listDateFormatter.format(new Date(value * 1000));
 }
 
 function formatListBytes(bytes: number) {
@@ -1767,6 +1904,18 @@ function scrollTopForAssetTop(rows: GridRow[], assetId: number) {
   for (const row of rows) {
     if (row.type === 'assets' && row.items.some((item) => item.asset.id === assetId)) {
       return offset;
+    }
+    offset += row.height + gap;
+  }
+  return null;
+}
+
+function gridScrollAnchor(rows: GridRow[], scrollTop: number) {
+  let offset = 0;
+  for (const row of rows) {
+    if (row.type === 'assets' && offset + row.height >= scrollTop) {
+      const assetId = row.items[0]?.asset.id;
+      return assetId === undefined ? null : { assetId, offset: scrollTop - offset };
     }
     offset += row.height + gap;
   }

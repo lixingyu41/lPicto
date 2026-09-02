@@ -1,13 +1,15 @@
-import { useEffect } from 'react';
+import { lazy, Suspense, useEffect } from 'react';
 import { Navigate, Route, Routes, useLocation, useNavigate, type Location } from 'react-router-dom';
 import Layout from './components/Layout';
-import AlbumsPage from './pages/AlbumsPage';
-import CollectionsPage from './pages/CollectionsPage';
-import FoldersPage from './pages/FoldersPage';
-import LibraryPage from './pages/LibraryPage';
-import SettingsPage from './pages/SettingsPage';
-import ViewerPage from './pages/ViewerPage';
 import { emitViewerOverlayCloseCompleted, viewerOverlayCloseRequested } from './utils/pageState';
+import { routeModules } from './utils/routeModules';
+
+const AlbumsPage = lazy(routeModules.albums);
+const CollectionsPage = lazy(routeModules.collections);
+const FoldersPage = lazy(routeModules.folders);
+const LibraryPage = lazy(routeModules.library);
+const SettingsPage = lazy(routeModules.settings);
+const ViewerPage = lazy(routeModules.viewer);
 
 interface ViewerOverlayState {
   backgroundLocation?: Location;
@@ -42,19 +44,24 @@ export default function App() {
   }, [backgroundLocation, navigate, showingViewerOverlay]);
 
   return (
-    <Layout routeLocation={routeLocation} overlay={showingViewerOverlay ? <ViewerPage overlay /> : null}>
-      <Routes location={routeLocation}>
-        <Route index element={<Navigate to="/library" replace />} />
-        <Route path="/timeline" element={<Navigate to="/library" replace />} />
-        <Route path="/library" element={<LibraryPage key="library" />} />
-        <Route path="/recent" element={<LibraryPage key="recent" mode="recent" />} />
-        <Route path="/albums" element={<AlbumsPage />} />
-        <Route path="/folders" element={<FoldersPage />} />
-        <Route path="/collections" element={<CollectionsPage />} />
-        <Route path="/settings" element={<SettingsPage />} />
-        <Route path="/settings/:section" element={<SettingsPage />} />
-        <Route path="/viewer/:assetId" element={<ViewerPage />} />
-      </Routes>
+    <Layout
+      routeLocation={routeLocation}
+      overlay={showingViewerOverlay ? <Suspense fallback={null}><ViewerPage overlay /></Suspense> : null}
+    >
+      <Suspense fallback={null}>
+        <Routes location={routeLocation}>
+          <Route index element={<Navigate to="/library" replace />} />
+          <Route path="/timeline" element={<Navigate to="/library" replace />} />
+          <Route path="/library" element={<LibraryPage key="library" />} />
+          <Route path="/recent" element={<LibraryPage key="recent" mode="recent" />} />
+          <Route path="/albums" element={<AlbumsPage />} />
+          <Route path="/folders" element={<FoldersPage />} />
+          <Route path="/collections" element={<CollectionsPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/settings/:section" element={<SettingsPage />} />
+          <Route path="/viewer/:assetId" element={<ViewerPage />} />
+        </Routes>
+      </Suspense>
     </Layout>
   );
 }

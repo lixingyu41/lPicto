@@ -134,6 +134,34 @@ func TestVideoPosterQueueHasWorker(t *testing.T) {
 	}
 }
 
+func TestStoryboardQueueUsesConfiguredWorkers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	manager := New(slog.Default(), func(_ context.Context, task Task) error {
+		if task.Type == "storyboard" {
+			started <- struct{}{}
+			<-release
+		}
+		return nil
+	})
+	manager.Start(ctx, WorkerConfig{Image: 1, VideoPoster: 1, Storyboard: 2})
+	defer func() {
+		close(release)
+		cancel()
+		manager.Stop()
+	}()
+	manager.Enqueue(Task{Type: "storyboard", AssetID: 41})
+	manager.Enqueue(Task{Type: "storyboard", AssetID: 42})
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("configured storyboard workers did not run concurrently")
+		}
+	}
+}
+
 func TestAIQueueHasSingleWorker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	handled := make(chan Task, 1)

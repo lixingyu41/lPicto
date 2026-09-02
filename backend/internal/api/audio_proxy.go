@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/model"
 )
 
@@ -32,7 +33,7 @@ type audioProxyStatusDTO struct {
 	AssetID     int64   `json:"assetId"`
 	Required    bool    `json:"required"`
 	Cached      bool    `json:"cached"`
-	Transcoding bool   `json:"transcoding"`
+	Transcoding bool    `json:"transcoding"`
 	Queued      bool    `json:"queued"`
 	Status      string  `json:"status"`
 	Progress    float64 `json:"progress"`
@@ -99,6 +100,10 @@ func (s *Server) startAudioProxy(w http.ResponseWriter, r *http.Request) {
 	path, _ := s.store.CachePath("audio-proxies", asset.CacheKey, "flac")
 	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
 		writeJSON(w, http.StatusOK, s.audioProxySnapshot(asset, nil))
+		return
+	}
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
 		return
 	}
 	s.audioProxyMu.Lock()
@@ -175,6 +180,10 @@ func (s *Server) audioProxySnapshot(asset model.Asset, state *audioProxyRuntime)
 }
 
 func (s *Server) runAudioProxy(ctx context.Context, asset model.Asset, state *audioProxyRuntime) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		s.finishAudioProxy(state, "idle", debugcontrol.ErrExternalFileAccessPaused)
+		return
+	}
 	select {
 	case s.audioProxySlot <- struct{}{}:
 		defer func() { <-s.audioProxySlot }()

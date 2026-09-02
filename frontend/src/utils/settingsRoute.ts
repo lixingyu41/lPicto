@@ -4,6 +4,7 @@ export const settingsSections = [
   { id: 'viewer', label: '查看与播放', slug: 'viewer' },
   { id: 'ai', label: 'AI', slug: 'ai' },
   { id: 'tasks', label: '任务', slug: 'tasks' },
+  { id: 'debug', label: '调试', slug: 'debug' },
 ] as const;
 
 export type SettingsSectionId = (typeof settingsSections)[number]['id'];

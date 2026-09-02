@@ -190,13 +190,34 @@ func (s *Server) systemTasks(w http.ResponseWriter, r *http.Request) {
 		executorTask,
 	}
 	for index := range items {
-		items[index].Actions = []SystemTaskActionDTO{}
+		items[index].Actions = automaticFailureRetryActions(items[index])
 		items[index].SupportsScope = false
 		if items[index].Failures == nil {
 			items[index].Failures = []SystemTaskFailureDTO{}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func automaticFailureRetryActions(item SystemTaskDTO) []SystemTaskActionDTO {
+	failed := int(item.FailedCount)
+	if item.Progress != nil && item.Progress.Failed > failed {
+		failed = item.Progress.Failed
+	}
+	if len(item.Failures) > failed {
+		failed = len(item.Failures)
+	}
+	if failed <= 0 {
+		return []SystemTaskActionDTO{}
+	}
+	switch item.ID {
+	case "media_scan", "library_scan", "thumbnail_creation", "preview_creation", "video_poster_creation", "storyboard_creation", "ai_analysis", taskDuplicateScan, taskStorageHealth, "ai_health_check", taskCacheCleanup:
+		return []SystemTaskActionDTO{{
+			ID: "retry_failed", Label: fmt.Sprintf("重试失败（%d）", failed), Kind: "secondary", Enabled: true,
+		}}
+	default:
+		return []SystemTaskActionDTO{}
+	}
 }
 
 func mediaScanSystemTask(run *model.ScanRun, status scanner.Status) SystemTaskDTO {

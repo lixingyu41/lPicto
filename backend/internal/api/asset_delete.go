@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/events"
 	"lpicto/backend/internal/media"
 	"lpicto/backend/internal/model"
@@ -219,6 +220,9 @@ func assetDeleteUnavailable(err error) bool {
 }
 
 func (s *Server) buildAssetDeletePlan(asset model.Asset) (assetDeletePlanInternal, error) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		return assetDeletePlanInternal{}, assetDeletePlanError{status: http.StatusServiceUnavailable, code: "external_file_access_paused", message: "调试模式已暂停外置文件访问"}
+	}
 	root, _, err := s.store.RootForRel(asset.RelPath)
 	if err != nil {
 		return assetDeletePlanInternal{}, assetDeletePlanError{status: http.StatusBadRequest, code: "asset_root_invalid", message: "资源路径无效"}

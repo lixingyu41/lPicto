@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/scanner"
 	"lpicto/backend/internal/storage"
@@ -532,6 +533,10 @@ func (s *Server) removeScanFolder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sourceFolders(w http.ResponseWriter, r *http.Request) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
+		return
+	}
 	parentRel, err := storage.NormalizeRelPath(r.URL.Query().Get("parentRelPath"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_path", "文件夹路径无效")

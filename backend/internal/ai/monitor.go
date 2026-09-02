@@ -13,9 +13,9 @@ import (
 
 const AIHealthCheckInterval = 30 * time.Minute
 
-func StartHealthMonitor(ctx context.Context, database *db.DB, baseURL string, logger *slog.Logger) {
+func StartHealthMonitor(ctx context.Context, database *db.DB, baseURL, externalToken string, logger *slog.Logger) {
 	go func() {
-		runAIHealthCheck(ctx, database, baseURL, logger)
+		runAIHealthCheck(ctx, database, baseURL, externalToken, logger)
 		ticker := time.NewTicker(AIHealthCheckInterval)
 		defer ticker.Stop()
 		for {
@@ -23,7 +23,7 @@ func StartHealthMonitor(ctx context.Context, database *db.DB, baseURL string, lo
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				runAIHealthCheck(ctx, database, baseURL, logger)
+				runAIHealthCheck(ctx, database, baseURL, externalToken, logger)
 			}
 		}
 	}()
@@ -31,7 +31,7 @@ func StartHealthMonitor(ctx context.Context, database *db.DB, baseURL string, lo
 
 // RunHealthCheck executes the same check used by the scheduled monitor.
 func RunHealthCheck(ctx context.Context, database *db.DB, baseURL string, logger *slog.Logger) {
-	runAIHealthCheck(ctx, database, baseURL, logger)
+	runAIHealthCheck(ctx, database, baseURL, "", logger)
 }
 
 // RestartService requests an AI worker restart and verifies recovery.
@@ -46,7 +46,7 @@ func RestartService(ctx context.Context, baseURL string) error {
 	return nil
 }
 
-func runAIHealthCheck(ctx context.Context, database *db.DB, baseURL string, logger *slog.Logger) {
+func runAIHealthCheck(ctx context.Context, database *db.DB, baseURL, externalToken string, logger *slog.Logger) {
 	if err := database.BeginSystemTask(ctx, db.SystemTaskAIHealth); err != nil {
 		logger.Warn("start AI health task failed", "error", err)
 		return
@@ -60,21 +60,53 @@ func runAIHealthCheck(ctx context.Context, database *db.DB, baseURL string, logg
 		finishAIHealthTask(ctx, database, "skipped", "自动分析和手动全库分析均未启用", logger)
 		return
 	}
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if waitForAIHealth(ctx, baseURL, time.Minute) {
-		finishAIHealthTask(ctx, database, "success", "AI 服务运行正常", logger)
+	settings, err := database.GetAISettings(ctx)
+	if err != nil {
+		finishAIHealthTask(ctx, database, "failed", "读取 AI 计算节点设置失败", logger)
 		return
 	}
-	restartErr := requestAIRestart(ctx, baseURL)
-	if waitForAIHealth(ctx, baseURL, 3*time.Minute) {
-		finishAIHealthTask(ctx, database, "success", "检测到异常，AI 服务已自动重启并恢复", logger)
+	nodes, err := ComputeNodes(settings, baseURL, externalToken)
+	if err != nil {
+		finishAIHealthTask(ctx, database, "failed", err.Error(), logger)
 		return
 	}
-	message := "AI 服务异常，自动重启后仍未恢复"
-	if restartErr != nil {
-		message = fmt.Sprintf("AI 服务异常，重启请求失败：%v", restartErr)
+	healthy, failed := 0, make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		status := ProbeComputeNode(ctx, node)
+		if status.State == "online" || status.State == "paused" {
+			healthy++
+		} else {
+			failed = append(failed, node.ID)
+		}
 	}
-	finishAIHealthTask(ctx, database, "failed", message, logger)
+	if healthy == len(nodes) {
+		finishAIHealthTask(ctx, database, "success", "全部 AI 计算节点运行正常", logger)
+		return
+	}
+	if healthy > 0 {
+		finishAIHealthTask(ctx, database, "warning", fmt.Sprintf("AI 节点 %s 不可用，已由另一节点继续处理", strings.Join(failed, "、")), logger)
+		return
+	}
+	ubuntuURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	canRestartUbuntu := settings.ComputeMode == db.AIComputeModeUbuntu || settings.ComputeMode == db.AIComputeModeDual
+	if canRestartUbuntu {
+		restartErr := requestAIRestart(ctx, ubuntuURL)
+		if waitForAIHealth(ctx, ubuntuURL, 3*time.Minute) {
+			state := "success"
+			message := "Ubuntu AI 服务已自动重启并恢复"
+			if settings.ComputeMode == db.AIComputeModeDual {
+				state = "warning"
+				message = "Ubuntu AI 服务已恢复，外部节点仍不可用"
+			}
+			finishAIHealthTask(ctx, database, state, message, logger)
+			return
+		}
+		if restartErr != nil {
+			finishAIHealthTask(ctx, database, "failed", fmt.Sprintf("全部 AI 节点不可用，Ubuntu 重启请求失败：%v", restartErr), logger)
+			return
+		}
+	}
+	finishAIHealthTask(ctx, database, "failed", "全部 AI 计算节点均不可用", logger)
 }
 
 func finishAIHealthTask(ctx context.Context, database *db.DB, status string, message string, logger *slog.Logger) {

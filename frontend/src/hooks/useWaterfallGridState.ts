@@ -45,10 +45,9 @@ export function useWaterfallGridState({
   );
   const [scrollTarget, setScrollTarget] = useState<{ ratio: number; signal: number } | undefined>();
   const [scrollResetSignal, setScrollResetSignal] = useState(0);
-  const [scrollRatio, setScrollRatio] = useState(0);
+  const scrollRatio = initialStateRef.current.scrollRatio;
   const [loadedStartIndex, setLoadedStartIndex] = useState(0);
   const [focusAssetId, setFocusAssetId] = useState(initialStateRef.current.focusAssetId ?? null);
-  const [, setGridUrlSignal] = useState(0);
   const gridStateRef = useRef<GridReturnState>(initialStateRef.current);
   const restoreRef = useRef({
     jumped: false,
@@ -134,7 +133,6 @@ export function useWaterfallGridState({
         scrollRatio: state.ratio,
         scrollTop: state.scrollTop,
       };
-      setGridUrlSignal((value) => value + 1);
     },
     [itemsLength, loadedStartIndex],
   );
@@ -183,6 +181,5 @@ export function useWaterfallGridState({
     scrollTarget,
     scrollTopTarget,
     seekIndex,
-    setScrollRatio,
   };
 }

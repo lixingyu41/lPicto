@@ -22,6 +22,46 @@ func TestSourceProbeTimeoutMarksSourceUnavailable(t *testing.T) {
 	}
 }
 
+func TestAssetReadErrorDistinguishesMissingMediaFromMissingRoot(t *testing.T) {
+	root := t.TempDir()
+	libraryRoot := filepath.Join(root, "PIC")
+	if err := os.MkdirAll(libraryRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewWithRoots([]RootConfig{{ID: "nas", Path: root}}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	health := NewSourceHealth(store, 0)
+	missing := errors.New("no such file")
+	if health.AssetReadErrorIsSourceUnavailable("nas/PIC/missing.jpg", missing, "nas/PIC") {
+		t.Fatal("a missing media file under a readable root was classified as storage failure")
+	}
+	if err := os.RemoveAll(libraryRoot); err != nil {
+		t.Fatal(err)
+	}
+	if !health.AssetReadErrorIsSourceUnavailable("nas/PIC/missing.jpg", missing, "nas/PIC") {
+		t.Fatal("a missing media file under a missing root was not classified as storage failure")
+	}
+}
+
+func TestMissingRootIsNotMaskedByMissingRecoverySample(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewWithRoots([]RootConfig{{ID: "nas", Path: root}}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	health := NewSourceHealth(store, 0)
+	health.samples[store.Roots[0].ID] = filepath.Join(root, "missing.jpg")
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	available, status := health.AvailableRoot(store.Roots[0])
+	if available || status.Available {
+		t.Fatal("missing storage root was masked by a missing recovery sample")
+	}
+}
+
 func TestNormalizeRelPathSafety(t *testing.T) {
 	got, err := NormalizeRelPath(`2024\IMG_001.jpg`)
 	if err != nil {

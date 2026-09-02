@@ -8,9 +8,10 @@ import (
 type mediaIOPriority int
 
 const (
-	mediaIOPriorityPreload mediaIOPriority = 20
-	mediaIOPriorityAhead   mediaIOPriority = 80
-	mediaIOPriorityCurrent mediaIOPriority = 100
+	mediaIOPriorityPreload  mediaIOPriority = 20
+	mediaIOPriorityAhead    mediaIOPriority = 80
+	mediaIOPriorityFullWarm mediaIOPriority = 90
+	mediaIOPriorityCurrent  mediaIOPriority = 100
 )
 
 type mediaIOWaiter struct {

@@ -127,7 +127,7 @@ function SidebarBatchSelectionMenu() {
       disabled: unavailable,
       icon: <ListChecks size={18} />,
       key: 'select-all',
-      label: '全选已加载',
+      label: '全选当前筛选',
       onSelect: () => dispatchAssetGridBatchCommand('select-all'),
     },
     {

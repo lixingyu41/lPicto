@@ -21,19 +21,23 @@ import (
 	"lpicto/backend/internal/model"
 	"lpicto/backend/internal/storage"
 	"lpicto/backend/internal/util"
+	"lpicto/backend/internal/video"
 )
 
 type Processor struct {
-	DB              *db.DB
-	Store           storage.Store
-	ThumbLongEdge   int
-	PreviewLongEdge int
-	PreviewQuality  int
-	CommandTimeout  time.Duration
-	Events          *events.Bus
-	Logger          *slog.Logger
-	Sources         *storage.SourceHealth
-	CachePolicy     *cachepolicy.Manager
+	DB               *db.DB
+	Store            storage.Store
+	ThumbLongEdge    int
+	PreviewLongEdge  int
+	PreviewQuality   int
+	CommandTimeout   time.Duration
+	Events           *events.Bus
+	Logger           *slog.Logger
+	Sources          *storage.SourceHealth
+	CachePolicy      *cachepolicy.Manager
+	FFmpegHWAccel    string
+	FFmpegHWDevice   string
+	FFmpegHWFallback bool
 }
 
 func (p Processor) Handle(ctx context.Context, task jobs.Task) error {
@@ -173,7 +177,7 @@ func storyboardTiming(metadataJSON *string, timelineDuration float64) storyboard
 	return fallback
 }
 
-func storyboardFilter(asset model.Asset, timelineDuration, interval float64) string {
+func storyboardTimelineFilters(asset model.Asset, timelineDuration float64) []string {
 	timing := storyboardTiming(asset.MetadataJSON, timelineDuration)
 	trailing := math.Max(0, timelineDuration-timing.Start-timing.Duration)
 	filters := []string{"setpts=PTS-STARTPTS"}
@@ -183,9 +187,29 @@ func storyboardFilter(asset model.Asset, timelineDuration, interval float64) str
 			timing.Start, trailing,
 		))
 	}
+	return filters
+}
+
+func storyboardFilter(asset model.Asset, timelineDuration, interval float64) string {
+	filters := storyboardTimelineFilters(asset, timelineDuration)
 	filters = append(filters,
 		fmt.Sprintf("fps=1/%.6f", interval),
 		fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease", storyboardCellWidth, storyboardCellHeight),
+		fmt.Sprintf("pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black", storyboardCellWidth, storyboardCellHeight),
+		fmt.Sprintf("tile=%dx%d:nb_frames=%d", storyboardColumns, storyboardRows, storyboardColumns*storyboardRows),
+	)
+	return strings.Join(filters, ",")
+}
+
+func storyboardVAAPIFilter(asset model.Asset, timelineDuration, interval float64) string {
+	filters := []string{
+		fmt.Sprintf("scale_vaapi=w=%d:h=%d:force_original_aspect_ratio=decrease", storyboardCellWidth, storyboardCellHeight),
+		"hwdownload",
+		"format=nv12",
+	}
+	filters = append(filters, storyboardTimelineFilters(asset, timelineDuration)...)
+	filters = append(filters,
+		fmt.Sprintf("fps=1/%.6f", interval),
 		fmt.Sprintf("pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black", storyboardCellWidth, storyboardCellHeight),
 		fmt.Sprintf("tile=%dx%d:nb_frames=%d", storyboardColumns, storyboardRows, storyboardColumns*storyboardRows),
 	)
@@ -291,25 +315,52 @@ func (p Processor) processStoryboard(ctx context.Context, assetID int64) (runErr
 			_ = os.Remove(match)
 		}
 	}()
-	filter := storyboardFilter(asset, duration, interval)
 	commandTimeout := p.timeout()
 	if commandTimeout < 15*time.Minute {
 		commandTimeout = 15 * time.Minute
 	}
 	fastKeyframes := duration >= 60
-	runStoryboard := func(keyframesOnly bool) error {
+	runStoryboardOnce := func(keyframesOnly bool, hardware bool) error {
 		args := []string{
 			"-y", "-hide_banner", "-loglevel", "error",
 			"-fflags", "+discardcorrupt+genpts", "-err_detect", "ignore_err",
+			"-filter_threads", "2",
+		}
+		filter := storyboardFilter(asset, duration, interval)
+		if hardware {
+			args = append(args, video.DecodeInputArgs(p.FFmpegHWAccel, p.FFmpegHWDevice, true)...)
+			filter = storyboardVAAPIFilter(asset, duration, interval)
+		} else {
+			args = append(args, "-threads", "3")
 		}
 		if keyframesOnly {
 			args = append(args, "-skip_frame", "nokey")
 		}
 		args = append(args, "-i", source,
 			"-map", "0:v:0", "-an", "-sn", "-dn",
-			"-vf", filter, "-frames:v", fmt.Sprintf("%d", sheetCount), "-start_number", "0", "-c:v", "libwebp", "-quality", "42", "-compression_level", "6", tmpPattern)
+			"-vf", filter, "-frames:v", fmt.Sprintf("%d", sheetCount), "-start_number", "0", "-c:v", "libwebp", "-threads", "2", "-quality", "42", "-compression_level", "6", tmpPattern)
 		_, commandErr := util.RunLowPriorityCommand(ctx, commandTimeout, "ffmpeg", args...)
 		return commandErr
+	}
+	removeTemporarySheets := func() {
+		matches, _ := filepath.Glob(filepath.Join(directory, asset.CacheKey+".tmp-*.webp"))
+		for _, match := range matches {
+			_ = os.Remove(match)
+		}
+	}
+	useVAAPI := strings.EqualFold(strings.TrimSpace(p.FFmpegHWAccel), "vaapi")
+	runStoryboard := func(keyframesOnly bool) error {
+		if useVAAPI {
+			hardwareErr := runStoryboardOnce(keyframesOnly, true)
+			if hardwareErr == nil || ctx.Err() != nil || !p.FFmpegHWFallback {
+				return hardwareErr
+			}
+			removeTemporarySheets()
+			if p.Logger != nil {
+				p.Logger.Warn("storyboard hardware decode failed; retrying on CPU", "assetID", assetID, "error", hardwareErr)
+			}
+		}
+		return runStoryboardOnce(keyframesOnly, false)
 	}
 	err = runStoryboard(fastKeyframes)
 	complete := func() bool {
@@ -325,10 +376,7 @@ func (p Processor) processStoryboard(ctx context.Context, assetID int64) (runErr
 	// decodable image. A full sequential decode is reserved for inputs where
 	// the keyframe pass produced no image at all.
 	if fastKeyframes && (err != nil || !complete()) && storyboardSheetCount(directory, asset.CacheKey, sheetCount) == 0 {
-		matches, _ := filepath.Glob(filepath.Join(directory, asset.CacheKey+".tmp-*.webp"))
-		for _, match := range matches {
-			_ = os.Remove(match)
-		}
+		removeTemporarySheets()
 		err = runStoryboard(false)
 	}
 	if ctx.Err() != nil {
@@ -460,7 +508,7 @@ func (p Processor) processVideoThumb(ctx context.Context, asset model.Asset, sou
 	tmpThumb := dest + ".tmp.webp"
 	_ = os.Remove(tmpFrame)
 	_ = os.Remove(tmpThumb)
-	if _, err := util.RunLowPriorityCommand(ctx, p.timeout(), "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", "1", "-i", source, "-frames:v", "1", "-q:v", "3", tmpFrame); err != nil {
+	if err := p.extractVideoPosterFrame(ctx, asset, source, tmpFrame); err != nil {
 		if ctx.Err() != nil {
 			_ = p.DB.SetAssetWorkStatus(context.Background(), asset.ID, "thumb_status", model.StatusPending, nil)
 			_ = p.DB.SetAssetWorkStatus(context.Background(), asset.ID, "video_poster_status", model.StatusPending, nil)
@@ -515,6 +563,132 @@ func (p Processor) processVideoThumb(ctx context.Context, asset model.Asset, sou
 		p.CachePolicy.Register(context.Background(), "thumbs", asset.CacheKey, dest, &assetID, 0)
 	}
 	return p.DB.SetAssetWorkStatus(ctx, asset.ID, "video_poster_status", model.StatusReady, nil)
+}
+
+// CaptureVideoPosterAt replaces a video's cached thumbnail with a frame from
+// the requested playback position. The existing thumbnail remains untouched
+// until both extraction and compression have completed successfully.
+func (p Processor) CaptureVideoPosterAt(ctx context.Context, assetID int64, seekSeconds float64) (model.Asset, error) {
+	asset, err := p.DB.GetAsset(ctx, assetID)
+	if err != nil {
+		return model.Asset{}, err
+	}
+	if asset.MediaType != model.MediaTypeVideo {
+		return model.Asset{}, errors.New("资源不是视频")
+	}
+	if math.IsNaN(seekSeconds) || math.IsInf(seekSeconds, 0) || seekSeconds < 0 {
+		return model.Asset{}, errors.New("截图时间无效")
+	}
+	if asset.Duration != nil && *asset.Duration > 0 && seekSeconds >= *asset.Duration {
+		seekSeconds = math.Max(0, *asset.Duration-0.001)
+	}
+	if p.Sources != nil {
+		if available, _ := p.Sources.AvailableForRel(asset.RelPath); !available {
+			return model.Asset{}, errors.New("存储不可访问")
+		}
+	}
+	source, err := p.Store.PhotoPath(asset.RelPath)
+	if err != nil {
+		return model.Asset{}, err
+	}
+	dest, err := p.Store.CachePath("thumbs", asset.CacheKey, "webp")
+	if err != nil {
+		return model.Asset{}, err
+	}
+	nonce := strconv.FormatInt(time.Now().UnixNano(), 10)
+	tmpFrame := dest + ".manual-" + nonce + ".jpg"
+	tmpThumb := dest + ".manual-" + nonce + ".webp"
+	defer os.Remove(tmpFrame)
+	defer os.Remove(tmpThumb)
+
+	if err := p.extractVideoFrameAt(ctx, source, tmpFrame, seekSeconds, false); err != nil {
+		return model.Asset{}, err
+	}
+	args := []string{tmpFrame, "-s", fmt.Sprintf("%dx%d", p.ThumbLongEdge, p.ThumbLongEdge), "-o", fmt.Sprintf("%s[Q=%d]", tmpThumb, 76)}
+	if _, err := util.RunCommand(ctx, p.timeout(), "vipsthumbnail", args...); err != nil {
+		return model.Asset{}, err
+	}
+	if !fileExists(tmpThumb) {
+		return model.Asset{}, errors.New("未生成视频封面")
+	}
+	if err := os.Rename(tmpThumb, dest); err != nil {
+		return model.Asset{}, err
+	}
+	if p.CachePolicy != nil {
+		id := asset.ID
+		p.CachePolicy.Register(context.Background(), "thumbs", asset.CacheKey, dest, &id, 0)
+	}
+	if err := p.DB.SetAssetWorkStatus(ctx, asset.ID, "thumb_status", model.StatusReady, nil); err != nil {
+		return model.Asset{}, err
+	}
+	if err := p.DB.SetAssetWorkStatus(ctx, asset.ID, "video_poster_status", model.StatusReady, nil); err != nil {
+		return model.Asset{}, err
+	}
+	refreshed, err := p.DB.GetAsset(ctx, asset.ID)
+	if err != nil {
+		return model.Asset{}, err
+	}
+	if p.Events != nil {
+		p.Events.Publish(events.Event{Type: "asset_ready", Payload: refreshed})
+	}
+	return refreshed, nil
+}
+
+func videoPosterSeekSeconds(duration *float64) float64 {
+	if duration == nil || *duration <= 0 || math.IsNaN(*duration) || math.IsInf(*duration, 0) {
+		return 1
+	}
+	return math.Min(1, *duration/2)
+}
+
+func (p Processor) extractVideoPosterFrame(ctx context.Context, asset model.Asset, source, destination string) error {
+	seek := videoPosterSeekSeconds(asset.Duration)
+	err := p.extractVideoFrameAt(ctx, source, destination, seek, true)
+	if err == nil || ctx.Err() != nil || seek == 0 {
+		return err
+	}
+	// Some very short or timestamp-irregular videos have no decodable frame at
+	// the preferred seek point. The first frame is a valid poster fallback.
+	return p.extractVideoFrameAt(ctx, source, destination, 0, true)
+}
+
+func (p Processor) extractVideoFrameAt(ctx context.Context, source, destination string, seek float64, lowPriority bool) error {
+	run := func(hardware bool) error {
+		_ = os.Remove(destination)
+		args := []string{"-y", "-hide_banner", "-loglevel", "error"}
+		if hardware {
+			args = append(args, video.DecodeInputArgs(p.FFmpegHWAccel, p.FFmpegHWDevice, false)...)
+		}
+		args = append(args,
+			"-ss", strconv.FormatFloat(seek, 'f', 6, 64),
+			"-i", source,
+			"-frames:v", "1", "-q:v", "3",
+			destination,
+		)
+		var err error
+		if lowPriority {
+			_, err = util.RunLowPriorityCommand(ctx, p.timeout(), "ffmpeg", args...)
+		} else {
+			_, err = util.RunCommand(ctx, p.timeout(), "ffmpeg", args...)
+		}
+		if err != nil {
+			return err
+		}
+		if fileExists(destination) {
+			return nil
+		}
+		return errors.New("FFmpeg 未生成视频封面帧")
+	}
+	hwAccel := strings.ToLower(strings.TrimSpace(p.FFmpegHWAccel))
+	useHardware := hwAccel != "" && hwAccel != "none"
+	err := run(useHardware)
+	if err == nil || !useHardware || !p.FFmpegHWFallback || ctx.Err() != nil {
+		return err
+	}
+	if p.Logger != nil {
+		p.Logger.Warn("video poster hardware decode failed; retrying on CPU", "source", source, "error", err)
+	}
+	return run(false)
 }
 
 func valueOrEmpty(value *string) string {

@@ -70,6 +70,11 @@ type AIBackfillItem struct {
 	RelPath  string
 }
 
+type AIAccessFailureCandidate struct {
+	AssetID int64
+	RelPath string
+}
+
 type AITagSummary struct {
 	Tag         string `json:"tag"`
 	Count       int64  `json:"count"`
@@ -146,7 +151,7 @@ WHERE asset_ai_result.input_cache_key<>excluded.input_cache_key`, assetID, cache
 func (d *DB) MarkAIProcessing(ctx context.Context, assetID int64, cacheKey string) (int, error) {
 	var attempts int
 	err := d.conn.QueryRowContext(ctx, `UPDATE asset_ai_result SET status='processing',attempts=attempts+1,started_at=now(),error_text=NULL,updated_at=now()
-WHERE asset_id=? AND input_cache_key=? RETURNING attempts`, assetID, cacheKey).Scan(&attempts)
+WHERE asset_id=? AND input_cache_key=? AND status IN ('pending','failed') RETURNING attempts`, assetID, cacheKey).Scan(&attempts)
 	return attempts, err
 }
 
@@ -160,7 +165,7 @@ func (d *DB) SaveAIResult(ctx context.Context, assetID int64, cacheKey, descript
 	if err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, rebindPostgres(`UPDATE asset_ai_result SET status='ready',description=?,tag_model=?,tag_model_version=?,description_model=?,description_model_version=?,taxonomy_version=?,sampled_frames=?::jsonb,palette=?::jsonb,error_text=NULL,finished_at=now(),updated_at=now() WHERE asset_id=? AND input_cache_key=?`), description, tagModel, tagVersion, descriptionModel, descriptionVersion, taxonomyVersion, string(frames), string(paletteJSON), assetID, cacheKey)
+	result, err := tx.ExecContext(ctx, rebindPostgres(`UPDATE asset_ai_result SET status='ready',description=?,tag_model=?,tag_model_version=?,description_model=?,description_model_version=?,taxonomy_version=?,sampled_frames=?::jsonb,palette=?::jsonb,error_text=NULL,finished_at=now(),updated_at=now() WHERE asset_id=? AND input_cache_key=? AND status='processing'`), description, tagModel, tagVersion, descriptionModel, descriptionVersion, taxonomyVersion, string(frames), string(paletteJSON), assetID, cacheKey)
 	if err != nil {
 		return err
 	}
@@ -215,9 +220,6 @@ VALUES($1,$2,'pending',now()) ON CONFLICT(asset_id) DO NOTHING`, assetID, cacheK
 		if _, err = tx.ExecContext(ctx, `DELETE FROM asset_ai_tag WHERE asset_id=$1 AND tag=$2`, assetID, previousTag); err != nil {
 			return AIResult{}, err
 		}
-	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM asset_ai_tag WHERE asset_id=$1 AND category_key=$2 AND subject_key=$3 AND tag<>$4`, assetID, tag.CategoryKey, tag.SubjectKey, tag.Tag); err != nil {
-		return AIResult{}, err
 	}
 	var count int
 	var exists bool
@@ -289,7 +291,7 @@ func fallback(value, defaultValue string) string {
 
 func (d *DB) MarkAIFailed(ctx context.Context, assetID int64, cacheKey, message string) (bool, error) {
 	var attempts int
-	err := d.conn.QueryRowContext(ctx, `UPDATE asset_ai_result SET status='failed',error_text=?,finished_at=now(),updated_at=now() WHERE asset_id=? AND input_cache_key=? RETURNING attempts`, message, assetID, cacheKey).Scan(&attempts)
+	err := d.conn.QueryRowContext(ctx, `UPDATE asset_ai_result SET status='failed',error_text=?,finished_at=now(),updated_at=now() WHERE asset_id=? AND input_cache_key=? AND status='processing' RETURNING attempts`, message, assetID, cacheKey).Scan(&attempts)
 	return attempts < AIMaxAttempts, err
 }
 
@@ -574,6 +576,69 @@ SELECT asset_id,cache_key FROM reset ORDER BY sort_time DESC,asset_id DESC`)
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func (d *DB) AIAccessFailureCandidates(ctx context.Context) ([]AIAccessFailureCandidate, error) {
+	rows, err := d.conn.QueryContext(ctx, `
+SELECT r.asset_id,fi.rel_path
+FROM asset_ai_result r
+JOIN media_asset ma ON ma.id=r.asset_id AND ma.deleted_at IS NULL AND ma.media_type IN (1,2) AND r.input_cache_key=ma.cache_key
+JOIN LATERAL (
+  SELECT rel_path FROM file_instance
+  WHERE asset_id=r.asset_id AND missing=false
+  ORDER BY id LIMIT 1
+) fi ON true
+WHERE r.status='failed' AND (
+  lower(COALESCE(r.error_text,'')) LIKE '%no such file%' OR
+  lower(COALESCE(r.error_text,'')) LIKE '%file not found%' OR
+  lower(COALESCE(r.error_text,'')) LIKE '%cannot find the file%' OR
+  lower(COALESCE(r.error_text,'')) LIKE '%permission denied%' OR
+  lower(COALESCE(r.error_text,'')) LIKE '%operation not permitted%' OR
+  lower(COALESCE(r.error_text,'')) LIKE '%input/output error%' OR
+  lower(COALESCE(r.error_text,'')) LIKE '%stale file handle%'
+)
+ORDER BY r.asset_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]AIAccessFailureCandidate, 0)
+	for rows.Next() {
+		var item AIAccessFailureCandidate
+		if err := rows.Scan(&item.AssetID, &item.RelPath); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (d *DB) RequeueAIFailuresByAssetIDs(ctx context.Context, assetIDs []int64) (int, error) {
+	if len(assetIDs) == 0 {
+		return 0, nil
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	count := 0
+	for _, assetID := range assetIDs {
+		result, err := tx.ExecContext(ctx, `UPDATE asset_ai_result r
+SET status='pending',attempts=0,error_text=NULL,started_at=NULL,finished_at=NULL,updated_at=now()
+FROM media_asset ma
+WHERE r.asset_id=? AND ma.id=r.asset_id AND ma.deleted_at IS NULL AND r.input_cache_key=ma.cache_key AND r.status='failed'`, assetID)
+		if err != nil {
+			return 0, err
+		}
+		if affected, affectedErr := result.RowsAffected(); affectedErr == nil {
+			count += int(affected)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (d *DB) AIActivity(ctx context.Context) (AIActivity, error) {

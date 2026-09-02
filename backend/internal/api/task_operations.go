@@ -17,6 +17,7 @@ import (
 
 	aiworker "lpicto/backend/internal/ai"
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/storage"
 )
@@ -72,10 +73,14 @@ func (s *Server) runSystemTask(w http.ResponseWriter, r *http.Request) {
 		if action == "scan" {
 			reason = "global_scan"
 		}
+		if action == "retry_failed" {
+			s.runMetadataTask(w, r, action, roots, reason, running)
+			return
+		}
 		result := s.scanner.RequestMediaScanRoots(reason, roots)
 		writeJSON(w, http.StatusAccepted, scanCommandResponse(result))
 	case "library_scan":
-		if action != "reconcile" && action != "scan" {
+		if action != "reconcile" && action != "scan" && action != "retry_failed" {
 			systemTaskActionError(w)
 			return
 		}
@@ -96,7 +101,7 @@ func (s *Server) runSystemTask(w http.ResponseWriter, r *http.Request) {
 	case "ai_analysis":
 		s.runAIAnalysisTask(w, r, action, running)
 	case taskDuplicateScan:
-		if action != "scan" && action != "continue" {
+		if action != "scan" && action != "continue" && action != "retry_failed" {
 			systemTaskActionError(w)
 			return
 		}
@@ -106,15 +111,18 @@ func (s *Server) runSystemTask(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "state": "running"})
 	case taskStorageHealth:
-		if action != "check" {
+		if action != "check" && action != "retry_failed" {
 			systemTaskActionError(w)
 			return
 		}
 		s.runStorageHealthTask(w, r)
 	case "ai_health_check":
+		if action == "retry_failed" {
+			action = "check"
+		}
 		s.runAIHealthTask(w, r, action)
 	case taskCacheCleanup:
-		if action != "cleanup" {
+		if action != "cleanup" && action != "retry_failed" {
 			systemTaskActionError(w)
 			return
 		}
@@ -617,7 +625,31 @@ func (s *Server) runStorageHealthTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) checkStorageHealth(ctx context.Context) ([]storage.SourceHealthStatus, int, string) {
+	previousState, _ := s.db.SystemTaskState(ctx, taskStorageHealth)
 	_ = s.db.BeginSystemTask(ctx, taskStorageHealth)
+	statuses := s.storageHealthStatuses(ctx)
+	failed := unavailableStorageStatusCount(statuses)
+	state, message := "success", fmt.Sprintf("已检查 %d 个存储来源，全部可访问", len(statuses))
+	if failed > 0 {
+		state, message = "failed", fmt.Sprintf("%d 个存储来源不可访问", failed)
+		s.scanner.RequestStop()
+		_ = s.jobs.ClearQueues(ctx, "thumb", "preview", "video_poster", "storyboard")
+		_ = s.jobs.ClearAIQueue(ctx)
+		s.jobs.CancelActive("thumb", "preview", "video_poster", "storyboard", "ai_analyze")
+		_ = s.db.RequeueProcessingWork(ctx, "thumb")
+		_ = s.db.RequeueProcessingWork(ctx, "preview")
+		_ = s.db.RequeueProcessingWork(ctx, "video_poster")
+		_ = s.db.RequeueProcessingWork(ctx, "storyboard")
+	} else if previousState != nil && previousState.Status == "failed" {
+		if recovered := s.requeueAccessibleAIStorageFailures(ctx); recovered > 0 {
+			message += fmt.Sprintf("；%d 个可读媒体已恢复为待分析", recovered)
+		}
+	}
+	_ = s.db.FinishSystemTask(ctx, taskStorageHealth, state, message)
+	return statuses, failed, message
+}
+
+func (s *Server) storageHealthStatuses(ctx context.Context) []storage.SourceHealthStatus {
 	libraries, _, _ := s.db.GetScanLibraries(ctx)
 	statuses := make([]storage.SourceHealthStatus, 0, len(libraries))
 	for _, library := range libraries {
@@ -632,25 +664,52 @@ func (s *Server) checkStorageHealth(ctx context.Context) ([]storage.SourceHealth
 	if len(statuses) == 0 {
 		statuses = s.sourceHealth.Statuses()
 	}
+	return statuses
+}
+
+func unavailableStorageStatusCount(statuses []storage.SourceHealthStatus) int {
 	failed := 0
 	for _, status := range statuses {
 		if !status.Available {
 			failed++
 		}
 	}
-	state, message := "success", fmt.Sprintf("已检查 %d 个存储来源，全部可访问", len(statuses))
-	if failed > 0 {
-		state, message = "failed", fmt.Sprintf("%d 个存储来源不可访问", failed)
-		s.scanner.RequestStop()
-		_ = s.jobs.ClearQueues(ctx, "thumb", "preview", "video_poster", "storyboard")
-		_ = s.jobs.ClearAIQueue(ctx)
-		_ = s.db.RequeueProcessingWork(ctx, "thumb")
-		_ = s.db.RequeueProcessingWork(ctx, "preview")
-		_ = s.db.RequeueProcessingWork(ctx, "video_poster")
-		_ = s.db.RequeueProcessingWork(ctx, "storyboard")
+	return failed
+}
+
+func (s *Server) requeueAccessibleAIStorageFailures(ctx context.Context) int {
+	items, err := s.db.AIAccessFailureCandidates(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("load AI storage failure candidates failed", "error", err)
+		}
+		return 0
 	}
-	_ = s.db.FinishSystemTask(ctx, taskStorageHealth, state, message)
-	return statuses, failed, message
+	assetIDs := make([]int64, 0, len(items))
+	for _, item := range items {
+		path, pathErr := s.store.PhotoPath(item.RelPath)
+		if pathErr != nil {
+			continue
+		}
+		file, openErr := os.Open(path)
+		if openErr != nil {
+			continue
+		}
+		var one [1]byte
+		_, readErr := file.Read(one[:])
+		_ = file.Close()
+		if readErr == nil || errors.Is(readErr, io.EOF) {
+			assetIDs = append(assetIDs, item.AssetID)
+		}
+	}
+	recovered, err := s.db.RequeueAIFailuresByAssetIDs(ctx, assetIDs)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("requeue accessible AI storage failures failed", "error", err)
+		}
+		return 0
+	}
+	return recovered
 }
 
 func (s *Server) probeConfiguredLibraryRoot(ctx context.Context, label string, rel string) storage.SourceHealthStatus {
@@ -677,7 +736,7 @@ func (s *Server) probeConfiguredLibraryRoot(ctx context.Context, label string, r
 					_, openErr = file.Read(one[:])
 					_ = file.Close()
 				}
-				if openErr != nil && !errors.Is(openErr, os.ErrNotExist) && !errors.Is(openErr, io.EOF) {
+				if storageSampleErrorMakesLibraryUnavailable(openErr) {
 					err = openErr
 				}
 			}
@@ -688,6 +747,13 @@ func (s *Server) probeConfiguredLibraryRoot(ctx context.Context, label string, r
 		status.Message = err.Error()
 	}
 	return status
+}
+
+func storageSampleErrorMakesLibraryUnavailable(err error) bool {
+	if err == nil || errors.Is(err, os.ErrNotExist) || errors.Is(err, io.EOF) {
+		return false
+	}
+	return storage.IsSourceUnavailable(err)
 }
 
 func (s *Server) runAIHealthTask(w http.ResponseWriter, r *http.Request, action string) {
@@ -864,17 +930,54 @@ func (s *Server) runScheduledCacheMaintenance(parent context.Context) {
 
 func (s *Server) startStorageHealthScheduler() {
 	go func() {
-		for {
+		recoveryTicker := time.NewTicker(time.Minute)
+		defer recoveryTicker.Stop()
+		nextDailyCheck := func() time.Time {
 			now := time.Now()
 			next := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, now.Location())
 			if !next.After(now) {
 				next = next.Add(24 * time.Hour)
 			}
-			time.Sleep(time.Until(next))
-			_, failed, _ := s.checkStorageHealth(context.Background())
-			if failed == 0 {
-				s.scanner.RequestReconcileScan("daily_source_window")
+			return next
+		}
+		dailyTimer := time.NewTimer(time.Until(nextDailyCheck()))
+		defer dailyTimer.Stop()
+		for {
+			select {
+			case <-recoveryTicker.C:
+				s.retryFailedStorageHealth()
+			case <-dailyTimer.C:
+				if !debugcontrol.ExternalFileAccessPaused() {
+					_, failed, _ := s.checkStorageHealth(context.Background())
+					if failed == 0 {
+						s.scanner.RequestReconcileScan("daily_source_window")
+					}
+				}
+				dailyTimer.Reset(time.Until(nextDailyCheck()))
 			}
 		}
 	}()
+}
+
+func (s *Server) retryFailedStorageHealth() {
+	if debugcontrol.ExternalFileAccessPaused() {
+		return
+	}
+	ctx := context.Background()
+	state, err := s.db.SystemTaskState(ctx, taskStorageHealth)
+	if err != nil || state == nil || state.Status != "failed" {
+		return
+	}
+	statuses := s.storageHealthStatuses(ctx)
+	if unavailableStorageStatusCount(statuses) != 0 {
+		return
+	}
+	recovered := s.requeueAccessibleAIStorageFailures(ctx)
+	message := fmt.Sprintf("存储已恢复，已检查 %d 个存储来源，全部可访问", len(statuses))
+	if recovered > 0 {
+		message += fmt.Sprintf("；%d 个可读媒体已恢复为待分析", recovered)
+	}
+	_ = s.db.BeginSystemTask(ctx, taskStorageHealth)
+	_ = s.db.FinishSystemTask(ctx, taskStorageHealth, "success", message)
+	s.scanner.RequestReconcileScan("storage_recovered")
 }

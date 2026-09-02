@@ -174,6 +174,7 @@ type VideoProxyHeartbeatRequest struct {
 	PlaybackRate float64 `json:"playbackRate"`
 	WantsStream  bool    `json:"wantsStream"`
 	Hidden       bool    `json:"hidden"`
+	Transcoder   string  `json:"transcoder"`
 }
 
 type AssetTagDTO struct {
@@ -221,6 +222,10 @@ type FolderDTO struct {
 	Depth               int     `json:"depth"`
 	AssetCount          int     `json:"assetCount"`
 	RecursiveAssetCount int     `json:"recursiveAssetCount"`
+	SizeBytes           int64   `json:"sizeBytes"`
+	RecursiveSizeBytes  int64   `json:"recursiveSizeBytes"`
+	CreatedAt           int64   `json:"createdAt"`
+	ModifiedAt          int64   `json:"modifiedAt"`
 	CoverAssetID        *int64  `json:"coverAssetId"`
 }
 
@@ -720,6 +725,10 @@ func folderDTO(folder model.Folder) FolderDTO {
 		Depth:               folder.Depth,
 		AssetCount:          folder.AssetCount,
 		RecursiveAssetCount: folder.RecursiveAssetCount,
+		SizeBytes:           folder.SizeBytes,
+		RecursiveSizeBytes:  folder.RecursiveSizeBytes,
+		CreatedAt:           folder.CreatedAt,
+		ModifiedAt:          folder.ModifiedAt,
 		CoverAssetID:        folder.CoverAssetID,
 	}
 }

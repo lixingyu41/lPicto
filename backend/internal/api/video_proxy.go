@@ -19,6 +19,7 @@ import (
 
 	"lpicto/backend/internal/config"
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/model"
 	videoproc "lpicto/backend/internal/video"
 )
@@ -29,6 +30,8 @@ const (
 	videoProxyReadDelay    = 250 * time.Millisecond
 	videoProxyIdleCheck    = 2 * time.Second
 	videoProxyOpenTimeout  = 90 * time.Second
+	videoTranscoderCPU     = "cpu"
+	videoTranscoderGPU     = "gpu"
 )
 
 var errVideoProxyIdle = errors.New("video proxy idle")
@@ -135,6 +138,10 @@ func (s *Server) videoProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "video_proxy_disabled", "视频代理未启用")
 		return
 	}
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
+		return
+	}
 	if !videoProxyPlaybackRequested(r) {
 		writeError(w, http.StatusConflict, "video_proxy_not_started", "视频未开始播放")
 		return
@@ -148,7 +155,8 @@ func (s *Server) videoProxy(w http.ResponseWriter, r *http.Request) {
 	cacheSettings := s.videoProxyCacheSettings(r.Context())
 	startSeconds := videoProxyStartSeconds(r, asset)
 	session := videoProxySessionFromRequest(r)
-	state, cached, err := s.ensureVideoProxyRuntime(asset, startSeconds, cacheSettings)
+	transcoder := videoTranscoderFromRequest(r)
+	state, cached, err := s.ensureVideoProxyRuntime(asset, startSeconds, cacheSettings, transcoder)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "video_proxy_failed", "启动视频转码失败")
 		return
@@ -166,7 +174,7 @@ func (s *Server) videoProxyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session := videoProxySessionFromRequest(r)
-	dto, err := s.videoProxyRuntimeDTO(r.Context(), asset, videoProxyStartSeconds(r, asset), session.SessionID)
+	dto, err := s.videoProxyRuntimeDTO(r.Context(), asset, videoProxyStartSeconds(r, asset), session.SessionID, session.Transcoder)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "video_proxy_status_failed", "读取转码状态失败")
 		return
@@ -182,17 +190,17 @@ func (s *Server) videoProxyKeepalive(w http.ResponseWriter, r *http.Request) {
 	startSeconds := videoProxyStartSeconds(r, asset)
 	heartbeat := videoProxyHeartbeatFromRequest(r)
 	cacheSettings := s.videoProxyCacheSettings(r.Context())
-	dto, err := s.touchVideoProxyRuntime(asset, true, startSeconds, heartbeat, cacheSettings)
+	dto, err := s.touchVideoProxyRuntime(asset, true, startSeconds, heartbeat, cacheSettings, heartbeat.Transcoder)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "video_proxy_keepalive_failed", "刷新转码缓存失败")
 		return
 	}
 	if videoProxyHeartbeatWantsRuntime(heartbeat) {
-		if _, _, err := s.ensureVideoProxyRuntime(asset, startSeconds, cacheSettings); err != nil {
+		if _, _, err := s.ensureVideoProxyRuntime(asset, startSeconds, cacheSettings, heartbeat.Transcoder); err != nil {
 			writeError(w, http.StatusInternalServerError, "video_proxy_failed", "启动视频转码失败")
 			return
 		}
-		dto, err = s.videoProxyRuntimeDTO(r.Context(), asset, startSeconds, heartbeat.SessionID)
+		dto, err = s.videoProxyRuntimeDTO(r.Context(), asset, startSeconds, heartbeat.SessionID, heartbeat.Transcoder)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "video_proxy_status_failed", "读取转码状态失败")
 			return
@@ -201,8 +209,9 @@ func (s *Server) videoProxyKeepalive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dto)
 }
 
-func (s *Server) ensureVideoProxyRuntime(asset model.Asset, startSeconds float64, cacheSettings videoProxyCacheSettings) (*videoProxyRuntime, bool, error) {
-	runtimeKey := videoProxyRuntimeKey(asset.CacheKey, startSeconds)
+func (s *Server) ensureVideoProxyRuntime(asset model.Asset, startSeconds float64, cacheSettings videoProxyCacheSettings, transcoder string) (*videoProxyRuntime, bool, error) {
+	hwAccel := s.videoHWAccelForTranscoder(transcoder)
+	runtimeKey := videoProxyRuntimeKey(asset.CacheKey, startSeconds, hwAccel)
 	dest, err := s.store.CachePath("video-proxies", runtimeKey, "mp4")
 	if err != nil {
 		return nil, false, err
@@ -260,7 +269,7 @@ func (s *Server) ensureVideoProxyRuntime(asset model.Asset, startSeconds float64
 	state.Error = ""
 	state.Done = make(chan struct{})
 	s.videoProxyMu.Unlock()
-	go s.runVideoProxyTranscode(asset, runtimeKey, startSeconds, dest, tmp)
+	go s.runVideoProxyTranscode(asset, runtimeKey, startSeconds, dest, tmp, hwAccel)
 	return state, false, nil
 }
 
@@ -358,7 +367,11 @@ func openGrowingFile(ctx context.Context, state *videoProxyRuntime) (*os.File, e
 	}
 }
 
-func (s *Server) runVideoProxyTranscode(asset model.Asset, runtimeKey string, startSeconds float64, dest string, tmp string) {
+func (s *Server) runVideoProxyTranscode(asset model.Asset, runtimeKey string, startSeconds float64, dest string, tmp string, hwAccel string) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		s.finishVideoProxyTranscode(asset, runtimeKey, dest, tmp, debugcontrol.ErrExternalFileAccessPaused)
+		return
+	}
 	releaseDest := s.cachePolicy.Pin(dest)
 	defer releaseDest()
 	releaseTemp := s.cachePolicy.Pin(tmp)
@@ -391,7 +404,7 @@ func (s *Server) runVideoProxyTranscode(asset model.Asset, runtimeKey string, st
 	}
 	defer releaseSlot()
 	s.markVideoProxyTranscodeStarted(runtimeKey)
-	args := videoproc.StreamProxyArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, s.cfg.FFmpegHWDevice, startSeconds)
+	args := videoproc.StreamProxyArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, hwAccel, s.cfg.FFmpegHWDevice, startSeconds)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -534,11 +547,24 @@ func videoProxyStartSeconds(r *http.Request, asset model.Asset) float64 {
 
 func videoProxySessionFromRequest(r *http.Request) VideoProxyHeartbeatRequest {
 	query := r.URL.Query()
+	clientID := firstNonEmpty(r.Header.Get(videoClientIDHeader), query.Get("clientId"))
+	sessionID := firstNonEmpty(r.Header.Get(videoSessionIDHeader), query.Get("sessionId"))
+	transcoder := firstNonEmpty(r.Header.Get(videoTranscoderHeader), query.Get("transcoder"))
 	return sanitizeVideoProxyHeartbeat(VideoProxyHeartbeatRequest{
-		ClientID:  query.Get("clientId"),
-		SessionID: query.Get("sessionId"),
-		State:     query.Get("state"),
+		ClientID:   clientID,
+		SessionID:  sessionID,
+		State:      query.Get("state"),
+		Transcoder: transcoder,
 	})
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func videoProxyHeartbeatFromRequest(r *http.Request) VideoProxyHeartbeatRequest {
@@ -555,6 +581,9 @@ func videoProxyHeartbeatFromRequest(r *http.Request) VideoProxyHeartbeatRequest 
 			}
 			if body.State != "" {
 				heartbeat.State = body.State
+			}
+			if body.Transcoder != "" {
+				heartbeat.Transcoder = body.Transcoder
 			}
 			heartbeat.CurrentTime = body.CurrentTime
 			heartbeat.PlaybackRate = body.PlaybackRate
@@ -573,6 +602,7 @@ func sanitizeVideoProxyHeartbeat(heartbeat VideoProxyHeartbeatRequest) VideoProx
 	heartbeat.ClientID = sanitizeVideoProxyID(heartbeat.ClientID, "browser")
 	heartbeat.SessionID = sanitizeVideoProxyID(heartbeat.SessionID, "legacy")
 	heartbeat.State = normalizeVideoProxySessionState(heartbeat.State)
+	heartbeat.Transcoder = normalizeVideoTranscoder(heartbeat.Transcoder)
 	if !isFinitePositiveOrZero(heartbeat.CurrentTime) {
 		heartbeat.CurrentTime = 0
 	}
@@ -611,6 +641,31 @@ func normalizeVideoProxySessionState(value string) string {
 	}
 }
 
+func normalizeVideoTranscoder(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), videoTranscoderGPU) {
+		return videoTranscoderGPU
+	}
+	return videoTranscoderCPU
+}
+
+func videoTranscoderFromRequest(r *http.Request) string {
+	if r == nil {
+		return videoTranscoderCPU
+	}
+	return normalizeVideoTranscoder(r.URL.Query().Get("transcoder"))
+}
+
+func (s *Server) videoHWAccelForTranscoder(transcoder string) string {
+	if normalizeVideoTranscoder(transcoder) != videoTranscoderGPU {
+		return "none"
+	}
+	resolved := strings.ToLower(strings.TrimSpace(s.cfg.FFmpegHWAccel))
+	if resolved == "" || resolved == "auto" {
+		return "none"
+	}
+	return resolved
+}
+
 func isFinitePositiveOrZero(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
 }
@@ -619,11 +674,15 @@ func videoProxyHeartbeatWantsRuntime(heartbeat VideoProxyHeartbeatRequest) bool 
 	return heartbeat.WantsStream || heartbeat.State == "preparing" || heartbeat.State == "playing"
 }
 
-func videoProxyRuntimeKey(cacheKey string, startSeconds float64) string {
-	if startSeconds <= 0 {
-		return cacheKey
+func videoProxyRuntimeKey(cacheKey string, startSeconds float64, hwAccel string) string {
+	profile := "cpu"
+	if normalizeVideoTranscoder(hwAccel) == videoTranscoderGPU || (strings.TrimSpace(hwAccel) != "" && strings.ToLower(strings.TrimSpace(hwAccel)) != "none") {
+		profile = "gpu-" + strings.ToLower(strings.TrimSpace(hwAccel))
 	}
-	return fmt.Sprintf("%s-s%d", cacheKey, int64(math.Round(startSeconds*100)))
+	if startSeconds <= 0 {
+		return fmt.Sprintf("%s-%s", cacheKey, profile)
+	}
+	return fmt.Sprintf("%s-%s-s%d", cacheKey, profile, int64(math.Round(startSeconds*100)))
 }
 
 func (s *Server) readVideoProxyProgress(cacheKey string, duration float64, startSeconds float64, stderr io.Reader) string {
@@ -778,17 +837,17 @@ func (s *Server) markVideoProxyError(cacheKey string, err error) {
 	}
 }
 
-func (s *Server) videoProxyRuntimeDTO(ctx context.Context, asset model.Asset, startSeconds float64, sessionID string) (VideoProxyRuntimeDTO, error) {
+func (s *Server) videoProxyRuntimeDTO(ctx context.Context, asset model.Asset, startSeconds float64, sessionID string, transcoder string) (VideoProxyRuntimeDTO, error) {
 	cacheSettings := s.videoProxyCacheSettings(ctx)
-	return s.touchVideoProxyRuntime(asset, false, startSeconds, VideoProxyHeartbeatRequest{SessionID: sessionID}, cacheSettings)
+	return s.touchVideoProxyRuntime(asset, false, startSeconds, VideoProxyHeartbeatRequest{SessionID: sessionID, Transcoder: transcoder}, cacheSettings, transcoder)
 }
 
-func (s *Server) touchVideoProxyRuntime(asset model.Asset, keepalive bool, startSeconds float64, heartbeat VideoProxyHeartbeatRequest, cacheSettings videoProxyCacheSettings) (VideoProxyRuntimeDTO, error) {
+func (s *Server) touchVideoProxyRuntime(asset model.Asset, keepalive bool, startSeconds float64, heartbeat VideoProxyHeartbeatRequest, cacheSettings videoProxyCacheSettings, transcoder string) (VideoProxyRuntimeDTO, error) {
 	now := time.Now()
 	required := asset.MediaType == model.MediaTypeVideo && !asset.BrowserPlayable && s.cfg.VideoProxyEnabled
 	dest := ""
 	tmp := ""
-	runtimeKey := videoProxyRuntimeKey(asset.CacheKey, startSeconds)
+	runtimeKey := videoProxyRuntimeKey(asset.CacheKey, startSeconds, s.videoHWAccelForTranscoder(transcoder))
 	heartbeat = sanitizeVideoProxyHeartbeat(heartbeat)
 	if required {
 		var err error

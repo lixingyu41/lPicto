@@ -8,12 +8,35 @@ export type ImmersivePinnedMenu =
   | { kind: 'tool'; menu: ImmersivePinnedToolMenu; target: ImmersivePinnedMenuTarget };
 
 const storageKey = 'lpicto.immersiveChrome.size';
+const pinnedStorageKey = 'lpicto.immersiveChrome.pinned';
 const pinnedMenuWidthStorageKey = 'lpicto.immersiveChrome.pinnedMenuWidth';
 const pinnedMenuStorageKey = 'lpicto.immersiveChrome.pinnedMenu.v1';
 export const defaultPinnedMenuWidth = 340;
 export const minPinnedMenuWidth = 240;
 export const maxPinnedMenuWidth = 680;
 export const immersiveChromeSizeChanged = 'lpicto:immersive-chrome-size-changed';
+export const immersiveChromePinnedChanged = 'lpicto:immersive-chrome-pinned-changed';
+
+export function loadImmersiveChromePinned() {
+  try {
+    return window.localStorage.getItem(pinnedStorageKey) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function saveImmersiveChromePinned(pinned: boolean) {
+  try {
+    window.localStorage.setItem(pinnedStorageKey, String(pinned));
+  } catch {
+    // The current tab still keeps the live pinned state.
+  }
+  window.dispatchEvent(new CustomEvent<boolean>(immersiveChromePinnedChanged, { detail: pinned }));
+}
+
+export function isImmersiveChromePinnedStorageEvent(event: StorageEvent) {
+  return event.key === pinnedStorageKey;
+}
 
 export function loadImmersiveChromeSize(): ImmersiveChromeSize {
   try {

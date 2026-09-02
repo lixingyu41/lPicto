@@ -29,6 +29,7 @@ type Config struct {
 	DatabaseURL                  string               `json:"-"`
 	RedisURL                     string               `json:"-"`
 	AIURL                        string               `json:"-"`
+	ExternalAIToken              string               `json:"-"`
 	HTTPAddr                     string               `json:"httpAddr"`
 	ScanInterval                 time.Duration        `json:"-"`
 	ScanIntervalMinutes          int                  `json:"scanIntervalMinutes"`
@@ -37,6 +38,7 @@ type Config struct {
 	ScanWorkers                  int                  `json:"scanWorkers"`
 	ThumbWorkers                 int                  `json:"thumbWorkers"`
 	VideoPosterWorkers           int                  `json:"videoPosterWorkers"`
+	StoryboardWorkers            int                  `json:"storyboardWorkers"`
 	BackgroundMaxActive          int                  `json:"backgroundMaxActive"`
 	BackgroundLoadTarget         float64              `json:"backgroundLoadTarget"`
 	BackgroundMinFreeMB          int                  `json:"backgroundMinFreeMb"`
@@ -78,13 +80,14 @@ func Load() (Config, error) {
 	}
 	cpus := runtime.NumCPU()
 	scanWorkers := intEnv("SCAN_WORKERS", boundedInt((cpus+1)/2, 1, 8))
-	thumbWorkers := intEnv("THUMB_WORKERS", boundedInt(cpus, 2, 8))
+	thumbWorkers := intEnv("THUMB_WORKERS", boundedInt((cpus+1)/2, 2, 4))
 	videoWorkersOverride := intEnv("VIDEO_WORKERS", 0)
 	videoPosterDefault := boundedInt((cpus+1)/2, 1, 4)
 	if videoWorkersOverride > 0 {
 		videoPosterDefault = videoWorkersOverride
 	}
 	videoPosterWorkers := intEnv("VIDEO_POSTER_WORKERS", videoPosterDefault)
+	storyboardWorkers := intEnv("STORYBOARD_WORKERS", 0)
 	backgroundMaxActive := intEnv("BACKGROUND_MAX_ACTIVE", boundedInt(cpus, 2, 8))
 	backgroundStartGapMS := intEnv("BACKGROUND_START_SPACING_MS", 50)
 	videoProxyCacheTTL := NormalizeVideoProxyCacheTTL(durationSecondsEnv("VIDEO_PROXY_CACHE_TTL_SECONDS", DefaultVideoProxyCacheTTL))
@@ -97,6 +100,7 @@ func Load() (Config, error) {
 		DatabaseURL:                  stringEnv("DATABASE_URL", "postgres://media:media@postgres:5432/media?sslmode=disable"),
 		RedisURL:                     stringEnv("REDIS_URL", "redis://redis:6379/0"),
 		AIURL:                        stringEnv("AI_URL", "http://ai:8090"),
+		ExternalAIToken:              stringEnv("EXTERNAL_AI_TOKEN", ""),
 		HTTPAddr:                     stringEnv("HTTP_ADDR", ":8080"),
 		ScanIntervalMinutes:          scanMinutes,
 		ScanInterval:                 time.Duration(scanMinutes) * time.Minute,
@@ -105,6 +109,7 @@ func Load() (Config, error) {
 		ScanWorkers:                  scanWorkers,
 		ThumbWorkers:                 thumbWorkers,
 		VideoPosterWorkers:           videoPosterWorkers,
+		StoryboardWorkers:            storyboardWorkers,
 		BackgroundMaxActive:          backgroundMaxActive,
 		BackgroundLoadTarget:         floatEnv("BACKGROUND_LOAD_TARGET", float64(maxInt(cpus*2, backgroundMaxActive))),
 		BackgroundMinFreeMB:          intEnv("BACKGROUND_MIN_FREE_MB", 512),
@@ -150,6 +155,9 @@ func Load() (Config, error) {
 	if cfg.VideoPosterWorkers < 1 {
 		cfg.VideoPosterWorkers = 1
 	}
+	if cfg.StoryboardWorkers < 0 {
+		cfg.StoryboardWorkers = 0
+	}
 	if cfg.LiveVideoProxyMaxActive < 1 {
 		cfg.LiveVideoProxyMaxActive = 1
 	}
@@ -191,6 +199,7 @@ func (c Config) Log(logger *slog.Logger) {
 		"scanWorkers", c.ScanWorkers,
 		"thumbWorkers", c.ThumbWorkers,
 		"videoPosterWorkers", c.VideoPosterWorkers,
+		"storyboardWorkers", c.StoryboardWorkers,
 		"backgroundMaxActive", c.BackgroundMaxActive,
 		"backgroundLoadTarget", c.BackgroundLoadTarget,
 		"backgroundMinFreeMB", c.BackgroundMinFreeMB,
@@ -398,6 +407,21 @@ func hwAccelEnv(key, fallback string) string {
 		return value
 	default:
 		return fallback
+	}
+}
+
+// ResolveStoryboardWorkers keeps software decoding conservative while allowing
+// two parallel jobs for the VAAPI pipeline that scales frames on the GPU. An
+// explicit value remains bounded so background work cannot monopolize the host.
+func ResolveStoryboardWorkers(configured int, hwAccel string) int {
+	if configured > 0 {
+		return boundedInt(configured, 1, 4)
+	}
+	switch strings.ToLower(strings.TrimSpace(hwAccel)) {
+	case "vaapi":
+		return 2
+	default:
+		return 1
 	}
 }
 

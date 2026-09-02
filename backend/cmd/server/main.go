@@ -16,6 +16,7 @@ import (
 	"lpicto/backend/internal/cachepolicy"
 	"lpicto/backend/internal/config"
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/events"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/media"
@@ -40,6 +41,7 @@ func main() {
 	defer stop()
 
 	cfg.FFmpegHWAccel = video.ResolveHWAccel(rootCtx, cfg.FFmpegHWAccel, cfg.FFmpegHWDevice, logger)
+	cfg.StoryboardWorkers = config.ResolveStoryboardWorkers(cfg.StoryboardWorkers, cfg.FFmpegHWAccel)
 	cfg.Log(logger)
 
 	store, err := storage.NewWithRootsAndCache(cfg.PhotoRoots, cfg.DataRoot, cfg.CacheRoot)
@@ -55,6 +57,12 @@ func main() {
 		os.Exit(1)
 	}
 	defer database.Close()
+	debugSettings, err := database.GetDebugSettings(rootCtx)
+	if err != nil {
+		logger.Error("load debug settings failed", "error", err)
+		os.Exit(1)
+	}
+	debugcontrol.Apply(debugSettings.ExternalFileAccessPaused, debugSettings.BackgroundProcessingPaused)
 
 	eventBus := events.NewBus()
 	cachePolicy := cachepolicy.New(store.CacheRoot, database)
@@ -73,6 +81,7 @@ func main() {
 	thumbProcessor := thumb.Processor{
 		DB: database, Store: store, ThumbLongEdge: cfg.ThumbLongEdge, PreviewLongEdge: cfg.PreviewLongEdge,
 		PreviewQuality: cfg.PreviewQuality, Events: eventBus, Logger: logger, Sources: sources, CachePolicy: cachePolicy,
+		FFmpegHWAccel: cfg.FFmpegHWAccel, FFmpegHWDevice: cfg.FFmpegHWDevice, FFmpegHWFallback: cfg.FFmpegHWFallback,
 	}
 	queue, err := jobs.NewRedis(rootCtx, logger, cfg.RedisURL, thumbProcessor.Handle, jobs.ResourcePolicy{
 		MaxActive:          cfg.BackgroundMaxActive,
@@ -91,7 +100,7 @@ func main() {
 	}
 	queue.SetScanHandler(scanTaskHandler(scan))
 	aiStager := &aiworker.Stager{DB: database, Store: store, Policy: cachePolicy}
-	queue.SetAIHandler((&aiworker.Processor{DB: database, BaseURL: cfg.AIURL, Logger: logger, Sources: sources, Stager: aiStager}).Handle)
+	queue.SetAIHandler((&aiworker.Processor{DB: database, BaseURL: cfg.AIURL, ExternalToken: cfg.ExternalAIToken, Logger: logger, Sources: sources, Stager: aiStager}).Handle)
 
 	role := ""
 	if len(os.Args) > 1 {
@@ -146,19 +155,19 @@ func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *j
 	if err := database.ResetBackgroundVideoProxyWork(ctx); err != nil {
 		logger.Warn("reset background video proxy work failed", "error", err)
 	}
-	if _, err := database.SetAIAutoAnalyze(ctx, true); err != nil {
-		logger.Warn("enable automatic AI analysis failed", "error", err)
+	if !debugcontrol.BackgroundProcessingPaused() {
+		enqueuePendingWork(ctx, database, queue, logger)
 	}
-	enqueuePendingWork(ctx, database, queue, logger)
 	queue.Start(ctx, jobs.WorkerConfig{
 		Image:       cfg.ThumbWorkers,
 		VideoPoster: cfg.VideoPosterWorkers,
-		AI:          1,
+		Storyboard:  cfg.StoryboardWorkers,
+		AI:          2,
 	})
 	go enqueueAIBackfill(ctx, database, queue, sources, aiStager, logger)
 	go superviseAutomaticTasks(ctx, database, queue, logger)
-	go monitorSourceRecovery(ctx, scan, sources, logger)
-	aiworker.StartHealthMonitor(ctx, database, cfg.AIURL, logger)
+	go monitorSourceRecovery(ctx, database, scan, sources, logger)
+	aiworker.StartHealthMonitor(ctx, database, cfg.AIURL, cfg.ExternalAIToken, logger)
 }
 
 func superviseAutomaticTasks(ctx context.Context, database *db.DB, queue *jobs.Manager, logger *slog.Logger) {
@@ -188,12 +197,8 @@ func superviseAutomaticTasks(ctx context.Context, database *db.DB, queue *jobs.M
 		stats := queue.Stats()
 		backgroundQueued := stats.ThumbQueued + stats.PreviewQueued + stats.VideoPosterQueued + stats.StoryboardQueued
 		backgroundActive := stats.ActiveThumb + stats.ActivePreview + stats.ActiveVideoPoster + stats.ActiveStoryboard
-		if backgroundQueued+backgroundActive == 0 {
+		if backgroundQueued+backgroundActive == 0 && !debugcontrol.BackgroundProcessingPaused() {
 			enqueuePendingWork(ctx, database, queue, logger)
-		}
-		settings, err := database.GetAISettings(ctx)
-		if err == nil && !settings.AutoAnalyze {
-			_, _ = database.SetAIAutoAnalyze(ctx, true)
 		}
 		select {
 		case <-ctx.Done():
@@ -215,37 +220,61 @@ func automaticBlockerMessage(reason string, queued int) string {
 		return fmt.Sprintf("系统负载较高，%d 项自动等待", queued)
 	case "memory":
 		return fmt.Sprintf("可用内存不足，%d 项自动等待", queued)
+	case "debug_pause":
+		return fmt.Sprintf("调试开关已暂停后台处理，%d 项等待", queued)
 	default:
 		return fmt.Sprintf("%d 项自动等待", queued)
 	}
 }
 
-func monitorSourceRecovery(ctx context.Context, scan *scanner.Scanner, sources *storage.SourceHealth, logger *slog.Logger) {
-	ticker := time.NewTicker(15 * time.Second)
+func monitorSourceRecovery(ctx context.Context, database *db.DB, scan *scanner.Scanner, sources *storage.SourceHealth, logger *slog.Logger) {
+	// Healthy storage is intentionally not polled so an idle NAS can sleep.
+	// Once a source has been marked unavailable, probe once per minute until it
+	// recovers, then run the normal media scan to refresh both data and task UI.
+	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	wasUnavailable := sourceUnavailable(sources)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			unavailable := sourceUnavailable(sources)
-			if wasUnavailable && !unavailable {
-				result := scan.RequestMetadataScan("storage_recovered")
+			if debugcontrol.ExternalFileAccessPaused() {
+				continue
+			}
+			if !storageRecoveryNeeded(ctx, database, sources) {
+				continue
+			}
+			statuses := sources.Statuses()
+			if !sourceStatusesUnavailable(statuses) {
+				result := scan.RequestMediaScan("storage_recovered")
 				if result.Accepted && logger != nil {
-					logger.Info("storage recovered; scheduled one metadata scan")
+					logger.Info("storage recovered; scheduled one media scan")
 				}
 			}
-			wasUnavailable = unavailable
 		}
 	}
+}
+
+func storageRecoveryNeeded(ctx context.Context, database *db.DB, sources *storage.SourceHealth) bool {
+	if sourceUnavailable(sources) {
+		return true
+	}
+	if database == nil {
+		return false
+	}
+	run, err := database.LastScanRunForTask(ctx, "media_scan")
+	return err == nil && run != nil && run.LastError != nil && strings.Contains(*run.LastError, "存储不可达")
 }
 
 func sourceUnavailable(sources *storage.SourceHealth) bool {
 	if sources == nil {
 		return false
 	}
-	for _, status := range sources.CachedStatuses() {
+	return sourceStatusesUnavailable(sources.CachedStatuses())
+}
+
+func sourceStatusesUnavailable(statuses []storage.SourceHealthStatus) bool {
+	for _, status := range statuses {
 		if !status.Available {
 			return true
 		}
@@ -257,6 +286,14 @@ func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
+		if debugcontrol.BackgroundProcessingPaused() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				continue
+			}
+		}
 		settings, settingsErr := database.GetAISettings(ctx)
 		if settingsErr != nil {
 			logger.Warn("load AI settings failed", "error", settingsErr)
@@ -338,10 +375,12 @@ func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager
 									break
 								}
 								logger.Warn("prepare AI staging failed", "assetID", item.AssetID, "error", stageErr)
+								sourceUnavailable := storage.IsSourceUnavailable(stageErr)
 								if sources != nil {
-									sources.RecordSourceError(item.RelPath, stageErr)
+									libraryRoot, _ := database.ScanLibraryRootForPath(ctx, item.RelPath)
+									sourceUnavailable = sources.AssetReadErrorIsSourceUnavailable(item.RelPath, stageErr, libraryRoot)
 								}
-								if storage.IsSourceUnavailable(stageErr) {
+								if sourceUnavailable {
 									stageBatchErr = stageErr
 									break
 								}
@@ -405,12 +444,19 @@ func enqueueAIBackfill(ctx context.Context, database *db.DB, queue *jobs.Manager
 }
 
 func prepareAIStageWithPlayback(ctx context.Context, queue *jobs.Manager, stager *aiworker.Stager, asset model.Asset) (*db.AIStage, error) {
+	if debugcontrol.BackgroundProcessingPaused() {
+		return nil, debugcontrol.ErrBackgroundProcessingPaused
+	}
 	stageCtx, cancel := context.WithCancelCause(ctx)
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
+			if debugcontrol.BackgroundProcessingPaused() {
+				cancel(debugcontrol.ErrBackgroundProcessingPaused)
+				return
+			}
 			if jobs.MediaScanPriorityActive() {
 				cancel(jobs.ErrMediaScanPriority)
 				return
@@ -494,6 +540,9 @@ func scanTaskHandler(scan *scanner.Scanner) jobs.Handler {
 }
 
 func enqueuePendingWork(ctx context.Context, database *db.DB, queue *jobs.Manager, logger *slog.Logger) {
+	if debugcontrol.BackgroundProcessingPaused() {
+		return
+	}
 	items, err := database.PendingWork(ctx)
 	if err != nil {
 		logger.Warn("load pending work failed", "error", err)

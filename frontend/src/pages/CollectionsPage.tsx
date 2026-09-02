@@ -124,14 +124,16 @@ export default function CollectionsPage() {
       const result = await api.collections();
       setCollections(result.items ?? []);
       setCollectionsError(null);
-		if (result.items.length > 0 && !isDynamicTagCollection(selectedCollectionId) && !result.items.some((item) => item.id === selectedCollectionId)) {
-        setSelectedCollectionId(result.items[0].id);
-      }
+      setSelectedCollectionId((current) => (
+        result.items.length > 0 && !isDynamicTagCollection(current) && !result.items.some((item) => item.id === current)
+          ? result.items[0].id
+          : current
+      ));
     } catch (err) {
       setCollections([]);
       setCollectionsError(err instanceof Error ? err.message : '集合加载失败');
     }
-  }, [selectedCollectionId]);
+  }, [setSelectedCollectionId]);
 
   useEffect(() => {
     void loadCollections();
@@ -152,6 +154,9 @@ export default function CollectionsPage() {
     },
     [activeRating, filenameQuery, orientation, query, selectedCollectionId, selectedTags, serverGroup, sort, type],
   );
+  const selectAllAssetIds = useCallback(async () => (
+    await api.collectionSelection(selectedCollectionId, sort, query, serverGroup, activeRating, orientation, type, [], selectedTags, filenameQuery)
+  ).assetIds, [activeRating, filenameQuery, orientation, query, selectedCollectionId, selectedTags, serverGroup, sort, type]);
 
   const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     selectedCollectionId,
@@ -175,7 +180,6 @@ export default function CollectionsPage() {
     scrollTarget,
     scrollTopTarget,
     seekIndex,
-    setScrollRatio,
   } = useWaterfallGridState({
     hasMore,
     hasPrevious,
@@ -556,9 +560,9 @@ export default function CollectionsPage() {
             onOpenViewer={handleOpenViewer}
             onBatchRemoveAssets={(ids) => mutateItems((current) => current.filter((asset) => !ids.includes(asset.id)))}
             onBatchDeleteComplete={handleBatchDeleteComplete}
+            selectAllAssetIds={selectAllAssetIds}
             purgeUnavailableOnDelete={preserveMissingAssets}
             onPressPreviewChange={setPressPreviewAsset}
-            onScrollRatioChange={setScrollRatio}
             onScrollStateChange={handlePersistentGridScrollState}
             totalCount={totalCount}
             loadedStartIndex={loadedStartIndex}

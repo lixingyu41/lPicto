@@ -22,6 +22,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"lpicto/backend/internal/config"
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/model"
 	videoproc "lpicto/backend/internal/video"
@@ -62,16 +63,21 @@ type videoSegmentPlan struct {
 	TotalDuration  float64
 	SegmentSeconds float64
 	SegmentCount   int
+	HWAccel        string
 }
 
 const videoPrioritySegmentCount = 5
 const videoFirstSegmentSeconds = 2.0
 const videoSegmentPriorityHeader = "X-LPicto-Segment-Priority"
+const videoClientIDHeader = "X-LPicto-Client-ID"
+const videoSessionIDHeader = "X-LPicto-Session-ID"
+const videoTranscoderHeader = "X-LPicto-Transcoder"
 
 const (
 	videoSegmentPriorityStale    = 10
 	videoSegmentPriorityBalanced = 50
 	videoSegmentPriorityCritical = 80
+	videoSegmentPriorityFullWarm = 90
 	videoSegmentPriorityPlayback = 100
 )
 
@@ -96,6 +102,10 @@ func (s *Server) videoHLSPlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.cfg.VideoProxyEnabled {
 		writeError(w, http.StatusNotFound, "video_segments_disabled", "视频分片未启用")
+		return
+	}
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
 		return
 	}
 	if missing, err := s.assetSourceMissing(asset); err != nil {
@@ -153,6 +163,10 @@ func (s *Server) videoHLSSegment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "video_segments_disabled", "视频分片未启用")
 		return
 	}
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
+		return
+	}
 	index, err := parseVideoSegmentIndex(chi.URLParam(r, "segment"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_segment", "视频分片无效")
@@ -166,7 +180,8 @@ func (s *Server) videoHLSSegment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
 		return
 	}
-	plan, err := s.videoSegmentPlan(asset, index)
+	session := videoProxySessionFromRequest(r)
+	plan, err := s.videoSegmentPlan(asset, index, session.Transcoder)
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "video_segment_failed"
@@ -183,7 +198,6 @@ func (s *Server) videoHLSSegment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, code, message)
 		return
 	}
-	session := videoProxySessionFromRequest(r)
 	cacheSettings := s.videoProxyCacheSettings(r.Context())
 	priority := videoSegmentPriorityFromRequest(r, videoSegmentPriorityBalanced)
 	var state *videoSegmentRuntime
@@ -228,17 +242,22 @@ func (s *Server) videoHLSPrewarm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "video_segments_disabled", "视频分片未启用")
 		return
 	}
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
+		return
+	}
 	start, _ := strconv.Atoi(r.URL.Query().Get("from"))
 	if start < 0 {
 		start = 0
 	}
+	session := videoProxySessionFromRequest(r)
 	if queryBool(r.URL.Query().Get("all")) {
 		segmentSeconds := s.adaptiveVideoSegmentSeconds(asset)
 		segmentCount := videoSegmentCount(assetDuration(asset), segmentSeconds)
 		if start > segmentCount {
 			start = segmentCount
 		}
-		started := s.startVideoSegmentFullWarm(asset, start, s.videoProxyCacheSettings(r.Context()))
+		started := s.startVideoSegmentFullWarm(asset, start, s.videoProxyCacheSettings(r.Context()), session)
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"accepted":       true,
 			"queuedSegments": segmentCount - start,
@@ -252,13 +271,12 @@ func (s *Server) videoHLSPrewarm(w http.ResponseWriter, r *http.Request) {
 	if count < 1 || count > videoPrioritySegmentCount {
 		count = videoPrioritySegmentCount
 	}
-	session := videoProxySessionFromRequest(r)
 	cacheSettings := s.videoProxyCacheSettings(r.Context())
 	priority := videoSegmentPriorityFromRequest(r, videoSegmentPriorityCritical)
 	segmentSeconds := s.adaptiveVideoSegmentSeconds(asset)
 	completed := 0
 	for index := start; index < start+count; index++ {
-		plan, err := s.videoSegmentPlan(asset, index)
+		plan, err := s.videoSegmentPlan(asset, index, session.Transcoder)
 		if errors.Is(err, errVideoSegmentOutOfRange) {
 			break
 		}
@@ -286,36 +304,37 @@ func (s *Server) videoHLSPrewarm(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"cachedSegments": completed, "required": true, "segmentSeconds": segmentSeconds})
 }
 
-func (s *Server) startVideoSegmentFullWarm(asset model.Asset, start int, cacheSettings videoProxyCacheSettings) bool {
-	key := "hls:" + asset.CacheKey
+func (s *Server) startVideoSegmentFullWarm(asset model.Asset, start int, cacheSettings videoProxyCacheSettings, session VideoProxyHeartbeatRequest) bool {
+	session.SessionID = sanitizeVideoProxyID(session.SessionID, "legacy")
+	key := "hls:" + asset.CacheKey + ":" + s.videoHWAccelForTranscoder(session.Transcoder) + ":" + session.SessionID
 	ctx, cancel := context.WithCancel(context.Background())
-	job := &videoFullWarmJob{cancel: cancel}
+	job := &videoFullWarmJob{cancel: cancel, assetCacheKey: asset.CacheKey, sessionID: session.SessionID}
 	if !s.registerVideoFullWarmJob(key, job) {
 		cancel()
 		return false
 	}
 	go func() {
 		defer s.finishVideoFullWarmJob(key, job)
-		s.warmAllVideoSegments(ctx, asset, start, cacheSettings)
+		s.warmAllVideoSegments(ctx, asset, start, cacheSettings, session)
 	}()
 	return true
 }
 
-func (s *Server) warmAllVideoSegments(ctx context.Context, asset model.Asset, start int, cacheSettings videoProxyCacheSettings) {
+func (s *Server) warmAllVideoSegments(ctx context.Context, asset model.Asset, start int, cacheSettings videoProxyCacheSettings, session VideoProxyHeartbeatRequest) {
 	stopPriority := s.holdPlaybackPriority(ctx)
 	defer stopPriority()
-	sessionID := fmt.Sprintf("full-cache-%d", asset.ID)
+	sessionID := sanitizeVideoProxyID(session.SessionID, fmt.Sprintf("full-cache-%d", asset.ID))
 	defer s.stopVideoSegmentSession(asset.ID, sessionID)
 	segmentCount := videoSegmentCount(assetDuration(asset), s.adaptiveVideoSegmentSeconds(asset))
 	for index := start; index < segmentCount; index++ {
 		if ctx.Err() != nil {
 			return
 		}
-		plan, err := s.videoSegmentPlan(asset, index)
+		plan, err := s.videoSegmentPlan(asset, index, session.Transcoder)
 		if err != nil {
 			return
 		}
-		state, cached, err := s.ensureVideoSegmentRuntime(asset, plan, sessionID, cacheSettings, videoSegmentPriorityBalanced)
+		state, cached, err := s.ensureVideoSegmentRuntime(asset, plan, sessionID, cacheSettings, videoSegmentPriorityFullWarm)
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Warn("full video segment warmup failed to queue", "assetID", asset.ID, "segmentIndex", index, "error", err)
@@ -328,6 +347,10 @@ func (s *Server) warmAllVideoSegments(ctx context.Context, asset model.Asset, st
 		if err := s.waitVideoSegment(ctx, state); err != nil {
 			if ctx.Err() != nil {
 				return
+			}
+			if errors.Is(err, errVideoSegmentPreempted) {
+				index--
+				continue
 			}
 			if s.logger != nil {
 				s.logger.Warn("full video segment warmup failed", "assetID", asset.ID, "segmentIndex", index, "error", err)
@@ -342,7 +365,8 @@ func (s *Server) videoHLSSessionStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session := videoProxySessionFromRequest(r)
-	cancelled := s.stopVideoSegmentSession(asset.ID, session.SessionID)
+	cancelled := s.cancelVideoFullWarmSession(asset.CacheKey, session.SessionID)
+	cancelled += s.stopVideoSegmentSession(asset.ID, session.SessionID)
 	writeJSON(w, http.StatusOK, map[string]any{"cancelled": cancelled})
 }
 
@@ -352,10 +376,10 @@ func (s *Server) videoHLSStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session := videoProxySessionFromRequest(r)
-	writeJSON(w, http.StatusOK, s.videoSegmentStatus(asset, session.SessionID))
+	writeJSON(w, http.StatusOK, s.videoSegmentStatus(asset, session.SessionID, session.Transcoder))
 }
 
-func (s *Server) videoSegmentPlan(asset model.Asset, index int) (videoSegmentPlan, error) {
+func (s *Server) videoSegmentPlan(asset model.Asset, index int, transcoder string) (videoSegmentPlan, error) {
 	duration := assetDuration(asset)
 	if duration <= 0 {
 		return videoSegmentPlan{}, errVideoSegmentDurationMissing
@@ -367,14 +391,16 @@ func (s *Server) videoSegmentPlan(asset model.Asset, index int) (videoSegmentPla
 	}
 	start := videoSegmentStartSeconds(segmentSeconds, index)
 	segmentDuration := videoSegmentDuration(duration, segmentSeconds, index)
+	hwAccel := s.videoHWAccelForTranscoder(transcoder)
 	return videoSegmentPlan{
-		CacheKey:       videoSegmentCacheKey(asset.CacheKey, segmentSeconds, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, index),
+		CacheKey:       videoSegmentCacheKey(asset.CacheKey, segmentSeconds, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, hwAccel, index),
 		SegmentIndex:   index,
 		StartSeconds:   start,
 		Duration:       segmentDuration,
 		TotalDuration:  duration,
 		SegmentSeconds: segmentSeconds,
 		SegmentCount:   count,
+		HWAccel:        hwAccel,
 	}, nil
 }
 
@@ -391,6 +417,16 @@ func (s *Server) ensureVideoSegmentRuntime(asset model.Asset, plan videoSegmentP
 		s.videoSegmentStates = map[string]*videoSegmentRuntime{}
 	}
 	state := s.videoSegmentStates[plan.CacheKey]
+	if state != nil && state.DeleteOnDone && state.Done != nil {
+		done := state.Done
+		s.videoProxyMu.Unlock()
+		select {
+		case <-done:
+			return s.ensureVideoSegmentRuntime(asset, plan, sessionID, cacheSettings, priority)
+		case <-time.After(5 * time.Second):
+			return nil, false, errors.New("timed out waiting for cancelled video segment")
+		}
+	}
 	if state == nil {
 		state = &videoSegmentRuntime{
 			AssetID:      asset.ID,
@@ -428,7 +464,7 @@ func (s *Server) ensureVideoSegmentRuntime(asset model.Asset, plan videoSegmentP
 		_ = touchFile(dest, now)
 		return state, true, nil
 	}
-	if state.Queued || state.Transcoding {
+	if state.Queued || state.Claiming || state.Transcoding {
 		if priority > state.Priority {
 			state.Priority = priority
 			state.SessionID = sessionID
@@ -481,17 +517,12 @@ func (s *Server) stopVideoSegmentSession(assetID int64, sessionID string) int {
 		if videoSegmentSessionCountLocked(state) > 0 {
 			continue
 		}
-		if state.Queued || state.Claiming {
+		if state.Queued || state.Claiming || state.Transcoding {
 			state.DeleteOnDone = true
 			if state.Cancel != nil {
 				state.Cancel(errVideoSegmentSessionStop)
 			}
 			cancelled++
-			continue
-		}
-		if state.Transcoding {
-			// A started segment is allowed to finish so the work remains reusable
-			// for the next viewer instead of being discarded mid-encode.
 			continue
 		}
 		delete(s.videoSegmentStates, key)
@@ -602,6 +633,10 @@ func (s *Server) removeVideoSegmentCaches(assetCacheKey string) error {
 }
 
 func (s *Server) runVideoSegmentTranscode(ctx context.Context, asset model.Asset, plan videoSegmentPlan, dest string, tmp string) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		s.finishVideoSegmentTranscode(plan.CacheKey, dest, tmp, debugcontrol.ErrExternalFileAccessPaused)
+		return
+	}
 	releaseDest := s.cachePolicy.Pin(dest)
 	defer releaseDest()
 	releaseTemp := s.cachePolicy.Pin(tmp)
@@ -626,9 +661,9 @@ func (s *Server) runVideoSegmentTranscode(ctx context.Context, asset model.Asset
 	s.markVideoSegmentTranscodeStarted(plan.CacheKey)
 	canIgnoreEditList := plan.StartSeconds > 0 && videoSegmentSupportsEditListFallback(source)
 	ignoreEditList := canIgnoreEditList && s.videoSegmentIgnoreEditListEnabled(asset.CacheKey)
-	args := videoproc.StreamSegmentArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
+	args := videoproc.StreamSegmentArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, plan.HWAccel, s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
 	if ignoreEditList {
-		args = videoproc.StreamSegmentIgnoreEditListArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
+		args = videoproc.StreamSegmentIgnoreEditListArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, plan.HWAccel, s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
 	}
 	err = s.writeVideoSegment(ctx, plan, tmp, args)
 	if err == nil {
@@ -641,7 +676,23 @@ func (s *Server) runVideoSegmentTranscode(ctx context.Context, asset model.Asset
 		s.enableVideoSegmentIgnoreEditList(asset.CacheKey)
 		_ = os.Remove(tmp)
 		s.updateVideoSegmentProgress(plan.CacheKey, 0, plan.Duration)
-		args = videoproc.StreamSegmentIgnoreEditListArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
+		args = videoproc.StreamSegmentIgnoreEditListArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, plan.HWAccel, s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
+		err = s.writeVideoSegment(ctx, plan, tmp, args)
+		if err == nil {
+			err = validateVideoSegmentFile(ctx, tmp, plan.Duration)
+		}
+	}
+	if err != nil && strings.TrimSpace(plan.HWAccel) != "" && !strings.EqualFold(plan.HWAccel, "none") && ctx.Err() == nil {
+		if s.logger != nil {
+			s.logger.Warn("gpu video segment failed; retrying on cpu", "assetID", asset.ID, "segmentIndex", plan.SegmentIndex, "hwAccel", plan.HWAccel, "error", err)
+		}
+		_ = os.Remove(tmp)
+		s.updateVideoSegmentProgress(plan.CacheKey, 0, plan.Duration)
+		if ignoreEditList || s.videoSegmentIgnoreEditListEnabled(asset.CacheKey) {
+			args = videoproc.StreamSegmentIgnoreEditListArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, "none", s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
+		} else {
+			args = videoproc.StreamSegmentArgs(source, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, "none", s.cfg.FFmpegHWDevice, plan.StartSeconds, plan.Duration)
+		}
 		err = s.writeVideoSegment(ctx, plan, tmp, args)
 		if err == nil {
 			err = validateVideoSegmentFile(ctx, tmp, plan.Duration)
@@ -1000,6 +1051,8 @@ func parseVideoSegmentPriority(value string, fallback int) int {
 		return videoSegmentPriorityPlayback
 	case "critical":
 		return videoSegmentPriorityCritical
+	case "full", "full-warm":
+		return videoSegmentPriorityFullWarm
 	case "balanced", "neighbor", "preload", "tail":
 		return videoSegmentPriorityBalanced
 	case "stale":
@@ -1023,6 +1076,8 @@ func videoSegmentPriorityName(priority int) string {
 	switch {
 	case priority >= videoSegmentPriorityPlayback:
 		return "playback"
+	case priority >= videoSegmentPriorityFullWarm:
+		return "full"
 	case priority >= videoSegmentPriorityCritical:
 		return "critical"
 	case priority >= videoSegmentPriorityBalanced:
@@ -1068,16 +1123,16 @@ func (s *Server) serveCachedVideoSegment(w http.ResponseWriter, r *http.Request,
 	}
 	s.cachePolicy.Touch(r.Context(), "video-proxies", state.CacheKey, state.DestPath)
 	w.Header().Set("Content-Type", "video/mp2t")
-	w.Header().Set("Cache-Control", "public, max-age=1200")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("ETag", `"`+state.CacheKey+`"`)
 	w.Header().Set("X-Accel-Buffering", "no")
 	http.ServeContent(w, r, filepath.Base(state.DestPath), info.ModTime(), file)
 }
 
-func (s *Server) videoSegmentStatus(asset model.Asset, sessionID string) VideoSegmentStatusDTO {
+func (s *Server) videoSegmentStatus(asset model.Asset, sessionID string, transcoder string) VideoSegmentStatusDTO {
 	now := time.Now()
 	sessionID = sanitizeVideoProxyID(sessionID, "legacy")
-	cacheSummary := s.videoSegmentCacheSummary(asset)
+	cacheSummary := s.videoSegmentCacheSummary(asset, transcoder)
 	dto := VideoSegmentStatusDTO{
 		AssetID:             asset.ID,
 		SessionID:           sessionID,
@@ -1152,14 +1207,15 @@ type videoSegmentCacheSummary struct {
 	EstimatedTotalBytes int64
 }
 
-func (s *Server) videoSegmentCacheSummary(asset model.Asset) videoSegmentCacheSummary {
+func (s *Server) videoSegmentCacheSummary(asset model.Asset, transcoder string) videoSegmentCacheSummary {
 	segmentSeconds := s.adaptiveVideoSegmentSeconds(asset)
 	segmentCount := videoSegmentCount(assetDuration(asset), segmentSeconds)
 	summary := videoSegmentCacheSummary{SegmentCount: segmentCount}
 	if segmentCount == 0 || strings.TrimSpace(asset.CacheKey) == "" {
 		return summary
 	}
-	firstKey := videoSegmentCacheKey(asset.CacheKey, segmentSeconds, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, 0)
+	hwAccel := s.videoHWAccelForTranscoder(transcoder)
+	firstKey := videoSegmentCacheKey(asset.CacheKey, segmentSeconds, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, hwAccel, 0)
 	firstPath, err := s.store.CacheFilePath("video-proxies", firstKey, "ts")
 	if err != nil {
 		return summary
@@ -1180,7 +1236,7 @@ func (s *Server) videoSegmentCacheSummary(asset model.Asset) videoSegmentCacheSu
 		entrySizes[entry.Name()] = info.Size()
 	}
 	for index := 0; index < segmentCount; index++ {
-		key := videoSegmentCacheKey(asset.CacheKey, segmentSeconds, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, s.cfg.FFmpegHWAccel, index)
+		key := videoSegmentCacheKey(asset.CacheKey, segmentSeconds, s.cfg.VideoProxyMaxHeight, s.cfg.VideoProxyCRF, hwAccel, index)
 		if size, ok := entrySizes[key+".ts"]; ok {
 			summary.CachedSegments++
 			summary.CachedBytes += size
@@ -1196,12 +1252,7 @@ func videoSegmentQuery(asset model.Asset, session VideoProxyHeartbeatRequest, pr
 	query := url.Values{}
 	query.Set("v", asset.CacheKey)
 	query.Set("priority", videoSegmentPriorityName(parseVideoSegmentPriority(priority, videoSegmentPriorityBalanced)))
-	if session.ClientID != "" {
-		query.Set("clientId", session.ClientID)
-	}
-	if session.SessionID != "" {
-		query.Set("sessionId", session.SessionID)
-	}
+	query.Set("transcoder", normalizeVideoTranscoder(session.Transcoder))
 	return query.Encode()
 }
 
@@ -1356,7 +1407,7 @@ func videoSegmentStartSeconds(segmentSeconds float64, index int) float64 {
 }
 
 func videoSegmentCacheKey(assetCacheKey string, segmentSeconds float64, maxHeight int, crf int, hwAccel string, index int) string {
-	profile := fmt.Sprintf("hls-v5:%s:%d:%d:%d:%s:%d", assetCacheKey, int(math.Round(segmentSeconds*1000)), maxHeight, crf, strings.ToLower(strings.TrimSpace(hwAccel)), index)
+	profile := fmt.Sprintf("hls-v7:%s:%d:%d:%d:%s:%d", assetCacheKey, int(math.Round(segmentSeconds*1000)), maxHeight, crf, strings.ToLower(strings.TrimSpace(hwAccel)), index)
 	sum := sha1.Sum([]byte(profile))
 	return fmt.Sprintf("%s-hls-%s", assetCacheKey, hex.EncodeToString(sum[:])[:16])
 }

@@ -44,7 +44,17 @@ import { parseTagFilters, serializeTagFilters } from '../utils/tagFilters';
 
 const pageSize = waterfallPageSize;
 const foldersStateKey = 'folders';
+const folderScopePreferenceKey = 'lpicto:folders:include-subfolders';
+const folderSortPreferenceKey = 'lpicto:folders:tree-sort';
 const foldersURLKeys = ['folderId', 'folder', 'type', 'rating', 'orientation', 'sort', 'group', 'q', 'recursive', 'combinedTags', 'tagNodes'];
+
+type FolderSortField = 'name' | 'created' | 'modified' | 'size' | 'count';
+type FolderSortDirection = 'asc' | 'desc';
+
+interface FolderSortPreference {
+  field: FolderSortField;
+  direction: FolderSortDirection;
+}
 
 interface FoldersPageState extends GridReturnState {
   collapsedFolderKeys: string[];
@@ -81,8 +91,13 @@ export default function FoldersPage() {
   const liveSearchText = typeof window === 'undefined' ? location.search : window.location.search;
   const liveSearchParams = useMemo(() => new URLSearchParams(liveSearchText), [liveSearchText]);
   const persistedState = loadPageState<FoldersPageState>(foldersStateKey, defaultFoldersState);
-  const decodedInitialState = decodeReturnState<FoldersPageState>(liveSearchParams.get('restore'), persistedState);
-  const initialStateRef = useRef(liveSearchParams.has('restore') ? decodedInitialState : foldersStateFromSearchParams(liveSearchParams, persistedState));
+  const rememberedState = { ...persistedState, includeSubfolders: loadFolderScopePreference(persistedState.includeSubfolders) };
+  const decodedInitialState = decodeReturnState<FoldersPageState>(liveSearchParams.get('restore'), rememberedState);
+  const initialStateRef = useRef(
+    liveSearchParams.has('restore')
+      ? decodedInitialState
+      : { ...foldersStateFromSearchParams(liveSearchParams, rememberedState), includeSubfolders: rememberedState.includeSubfolders },
+  );
   const requestedFolderRelPath = liveSearchParams.has('folder') ? liveSearchParams.get('folder') ?? '' : null;
   const [tree, setTree] = useState<Folder[]>(() => folderTreeCache ?? []);
   const [treeLoading, setTreeLoading] = useState(folderTreeCache === null);
@@ -96,6 +111,7 @@ export default function FoldersPage() {
   const [rating, setRating] = useViewerAwareMediaState<AssetRatingFilter>(initialStateRef.current.rating ?? 'all');
   const [orientation, setOrientation] = useViewerAwareMediaState<OrientationFilter>(initialStateRef.current.orientation);
   const [type, setType] = useViewerAwareMediaState<AssetKind>(initialStateRef.current.type);
+  const [folderSort, setFolderSort] = useState<FolderSortPreference>(loadFolderSortPreference);
   useEffect(() => {
     if (type === 'audio') setOrientation('all');
   }, [type]);
@@ -128,6 +144,14 @@ export default function FoldersPage() {
     return chips;
   }, [query, tagFilters]);
   useSidebarQueryChips('folders', queryChips, [queryChips]);
+
+  useEffect(() => {
+    saveFolderScopePreference(includeSubfolders);
+  }, [includeSubfolders]);
+
+  useEffect(() => {
+    saveFolderSortPreference(folderSort);
+  }, [folderSort]);
 
   useEffect(() => {
     let live = true;
@@ -183,7 +207,10 @@ export default function FoldersPage() {
     };
   }, [currentLookupId, requestedFolderRelPath]);
 
-  const childrenByParent = useMemo(() => buildFolderChildren(tree), [tree]);
+  const childrenByParent = useMemo(
+    () => buildFolderChildren(tree, folderSort, includeSubfolders),
+    [folderSort, includeSubfolders, tree],
+  );
   const folderByRelPath = useMemo(() => new Map(tree.map((folder) => [folder.relPath, folder])), [tree]);
 
   useEffect(() => {
@@ -205,6 +232,9 @@ export default function FoldersPage() {
     },
     [activeRating, currentId, includeSubfolders, orientation, query, resolvingRequestedFolder, serverGroup, sort, tagFilters, type],
   );
+  const selectAllAssetIds = useCallback(async () => (
+    await api.folderSelection(currentId, sort, query, includeSubfolders, serverGroup, activeRating, orientation, type, undefined, serializeTagFilters(tagFilters))
+  ).assetIds, [activeRating, currentId, includeSubfolders, orientation, query, serverGroup, sort, tagFilters, type]);
   const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     currentId,
     groupMode,
@@ -213,6 +243,7 @@ export default function FoldersPage() {
     rating,
     resolvingRequestedFolder,
     sort,
+    tagFilters,
     query,
     type,
   ]);
@@ -227,7 +258,6 @@ export default function FoldersPage() {
     scrollTarget,
     scrollTopTarget,
     seekIndex,
-    setScrollRatio,
   } = useWaterfallGridState({
     hasMore,
     hasPrevious,
@@ -238,7 +268,7 @@ export default function FoldersPage() {
     loadMore,
     loadPrevious,
     pageSize,
-    resetKey: JSON.stringify([currentId, resolvingRequestedFolder, includeSubfolders, rating, orientation, type, sort, query, groupMode]),
+    resetKey: JSON.stringify([currentId, resolvingRequestedFolder, includeSubfolders, rating, orientation, type, sort, query, groupMode, tagFilters]),
     searchParams: liveSearchParams,
   });
 
@@ -470,6 +500,29 @@ export default function FoldersPage() {
         <CompactSortControls sort={sort} onChange={setSort} />
       </SidebarFilterIconRow>
       <div className="sidebar-panel-section sidebar-panel-scope">
+        <div className="sidebar-field-grid sidebar-folder-sort-controls">
+          <SidebarSelect
+            label="文件夹排序"
+            value={folderSort.field}
+            options={[
+              { value: 'name', label: '文件名' },
+              { value: 'created', label: '创建时间' },
+              { value: 'modified', label: '修改时间' },
+              { value: 'size', label: '大小' },
+              { value: 'count', label: '媒体数量' },
+            ]}
+            onChange={(value) => setFolderSort((current) => ({ ...current, field: parseFolderSortField(value) }))}
+          />
+          <SidebarSelect
+            label="顺序"
+            value={folderSort.direction}
+            options={[
+              { value: 'asc', label: '正序' },
+              { value: 'desc', label: '倒序' },
+            ]}
+            onChange={(value) => setFolderSort((current) => ({ ...current, direction: value === 'desc' ? 'desc' : 'asc' }))}
+          />
+        </div>
         <SidebarSelect
           label="文件夹范围"
           value={includeSubfolders ? 'recursive' : 'direct'}
@@ -511,6 +564,7 @@ export default function FoldersPage() {
       groupMode,
       handleRatingChange,
       includeSubfolders,
+      folderSort,
       orientation,
       query,
       rating,
@@ -546,8 +600,8 @@ export default function FoldersPage() {
               onOpenAsset={handleOpenAsset}
               onOpenViewer={handleOpenViewer}
               onBatchRemoveAssets={(ids) => mutateItems((current) => current.filter((asset) => !ids.includes(asset.id)))}
+              selectAllAssetIds={selectAllAssetIds}
               onPressPreviewChange={setPressPreviewAsset}
-              onScrollRatioChange={setScrollRatio}
               onScrollStateChange={handlePersistentGridScrollState}
               totalCount={totalCount}
               loadedStartIndex={loadedStartIndex}
@@ -590,6 +644,54 @@ function folderID(folder: Folder) {
   return folder.relPath === '' ? 0 : folder.id;
 }
 
+function loadFolderScopePreference(fallback: boolean) {
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const stored = window.localStorage.getItem(folderScopePreferenceKey);
+    if (stored === 'true') return true;
+    if (stored === 'false') return false;
+  } catch {
+    // The page-state and URL fallbacks still preserve the current view.
+  }
+  return fallback;
+}
+
+function saveFolderScopePreference(includeSubfolders: boolean) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(folderScopePreferenceKey, String(includeSubfolders));
+  } catch {
+    // Browser storage may be unavailable in private or restricted contexts.
+  }
+}
+
+function loadFolderSortPreference(): FolderSortPreference {
+  const fallback: FolderSortPreference = { field: 'name', direction: 'asc' };
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(folderSortPreferenceKey) ?? '') as Partial<FolderSortPreference>;
+    return {
+      field: parseFolderSortField(parsed.field),
+      direction: parsed.direction === 'desc' ? 'desc' : 'asc',
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function saveFolderSortPreference(preference: FolderSortPreference) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(folderSortPreferenceKey, JSON.stringify(preference));
+  } catch {
+    // Browser storage may be unavailable in private or restricted contexts.
+  }
+}
+
+function parseFolderSortField(value: unknown): FolderSortField {
+  return value === 'created' || value === 'modified' || value === 'size' || value === 'count' ? value : 'name';
+}
+
 function foldersStateFromSearchParams(params: URLSearchParams, fallback: FoldersPageState): FoldersPageState {
   const currentId = nonNegativeIntParam(params.get('folderId'));
   const currentRelPath = params.has('folder') ? params.get('folder') ?? '' : null;
@@ -628,7 +730,7 @@ function orientationViewerParam(orientation: OrientationFilter) {
   return orientation === 'all' ? '' : `&orientation=${orientation}`;
 }
 
-function buildFolderChildren(tree: Folder[]) {
+function buildFolderChildren(tree: Folder[], preference: FolderSortPreference, includeSubfolders: boolean) {
   const result = new Map<string | null, Folder[]>();
   tree.forEach((folder) => {
     const key = folder.parentRelPath ?? null;
@@ -637,9 +739,35 @@ function buildFolderChildren(tree: Folder[]) {
     result.set(key, items);
   });
   result.forEach((items) => {
-    items.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+    items.sort((a, b) => compareFolders(a, b, preference, includeSubfolders));
   });
   return result;
+}
+
+function compareFolders(a: Folder, b: Folder, preference: FolderSortPreference, includeSubfolders: boolean) {
+  let result = 0;
+  switch (preference.field) {
+    case 'created':
+      result = a.createdAt - b.createdAt;
+      break;
+    case 'modified':
+      result = a.modifiedAt - b.modifiedAt;
+      break;
+    case 'size':
+      result = (includeSubfolders ? a.recursiveSizeBytes : a.sizeBytes) - (includeSubfolders ? b.recursiveSizeBytes : b.sizeBytes);
+      break;
+    case 'count':
+      result = (includeSubfolders ? a.recursiveAssetCount : a.assetCount) - (includeSubfolders ? b.recursiveAssetCount : b.assetCount);
+      break;
+    default:
+      result = naturalFolderNameCompare(a.name, b.name);
+  }
+  if (result !== 0) return preference.direction === 'desc' ? -result : result;
+  return naturalFolderNameCompare(a.name, b.name);
+}
+
+function naturalFolderNameCompare(a: string, b: string) {
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 }
 
 function SidebarFolderTree({

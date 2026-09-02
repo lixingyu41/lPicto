@@ -160,6 +160,7 @@ export interface VideoProxyHeartbeat {
   playbackRate: number;
   wantsStream: boolean;
   hidden: boolean;
+  transcoder: 'cpu' | 'gpu';
 }
 
 export interface VideoProxySettings {
@@ -216,7 +217,28 @@ export interface AIStatus {
   queued: number; active: number; perMinute: number; etaSeconds: number | null;
   staged: number; stagedBytes: number; sourceReading: boolean; pausedReason: string;
 }
-export interface AISettings { autoAnalyze: boolean; manualRun: boolean; }
+export type AIComputeMode = 'ubuntu' | 'external' | 'dual';
+export interface AIComputeNodeStatus {
+  id: 'ubuntu' | 'external';
+  state: 'online' | 'paused' | 'offline' | 'unconfigured';
+  latencyMs: number | null;
+  checkedAt: number;
+  message: string;
+}
+export interface AISettings {
+  autoAnalyze: boolean;
+  manualRun: boolean;
+  computeMode: AIComputeMode;
+  externalHost: string;
+  externalPort: number;
+  nodes: AIComputeNodeStatus[];
+}
+export type AISettingsUpdate = Partial<Pick<AISettings, 'autoAnalyze' | 'computeMode' | 'externalHost' | 'externalPort'>>;
+export interface DebugSettings {
+  externalFileAccessPaused: boolean;
+  backgroundProcessingPaused: boolean;
+  effectiveBackgroundPaused: boolean;
+}
 export interface SourceHealth { rootId: string; available: boolean; message?: string; checkedAt: number; }
 export interface StorageStatus { available: boolean; message: string; roots: SourceHealth[]; }
 
@@ -279,6 +301,10 @@ export interface BatchOperationResult {
   updatedAssetIds: number[];
   deletedAssetIds?: number[];
   failures?: BatchOperationFailure[];
+}
+
+export interface AssetSelectionResponse {
+  assetIds: number[];
 }
 
 export interface DuplicateGroup {
@@ -373,6 +399,10 @@ export interface Folder {
   depth: number;
   assetCount: number;
   recursiveAssetCount: number;
+  sizeBytes: number;
+  recursiveSizeBytes: number;
+  createdAt: number;
+  modifiedAt: number;
   coverAssetId: number | null;
 }
 

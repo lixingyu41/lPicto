@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,26 @@ import (
 	"lpicto/backend/internal/model"
 	"lpicto/backend/internal/scanner"
 )
+
+func TestStorageSampleErrorOnlyFailsLibraryForSourceErrors(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "readable", err: nil, want: false},
+		{name: "missing media", err: errors.New("no such file"), want: false},
+		{name: "media permission", err: errors.New("permission denied"), want: false},
+		{name: "stale mount", err: errors.New("stale file handle"), want: true},
+		{name: "storage IO", err: errors.New("input/output error"), want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := storageSampleErrorMakesLibraryUnavailable(test.err); got != test.want {
+				t.Fatalf("storage sample error classification = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
 
 func TestVisibleOnlyRequiresExplicitReadyFilter(t *testing.T) {
 	for path, want := range map[string]bool{
@@ -239,6 +260,22 @@ func TestAutomaticMediaTasksExposeNoManualActions(t *testing.T) {
 	aiTask := aiAnalysisSystemTask(db.AIStatus{Total: 10, Pending: 7, Failed: 2, Ready: 1}, db.AIActivity{}, 0, 0, false)
 	if len(aiTask.Actions) != 0 {
 		t.Fatalf("AI actions = %#v, want none", aiTask.Actions)
+	}
+}
+
+func TestAutomaticTasksExposeOnlyFailureRetryActions(t *testing.T) {
+	thumbnail := thumbnailSystemTask(db.WorkStatusCounts{Total: 10, Ready: 3, Pending: 5, Error: 2}, 0, 0)
+	thumbnail.Failures = []SystemTaskFailureDTO{{AssetID: 1, Path: "PIC/a.jpg", Reason: "没有权限读取媒体文件"}}
+	if got := taskActionIDs(automaticFailureRetryActions(thumbnail)); got != "retry_failed" {
+		t.Fatalf("thumbnail automatic actions = %q, want retry_failed", got)
+	}
+	aiTask := aiAnalysisSystemTask(db.AIStatus{Total: 10, Pending: 7, Failed: 2, Ready: 1}, db.AIActivity{}, 0, 0, false)
+	if got := taskActionIDs(automaticFailureRetryActions(aiTask)); got != "retry_failed" {
+		t.Fatalf("AI automatic actions = %q, want retry_failed", got)
+	}
+	pending := thumbnailSystemTask(db.WorkStatusCounts{Total: 10, Ready: 3, Pending: 7}, 0, 0)
+	if got := taskActionIDs(automaticFailureRetryActions(pending)); got != "" {
+		t.Fatalf("pending automatic actions = %q, want none", got)
 	}
 }
 

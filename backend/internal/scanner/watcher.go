@@ -11,6 +11,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/media"
 	"lpicto/backend/internal/util"
@@ -33,7 +34,9 @@ func (s *Scanner) StartWatcher(ctx context.Context, debounce time.Duration) {
 			return
 		}
 		defer watcher.Close()
-		s.addExistingWatches(watcher)
+		if !debugcontrol.ExternalFileAccessPaused() && !debugcontrol.BackgroundProcessingPaused() {
+			s.addExistingWatches(watcher)
+		}
 		timer := time.NewTimer(time.Hour)
 		if !timer.Stop() {
 			<-timer.C
@@ -50,6 +53,9 @@ func (s *Scanner) StartWatcher(ctx context.Context, debounce time.Duration) {
 					s.Logger.Warn("fsnotify error", "error", err)
 				}
 			case event := <-watcher.Events:
+				if debugcontrol.BackgroundProcessingPaused() {
+					continue
+				}
 				if event.Name != "" {
 					rel, root, full := s.handleWatchEvent(watcher, event)
 					if rel != "" {
@@ -99,6 +105,9 @@ func (s *Scanner) addExistingWatches(watcher *fsnotify.Watcher) {
 }
 
 func (s *Scanner) handleWatchEvent(watcher *fsnotify.Watcher, event fsnotify.Event) (string, string, bool) {
+	if debugcontrol.BackgroundProcessingPaused() {
+		return "", "", false
+	}
 	if s.Sources != nil {
 		if rel, err := s.Store.RelPath(event.Name); err == nil {
 			if available, _ := s.Sources.AvailableForRel(rel); !available {
@@ -177,7 +186,7 @@ func (s *Scanner) handleRemovedPath(name string) {
 }
 
 func (s *Scanner) flushWatchMetadata(paths map[string]struct{}, roots map[string]struct{}, fullMetadata bool) {
-	if s.Jobs == nil {
+	if s.Jobs == nil || debugcontrol.BackgroundProcessingPaused() {
 		return
 	}
 	rootList := mapKeys(roots)

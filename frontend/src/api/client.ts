@@ -4,19 +4,21 @@ import type {
   AlbumSourceInput,
   AlbumsResponse,
   Asset,
+  AssetSelectionResponse,
   BatchOperationResult,
   Collection,
   CollectionRule,
   DuplicateGroup,
   AssetDeletePlan,
   AssetDeleteResult,
-  AlbumAssetFilter,
   AssetTag,
 	AssetAIResult,
 	AITagSummary,
 	AITagTreeNode,
 	AIStatus,
+	AIComputeNodeStatus,
 	AISettings,
+	AISettingsUpdate,
   AssetRating,
   AssetServerGroup,
   AssetKind,
@@ -65,6 +67,13 @@ interface APIErrorBody {
 const requestTimeoutMs = 30_000;
 let mediaOriginPorts: number[] = [];
 
+function invalidateAITagTreeAfter<T>(requestPromise: Promise<T>) {
+  return requestPromise.then((result) => {
+    window.dispatchEvent(new Event('lpicto:ai-tag-tree-invalidated'));
+    return result;
+  });
+}
+
 export function configureMediaOrigins(ports: number[] | undefined) {
   mediaOriginPorts = Array.from(new Set((ports ?? []).filter((port) => Number.isInteger(port) && port > 0 && port <= 65535)));
 }
@@ -73,6 +82,7 @@ export interface VideoProxySessionContext {
   clientId?: string;
   sessionId?: string;
   priority?: 'playback' | 'preload';
+  transcoder?: 'cpu' | 'gpu';
 }
 
 async function request<T>(url: string, init?: RequestInit, timeoutMs = requestTimeoutMs): Promise<T> {
@@ -197,6 +207,13 @@ export const api = {
     }),
   stopSystemTask: (id: string) =>
     request<{ accepted: boolean; state?: string }>(`/api/settings/tasks/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
+  debugSettings: () => request<import('../types/api').DebugSettings>('/api/settings/debug'),
+  updateDebugSettings: (settings: Pick<import('../types/api').DebugSettings, 'externalFileAccessPaused' | 'backgroundProcessingPaused'>) =>
+    request<import('../types/api').DebugSettings>('/api/settings/debug', {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings),
+    }),
   videoProxySettings: () => request<VideoProxySettings>('/api/settings/video-proxy'),
   updateVideoProxySettings: (settings: VideoProxySettings) =>
     request<VideoProxySettings>('/api/settings/video-proxy', {
@@ -285,12 +302,16 @@ export const api = {
   ) => request<Page<Asset>>(`/api/albums/${id}/assets${qs({ page, pageSize, ...params, includeAiSummary: includeAISummary() })}`),
   albumAnchors: (id: number, pageSize: number, params: LibraryFilterParams) =>
     request<LibraryAnchorsResponse>(`/api/albums/${id}/anchors${qs({ pageSize, ...params })}`),
+  albumSelection: (id: number, params: LibraryFilterParams) =>
+    request<AssetSelectionResponse>(`/api/albums/${id}/selection${qs({ ...params })}`, undefined, 120_000),
   albumSourceFolders: (parentRelPath: string) =>
     request<SourceFoldersResponse>(`/api/albums/source-folders${qs({ parentRelPath })}`),
   libraryAssets: (page: number, pageSize: number, params: LibraryFilterParams) =>
     request<Page<Asset>>(`/api/library/assets${qs({ page, pageSize, ...params, includeAiSummary: includeAISummary() })}`),
   libraryAnchors: (pageSize: number, params: LibraryFilterParams) =>
     request<LibraryAnchorsResponse>(`/api/library/anchors${qs({ pageSize, ...params })}`),
+  librarySelection: (params: LibraryFilterParams) =>
+    request<AssetSelectionResponse>(`/api/library/selection${qs({ ...params })}`, undefined, 120_000),
   libraryNFOOptions: (field: NFOFilterField, q: string, signal?: AbortSignal) =>
     request<{ items: string[] }>(`/api/library/nfo-options${qs({ field, q, limit: 40 })}`, { signal }),
   folders: (parentId: number) => request<{ items: Folder[] }>(`/api/folders${qs({ parentId })}`),
@@ -301,6 +322,8 @@ export const api = {
     request<Page<Asset>>(`/api/folders/${id}/assets${qs({ page, pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation, type, combinedTags, tagNodes, includeAiSummary: includeAISummary() })}`),
   folderAnchors: (id: number, pageSize: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags?: string, tagNodes?: string) =>
     request<LibraryAnchorsResponse>(`/api/folders/${id}/anchors${qs({ pageSize, sort, q, recursive: recursive ? 1 : 0, group, rating, orientation, type, combinedTags, tagNodes })}`),
+  folderSelection: (id: number, sort: SortKey, q: string, recursive: boolean, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags?: string, tagNodes?: string) =>
+    request<AssetSelectionResponse>(`/api/folders/${id}/selection${qs({ sort, q, recursive: recursive ? 1 : 0, group, rating, orientation, type, combinedTags, tagNodes })}`, undefined, 120_000),
   tags: () => request<{ items: TagSummary[] }>('/api/tags'),
   createTag: (name: string) =>
     request<TagSummary>('/api/tags', {
@@ -351,6 +374,8 @@ export const api = {
   ) => request<Page<Asset>>(`/api/collections/${collectionPathID(id)}/assets${qs({ page, pageSize, sort, q: filenameQuery, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined, includeAiSummary: includeAISummary() })}`),
   collectionAnchors: (id: string, pageSize: number, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags: string[] = [], tagNodes: string[] = [], filenameQuery = '') =>
     request<LibraryAnchorsResponse>(`/api/collections/${collectionPathID(id)}/anchors${qs({ pageSize, sort, q: filenameQuery, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined })}`),
+  collectionSelection: (id: string, sort: SortKey, q: string, group?: AssetServerGroup, rating?: AssetRating, orientation?: OrientationFilter, type?: AssetKind, combinedTags: string[] = [], tagNodes: string[] = [], filenameQuery = '') =>
+    request<AssetSelectionResponse>(`/api/collections/${collectionPathID(id)}/selection${qs({ sort, q: filenameQuery, combinedQuery: q, group, rating, orientation, type, combinedTags: combinedTags.length > 0 ? JSON.stringify(combinedTags) : undefined, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined })}`, undefined, 120_000),
   duplicates: () => request<{ items: DuplicateGroup[] }>('/api/duplicates'),
   duplicateSelection: () => request<{ assetIds: number[]; keepPolicy: 'oldest_imported' }>('/api/duplicates/selection'),
   addAlbumAssets: (id: number, assetIds: number[]) =>
@@ -396,55 +421,61 @@ export const api = {
       body: JSON.stringify({ assetIds }),
     }),
   batchDelete: (assetIds: number[], purgeUnavailable = false, refreshCollectionCounts = false) =>
-    request<BatchOperationResult>('/api/assets/batch/delete', {
+    invalidateAITagTreeAfter(request<BatchOperationResult>('/api/assets/batch/delete', {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ assetIds, purgeUnavailable, refreshCollectionCounts }),
-    }),
+    })),
   batchDeleteRecords: (assetIds: number[], refreshCollectionCounts = false) =>
-    request<BatchOperationResult>('/api/assets/batch/delete-records', {
+    invalidateAITagTreeAfter(request<BatchOperationResult>('/api/assets/batch/delete-records', {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ assetIds, refreshCollectionCounts }),
-    }),
+    }, 120_000)),
   asset: (id: number) => request<Asset>(`/api/assets/${id}`),
   assetAI: (id: number) => request<AssetAIResult>(`/api/assets/${id}/ai`),
   reanalyzeAssetAI: (id: number) => request<{ accepted: boolean; assetId: number }>(`/api/assets/${id}/ai/reanalyze`, { method: 'POST' }),
   replaceAssetAITag: (id: number, payload: { previousTag?: string; tag: string; categoryKey: string; subjectKey: string }) =>
-    request<AssetAIResult>(`/api/assets/${id}/ai/tags`, {
+    invalidateAITagTreeAfter(request<AssetAIResult>(`/api/assets/${id}/ai/tags`, {
       method: 'PUT',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-    }),
+    })),
   deleteAssetAITag: (id: number, tag: string) =>
-    request<AssetAIResult>(`/api/assets/${id}/ai/tags${qs({ tag })}`, { method: 'DELETE' }),
+    invalidateAITagTreeAfter(request<AssetAIResult>(`/api/assets/${id}/ai/tags${qs({ tag })}`, { method: 'DELETE' })),
   aiStatus: () => request<AIStatus>('/api/ai/status'),
   aiSettings: () => request<AISettings>('/api/ai/settings'),
-  updateAISettings: (autoAnalyze: boolean) => request<AISettings>('/api/ai/settings', {
+  updateAISettings: (settings: AISettingsUpdate) => request<AISettings>('/api/ai/settings', {
     method: 'PUT',
     headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ autoAnalyze }),
+    body: JSON.stringify(settings),
   }),
+  testAIComputeNode: (externalHost: string, externalPort: number) =>
+    request<{ node: AIComputeNodeStatus }>('/api/ai/settings/test', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ externalHost, externalPort }),
+    }),
   runAIManually: () => request<{ accepted: boolean; count: number; settings: AISettings }>('/api/ai/run', { method: 'POST' }),
   stopAIManually: () => request<AISettings>('/api/ai/stop', { method: 'POST' }),
-  reindexAI: () => request<{ accepted: boolean; count: number }>('/api/ai/reindex', { method: 'POST' }),
+  reindexAI: () => invalidateAITagTreeAfter(request<{ accepted: boolean; count: number }>('/api/ai/reindex', { method: 'POST' })),
   retryFailedAI: () => request<{ accepted: boolean; count: number }>('/api/ai/retry-failed', { method: 'POST' }),
   aiTags: (q = '', tagNodes: string[] = []) =>
     request<{ items: AITagSummary[]; tree: AITagTreeNode[] }>(`/api/ai/tags${qs({ q, tagNodes: tagNodes.length > 0 ? JSON.stringify(tagNodes) : undefined })}`),
   assetDeletePlan: (id: number) => request<AssetDeletePlan>(`/api/assets/${id}/delete-plan`),
-  deleteAsset: (id: number, token: string) => requestDeleteAsset(`/api/assets/${id}/delete`, token),
-  deleteAssetRecord: (id: number) => request<AssetDeleteResult>(`/api/assets/${id}/record`, { method: 'DELETE' }),
+  deleteAsset: (id: number, token: string) => invalidateAITagTreeAfter(requestDeleteAsset(`/api/assets/${id}/delete`, token)),
+  deleteAssetRecord: (id: number) => invalidateAITagTreeAfter(request<AssetDeleteResult>(`/api/assets/${id}/record`, { method: 'DELETE' })),
   markAssetPlayed: (id: number) =>
     request<{ recorded: boolean; lastPlayedAt: number }>(`/api/assets/${id}/played`, { method: 'POST' }),
   assetTags: (id: number) => request<{ items: AssetTag[] }>(`/api/assets/${id}/tags`),
   addAssetTag: (id: number, tag: string) =>
-    request<{ items: AssetTag[] }>(`/api/assets/${id}/tags`, {
+    invalidateAITagTreeAfter(request<{ items: AssetTag[] }>(`/api/assets/${id}/tags`, {
       method: 'POST',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ tag }),
-    }),
+    })),
   removeAssetTag: (id: number, tag: string) =>
-    request<{ items: AssetTag[] }>(`/api/assets/${id}/tags${qs({ tag })}`, { method: 'DELETE' }),
+    invalidateAITagTreeAfter(request<{ items: AssetTag[] }>(`/api/assets/${id}/tags${qs({ tag })}`, { method: 'DELETE' })),
   assetPreferences: (id: number) => request<AssetPreference>(`/api/assets/${id}/preferences`),
   assetSidecars: (id: number) => request<AssetSidecars>(`/api/assets/${id}/sidecars`),
   updateAssetPreferences: (id: number, rotation: number) =>
@@ -476,6 +507,7 @@ export const api = {
       priority,
       clientId: session?.clientId,
       sessionId: session?.sessionId,
+      transcoder: session?.transcoder,
     })}`, { method: 'POST', signal }),
   prewarmAllVideoSegments: (id: number, from: number, session?: VideoProxySessionContext, signal?: AbortSignal) =>
     request<{ accepted: boolean; queuedSegments: number; required: boolean; segmentSeconds?: number; started: boolean }>(`/api/assets/${id}/hls/prewarm${qs({
@@ -484,13 +516,17 @@ export const api = {
       priority: 'balanced',
       clientId: session?.clientId,
       sessionId: session?.sessionId,
+      transcoder: session?.transcoder,
     })}`, { method: 'POST', signal }),
   stopVideoSegmentSession: (id: number, session?: VideoProxySessionContext) =>
     request<{ cancelled: number }>(`/api/assets/${id}/hls/session/stop${videoSessionQuery(session)}`, { method: 'POST' }),
-  prewarmDirectVideo: (id: number, startSeconds = 0, full = false) =>
+  prewarmDirectVideo: (id: number, startSeconds = 0, full = false, session?: VideoProxySessionContext) =>
     request<{ accepted: boolean; chunks: number; full?: boolean; started?: boolean }>(`/api/assets/${id}/video/cache/prewarm${qs({
       start: Math.max(0, startSeconds),
       all: full ? 1 : undefined,
+      clientId: session?.clientId,
+      sessionId: session?.sessionId,
+      transcoder: session?.transcoder,
     })}`, { method: 'POST' }),
   startAudioProxy: (id: number, priority: 'current' | 'preload', signal?: AbortSignal) =>
     request<AudioProxyRuntime>(`/api/assets/${id}/audio-proxy?priority=${priority}`, { method: 'POST', signal }),
@@ -504,10 +540,19 @@ export const api = {
     request<VideoStoryboard>(`/api/assets/${id}/storyboard`, { signal }),
   generateAssetStoryboard: (id: number, signal?: AbortSignal) =>
     request<{ accepted: boolean; state: string }>(`/api/assets/${id}/storyboard/generate`, { method: 'POST', signal }),
+  captureVideoPoster: (id: number, timeSeconds: number) =>
+    request<{ asset: Asset; timeSeconds: number }>(`/api/assets/${id}/video-poster/capture`, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ timeSeconds }),
+    }, 120_000),
 };
 
-export function assetThumbUrl(asset: Asset): string {
+export function assetThumbUrl(asset: Asset, revision = 0): string {
   if (asset.mediaType === 'audio') return audioCoverUrl;
+  if (asset.mediaType === 'video') {
+    return `/api/assets/${asset.id}/video-poster${qs({ v: asset.cacheKey, r: revision > 0 ? revision : undefined })}`;
+  }
   return `/api/cache/thumbs/${asset.cacheKey}.webp`;
 }
 
@@ -554,6 +599,9 @@ export function assetVideoProxyUrl(asset: Asset, startSeconds = 0, session?: Vid
   if (session?.sessionId) {
     query.set('sessionId', session.sessionId);
   }
+  if (session?.transcoder) {
+    query.set('transcoder', session.transcoder);
+  }
   return mediaTransferUrl(asset.id, `/api/assets/${asset.id}/video-proxy?${query.toString()}`);
 }
 
@@ -564,6 +612,9 @@ export function assetVideoHlsPlaylistUrl(asset: Asset, session?: VideoProxySessi
   }
   if (session?.sessionId) {
     query.set('sessionId', session.sessionId);
+  }
+  if (session?.transcoder) {
+    query.set('transcoder', session.transcoder);
   }
   query.set('priority', session?.priority ?? 'preload');
   return mediaTransferUrl(asset.id, `/api/assets/${asset.id}/hls/playlist.m3u8?${query.toString()}`);
@@ -576,6 +627,9 @@ export function assetVideoHlsSegmentUrl(asset: Asset, segmentIndex: number, sess
   }
   if (session?.sessionId) {
     query.set('sessionId', session.sessionId);
+  }
+  if (session?.transcoder) {
+    query.set('transcoder', session.transcoder);
   }
   return mediaTransferUrl(asset.id, `/api/assets/${asset.id}/hls/segments/${Math.max(0, Math.floor(segmentIndex))}.ts?${query.toString()}`);
 }
@@ -593,6 +647,7 @@ function videoProxyQuery(startSeconds: number, session?: VideoProxySessionContex
     start: Number.isFinite(startSeconds) && startSeconds > 0 ? Math.max(0, startSeconds).toFixed(2) : undefined,
     clientId: session?.clientId,
     sessionId: session?.sessionId,
+    transcoder: session?.transcoder,
   });
 }
 
@@ -600,6 +655,7 @@ function videoSessionQuery(session?: VideoProxySessionContext) {
   return qs({
     clientId: session?.clientId,
     sessionId: session?.sessionId,
+    transcoder: session?.transcoder,
   });
 }
 

@@ -95,3 +95,24 @@ func TestVideoFullWarmJobDeduplicatesAndCancelsByAsset(t *testing.T) {
 		t.Fatalf("jobs remain after cancellation: %d", len(server.videoFullWarmJobs))
 	}
 }
+
+func TestVideoFullWarmSessionCancellationOnlyStopsMatchingViewer(t *testing.T) {
+	server := &Server{videoFullWarmJobs: map[string]*videoFullWarmJob{}}
+	matchingCtx, cancelMatching := context.WithCancel(context.Background())
+	otherCtx, cancelOther := context.WithCancel(context.Background())
+	server.videoFullWarmJobs["direct:asset:viewer-a"] = &videoFullWarmJob{
+		cancel: cancelMatching, assetCacheKey: "asset", sessionID: "viewer-a",
+	}
+	server.videoFullWarmJobs["direct:asset:viewer-b"] = &videoFullWarmJob{
+		cancel: cancelOther, assetCacheKey: "asset", sessionID: "viewer-b",
+	}
+	if got := server.cancelVideoFullWarmSession("asset", "viewer-a"); got != 1 {
+		t.Fatalf("cancelled = %d, want 1", got)
+	}
+	if matchingCtx.Err() == nil {
+		t.Fatal("matching viewer warm job was not cancelled")
+	}
+	if otherCtx.Err() != nil {
+		t.Fatal("other viewer warm job was cancelled")
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/model"
 )
 
@@ -20,7 +21,9 @@ const directVideoChunkBytes int64 = directMediaChunkBytes
 const directVideoSourceOpenTimeout = 10 * time.Second
 
 type videoFullWarmJob struct {
-	cancel context.CancelFunc
+	cancel        context.CancelFunc
+	assetCacheKey string
+	sessionID     string
 }
 
 func (s *Server) serveCachedOriginalImage(w http.ResponseWriter, r *http.Request, asset model.Asset) bool {
@@ -38,6 +41,9 @@ func (s *Server) serveCachedOriginalImage(w http.ResponseWriter, r *http.Request
 		return true
 	}
 	if r.Method == http.MethodHead {
+		return false
+	}
+	if debugcontrol.ExternalFileAccessPaused() {
 		return false
 	}
 	releaseIO, err := s.mediaIO.acquire(r.Context(), mediaIOPriorityFromRequest(r, mediaIOPriorityCurrent))
@@ -70,7 +76,7 @@ func (s *Server) serveCachedOriginalImage(w http.ResponseWriter, r *http.Request
 	output, err := os.Create(tmp)
 	var copied int64
 	if err == nil {
-		copied, err = io.Copy(output, input)
+		copied, err = io.Copy(output, &externalSourceReadSeeker{File: input})
 		closeErr := output.Close()
 		if err == nil {
 			err = closeErr
@@ -244,13 +250,18 @@ func (s *Server) prewarmDirectVideo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"accepted": false, "chunks": 0})
 		return
 	}
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
+		return
+	}
 	start, _ := strconv.ParseFloat(r.URL.Query().Get("start"), 64)
 	if start < 0 {
 		start = 0
 	}
+	session := videoProxySessionFromRequest(r)
 	if queryBool(r.URL.Query().Get("all")) {
 		first, last := directVideoChunkRange(asset, start, true)
-		started := s.startDirectVideoFullWarm(asset, first, last)
+		started := s.startDirectVideoWarm(asset, first, last, session.SessionID)
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"accepted": true,
 			"chunks":   int(last-first) + 1,
@@ -261,8 +272,8 @@ func (s *Server) prewarmDirectVideo(w http.ResponseWriter, r *http.Request) {
 	}
 	first, last := directVideoChunkRange(asset, start, false)
 	chunks := int(last-first) + 1
-	go s.warmDirectVideoChunks(context.Background(), asset, first, last)
-	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "chunks": chunks, "full": false})
+	started := s.startDirectVideoWarm(asset, first, last, session.SessionID)
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "chunks": chunks, "full": false, "started": started})
 }
 
 func directVideoChunkRange(asset model.Asset, start float64, full bool) (int64, int64) {
@@ -292,14 +303,12 @@ func directVideoChunkRange(asset model.Asset, start float64, full bool) (int64, 
 	return first, last
 }
 
-func (s *Server) startDirectVideoFullWarm(asset model.Asset, first, last int64) bool {
-	key := "direct:" + asset.CacheKey
+func (s *Server) startDirectVideoWarm(asset model.Asset, first, last int64, sessionID string) bool {
+	sessionID = sanitizeVideoProxyID(sessionID, "legacy")
+	key := "direct:" + asset.CacheKey + ":" + sessionID
 	ctx, cancel := context.WithCancel(context.Background())
-	job := &videoFullWarmJob{cancel: cancel}
-	if !s.registerVideoFullWarmJob(key, job) {
-		cancel()
-		return false
-	}
+	job := &videoFullWarmJob{cancel: cancel, assetCacheKey: asset.CacheKey, sessionID: sessionID}
+	s.replaceVideoFullWarmJob(key, job)
 	go func() {
 		defer s.finishVideoFullWarmJob(key, job)
 		s.warmDirectVideoChunks(ctx, asset, first, last)
@@ -307,10 +316,22 @@ func (s *Server) startDirectVideoFullWarm(asset model.Asset, first, last int64) 
 	return true
 }
 
+func (s *Server) replaceVideoFullWarmJob(key string, job *videoFullWarmJob) {
+	s.videoFullWarmMu.Lock()
+	if s.videoFullWarmJobs == nil {
+		s.videoFullWarmJobs = map[string]*videoFullWarmJob{}
+	}
+	if previous := s.videoFullWarmJobs[key]; previous != nil {
+		previous.cancel()
+	}
+	s.videoFullWarmJobs[key] = job
+	s.videoFullWarmMu.Unlock()
+}
+
 func (s *Server) warmDirectVideoChunks(ctx context.Context, asset model.Asset, first, last int64) {
 	stopPriority := s.holdPlaybackPriority(ctx)
 	defer stopPriority()
-	reader := &chunkedVideoReader{server: s, ctx: ctx, asset: asset, size: asset.Size, cacheKind: "video-chunks", sourceReason: "video_playback", priority: mediaIOPriorityAhead}
+	reader := &chunkedVideoReader{server: s, ctx: ctx, asset: asset, size: asset.Size, cacheKind: "video-chunks", sourceReason: "video_playback", priority: mediaIOPriorityFullWarm}
 	defer reader.Close()
 	for index := first; index <= last; index++ {
 		if ctx.Err() != nil {
@@ -347,15 +368,38 @@ func (s *Server) finishVideoFullWarmJob(key string, job *videoFullWarmJob) {
 }
 
 func (s *Server) cancelVideoFullWarm(assetCacheKey string) {
-	keys := []string{"direct:" + assetCacheKey, "hls:" + assetCacheKey}
+	prefixes := []string{"direct:" + assetCacheKey, "hls:" + assetCacheKey}
 	s.videoFullWarmMu.Lock()
-	for _, key := range keys {
-		if job := s.videoFullWarmJobs[key]; job != nil {
+	for key, job := range s.videoFullWarmJobs {
+		matched := false
+		for _, prefix := range prefixes {
+			if key == prefix || strings.HasPrefix(key, prefix+":") {
+				matched = true
+				break
+			}
+		}
+		if matched && job != nil {
 			job.cancel()
 			delete(s.videoFullWarmJobs, key)
 		}
 	}
 	s.videoFullWarmMu.Unlock()
+}
+
+func (s *Server) cancelVideoFullWarmSession(assetCacheKey string, sessionID string) int {
+	sessionID = sanitizeVideoProxyID(sessionID, "legacy")
+	cancelled := 0
+	s.videoFullWarmMu.Lock()
+	for key, job := range s.videoFullWarmJobs {
+		if job == nil || job.assetCacheKey != assetCacheKey || job.sessionID != sessionID {
+			continue
+		}
+		job.cancel()
+		delete(s.videoFullWarmJobs, key)
+		cancelled++
+	}
+	s.videoFullWarmMu.Unlock()
+	return cancelled
 }
 
 func queryBool(value string) bool {
@@ -465,6 +509,9 @@ func (r *chunkedVideoReader) ensureChunk(index int64) (string, error) {
 		r.server.cachePolicy.Touch(r.ctx, r.cacheKind, key, path)
 		return path, nil
 	}
+	if debugcontrol.ExternalFileAccessPaused() {
+		return "", debugcontrol.ErrExternalFileAccessPaused
+	}
 	priority := r.priority
 	if priority == 0 {
 		priority = mediaIOPriorityCurrent
@@ -493,15 +540,26 @@ func (r *chunkedVideoReader) ensureChunk(index int64) (string, error) {
 		r.source = source
 		r.batchID, _ = r.server.db.BeginSourceIOBatch(context.Background(), r.sourceReason, 0)
 	}
-	data := make([]byte, length)
-	count, err := r.source.ReadAt(data, index*directMediaChunkBytes)
-	if err != nil && !errors.Is(err, io.EOF) {
+	tmp := path + ".tmp"
+	_ = os.Remove(tmp)
+	output, err := os.Create(tmp)
+	if err != nil {
 		return "", err
 	}
-	r.bytesRead += int64(count)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data[:count], 0o644); err != nil {
-		return "", err
+	count, copyErr := io.CopyN(output, io.NewSectionReader(r.source, index*directMediaChunkBytes, length), length)
+	closeErr := output.Close()
+	r.bytesRead += count
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+		_ = os.Remove(tmp)
+		return "", copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return "", closeErr
+	}
+	if count != length {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("short video chunk read: got %d bytes, want %d", count, length)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)

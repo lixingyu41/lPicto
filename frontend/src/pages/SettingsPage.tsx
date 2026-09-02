@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { useNavigate, useParams } from 'react-router-dom';
 import Toolbar from '../components/Toolbar';
 import { api } from '../api/client';
-import type { AISettings, CleanupStatus, ProcessingProgress, ScanLibrary, ScanLibraryProgress, ScanStatus, StorageStatus, SystemTask, VideoProxySettings, WorkStatusCounts } from '../types/api';
+import type { AIComputeMode, AIComputeNodeStatus, AISettings, AISettingsUpdate, CleanupStatus, DebugSettings, ProcessingProgress, ScanLibrary, ScanLibraryProgress, ScanStatus, SystemTask, VideoProxySettings } from '../types/api';
 import { useAssetReadyEvents, useScanStatusEvents } from '../hooks/useAssetReadyEvents';
 import { loadGridRowHeightLevel, saveGridRowHeightLevel, type GridRowHeightLevel } from '../utils/gridPrefs';
 import { loadThemeMode, saveThemeMode, type ThemeMode } from '../utils/themePrefs';
@@ -34,7 +34,6 @@ export default function SettingsPage() {
   const { section: sectionSlug } = useParams<{ section?: string }>();
   const routeSection = settingsSectionFromSlug(sectionSlug);
   const activeSettingsSection = routeSection ?? loadSettingsSection();
-  const [status, setStatus] = useState<ScanStatus | null>(null);
   const [progress, setProgress] = useState<ProcessingProgress | null>(null);
   const [libraries, setLibraries] = useState<ScanLibrary[]>([]);
   const [cleanup, setCleanup] = useState<CleanupStatus | null>(null);
@@ -55,8 +54,10 @@ export default function SettingsPage() {
   const [videoProxyMaxCacheGB, setVideoProxyMaxCacheGB] = useState('0');
   const [videoProxySaving, setVideoProxySaving] = useState(false);
   const [aiSettings, setAISettings] = useState<AISettings | null>(null);
-  const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
+  const [aiSettingsSaving, setAISettingsSaving] = useState(false);
   const [systemTasks, setSystemTasks] = useState<SystemTask[]>([]);
+  const [debugSettings, setDebugSettings] = useState<DebugSettings | null>(null);
+  const [debugSaving, setDebugSaving] = useState(false);
   const progressRefreshTimer = useRef<number | null>(null);
   const progressRefreshInFlight = useRef(false);
   const progressRefreshQueued = useRef(false);
@@ -119,20 +120,11 @@ export default function SettingsPage() {
     applyVideoProxySettings(await api.videoProxySettings());
   }, [applyVideoProxySettings]);
 
-  const applyScanStatus = useCallback((scan: ScanStatus) => {
-    setStatus(scan);
-  }, []);
-
-  const refreshScanStatus = useCallback(async () => {
-    applyScanStatus(await api.scanStatus());
-  }, [applyScanStatus]);
-
   const refreshActivity = useCallback(async () => {
     const activity = await api.settingsActivity();
-    applyScanStatus(activity.scan);
     setProgress(activity.progress);
     setCleanup(activity.cleanup);
-  }, [applyScanStatus]);
+  }, []);
 
   const refreshActivityWithoutScan = useCallback(async () => {
     const activity = await api.settingsActivity();
@@ -141,13 +133,12 @@ export default function SettingsPage() {
   }, []);
 
   const handleLiveScanStatus = useCallback((scan: ScanStatus) => {
-    applyScanStatus(scan);
     if (!scan.running) {
       void Promise.all([refreshActivityWithoutScan(), refreshLibraries()]).catch((err) => {
         setError(err instanceof Error ? err.message : '刷新进度失败');
       });
     }
-  }, [applyScanStatus, refreshActivityWithoutScan, refreshLibraries]);
+  }, [refreshActivityWithoutScan, refreshLibraries]);
 
   const runQueuedProgressRefresh = useCallback(() => {
     if (progressRefreshInFlight.current) {
@@ -205,13 +196,12 @@ export default function SettingsPage() {
   const resetMediaLibrary = useCallback(async (confirmation: string) => {
     const result = await api.resetMediaLibrary(confirmation);
     const [activity, libraryResult] = await Promise.all([api.settingsActivity(), api.scanLibraries()]);
-    applyScanStatus(activity.scan);
     setProgress(activity.progress);
     setCleanup(activity.cleanup);
     setLibraries(libraryResult.items);
     setSystemTasks([]);
     return result;
-  }, [applyScanStatus]);
+  }, []);
 
   useEffect(() => {
     void refreshInitial();
@@ -220,8 +210,8 @@ export default function SettingsPage() {
   useEffect(() => {
     if (activeSettingsSection !== 'ai') return;
     let live = true;
-    const refresh = () => void Promise.all([api.aiSettings(), api.storageStatus()])
-      .then(([settingsResult, storageResult]) => { if (live) { setAISettings(settingsResult); setStorageStatus(storageResult); } })
+    const refresh = () => void api.aiSettings()
+      .then((settingsResult) => { if (live) setAISettings(settingsResult); })
       .catch((err) => { if (live) setError(err instanceof Error ? err.message : '读取 AI 状态失败'); });
     refresh();
     const timer = window.setInterval(refresh, 15_000);
@@ -272,19 +262,49 @@ export default function SettingsPage() {
   }, [activeSettingsSection]);
 
   useEffect(() => {
+    if (activeSettingsSection !== 'debug') return;
+    let live = true;
+    void api.debugSettings()
+      .then((settings) => { if (live) setDebugSettings(settings); })
+      .catch((err) => { if (live) setError(err instanceof Error ? err.message : '读取调试设置失败'); });
+    return () => { live = false; };
+  }, [activeSettingsSection]);
+
+  const updateDebugSettings = useCallback(async (next: Pick<DebugSettings, 'externalFileAccessPaused' | 'backgroundProcessingPaused'>) => {
+    if (debugSaving) return;
+    setDebugSaving(true);
+    try {
+      setDebugSettings(await api.updateDebugSettings(next));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存调试设置失败');
+    } finally {
+      setDebugSaving(false);
+    }
+  }, [debugSaving]);
+
+  const saveAISettings = useCallback(async (next: AISettingsUpdate) => {
+    if (aiSettingsSaving) return;
+    setAISettingsSaving(true);
+    try {
+      setAISettings(await api.updateAISettings(next));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存 AI 设置失败');
+    } finally {
+      setAISettingsSaving(false);
+    }
+  }, [aiSettingsSaving]);
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
-      if (!eventsConnected) {
-        void refreshScanStatus().catch((err) => {
-          setError(err instanceof Error ? err.message : '刷新扫描状态失败');
-        });
-      }
       const activityRefresh = eventsConnected ? refreshActivityWithoutScan() : refreshActivity();
       void Promise.all([activityRefresh, refreshLibraries()]).catch((err) => {
         setError(err instanceof Error ? err.message : '刷新进度失败');
       });
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [eventsConnected, refreshActivity, refreshActivityWithoutScan, refreshLibraries, refreshScanStatus]);
+  }, [eventsConnected, refreshActivity, refreshActivityWithoutScan, refreshLibraries]);
 
   async function createLibrary(name: string, relPaths: string[]) {
     const tempId = `pending-${Date.now()}`;
@@ -510,6 +530,27 @@ export default function SettingsPage() {
                       </button>
                     </div>
                   </div>
+                  {viewerPrefs.videoProcessingMode === 'server' && (
+                    <div className="settings-field settings-field-wide">
+                      <span>服务器转码器</span>
+                      <div className="settings-segmented two-options">
+                        <button
+                          className={viewerPrefs.videoServerTranscoder === 'cpu' ? 'active' : ''}
+                          type="button"
+                          onClick={() => updateViewerPrefs({ ...viewerPrefs, videoServerTranscoder: 'cpu' })}
+                        >
+                          CPU 转码
+                        </button>
+                        <button
+                          className={viewerPrefs.videoServerTranscoder === 'gpu' ? 'active' : ''}
+                          type="button"
+                          onClick={() => updateViewerPrefs({ ...viewerPrefs, videoServerTranscoder: 'gpu' })}
+                        >
+                          GPU 转码
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </section>
                 <section className="settings-panel settings-section">
                   <div className="settings-panel-title">视频转码缓存</div>
@@ -727,7 +768,7 @@ export default function SettingsPage() {
                       disabled={viewerPrefs.zoomMode !== 'pixels'}
                       max={2000}
                       min={50}
-                      step={50}
+                      step={10}
                       type="number"
                       value={viewerPrefs.zoomPixelArea}
                       onChange={(event) =>
@@ -832,7 +873,9 @@ export default function SettingsPage() {
             {activeSettingsSection === 'ai' && (
               <AISettingsPanel
                 libraries={libraries}
+                saving={aiSettingsSaving}
                 settings={aiSettings}
+                onSave={saveAISettings}
                 onReanalyzeLibrary={reanalyzeLibraryAI}
                 onSaveLibraryFocus={saveLibraryAIFocus}
               />
@@ -841,9 +884,74 @@ export default function SettingsPage() {
             {activeSettingsSection === 'tasks' && (
               <TaskSettingsPanel tasks={systemTasks} />
             )}
+
+            {activeSettingsSection === 'debug' && (
+              <DebugSettingsPanel
+                settings={debugSettings}
+                saving={debugSaving}
+                onChange={updateDebugSettings}
+              />
+            )}
           </div>
         </div>
       </div>
+    </section>
+  );
+}
+
+function DebugSettingsPanel({
+  settings,
+  saving,
+  onChange,
+}: {
+  settings: DebugSettings | null;
+  saving: boolean;
+  onChange: (settings: Pick<DebugSettings, 'externalFileAccessPaused' | 'backgroundProcessingPaused'>) => void | Promise<void>;
+}) {
+  if (!settings) {
+    return <section className="settings-panel settings-section debug-settings-panel"><div className="settings-panel-title">调试</div><div className="muted-line">读取中</div></section>;
+  }
+  return (
+    <section className="settings-section debug-settings-section">
+      <section className="settings-panel debug-settings-panel">
+        <div className="settings-panel-title">外置文件访问</div>
+        <label className="settings-check-row settings-field-wide debug-toggle-row">
+          <input
+            checked={settings.externalFileAccessPaused}
+            disabled={saving}
+            type="checkbox"
+            onChange={(event) => void onChange({
+              externalFileAccessPaused: event.target.checked,
+              backgroundProcessingPaused: settings.backgroundProcessingPaused,
+            })}
+          />
+          <span><strong>停止对外置文件的任何操作</strong><small>停止 LPICTO 对 NAS 和外置媒体源的新读取、写入及按需转码；数据库与本地缓存仍可使用。</small></span>
+        </label>
+        <div className={`debug-state ${settings.externalFileAccessPaused ? 'paused' : 'running'}`}>
+          {settings.externalFileAccessPaused ? '外置文件访问已停止' : '外置文件访问正常'}
+        </div>
+      </section>
+      <section className="settings-panel debug-settings-panel">
+        <div className="settings-panel-title">后台媒体处理</div>
+        <label className="settings-check-row settings-field-wide debug-toggle-row">
+          <input
+            checked={settings.backgroundProcessingPaused}
+            disabled={saving}
+            type="checkbox"
+            onChange={(event) => void onChange({
+              externalFileAccessPaused: settings.externalFileAccessPaused,
+              backgroundProcessingPaused: event.target.checked,
+            })}
+          />
+          <span><strong>停止媒体库扫描与分析</strong><small>暂停扫描、信息提取、缩略图、封面、高清预览、进度预览和 AI；已有缩略图仍可显示，前台仍可从 NAS 查看媒体。</small></span>
+        </label>
+        <div className={`debug-state ${settings.effectiveBackgroundPaused ? 'paused' : 'running'}`}>
+          {settings.effectiveBackgroundPaused ? '后台媒体处理已停止' : '后台媒体处理正常'}
+        </div>
+        {settings.externalFileAccessPaused && !settings.backgroundProcessingPaused && (
+          <div className="muted-line">外置文件访问总闸已开启，因此后台媒体处理同步暂停。</div>
+        )}
+      </section>
     </section>
   );
 }
@@ -860,12 +968,16 @@ const bytesPerGB = 1024 ** 3;
 const videoProxyMaxTTLMinutes = 30 * 24 * 60;
 function AISettingsPanel({
   libraries,
+  saving,
   settings,
+  onSave,
   onReanalyzeLibrary,
   onSaveLibraryFocus,
 }: {
   libraries: ScanLibrary[];
+  saving: boolean;
   settings: AISettings | null;
+  onSave: (settings: AISettingsUpdate) => void | Promise<void>;
   onReanalyzeLibrary: (id: string) => Promise<{ accepted: boolean; count: number; libraryId: string }>;
   onSaveLibraryFocus: (id: string, focus: string) => Promise<ScanLibrary>;
 }) {
@@ -873,9 +985,21 @@ function AISettingsPanel({
   const [saved, setSaved] = useState<Set<string>>(new Set());
   const [messages, setMessages] = useState<Record<string, string>>({});
   const [libraryBusy, setLibraryBusy] = useState<string | null>(null);
+  const [computeMode, setComputeMode] = useState<AIComputeMode>(() => settings?.computeMode ?? 'ubuntu');
+  const [externalHost, setExternalHost] = useState(() => settings?.externalHost ?? '');
+  const [externalPort, setExternalPort] = useState(() => String(settings?.externalPort ?? 18090));
+  const [testingNode, setTestingNode] = useState(false);
+  const [testedNode, setTestedNode] = useState<AIComputeNodeStatus | null>(null);
   useEffect(() => {
     setDrafts((current) => Object.fromEntries(libraries.map((library) => [library.id, current[library.id] ?? library.aiFocus ?? ''])));
   }, [libraries]);
+  useEffect(() => {
+    if (!settings) return;
+    setComputeMode(settings.computeMode);
+    setExternalHost(settings.externalHost);
+    setExternalPort(String(settings.externalPort));
+    setTestedNode(null);
+  }, [settings?.computeMode, settings?.externalHost, settings?.externalPort]);
   if (!settings) {
     return (
       <section className="settings-panel settings-section">
@@ -884,11 +1008,119 @@ function AISettingsPanel({
       </section>
     );
   }
+  const port = Number(externalPort);
+  const externalRequired = computeMode !== 'ubuntu';
+  const externalValid = externalHost.trim() !== '' && Number.isInteger(port) && port >= 1 && port <= 65535;
+  const computeDirty = computeMode !== settings.computeMode || externalHost.trim() !== settings.externalHost || port !== settings.externalPort;
+  const nodes = settings.nodes.map((node) => node.id === 'external' && testedNode ? testedNode : node);
+  const computePayload = (): AISettingsUpdate => ({
+    computeMode,
+    externalHost: externalHost.trim(),
+    externalPort: port,
+  });
   return (
     <section className="settings-panel settings-section ai-settings-panel">
       <div className="settings-panel-title">AI 分析</div>
       <div className="ai-settings-controls">
-        <div className="settings-help-line">新增媒体会在基础缓存完成后自动进入 AI 分析，无需手动启动或停止。</div>
+        <div className="ai-compute-settings">
+          <div className="settings-field settings-field-wide">
+            <span>计算节点</span>
+            <div className="settings-segmented three-options">
+              {([
+                ['ubuntu', '仅 Ubuntu'],
+                ['external', '仅外部电脑'],
+                ['dual', '双端并行'],
+              ] as Array<[AIComputeMode, string]>).map(([value, label]) => (
+                <button
+                  className={computeMode === value ? 'active' : ''}
+                  disabled={saving}
+                  key={value}
+                  type="button"
+                  onClick={() => setComputeMode(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {externalRequired && (
+            <div className="viewer-settings-grid ai-external-address">
+              <label className="settings-field">
+                <span>外部电脑 IP</span>
+                <input
+                  inputMode="decimal"
+                  placeholder="192.168.2.82"
+                  type="text"
+                  value={externalHost}
+                  onChange={(event) => { setExternalHost(event.target.value); setTestedNode(null); }}
+                />
+              </label>
+              <label className="settings-field">
+                <span>端口</span>
+                <input
+                  max={65535}
+                  min={1}
+                  type="number"
+                  value={externalPort}
+                  onChange={(event) => { setExternalPort(event.target.value); setTestedNode(null); }}
+                />
+              </label>
+            </div>
+          )}
+          <div className="settings-action-row ai-compute-actions">
+            {externalRequired && (
+              <button
+                className="settings-action"
+                disabled={testingNode || !externalValid}
+                type="button"
+                onClick={() => {
+                  setTestingNode(true);
+                  void api.testAIComputeNode(externalHost.trim(), port)
+                    .then((result) => setTestedNode(result.node))
+                    .catch((err) => setTestedNode({ id: 'external', state: 'offline', latencyMs: null, checkedAt: Math.floor(Date.now() / 1000), message: err instanceof Error ? err.message : '连接失败' }))
+                    .finally(() => setTestingNode(false));
+                }}
+              >
+                {testingNode ? '测试中' : '测试连接'}
+              </button>
+            )}
+            <button
+              className="settings-save-button"
+              disabled={saving || !computeDirty || (externalRequired && !externalValid)}
+              type="button"
+              onClick={() => void onSave(computePayload())}
+            >
+              {saving ? '保存中' : '保存节点设置'}
+            </button>
+          </div>
+          <div className="ai-node-status-grid">
+            {nodes.map((node) => (
+              <div className="ai-settings-stat" key={node.id}>
+                <span>{node.id === 'ubuntu' ? 'Ubuntu 内置节点' : '外部电脑节点'}</span>
+                <div className={`debug-state ${node.state === 'online' ? 'running' : node.state === 'paused' || node.state === 'unconfigured' ? 'paused' : 'failed'}`}>
+                  {node.state === 'online' ? '在线' : node.state === 'paused' ? '已暂停' : node.state === 'unconfigured' ? '未配置' : '不可用'}
+                </div>
+                <small>{node.latencyMs != null ? `${node.latencyMs} ms · ` : ''}{node.message}</small>
+              </div>
+            ))}
+          </div>
+          <div className="settings-help-line">双端并行时，每个节点同时处理 1 个媒体；任一节点离线后由另一节点继续。</div>
+        </div>
+        <label className="settings-check-row settings-field-wide debug-toggle-row">
+          <input
+            checked={settings.autoAnalyze}
+            disabled={saving}
+            type="checkbox"
+            onChange={(event) => void onSave({ autoAnalyze: event.target.checked })}
+          />
+          <span>
+            <strong>自动扫描并进行 AI 分析</strong>
+            <small>关闭后不再自动分析新增或待处理媒体；已有 AI 描述、标签和记录会保留，仍可手动重新分析。</small>
+          </span>
+        </label>
+        <div className={`debug-state ${settings.autoAnalyze ? 'running' : 'paused'}`}>
+          {saving ? '正在保存' : settings.autoAnalyze ? 'AI 自动扫描已开启' : 'AI 自动扫描已关闭'}
+        </div>
       </div>
       <div className="ai-focus-settings">
         <div className="settings-panel-title">按图库重点识别</div>
@@ -985,6 +1217,8 @@ function TaskSettingsPanel({ tasks }: { tasks: SystemTask[] }) {
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
   const [globalScanStarting, setGlobalScanStarting] = useState(false);
   const [globalScanMessage, setGlobalScanMessage] = useState('');
+  const [retryingPipeline, setRetryingPipeline] = useState<string | null>(null);
+  const [pipelineRetryMessages, setPipelineRetryMessages] = useState<Record<string, string>>({});
   useEffect(() => {
     if (!tasks.some((task) => task.status === 'running')) return;
     setNowSeconds(Math.floor(Date.now() / 1000));
@@ -1028,18 +1262,38 @@ function TaskSettingsPanel({ tasks }: { tasks: SystemTask[] }) {
   const mediaScan = byID.get('media_scan');
   const globalScanRunning = globalScanStarting || mediaScan?.status === 'running';
   const globalStatus = executor?.status === 'failed' ? 'failed' : active > 0 ? 'running' : queued > 0 ? 'pending' : failed > 0 ? 'warning' : 'success';
-  const renderPipeline = (task: SystemTask, members: SystemTask[]) => {
+  const retryPipelineFailures = async (pipelineID: string, members: SystemTask[]) => {
+    const targets = members.filter((member) => member.actions.some((action) => action.id === 'retry_failed' && action.enabled));
+    if (targets.length === 0 || retryingPipeline != null) return;
+    setRetryingPipeline(pipelineID);
+    setPipelineRetryMessages((current) => ({ ...current, [pipelineID]: '' }));
+    try {
+      const results = await Promise.allSettled(targets.map((target) => api.runSystemTask(target.id, 'retry_failed', null)));
+      const succeeded = results.filter((result) => result.status === 'fulfilled').length;
+      const failedRequests = results.length - succeeded;
+      const itemCount = results.reduce((sum, result) => result.status === 'fulfilled' ? sum + Number(result.value.count ?? 0) : sum, 0);
+      const message = failedRequests > 0
+        ? `已提交 ${succeeded} 个任务，${failedRequests} 个任务提交失败`
+        : `已提交 ${succeeded} 个任务的失败重试${itemCount > 0 ? `，共 ${itemCount.toLocaleString()} 项` : ''}`;
+      setPipelineRetryMessages((current) => ({ ...current, [pipelineID]: message }));
+    } finally {
+      setRetryingPipeline(null);
+    }
+  };
+  const renderPipeline = (task: SystemTask, members: SystemTask[], stageCount: number, isLoading: boolean) => {
     const finishedAt = task.status === 'running' ? null : task.lastFinishedAt;
     const durationSeconds = task.status === 'running' && task.lastStartedAt != null
       ? Math.max(0, nowSeconds - task.lastStartedAt)
       : task.durationSeconds;
     const hasTimeline = task.lastStartedAt != null || finishedAt != null || durationSeconds != null || task.nextRunAt != null;
-    const hasFailures = (task.failures?.length ?? 0) > 0;
+    const hasFailures = !isLoading && (task.failures?.length ?? 0) > 0;
     const hasDetails = hasTimeline || hasFailures;
+    const retryableFailures = members.some((member) => member.actions.some((action) => action.id === 'retry_failed' && action.enabled));
     return (
       <article
         aria-label={`${task.name}，${systemTaskStatusLabel(task.status)}`}
-        className={`system-task-card automatic-task-card status-${task.status}`}
+        aria-busy={isLoading}
+        className={`system-task-card automatic-task-card status-${task.status}${isLoading ? ' is-loading' : ''}`}
         key={task.id}
       >
         <div className="system-task-heading">
@@ -1055,21 +1309,22 @@ function TaskSettingsPanel({ tasks }: { tasks: SystemTask[] }) {
               </span>
             </span>
           </div>
-          <span className={`automatic-task-state status-${task.status}`}>{systemTaskStatusLabel(task.status)}</span>
+          <span className={`automatic-task-state status-${task.status}`}>{isLoading ? '读取中' : systemTaskStatusLabel(task.status)}</span>
         </div>
-        {task.progress && (
+        {isLoading && <AutomaticTaskLoadingSkeleton stageCount={stageCount} />}
+        {!isLoading && task.progress && (
           <SystemTaskProgress
             averageSecondsPerItem={task.averageSecondsPerItem}
             task={task}
           />
         )}
-        {task.blockedReason && (
+        {!isLoading && task.blockedReason && (
           <div className="system-task-blocked-reason" role="status">
             <span aria-hidden="true" className="system-task-blocked-indicator" />
             {task.blockedReason}
           </div>
         )}
-        <div className="automatic-task-stages">
+        {!isLoading && <div className="automatic-task-stages">
           {members.map((member) => {
             const memberPending = Math.max(member.progress?.queued ?? 0, member.progress?.pending ?? 0);
             return (
@@ -1079,8 +1334,8 @@ function TaskSettingsPanel({ tasks }: { tasks: SystemTask[] }) {
               </div>
             );
           })}
-        </div>
-        {hasDetails && <div className="system-task-details">
+        </div>}
+        {!isLoading && hasDetails && <div className="system-task-details">
           {hasTimeline && (
             <div className="system-task-timeline">
               {task.lastStartedAt != null && <span>开始 {formatSystemTaskTime(task.lastStartedAt)}</span>}
@@ -1090,7 +1345,13 @@ function TaskSettingsPanel({ tasks }: { tasks: SystemTask[] }) {
             </div>
           )}
           {!task.progress && <div className="system-task-message">{task.message || '尚未运行'}</div>}
-          {hasFailures && <SystemTaskFailures task={task} onOpen={openFailureInLibrary} />}
+          {hasFailures && <SystemTaskFailures
+            task={task}
+            onOpen={openFailureInLibrary}
+            onRetry={retryableFailures ? () => retryPipelineFailures(task.id, members) : undefined}
+            retrying={retryingPipeline === task.id}
+            retryMessage={pipelineRetryMessages[task.id]}
+          />}
         </div>}
       </article>
     );
@@ -1123,10 +1384,23 @@ function TaskSettingsPanel({ tasks }: { tasks: SystemTask[] }) {
       </div>
       {globalScanMessage && <div className="automatic-task-global-scan-message" role="status">{globalScanMessage}</div>}
       <div className="system-task-groups automatic-task-groups">
-        {tasks.length === 0 && <div className="muted-line">读取中</div>}
-        {pipelines.map((pipeline) => renderPipeline(pipeline.task, pipeline.members))}
+        {pipelines.map((pipeline) => renderPipeline(pipeline.task, pipeline.members, pipeline.taskIds.length, tasks.length === 0))}
       </div>
     </section>
+  );
+}
+
+function AutomaticTaskLoadingSkeleton({ stageCount }: { stageCount: number }) {
+  return (
+    <div aria-hidden="true" className="automatic-task-loading-skeleton">
+      <div className="automatic-task-loading-stats">
+        {Array.from({ length: 4 }, (_, index) => <span key={index} />)}
+      </div>
+      <span className="automatic-task-loading-progress" />
+      <div className="automatic-task-loading-stages">
+        {Array.from({ length: Math.max(2, stageCount) }, (_, index) => <span key={index} />)}
+      </div>
+    </div>
   );
 }
 
@@ -1185,7 +1459,19 @@ function automaticTaskOverviewTitle(status: SystemTask['status']) {
   return '自动处理正常';
 }
 
-function SystemTaskFailures({ task, onOpen }: { task: SystemTask; onOpen: (path: string) => void }) {
+function SystemTaskFailures({
+  task,
+  onOpen,
+  onRetry,
+  retrying = false,
+  retryMessage = '',
+}: {
+  task: SystemTask;
+  onOpen: (path: string) => void;
+  onRetry?: () => void | Promise<void>;
+  retrying?: boolean;
+  retryMessage?: string;
+}) {
   const failures = task.failures ?? [];
   const shown = failures.length;
   const total = Math.max(shown, Number(task.failedCount));
@@ -1194,7 +1480,24 @@ function SystemTaskFailures({ task, onOpen }: { task: SystemTask; onOpen: (path:
       <summary>
         <span>失败明细</span>
         <span className="system-task-failure-count">显示 {shown.toLocaleString()} / {total.toLocaleString()}</span>
+        {onRetry && (
+          <button
+            aria-busy={retrying}
+            className="system-task-failure-retry"
+            disabled={retrying}
+            type="button"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              void onRetry();
+            }}
+          >
+            {retrying && <span aria-hidden="true" className="button-progress-spinner" />}
+            {retrying ? '正在重试' : '重试失败'}
+          </button>
+        )}
       </summary>
+      {retryMessage && <div className="system-task-failure-retry-message" role="status">{retryMessage}</div>}
       <div className="system-task-failure-list">
         {failures.map((failure, index) => (
           <div className="system-task-failure-item" key={`${failure.assetId ?? 'summary'}:${failure.path}:${index}`}>

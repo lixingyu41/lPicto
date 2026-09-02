@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/media"
 	"lpicto/backend/internal/storage"
 )
@@ -111,6 +112,11 @@ func (s *Server) nasWatcherEvents(w http.ResponseWriter, r *http.Request) {
 	expected := s.cfg.NASWatcherToken
 	if len(provided) != len(expected) || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
 		writeError(w, http.StatusUnauthorized, "nas_watcher_unauthorized", "NAS 监听器认证失败")
+		return
+	}
+	if debugcontrol.BackgroundProcessingPaused() {
+		s.nasWatcher.observe("", remoteHost(r.RemoteAddr), 0)
+		writeJSON(w, http.StatusAccepted, map[string]any{"accepted": 0, "ignored": 0, "paused": true})
 		return
 	}
 	var payload nasWatcherEventRequest

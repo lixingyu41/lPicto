@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import type { LibraryAnchor } from '../types/api';
+import { assetGridScrollRatioEvent, type AssetGridScrollRatioDetail } from '../utils/gridScroll';
 
 interface Props {
   anchors: LibraryAnchor[];
@@ -29,6 +30,7 @@ export default function LibraryIndexRail({ anchors, hideLabels = false, scrollRa
   const wheelFrameTimeRef = useRef(0);
   const [active, setActive] = useState<ActiveBubble | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [liveScrollRatio, setLiveScrollRatio] = useState(scrollRatio);
   const visibleAnchors = useMemo(() => anchors.filter((anchor) => anchor.position >= 0 && anchor.position <= 1), [anchors]);
   const visibleMarks = useMemo(() => sampleAnchors(visibleAnchors, 8), [visibleAnchors]);
 
@@ -40,10 +42,18 @@ export default function LibraryIndexRail({ anchors, hideLabels = false, scrollRa
   }
 
   useEffect(() => {
+    setLiveScrollRatio(scrollRatio);
+  }, [scrollRatio]);
+
+  useEffect(() => {
     const rail = railRef.current;
     if (!rail) return undefined;
     const scrollElement = rail.parentElement?.querySelector<HTMLElement>('.grid-scroll');
     if (!scrollElement) return undefined;
+    const handleScrollRatio = (event: Event) => {
+      const ratio = (event as CustomEvent<AssetGridScrollRatioDetail>).detail?.ratio;
+      if (Number.isFinite(ratio)) setLiveScrollRatio(clampRatio(ratio));
+    };
     const cancelForGridInput = () => cancelWheelAnimation();
     const handleWheel = (event: WheelEvent) => {
       const unit = event.deltaMode === 1
@@ -61,11 +71,8 @@ export default function LibraryIndexRail({ anchors, hideLabels = false, scrollRa
       wheelFrameTimeRef.current = performance.now();
       const animate = (now: number) => {
         const target = wheelTargetRef.current;
-        if (target === null) {
-          cancelWheelAnimation();
-          return;
-        }
-        const elapsed = Math.min(48, Math.max(1, now - wheelFrameTimeRef.current));
+        if (target === null) return;
+        const elapsed = Math.min(32, Math.max(1, now - wheelFrameTimeRef.current));
         wheelFrameTimeRef.current = now;
         const distance = target - scrollElement.scrollTop;
         if (Math.abs(distance) < 0.5) {
@@ -73,18 +80,19 @@ export default function LibraryIndexRail({ anchors, hideLabels = false, scrollRa
           cancelWheelAnimation();
           return;
         }
-        const progress = 1 - Math.exp(-elapsed / 70);
-        scrollElement.scrollTop += distance * progress;
+        scrollElement.scrollTop += distance * (1 - Math.exp(-elapsed / 28));
         wheelAnimationRef.current = window.requestAnimationFrame(animate);
       };
       wheelAnimationRef.current = window.requestAnimationFrame(animate);
     };
     rail.addEventListener('wheel', handleWheel, { passive: false });
+    scrollElement.addEventListener(assetGridScrollRatioEvent, handleScrollRatio);
     scrollElement.addEventListener('wheel', cancelForGridInput, { passive: true });
     scrollElement.addEventListener('pointerdown', cancelForGridInput, { passive: true });
     scrollElement.addEventListener('touchstart', cancelForGridInput, { passive: true });
     return () => {
       rail.removeEventListener('wheel', handleWheel);
+      scrollElement.removeEventListener(assetGridScrollRatioEvent, handleScrollRatio);
       scrollElement.removeEventListener('wheel', cancelForGridInput);
       scrollElement.removeEventListener('pointerdown', cancelForGridInput);
       scrollElement.removeEventListener('touchstart', cancelForGridInput);
@@ -93,7 +101,7 @@ export default function LibraryIndexRail({ anchors, hideLabels = false, scrollRa
   }, [visibleAnchors.length]);
 
   if (visibleAnchors.length === 0) return null;
-  const thumbPosition = clampRatio(dragging && active ? active.position : scrollRatio);
+  const thumbPosition = clampRatio(dragging && active ? active.position : liveScrollRatio);
 
   function pick(clientY: number): PickResult | null {
     const rect = railRef.current?.getBoundingClientRect();
@@ -160,7 +168,6 @@ export default function LibraryIndexRail({ anchors, hideLabels = false, scrollRa
       }}
       onPointerLeave={() => {
         if (!draggingRef.current) {
-          cancelWheelAnimation();
           setActive(null);
         }
       }}

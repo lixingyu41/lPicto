@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -34,8 +36,8 @@ import AssetRecordDeleteDialog from '../components/AssetRecordDeleteDialog';
 import RatingStars, { normalizeAssetRating } from '../components/RatingStars';
 import { formatBytes, formatDateTime, formatDuration } from '../utils/format';
 import ImageViewer from '../viewer/ImageViewer';
-import VideoViewer, { type VideoPlaybackInfo } from '../viewer/VideoViewer';
-import AudioViewer, { type AudioPlaybackInfo } from '../viewer/AudioViewer';
+import type { VideoPlaybackInfo } from '../viewer/VideoViewer';
+import type { AudioPlaybackInfo } from '../viewer/AudioViewer';
 import { viewerAudioOutputBridge } from '../viewer/audioOutputBridge';
 import type { ViewerMediaLayerMode } from '../viewer/mediaLayer';
 import type { ViewerMediaPlaybackController } from '../viewer/mediaPlaybackController';
@@ -65,6 +67,9 @@ import {
   saveViewerPanelWidth,
 } from '../utils/viewerPanelPrefs';
 
+const AudioViewer = lazy(() => import('../viewer/AudioViewer'));
+const VideoViewer = lazy(() => import('../viewer/VideoViewer'));
+
 interface WheelBase {
   current: Asset;
   next: Asset[];
@@ -87,9 +92,8 @@ interface SafariFullscreenVideo extends HTMLVideoElement {
   webkitExitFullscreen?: () => void;
 }
 
-const wheelStepThreshold = 60;
-const wheelGestureUnlockMs = 70;
-const wheelStepCooldownMs = 90;
+const wheelPixelStep = 40;
+const wheelCommitDelayMs = 120;
 const mobileSwipeThresholdPx = 56;
 const mobileSwipeAxisRatio = 1.25;
 const mobileSwipeClickSuppressMs = 500;
@@ -153,9 +157,12 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const [neighbors, setNeighbors] = useState<Neighbors | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sidecars, setSidecars] = useState<AssetSidecars | null>(null);
+  const [sidecarsAssetId, setSidecarsAssetId] = useState<number | null>(null);
   const [sidecarError, setSidecarError] = useState<string | null>(null);
   const [assetTags, setAssetTags] = useState<AssetTag[]>([]);
+  const [assetTagsAssetId, setAssetTagsAssetId] = useState<number | null>(null);
 	const [assetAI, setAssetAI] = useState<AssetAIResult | null>(null);
+	const [assetAIAssetId, setAssetAIAssetId] = useState<number | null>(null);
 	const [assetAIError, setAssetAIError] = useState<string | null>(null);
   const [aiTagError, setAITagError] = useState<string | null>(null);
   const [aiTagSaving, setAITagSaving] = useState(false);
@@ -169,7 +176,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const [videoPlaybackInfo, setVideoPlaybackInfo] = useState<VideoPlaybackInfo | null>(null);
   const [audioPlaybackInfo, setAudioPlaybackInfo] = useState<AudioPlaybackInfo | null>(null);
   const [videoProxyRuntime, setVideoProxyRuntime] = useState<VideoSegmentStatus | null>(null);
-	const [viewerHasFocus, setViewerHasFocus] = useState(() => document.visibilityState === 'visible' && document.hasFocus());
+	const [viewerPageVisible, setViewerPageVisible] = useState(() => document.visibilityState === 'visible');
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deletePlan, setDeletePlan] = useState<AssetDeletePlan | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -185,9 +192,10 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const [viewerAvailableWidth, setViewerAvailableWidth] = useState(() => window.innerWidth);
   const wheelBase = useRef<WheelBase | null>(null);
   const wheelDelta = useRef(0);
-  const wheelGestureLocked = useRef(false);
-  const lastWheelStepAt = useRef(-Infinity);
-  const wheelGestureTimer = useRef<number | null>(null);
+  const wheelPendingSteps = useRef(0);
+  const wheelFrame = useRef<number | null>(null);
+  const wheelCommitTimer = useRef<number | null>(null);
+  const wheelSelectedAsset = useRef<Asset | null>(null);
   const mobileSwipeRef = useRef<{ pointerId: number; startX: number; startY: number } | null>(null);
   const suppressMobileClickUntilRef = useRef(0);
   const viewerRef = useRef<HTMLElement | null>(null);
@@ -202,7 +210,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const backgroundLocation = viewerLocationState?.backgroundLocation;
   const assetId = Number(params.assetId || assetIdFromPath(location.pathname) || 0);
   const initialAsset = viewerLocationState?.initialAsset?.id === assetId ? viewerLocationState.initialAsset : undefined;
-  const [displayedAsset, setDisplayedAsset] = useState<Asset | undefined>();
+  const [selectedAsset, setSelectedAsset] = useState<Asset | undefined>();
   const [mediaWindow, setMediaWindow] = useState<Asset[]>([]);
   const [preparedMediaStatus, setPreparedMediaStatus] = useState<Record<string, PreparedMediaStatus>>({});
   const [priorityReadyKey, setPriorityReadyKey] = useState('');
@@ -210,8 +218,10 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   const currentAssetIdRef = useRef<number | null>(null);
   const currentCacheKeyRef = useRef('');
   const currentAssetRef = useRef<Asset | undefined>(undefined);
-  const displayedMediaKeyRef = useRef('');
   const failedMediaKeyRef = useRef('');
+  const sidecarsCacheRef = useRef(new Map<number, AssetSidecars>());
+  const assetTagsCacheRef = useRef(new Map<number, AssetTag[]>());
+  const assetAICacheRef = useRef(new Map<number, AssetAIResult>());
 
   useLayoutEffect(() => {
     const viewer = viewerRef.current;
@@ -249,7 +259,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     const controller = new AbortController();
     async function load() {
       try {
-        const result = await api.neighbors(assetId, query, controller.signal);
+        const result = await api.neighbors(assetId, { ...query, limit: 50 }, controller.signal);
         if (!live) return;
         setNeighbors(result);
         setError(null);
@@ -268,14 +278,15 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
 
   const activeNeighbors = neighbors?.current.id === assetId ? neighbors : null;
   const activeNeighborAssetId = activeNeighbors?.current.id ?? null;
-  const current = activeNeighbors?.current ?? initialAsset;
+  const committedAsset = activeNeighbors?.current ?? initialAsset;
+  const current = selectedAsset ?? committedAsset;
   const currentAssetId = current?.id ?? null;
   currentAssetIdRef.current = currentAssetId;
   currentCacheKeyRef.current = current?.cacheKey ?? '';
   currentAssetRef.current = current;
   const currentMediaKey = current ? mediaReadyKey(current.id, current.cacheKey) : '';
-  const displayedMediaKey = displayedAsset ? mediaReadyKey(displayedAsset.id, displayedAsset.cacheKey) : '';
-  displayedMediaKeyRef.current = displayedMediaKey;
+  const committedMediaKey = committedAsset ? mediaReadyKey(committedAsset.id, committedAsset.cacheKey) : '';
+  const displayedMediaKey = currentMediaKey;
   const currentMediaFailed = Boolean(currentMediaKey) && mediaLoadFailure?.key === currentMediaKey;
   const currentPreparedStatus = currentMediaKey ? preparedMediaStatus[currentMediaKey] : undefined;
   const currentPriorityReady = Boolean(currentMediaKey) && (
@@ -291,7 +302,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
 			: 0;
 	const neighborPreloadAllowed = videoActivelyPlaying || audioActivelyPlaying
 		? activeBufferedAhead >= playingNeighborPreloadBufferSeconds
-		: viewerHasFocus;
+		: viewerPageVisible;
   const indicatorAssets = useMemo(() => viewerIndicatorAssets(neighbors, current), [current, neighbors]);
   const mediaWindowKeys = useMemo(
     () => new Set(mediaWindow.map((asset) => mediaReadyKey(asset.id, asset.cacheKey))),
@@ -311,13 +322,9 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   }, [currentMediaKey, currentPriorityReady, indicatorAssets, mediaWindowKeys, neighborPreloadAllowed, preparedMediaStatus]);
 
 	useEffect(() => {
-		const update = () => setViewerHasFocus(document.visibilityState === 'visible' && document.hasFocus());
-		window.addEventListener('focus', update);
-		window.addEventListener('blur', update);
+		const update = () => setViewerPageVisible(document.visibilityState === 'visible');
 		document.addEventListener('visibilitychange', update);
 		return () => {
-			window.removeEventListener('focus', update);
-			window.removeEventListener('blur', update);
 			document.removeEventListener('visibilitychange', update);
 		};
 	}, []);
@@ -332,21 +339,29 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       return 'idle';
     });
   }, [backgroundMediaPreloadKey, currentMediaKey, indicatorAssets, mediaWindowKeys, preparedMediaStatus]);
+  const viewerPreloadStatusByKey = useMemo(() => {
+    const statuses: Record<string, ViewerLoadIndicatorStatus> = {};
+    indicatorAssets.forEach((asset, index) => {
+      if (!asset) return;
+      statuses[mediaReadyKey(asset.id, asset.cacheKey)] = viewerPreloadIndicators[index] ?? 'idle';
+    });
+    return statuses;
+  }, [indicatorAssets, viewerPreloadIndicators]);
   const viewerNeighborSlots = useMemo(
     () => indicatorAssets.flatMap((asset, index) => (
       index === viewerIndicatorCenter ? [] : [{ asset, status: viewerPreloadIndicators[index] }]
     )),
     [indicatorAssets, viewerPreloadIndicators],
   );
-  const previousAsset = activeNeighbors?.previous[0];
-  const nextAsset = activeNeighbors?.next[0];
+  const previousAsset = indicatorAssets[viewerIndicatorCenter - 1];
+  const nextAsset = indicatorAssets[viewerIndicatorCenter + 1];
   const previousReady = Boolean(previousAsset && mediaNavigationReady(previousAsset, preparedMediaStatus[mediaReadyKey(previousAsset.id, previousAsset.cacheKey)]));
   const nextReady = Boolean(nextAsset && mediaNavigationReady(nextAsset, preparedMediaStatus[mediaReadyKey(nextAsset.id, nextAsset.cacheKey)]));
 
   useLayoutEffect(() => {
-    if (!current) return;
-    setDisplayedAsset((displayed) => displayed === current ? displayed : current);
-  }, [current]);
+    if (!committedAsset) return;
+    setSelectedAsset((selected) => selected === committedAsset ? selected : committedAsset);
+  }, [committedAsset]);
 
   useLayoutEffect(() => {
     if (!current) return;
@@ -355,18 +370,9 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
 
   useLayoutEffect(() => {
     if (!activeNeighbors) return;
-    const desired = viewerMediaWindow(activeNeighbors);
-    const desiredKeys = new Set(desired.map((asset) => mediaReadyKey(asset.id, asset.cacheKey)));
-    if (
-      displayedAsset &&
-      displayedMediaKey !== currentMediaKey &&
-      currentPreparedStatus !== 'ready' &&
-      !desiredKeys.has(displayedMediaKey)
-    ) {
-      desired.push(displayedAsset);
-    }
+    const desired = viewerMediaWindow(activeNeighbors, current);
     setMediaWindow((existing) => mergeMediaWindow(existing, desired));
-  }, [activeNeighbors, currentMediaKey, currentPreparedStatus, displayedAsset, displayedMediaKey]);
+  }, [activeNeighbors, current]);
 
   useEffect(() => {
     const retainedKeys = new Set(mediaWindow.map((asset) => mediaReadyKey(asset.id, asset.cacheKey)));
@@ -408,14 +414,16 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
 			try {
 				const result = await api.assetAI(asset.id);
 				if (!live) return;
-				setAssetAI(result); setAssetAIError(null);
+				assetAICacheRef.current.set(asset.id, result);
+				setAssetAI(result); setAssetAIAssetId(asset.id); setAssetAIError(null);
 				if (result.status === 'pending' || result.status === 'processing') timer = window.setTimeout(() => void loadAI(asset), 5000);
 			} catch (err) {
 				if (!live) return;
-				setAssetAI(null); setAssetAIError(err instanceof Error ? err.message : '读取 AI 结果失败');
+				setAssetAI(null); setAssetAIAssetId(asset.id); setAssetAIError(err instanceof Error ? err.message : '读取 AI 结果失败');
 			}
 		}
-		setAssetAI(null); setAssetAIError(null); setAITagError(null);
+		const cached = current ? assetAICacheRef.current.get(current.id) : undefined;
+		setAssetAI(cached ?? null); setAssetAIAssetId(cached && current ? current.id : null); setAssetAIError(null); setAITagError(null);
 		if (current && current.mediaType !== 'audio') void loadAI(current);
 		return () => { live = false; window.clearTimeout(timer); };
 	}, [current?.id]);
@@ -424,37 +432,11 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     if (activeNeighborAssetId === null) return;
     wheelBase.current = null;
     wheelDelta.current = 0;
+    wheelPendingSteps.current = 0;
   }, [activeNeighborAssetId]);
 
   const currentVideoProxyRuntime =
     videoProxyRuntime && currentAssetId !== null && videoProxyRuntime.assetId === currentAssetId ? videoProxyRuntime : null;
-
-  useEffect(() => {
-    if (!current || current.mediaType !== 'video' || current.browserPlayable) {
-      setVideoProxyRuntime(null);
-      return undefined;
-    }
-    let active = true;
-    let timer = 0;
-    const poll = async () => {
-      let nextDelay = 3000;
-      try {
-        const runtime = await api.videoSegmentStatus(current.id);
-        if (!active || runtime.assetId !== current.id) return;
-        setVideoProxyRuntime(runtime);
-        if (runtime.transcoding || runtime.queued) nextDelay = 1000;
-      } catch {
-        // Playback remains authoritative; status information is advisory.
-      } finally {
-        if (active) timer = window.setTimeout(poll, nextDelay);
-      }
-    };
-    void poll();
-    return () => {
-      active = false;
-      window.clearTimeout(timer);
-    };
-  }, [current?.browserPlayable, current?.cacheKey, current?.id, current?.mediaType]);
 
   const handleProxyRuntimeChange = useCallback(
     (sourceAssetId: number, runtime: VideoSegmentStatus | null) => {
@@ -477,7 +459,9 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       try {
         const result = await api.assetSidecars(asset.id);
         if (!live) return;
+        sidecarsCacheRef.current.set(asset.id, result);
         setSidecars(result);
+        setSidecarsAssetId(asset.id);
         setSidecarError(null);
         const defaultID = result.defaultSubtitleId ?? result.subtitles[0]?.id ?? '';
         setSelectedSubtitleId(defaultID);
@@ -485,15 +469,22 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       } catch (err) {
         if (!live) return;
         setSidecars(null);
+        setSidecarsAssetId(asset.id);
         setSidecarError(err instanceof Error ? err.message : '读取附加信息失败');
         setSelectedSubtitleId('');
         setSubtitlesEnabled(false);
       }
     }
     if (current) {
+      const cached = sidecarsCacheRef.current.get(current.id);
+      if (cached) {
+        setSidecars(cached);
+        setSidecarsAssetId(current.id);
+      }
       void loadSidecars(current);
     } else {
       setSidecars(null);
+      setSidecarsAssetId(null);
       setSidecarError(null);
       setSelectedSubtitleId('');
       setSubtitlesEnabled(false);
@@ -509,18 +500,27 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       try {
         const result = await api.assetTags(asset.id);
         if (!live) return;
+        assetTagsCacheRef.current.set(asset.id, result.items);
         setAssetTags(result.items);
+        setAssetTagsAssetId(asset.id);
         setTagError(null);
       } catch (err) {
         if (!live) return;
         setAssetTags([]);
+        setAssetTagsAssetId(asset.id);
         setTagError(err instanceof Error ? err.message : '读取标签失败');
       }
     }
     if (current) {
+      const cached = assetTagsCacheRef.current.get(current.id);
+      if (cached) {
+        setAssetTags(cached);
+        setAssetTagsAssetId(current.id);
+      }
       void loadTags(current);
     } else {
       setAssetTags([]);
+      setAssetTagsAssetId(null);
       setTagError(null);
     }
     setTagDraft('');
@@ -608,7 +608,6 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     const readyAsset = currentAssetRef.current;
     if (!readyAsset || readyAsset.id !== sourceAssetId || readyAsset.cacheKey !== sourceCacheKey) return;
     if (readyAsset.mediaType !== 'video' || readyAsset.browserPlayable) setPriorityReadyKey(key);
-    setDisplayedAsset(readyAsset);
   }, []);
 
   const handlePosterReady = useCallback((sourceAssetId: number, sourceCacheKey: string) => {
@@ -628,14 +627,12 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     failedMediaKeyRef.current = key;
     setMediaLoadFailure({
       key,
-      message: displayedMediaKeyRef.current && displayedMediaKeyRef.current !== key
-        ? `${message}，已保留上一画面`
-        : message,
+      message,
     });
   }, []);
 
-  const goAsset = useCallback(
-    (asset: Asset | undefined, _direction: -1 | 0 | 1 = 0) => {
+  const revealAsset = useCallback(
+    (asset: Asset | undefined) => {
       if (!asset) return;
       const source = currentAssetRef.current;
       if (
@@ -648,12 +645,17 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           mediaReadyKey(asset.id, asset.cacheKey),
         );
       }
-      // Reveal the target's already-cached thumbnail before URL and neighbour
-      // state update. The full image or video frame replaces it independently.
       flushSync(() => {
-        setDisplayedAsset(asset);
+        setSelectedAsset(asset);
         setMediaWindow((existing) => mergeMediaWindow(existing, [asset, ...existing]));
       });
+    },
+    [],
+  );
+
+  const commitAsset = useCallback(
+    (asset: Asset | undefined) => {
+      if (!asset) return;
       const destination = { pathname: `/viewer/${asset.id}`, search: searchParams.toString() };
       navigate(
         destination,
@@ -663,6 +665,20 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       );
     },
     [backgroundLocation, navigate, overlay, searchParams],
+  );
+
+  const goAsset = useCallback(
+    (asset: Asset | undefined, _direction: -1 | 0 | 1 = 0) => {
+      if (!asset) return;
+      if (wheelCommitTimer.current !== null) {
+        window.clearTimeout(wheelCommitTimer.current);
+        wheelCommitTimer.current = null;
+      }
+      wheelSelectedAsset.current = null;
+      revealAsset(asset);
+      commitAsset(asset);
+    },
+    [commitAsset, revealAsset],
   );
 
   const handleViewerTouchStart = useCallback((event: ReactTouchEvent<HTMLDivElement>) => {
@@ -777,65 +793,82 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     return () => window.removeEventListener('keydown', handleMediaKey);
   }, [audioPlaybackInfo?.playing, current, runMediaControl, videoPlaybackInfo?.paused]);
 
-  const goWheelStep = useCallback(
-    (direction: 1 | -1) => {
+  const goWheelSteps = useCallback(
+    (steps: number) => {
+      if (!steps) return;
       const base =
         wheelBase.current ??
         (activeNeighbors
           ? { current: activeNeighbors.current, next: activeNeighbors.next, offset: 0, previous: activeNeighbors.previous }
           : null);
       if (!base) return;
-
-      const nextOffset = base.offset + direction;
-      const target = wheelTargetAtOffset(base, nextOffset);
+      const direction = steps > 0 ? 1 : -1;
+      let nextOffset = base.offset;
+      let target: Asset | undefined;
+      for (let index = 0; index < Math.abs(steps); index += 1) {
+        const candidateOffset = nextOffset + direction;
+        const candidate = wheelTargetAtOffset(base, candidateOffset);
+        if (!candidate) break;
+        nextOffset = candidateOffset;
+        target = candidate;
+      }
       if (!target) return;
-
       base.offset = nextOffset;
       wheelBase.current = base;
-      goAsset(target, direction);
+      wheelSelectedAsset.current = target;
+      revealAsset(target);
+      if (wheelCommitTimer.current !== null) window.clearTimeout(wheelCommitTimer.current);
+      wheelCommitTimer.current = window.setTimeout(() => {
+        wheelCommitTimer.current = null;
+        const selected = wheelSelectedAsset.current;
+        if (!selected) return;
+        wheelSelectedAsset.current = null;
+        commitAsset(selected);
+      }, wheelCommitDelayMs);
     },
-    [activeNeighbors, goAsset],
+    [activeNeighbors, commitAsset, revealAsset],
   );
 
   useEffect(() => {
     const handleWheel = (event: WheelEvent) => {
       if (!wheelBelongsToViewer(event, viewerRef.current)) return;
-      if (wheelGestureTimer.current !== null) window.clearTimeout(wheelGestureTimer.current);
-      wheelGestureTimer.current = window.setTimeout(() => {
-        wheelGestureLocked.current = false;
-        wheelGestureTimer.current = null;
-        wheelDelta.current = 0;
-      }, wheelGestureUnlockMs);
       if (isViewerWheelControl(event)) {
         wheelDelta.current = 0;
         return;
       }
-      if (isImageZoomWheel(event)) {
+      if (isMediaZoomWheel(event)) {
         wheelDelta.current = 0;
         return;
       }
       if (event.cancelable) event.preventDefault();
-      if (wheelGestureLocked.current) return;
-      wheelDelta.current += normalizedViewerWheelDelta(event);
-      if (Math.abs(wheelDelta.current) < wheelStepThreshold) return;
-      const now = performance.now();
-      if (now - lastWheelStepAt.current < wheelStepCooldownMs) return;
-      const direction = wheelDelta.current > 0 ? 1 : -1;
-      wheelDelta.current = 0;
-      wheelGestureLocked.current = true;
-      lastWheelStepAt.current = now;
-      goWheelStep(direction);
+      const delta = normalizedViewerWheelDelta(event);
+      if (event.deltaMode !== 0 || Math.abs(delta) >= 50) {
+        wheelPendingSteps.current += delta > 0 ? 1 : -1;
+      } else {
+        wheelDelta.current += delta;
+        const pixelSteps = Math.trunc(wheelDelta.current / wheelPixelStep);
+        if (pixelSteps !== 0) {
+          wheelPendingSteps.current += pixelSteps;
+          wheelDelta.current -= pixelSteps * wheelPixelStep;
+        }
+      }
+      if (wheelPendingSteps.current === 0 || wheelFrame.current !== null) return;
+      wheelFrame.current = window.requestAnimationFrame(() => {
+        wheelFrame.current = null;
+        const steps = wheelPendingSteps.current;
+        wheelPendingSteps.current = 0;
+        goWheelSteps(steps);
+      });
     };
     window.addEventListener('wheel', handleWheel, { capture: true, passive: false });
     return () => {
       window.removeEventListener('wheel', handleWheel, true);
-      if (wheelGestureTimer.current !== null) {
-        window.clearTimeout(wheelGestureTimer.current);
-        wheelGestureTimer.current = null;
-      }
-      wheelGestureLocked.current = false;
+      if (wheelFrame.current !== null) window.cancelAnimationFrame(wheelFrame.current);
+      wheelFrame.current = null;
+      if (wheelCommitTimer.current !== null) window.clearTimeout(wheelCommitTimer.current);
+      wheelCommitTimer.current = null;
     };
-  }, [goWheelStep]);
+  }, [goWheelSteps]);
 
   const leave = useCallback(() => {
     if (overlay) {
@@ -979,6 +1012,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     setTagError(null);
     try {
       const result = await api.addAssetTag(current.id, tag);
+      assetTagsCacheRef.current.set(current.id, result.items);
       setAssetTags(result.items);
       setTagDraft('');
       return true;
@@ -991,14 +1025,17 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
   }, [current, tagDraft, tagSaving]);
 
   const removeCurrentAssetTag = useCallback(async (tag: string) => {
-    if (!current || tagSaving) return;
+    if (!current || tagSaving) return false;
     setTagSaving(true);
     setTagError(null);
     try {
       const result = await api.removeAssetTag(current.id, tag);
+      assetTagsCacheRef.current.set(current.id, result.items);
       setAssetTags(result.items);
+      return true;
     } catch (err) {
       setTagError(err instanceof Error ? err.message : '删除标签失败');
+      return false;
     } finally {
       setTagSaving(false);
     }
@@ -1015,6 +1052,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     setAITagError(null);
     try {
       const result = await api.replaceAssetAITag(current.id, payload);
+      assetAICacheRef.current.set(current.id, result);
       setAssetAI(result);
       return true;
     } catch (err) {
@@ -1031,6 +1069,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     setAITagError(null);
     try {
       const result = await api.deleteAssetAITag(current.id, tag);
+      assetAICacheRef.current.set(current.id, result);
       setAssetAI(result);
       return true;
     } catch (err) {
@@ -1190,13 +1229,13 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     <ViewerSidebarPanel
       asset={current}
       error={error}
-      sidecarError={sidecarError}
-      sidecars={sidecars}
-      tags={assetTags}
+      sidecarError={sidecarsAssetId === currentAssetId ? sidecarError : null}
+      sidecars={sidecarsAssetId === currentAssetId ? sidecars : null}
+      tags={assetTagsAssetId === currentAssetId ? assetTags : []}
       preloadIndicators={viewerPreloadIndicators}
       neighborSlots={viewerNeighborSlots}
-      aiResult={assetAI}
-      aiError={assetAIError}
+      aiResult={assetAIAssetId === currentAssetId ? assetAI : null}
+      aiError={assetAIAssetId === currentAssetId ? assetAIError : null}
       aiTagError={aiTagError}
       aiTagSaving={aiTagSaving}
       tagDraft={tagDraft}
@@ -1212,10 +1251,14 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
       onNFOSearch={searchByNFOValue}
       onTagDraftChange={setTagDraft}
       onAddTag={addCurrentAssetTag}
-      onRemoveTag={(tag) => void removeCurrentAssetTag(tag)}
+      onRemoveTag={removeCurrentAssetTag}
       onSaveAITag={saveCurrentAITag}
       onRemoveAITag={removeCurrentAITag}
-      onReanalyzeAI={() => current && void api.reanalyzeAssetAI(current.id).then(() => setAssetAI((value) => value ? { ...value, status: 'pending', error: undefined } : value))}
+      onReanalyzeAI={() => current && void api.reanalyzeAssetAI(current.id).then(() => setAssetAI((value) => {
+        const next = value ? { ...value, status: 'pending' as const, error: undefined } : value;
+        if (next) assetAICacheRef.current.set(current.id, next);
+        return next;
+      }))}
       onRatingChange={(rating) => void rateCurrentAsset(rating)}
     />
   );
@@ -1225,6 +1268,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
     const requestedCurrent = key === currentMediaKey;
     const displayed = key === displayedMediaKey;
     const layerMode: ViewerMediaLayerMode = displayed ? (requestedCurrent ? 'active' : 'hold') : 'prepare';
+    const playbackLayerMode: ViewerMediaLayerMode = layerMode === 'active' && key !== committedMediaKey ? 'prepare' : layerMode;
     const preloadEnabled = requestedCurrent
       || displayed
       || preparedMediaStatus[key] === 'ready'
@@ -1252,6 +1296,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onDeleteRecord={openRecordDeleteDialog}
           onMediaError={handleMediaError}
           onMediaReady={handleMediaReady}
+          onPosterReady={handlePosterReady}
           playbackMode={viewerPrefs.playbackMode}
           slideshowSeconds={viewerPrefs.imageSlideshowSeconds}
           onPlaybackEnded={playNextAsset}
@@ -1260,15 +1305,15 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onToggleFullscreen={toggleFullscreen}
         />
         ) : asset.mediaType === 'video' ? (
-        <VideoViewer
+        <Suspense fallback={null}><VideoViewer
           asset={asset}
           fullscreen={fullscreen}
-          layerMode={layerMode}
+          layerMode={playbackLayerMode}
           playbackRate={playbackRate}
           viewerPrefs={viewerPrefs}
           selectedSubtitleId={selectedSubtitleId}
-          subtitles={layerMode === 'active' ? sidecars?.subtitles ?? [] : []}
-          subtitlesEnabled={layerMode === 'active' && subtitlesEnabled}
+          subtitles={playbackLayerMode === 'active' && sidecarsAssetId === asset.id ? sidecars?.subtitles ?? [] : []}
+          subtitlesEnabled={playbackLayerMode === 'active' && sidecarsAssetId === asset.id && subtitlesEnabled}
           deleting={deleteLoading || deleteSubmitting || recordDeleteSubmitting}
           onDanmakuPrefChange={updateDanmakuPref}
           onDelete={openDeleteDialog}
@@ -1291,15 +1336,15 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onSubtitlesEnabledChange={updateSubtitlesEnabled}
           onToggleFullscreen={toggleFullscreen}
           onProxyRuntimeChange={handleCurrentProxyRuntimeChange}
-        />
+        /></Suspense>
         ) : (
-        <AudioViewer
+        <Suspense fallback={null}><AudioViewer
           asset={asset}
           deleting={deleteLoading || deleteSubmitting || recordDeleteSubmitting}
           fullscreen={fullscreen}
-          layerMode={layerMode}
+          layerMode={playbackLayerMode}
           playbackRate={playbackRate}
-          preloadEnabled={preloadEnabled}
+          preloadEnabled={playbackLayerMode === 'active'}
           viewerPrefs={viewerPrefs}
           onDelete={openDeleteDialog}
           onDeleteRecord={openRecordDeleteDialog}
@@ -1315,14 +1360,28 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           onPlaybackModeChange={updatePlaybackMode}
           onPlaybackRateChange={updatePlaybackRate}
           onToggleFullscreen={toggleFullscreen}
-        />
+        /></Suspense>
         )}
       </div>
     );
   };
 
+  const fittedViewerPanelWidth = fitViewerPanelWidth(viewerPanelWidth, viewerAvailableWidth);
+
+  useLayoutEffect(() => {
+    const shell = viewerRef.current?.closest<HTMLElement>('.app-shell');
+    if (!shell) return;
+    // Let the pinned top bar cover the resize gutter at the top edge so the
+    // media bar and information panel meet without a visible vertical seam.
+    const offset = viewerInfoPanelState.visible ? fittedViewerPanelWidth : 0;
+    shell.style.setProperty('--viewer-info-offset', `${offset}px`);
+    return () => {
+      shell.style.removeProperty('--viewer-info-offset');
+    };
+  }, [fittedViewerPanelWidth, viewerInfoPanelState.visible]);
+
   const viewerStyle = {
-    '--viewer-info-width': `${fitViewerPanelWidth(viewerPanelWidth, viewerAvailableWidth)}px`,
+    '--viewer-info-width': `${fittedViewerPanelWidth}px`,
   } as CSSProperties;
 
   return (
@@ -1350,6 +1409,7 @@ export default function ViewerPage({ overlay = false }: ViewerPageProps) {
           <FullscreenMediaFilmstrip
             current={current}
             fullscreen={fullscreen}
+            loadStatusByKey={viewerPreloadStatusByKey}
             neighborQuery={query}
             next={activeNeighbors?.next ?? []}
             previous={activeNeighbors?.previous ?? []}
@@ -1406,8 +1466,8 @@ function assetIdFromPath(pathname: string) {
   return match?.[1] ?? '';
 }
 
-function isImageZoomWheel(event: WheelEvent) {
-  return event.target instanceof Element && Boolean(event.target.closest('.image-stage.zooming'));
+function isMediaZoomWheel(event: WheelEvent) {
+  return event.target instanceof Element && Boolean(event.target.closest('.image-stage.zooming, .video-stage.video-hold-zoom-active'));
 }
 
 function isViewerWheelControl(event: WheelEvent) {
@@ -1536,7 +1596,7 @@ function ViewerSidebarPanel({
   onNFOSearch: (field: NFOFilterField | 'nfo', value: string) => void;
   onTagDraftChange: (value: string) => void;
   onAddTag: (tag?: string) => Promise<boolean>;
-  onRemoveTag: (tag: string) => void;
+  onRemoveTag: (tag: string) => Promise<boolean>;
   onSaveAITag: (payload: { previousTag?: string; tag: string; categoryKey: string; subjectKey: string }) => Promise<boolean>;
   onRemoveAITag: (tag: string) => Promise<boolean>;
 	onReanalyzeAI: () => void;
@@ -1769,6 +1829,7 @@ const filmstripNeighborPageSize = 12;
 function FullscreenMediaFilmstrip({
   current,
   fullscreen,
+  loadStatusByKey,
   neighborQuery,
   next,
   onSelect,
@@ -1776,6 +1837,7 @@ function FullscreenMediaFilmstrip({
 }: {
   current?: Asset;
   fullscreen: boolean;
+  loadStatusByKey: Record<string, ViewerLoadIndicatorStatus>;
   neighborQuery: Record<string, string>;
   next: Asset[];
   onSelect: (asset: Asset | undefined, direction?: -1 | 0 | 1) => void;
@@ -1946,6 +2008,7 @@ function FullscreenMediaFilmstrip({
                   currentRef={selected ? (element) => { currentItemRef.current = element; } : undefined}
                   direction={index < currentIndex ? -1 : 1}
                   key={mediaReadyKey(asset.id, asset.cacheKey)}
+                  loadStatus={loadStatusByKey[mediaReadyKey(asset.id, asset.cacheKey)] ?? 'idle'}
                   selected={selected}
                   onSelect={onSelect}
                 />
@@ -1962,12 +2025,14 @@ function FullscreenMediaFilmstripItem({
   asset,
   currentRef,
   direction,
+  loadStatus,
   onSelect,
   selected,
 }: {
   asset: Asset;
   currentRef?: (element: HTMLButtonElement | null) => void;
   direction: -1 | 1;
+  loadStatus: ViewerLoadIndicatorStatus;
   onSelect: (asset: Asset | undefined, direction?: -1 | 0 | 1) => void;
   selected: boolean;
 }) {
@@ -2014,6 +2079,11 @@ function FullscreenMediaFilmstripItem({
           onError={(event) => { event.currentTarget.hidden = true; }}
         />
       )}
+      <span
+        aria-label={loadStatus === 'ready' ? '加载好了' : loadStatus === 'loading' ? '加载过程中' : '没有加载'}
+        className={`sidebar-viewer-preload-dot viewer-neighbor-thumbnail-status ${loadStatus}`}
+        title={loadStatus === 'ready' ? '加载好了' : loadStatus === 'loading' ? '加载过程中' : '没有加载'}
+      />
       {selected && <span className="viewer-filmstrip-current-indicator" aria-hidden="true" />}
     </button>
   );
@@ -2085,6 +2155,7 @@ function ViewerEditableAITags({
   onSave: (draft: EditableAITagDraft) => Promise<boolean>;
 }) {
   const [draft, setDraft] = useState<EditableAITagDraft | null>(null);
+  const [pendingDeleteTag, setPendingDeleteTag] = useState('');
   const selectedKindKey = draft ? `${draft.categoryKey}.${draft.subjectKey}` : '';
   const selectedKind = aiTagKinds.find((kind) => kind.key === selectedKindKey) ?? aiTagKinds[0];
   const fixedOptions = selectedKind.options
@@ -2152,9 +2223,7 @@ function ViewerEditableAITags({
                     disabled={saving}
                     type="button"
                     title={`删除 ${item.tag}`}
-                    onClick={() => void onRemove(item.tag).then((removed) => {
-                      if (removed && draft?.previousTag === item.tag) setDraft(null);
-                    })}
+                    onClick={() => setPendingDeleteTag(item.tag)}
                   >
                     <X size={11} />
                   </button>
@@ -2195,6 +2264,18 @@ function ViewerEditableAITags({
           <button disabled={saving || !draft.tag.trim()} type="submit" title="保存"><Check size={13} /></button>
         </form>
       )}
+      {pendingDeleteTag && (
+        <ViewerTagDeleteConfirmDialog
+          saving={saving}
+          tag={pendingDeleteTag}
+          onCancel={() => setPendingDeleteTag('')}
+          onConfirm={() => void onRemove(pendingDeleteTag).then((removed) => {
+            if (!removed) return;
+            if (draft?.previousTag === pendingDeleteTag) setDraft(null);
+            setPendingDeleteTag('');
+          })}
+        />
+      )}
     </div>
   );
 }
@@ -2214,9 +2295,10 @@ function SidebarAssetTags({
   tags: AssetTag[];
   onAdd: (tag?: string) => Promise<boolean>;
   onDraftChange: (value: string) => void;
-  onRemove: (tag: string) => void;
+  onRemove: (tag: string) => Promise<boolean>;
 }) {
   const [adding, setAdding] = useState(false);
+  const [pendingDeleteTag, setPendingDeleteTag] = useState('');
   const [options, setOptions] = useState<TagSummary[]>([]);
   const [optionsLoading, setOptionsLoading] = useState(false);
   const [optionsError, setOptionsError] = useState('');
@@ -2283,7 +2365,7 @@ function SidebarAssetTags({
         {tags.map((item) => (
           <span className="sidebar-asset-tag" key={item.tag}>
             {item.tag}
-            <button type="button" title="删除标签" disabled={saving} onClick={() => onRemove(item.tag)}>
+            <button type="button" title="删除标签" disabled={saving} onClick={() => setPendingDeleteTag(item.tag)}>
               <X size={12} />
             </button>
           </span>
@@ -2354,7 +2436,61 @@ function SidebarAssetTags({
         </div>,
         document.body,
       )}
+      {pendingDeleteTag && (
+        <ViewerTagDeleteConfirmDialog
+          saving={saving}
+          tag={pendingDeleteTag}
+          onCancel={() => setPendingDeleteTag('')}
+          onConfirm={() => void onRemove(pendingDeleteTag).then((removed) => {
+            if (removed) setPendingDeleteTag('');
+          })}
+        />
+      )}
     </div>
+  );
+}
+
+function ViewerTagDeleteConfirmDialog({
+  onCancel,
+  onConfirm,
+  saving,
+  tag,
+}: {
+  onCancel: () => void;
+  onConfirm: () => void;
+  saving: boolean;
+  tag: string;
+}) {
+  return createPortal(
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !saving) onCancel();
+      }}
+    >
+      <div aria-label="确认删除标签" aria-modal="true" className="asset-delete-dialog viewer-tag-delete-dialog" role="dialog">
+        <div className="modal-title">
+          <span>确认删除标签</span>
+          <button disabled={saving} title="关闭" type="button" onClick={onCancel}><X size={17} /></button>
+        </div>
+        <div className="asset-delete-content">
+          <div className="asset-delete-summary">
+            <strong>删除“{tag}”标签？</strong>
+            <span>只会从当前媒体移除该标签，其他标签不会受到影响。</span>
+          </div>
+        </div>
+        <div className="modal-actions">
+          <span />
+          <button className="text-button" disabled={saving} type="button" onClick={onCancel}>取消</button>
+          <button className="command-button danger" disabled={saving} type="button" onClick={onConfirm}>
+            <Check size={16} />
+            {saving ? '删除中' : '确认删除'}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -2655,12 +2791,18 @@ function updateNeighborRating(neighbors: Neighbors, assetId: number, rating: Ass
   };
 }
 
-function viewerMediaWindow(neighbors: Neighbors) {
-  return uniqueMediaAssets([
-    ...neighbors.previous.slice(0, viewerRetainRadius).reverse(),
+function viewerMediaWindow(neighbors: Neighbors, selected: Asset | undefined) {
+  const sequence = [
+    ...neighbors.previous.slice().reverse(),
     neighbors.current,
-    ...neighbors.next.slice(0, viewerRetainRadius),
-  ]);
+    ...neighbors.next,
+  ];
+  const selectedIndex = selected ? sequence.findIndex((asset) => asset.id === selected.id) : -1;
+  if (selectedIndex < 0) return uniqueMediaAssets([selected]);
+  return uniqueMediaAssets(sequence.slice(
+    Math.max(0, selectedIndex - viewerRetainRadius),
+    selectedIndex + viewerRetainRadius + 1,
+  ));
 }
 
 function viewerIndicatorAssets(neighbors: Neighbors | null, current: Asset | undefined): Array<Asset | undefined> {
@@ -2669,9 +2811,9 @@ function viewerIndicatorAssets(neighbors: Neighbors | null, current: Asset | und
     return Array.from({ length: viewerIndicatorCount }, (_, index) => index === viewerIndicatorCenter ? current : undefined);
   }
   const sequence = [
-    ...neighbors.previous.slice(0, viewerRetainRadius + 1).reverse(),
+    ...neighbors.previous.slice().reverse(),
     neighbors.current,
-    ...neighbors.next.slice(0, viewerRetainRadius + 1),
+    ...neighbors.next,
   ];
   const currentIndex = sequence.findIndex((asset) => asset.id === current.id);
   if (currentIndex < 0) {

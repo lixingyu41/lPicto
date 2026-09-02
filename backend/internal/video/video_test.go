@@ -21,6 +21,20 @@ func TestHWAccelArgsWithDevice(t *testing.T) {
 	}
 }
 
+func TestDecodeInputArgsKeepsVAAPIFramesOnGPU(t *testing.T) {
+	got := DecodeInputArgs("vaapi", "/dev/dri/renderD128", true)
+	want := []string{"-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128", "-hwaccel_output_format", "vaapi"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
+func TestDecodeInputArgsDisabled(t *testing.T) {
+	if got := DecodeInputArgs("none", "", true); len(got) != 0 {
+		t.Fatalf("args = %#v, want empty", got)
+	}
+}
+
 func TestStreamProxyArgsUseFastSeekKeyframes(t *testing.T) {
 	got := StreamProxyArgs("in.mkv", 0, 23, "none", "", 0)
 	for _, want := range []string{"-g", "48", "-keyint_min", "24", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)"} {

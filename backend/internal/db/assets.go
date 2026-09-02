@@ -1257,7 +1257,17 @@ WHERE deleted_at IS NULL AND (
 		_ = proxyStatus
 		_ = browserPlayable
 	}
-	return items, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	storyboards, err := d.storyboardWorkItemsForRoots(ctx, nil, []string{model.StatusPending, model.StatusProcessing})
+	if err != nil {
+		return nil, err
+	}
+	return append(items, storyboards...), nil
 }
 
 func recoverableWorkStatus(status string) bool {

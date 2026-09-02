@@ -25,11 +25,13 @@ import (
 	"lpicto/backend/internal/cachepolicy"
 	"lpicto/backend/internal/config"
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/events"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/model"
 	"lpicto/backend/internal/scanner"
 	"lpicto/backend/internal/storage"
+	thumbworker "lpicto/backend/internal/thumb"
 	"lpicto/backend/internal/util"
 )
 
@@ -43,6 +45,7 @@ type Server struct {
 	logger       *slog.Logger
 	sourceHealth *storage.SourceHealth
 	cachePolicy  *cachepolicy.Manager
+	posterMaker  thumbworker.Processor
 	aiStager     *aiworker.Stager
 	mediaIO      *mediaIOScheduler
 	nasWatcher   *nasWatcherIntegration
@@ -125,16 +128,23 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 		liveVideoProxyMaxActive = 1
 	}
 	cachePolicy := cachepolicy.New(store.CacheRoot, database)
+	sourceHealth := storage.NewSourceHealth(store, 15*time.Second, cfg.RedisURL)
 	s := &Server{
-		cfg:                        cfg,
-		db:                         database,
-		store:                      store,
-		scanner:                    scan,
-		jobs:                       queue,
-		events:                     bus,
-		logger:                     logger,
-		sourceHealth:               storage.NewSourceHealth(store, 15*time.Second, cfg.RedisURL),
-		cachePolicy:                cachePolicy,
+		cfg:          cfg,
+		db:           database,
+		store:        store,
+		scanner:      scan,
+		jobs:         queue,
+		events:       bus,
+		logger:       logger,
+		sourceHealth: sourceHealth,
+		cachePolicy:  cachePolicy,
+		posterMaker: thumbworker.Processor{
+			DB: database, Store: store, ThumbLongEdge: cfg.ThumbLongEdge,
+			CommandTimeout: 90 * time.Second, Events: bus, Logger: logger,
+			Sources: sourceHealth, CachePolicy: cachePolicy,
+			FFmpegHWAccel: cfg.FFmpegHWAccel, FFmpegHWDevice: cfg.FFmpegHWDevice, FFmpegHWFallback: cfg.FFmpegHWFallback,
+		},
 		aiStager:                   &aiworker.Stager{DB: database, Store: store, Policy: cachePolicy},
 		mediaIO:                    &mediaIOScheduler{},
 		nasWatcher:                 newNASWatcherIntegration(strings.TrimSpace(cfg.NASWatcherToken) != "", cfg.NASWatcherOfflineAfter),
@@ -190,6 +200,8 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Post("/api/settings/tasks/{id}/run", s.runSystemTask)
 	r.Post("/api/settings/tasks/{id}/stop", s.stopSystemTask)
 	r.Post("/api/settings/media-library/reset", s.resetMediaLibrary)
+	r.Get("/api/settings/debug", s.debugSettings)
+	r.Put("/api/settings/debug", s.updateDebugSettings)
 	r.Get("/api/settings/video-proxy", s.videoProxySettings)
 	r.Put("/api/settings/video-proxy", s.updateVideoProxySettings)
 	r.Get("/api/settings/libraries", s.scanLibraries)
@@ -218,9 +230,11 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Delete("/api/collections/{id}", s.deleteCollection)
 	r.Get("/api/collections/{id}/assets", s.collectionAssets)
 	r.Get("/api/collections/{id}/anchors", s.collectionAnchors)
+	r.Get("/api/collections/{id}/selection", s.collectionAssetSelection)
 	r.Get("/api/ai/status", s.aiStatus)
 	r.Get("/api/ai/settings", s.aiSettings)
 	r.Put("/api/ai/settings", s.updateAISettings)
+	r.Post("/api/ai/settings/test", s.testAIComputeNode)
 	r.Post("/api/ai/run", s.runAIManually)
 	r.Post("/api/ai/stop", s.stopAIManually)
 	r.Post("/api/ai/reindex", s.reindexAI)
@@ -240,11 +254,13 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Delete("/api/albums/{id}", s.deleteAlbum)
 	r.Post("/api/albums/{id}/refresh", s.refreshAlbum)
 	r.Get("/api/albums/{id}/anchors", s.albumAnchors)
+	r.Get("/api/albums/{id}/selection", s.albumAssetSelection)
 	r.Get("/api/albums/{id}/assets", s.albumAssets)
 	r.Post("/api/albums/{id}/assets", s.addAlbumAssets)
 	r.Delete("/api/albums/{id}/assets", s.removeAlbumAssets)
 	r.Get("/api/library/assets", s.libraryAssets)
 	r.Get("/api/library/anchors", s.libraryAnchors)
+	r.Get("/api/library/selection", s.libraryAssetSelection)
 	r.Get("/api/library/nfo-options", s.libraryNFOOptions)
 	r.Get("/api/folders", s.folders)
 	r.Get("/api/folders/tree", s.folderTree)
@@ -252,6 +268,7 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Get("/api/folders/{id}", s.folder)
 	r.Get("/api/folders/{id}/assets", s.folderAssets)
 	r.Get("/api/folders/{id}/anchors", s.folderAnchors)
+	r.Get("/api/folders/{id}/selection", s.folderAssetSelection)
 	r.Get("/api/assets/{id}", s.asset)
 	r.Get("/api/assets/{id}/ai", s.assetAI)
 	r.Post("/api/assets/{id}/ai/reanalyze", s.reanalyzeAssetAI)
@@ -288,6 +305,7 @@ func NewServer(cfg config.Config, database *db.DB, store storage.Store, scan Sca
 	r.Get("/api/assets/{id}/audio-proxy/status", s.audioProxyStatus)
 	r.Post("/api/assets/{id}/video/cache/prewarm", s.prewarmDirectVideo)
 	r.Get("/api/assets/{id}/video-poster", s.videoPoster)
+	r.Post("/api/assets/{id}/video-poster/capture", s.captureVideoPoster)
 	r.Get("/api/assets/{id}/storyboard", s.assetStoryboard)
 	r.Post("/api/assets/{id}/storyboard/generate", s.generateAssetStoryboard)
 	r.Get("/api/assets/{id}/storyboard/{sheet}", s.assetStoryboardSheet)
@@ -352,7 +370,7 @@ func mediaTransferCORS(next http.Handler) http.Handler {
 		if isStreamingAssetRequest(r.URL.Path) || strings.HasSuffix(r.URL.Path, "/original") {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Range, X-LPicto-Segment-Priority")
+			w.Header().Set("Access-Control-Allow-Headers", "Range, X-LPicto-Segment-Priority, X-LPicto-Client-ID, X-LPicto-Session-ID, X-LPicto-Transcoder")
 			w.Header().Set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range, ETag")
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusNoContent)
@@ -784,11 +802,17 @@ func (s *Server) neighbors(w http.ResponseWriter, r *http.Request) {
 		folderID = v
 	}
 	albumID := int64QueryPtr(r, "albumId")
+	limit := intQuery(r, "limit", 12)
+	if limit < 1 {
+		limit = 1
+	} else if limit > 50 {
+		limit = 50
+	}
 	opts := db.NeighborOptions{
 		Context: contextName, AssetID: id, Type: typeFilter, Sort: safeSort(r.URL.Query().Get("sort")), Group: safeGroup(r.URL.Query().Get("group")),
 		Query: strings.TrimSpace(r.URL.Query().Get("q")), FolderID: folderID,
 		CombinedQuery: strings.TrimSpace(r.URL.Query().Get("combinedQuery")),
-		From:          int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: 12, Recursive: boolQuery(r, "recursive", false),
+		From:          int64QueryPtr(r, "from"), To: int64QueryPtr(r, "to"), Limit: limit, Recursive: boolQuery(r, "recursive", false),
 		NFOQuery:      strings.TrimSpace(r.URL.Query().Get("nfo")),
 		NFOActor:      strings.TrimSpace(r.URL.Query().Get("nfoActor")),
 		NFOID:         strings.TrimSpace(r.URL.Query().Get("nfoId")),
@@ -990,6 +1014,10 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "not_image", "资源不是图片")
 		return
 	}
+	if debugcontrol.BackgroundProcessingPaused() {
+		s.serveCacheAsset(w, r, asset, "previews", "webp", "image/webp", "preview")
+		return
+	}
 	if err := s.ensureViewerPreview(r.Context(), asset); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
@@ -1004,7 +1032,32 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) videoPoster(w http.ResponseWriter, r *http.Request) {
-	s.serveCache(w, r, "thumbs", "webp", "image/webp", "thumb")
+	asset, ok := s.assetByParam(w, r)
+	if !ok {
+		return
+	}
+	path, err := s.store.CachePath("thumbs", asset.CacheKey, "webp")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "cache_path_failed", "读取视频封面失败")
+		return
+	}
+	releaseCache := s.cachePolicy.Pin(path)
+	defer releaseCache()
+	file, err := os.Open(path)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "cache_not_ready", "视频封面尚未生成")
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		writeError(w, http.StatusNotFound, "cache_not_ready", "视频封面尚未生成")
+		return
+	}
+	w.Header().Set("Content-Type", "image/webp")
+	w.Header().Set("Cache-Control", "public, max-age=0, must-revalidate")
+	w.Header().Set("ETag", fmt.Sprintf(`"%s-%d-%d"`, asset.CacheKey, info.ModTime().UnixNano(), info.Size()))
+	http.ServeContent(w, r, asset.Filename+".webp", info.ModTime(), file)
 }
 
 func (s *Server) original(w http.ResponseWriter, r *http.Request) {
@@ -1103,6 +1156,10 @@ func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 	}
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
+		return
+	}
 	if available, _ := s.sourceHealth.AvailableForRel(asset.RelPath); !available {
 		writeError(w, http.StatusServiceUnavailable, "source_unavailable", "源文件暂时不可用")
 		return
@@ -1146,7 +1203,23 @@ func (s *Server) serveOriginalAssetFile(w http.ResponseWriter, r *http.Request, 
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("X-Accel-Buffering", "no")
 	}
-	http.ServeContent(w, r, asset.Filename, info.ModTime(), file)
+	http.ServeContent(w, r, asset.Filename, info.ModTime(), &externalSourceReadSeeker{File: file})
+}
+
+type externalSourceReadSeeker struct{ File *os.File }
+
+func (r *externalSourceReadSeeker) Read(p []byte) (int, error) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		return 0, debugcontrol.ErrExternalFileAccessPaused
+	}
+	return r.File.Read(p)
+}
+
+func (r *externalSourceReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		return 0, debugcontrol.ErrExternalFileAccessPaused
+	}
+	return r.File.Seek(offset, whence)
 }
 
 type readableSourceResult struct {
@@ -1389,6 +1462,9 @@ func (s *Server) deleteAssetIfSourceMissing(ctx context.Context, asset model.Ass
 }
 
 func (s *Server) assetSourceMissing(asset model.Asset) (bool, error) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		return false, debugcontrol.ErrExternalFileAccessPaused
+	}
 	root, _, err := s.store.RootForRel(asset.RelPath)
 	if err != nil {
 		return false, err

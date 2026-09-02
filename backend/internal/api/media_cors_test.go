@@ -18,7 +18,7 @@ func TestMediaTransferCORSHandlesSegmentPreflight(t *testing.T) {
 	if response.Code != http.StatusNoContent || called {
 		t.Fatalf("response = %d, downstream called = %v", response.Code, called)
 	}
-	if got := response.Header().Get("Access-Control-Allow-Headers"); got != "Range, X-LPicto-Segment-Priority" {
+	if got := response.Header().Get("Access-Control-Allow-Headers"); got != "Range, X-LPicto-Segment-Priority, X-LPicto-Client-ID, X-LPicto-Session-ID, X-LPicto-Transcoder" {
 		t.Fatalf("allow headers = %q", got)
 	}
 }

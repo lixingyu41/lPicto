@@ -24,6 +24,8 @@ const (
 	SystemCollectionNeedsTranscode  = "needs_transcode"
 	SystemCollectionDuplicates      = "duplicates"
 	SystemCollectionMissing         = "missing"
+	SystemCollectionInaccessible    = "inaccessible"
+	SystemCollectionCorrupt         = "corrupt"
 	SystemCollectionHidden          = "hidden"
 	SystemCollectionAIPending       = "ai_pending"
 	SystemCollectionAIReady         = "ai_ready"
@@ -40,7 +42,9 @@ var systemCollections = []model.Collection{
 	{ID: SystemCollectionWithSubtitles, Name: "有字幕", Kind: CollectionKindSystem, SystemKind: SystemCollectionWithSubtitles},
 	{ID: SystemCollectionNeedsTranscode, Name: "需要转码", Kind: CollectionKindSystem, SystemKind: SystemCollectionNeedsTranscode},
 	{ID: SystemCollectionDuplicates, Name: "重复文件", Kind: CollectionKindSystem, SystemKind: SystemCollectionDuplicates},
-	{ID: SystemCollectionMissing, Name: "缺失/不可访问", Kind: CollectionKindSystem, SystemKind: SystemCollectionMissing},
+	{ID: SystemCollectionMissing, Name: "文件缺失", Kind: CollectionKindSystem, SystemKind: SystemCollectionMissing},
+	{ID: SystemCollectionInaccessible, Name: "无法访问", Kind: CollectionKindSystem, SystemKind: SystemCollectionInaccessible},
+	{ID: SystemCollectionCorrupt, Name: "文件损坏", Kind: CollectionKindSystem, SystemKind: SystemCollectionCorrupt},
 	{ID: SystemCollectionHidden, Name: "隐藏项", Kind: CollectionKindSystem, SystemKind: SystemCollectionHidden},
 	{ID: SystemCollectionAIPending, Name: "AI 待分析", Kind: CollectionKindSystem, SystemKind: SystemCollectionAIPending},
 	{ID: SystemCollectionAIReady, Name: "AI 已分析", Kind: CollectionKindSystem, SystemKind: SystemCollectionAIReady},
@@ -251,7 +255,8 @@ func (d *DB) CountSystemCollectionAssets(ctx context.Context, kind string, opts 
 
 func (d *DB) SystemCollectionAnchors(ctx context.Context, kind string, opts AssetListOptions) (LibraryAnchorResult, error) {
 	if kind == SystemCollectionMissing {
-		return LibraryAnchorResult{}, nil
+		total, err := d.CountSystemCollectionAssets(ctx, kind, opts)
+		return LibraryAnchorResult{Items: []LibraryAnchor{}, Total: total}, err
 	}
 	_, where, args, ok := d.systemCollectionFilter(kind, opts)
 	if !ok {
@@ -412,8 +417,66 @@ func (d *DB) systemCollectionFilter(kind string, opts AssetListOptions) (string,
 			args = append(args, "%"+escapeLike(strings.ToLower(opts.Query))+"%")
 		}
 		where = strings.Join(parts, " AND ")
+	case SystemCollectionInaccessible:
+		where += " AND " + assetSourceInaccessibleSQL()
+	case SystemCollectionCorrupt:
+		where += " AND NOT " + assetSourceInaccessibleSQL() + " AND " + assetSourceCorruptSQL()
 	}
 	return source, where, args, true
+}
+
+// assetSourceInaccessibleSQL identifies an existing source that lPicto cannot
+// currently read. Successful retries clear media_job.error_text, so repaired
+// permissions automatically remove the asset from this collection.
+func assetSourceInaccessibleSQL() string {
+	matchAsset := failureTextMatchesSQL("COALESCE(assets.error,'')", sourceInaccessiblePatterns)
+	matchJob := failureTextMatchesSQL("COALESCE(access_job.error_text,'')", sourceInaccessiblePatterns)
+	return `(` + matchAsset + ` OR EXISTS (
+  SELECT 1 FROM media_job access_job
+  WHERE access_job.asset_id=assets.id AND access_job.status='error'
+    AND ` + matchJob + `
+))`
+}
+
+// assetSourceCorruptSQL identifies a present, readable file whose media
+// structure cannot be parsed. Metadata failures are included because metadata
+// extraction is the first format validation performed for every media item.
+func assetSourceCorruptSQL() string {
+	matchAsset := failureTextMatchesSQL("COALESCE(assets.error,'')", sourceCorruptPatterns)
+	matchJob := failureTextMatchesSQL("COALESCE(corrupt_job.error_text,'')", sourceCorruptPatterns)
+	return `(COALESCE(assets.size,0)=0
+  OR EXISTS (
+    SELECT 1 FROM media_job metadata_job
+    WHERE metadata_job.asset_id=assets.id
+      AND metadata_job.job_type='metadata'
+      AND metadata_job.status='error'
+  )
+  OR ` + matchAsset + `
+  OR EXISTS (
+    SELECT 1 FROM media_job corrupt_job
+    WHERE corrupt_job.asset_id=assets.id AND corrupt_job.status='error'
+      AND ` + matchJob + `
+  ))`
+}
+
+var sourceInaccessiblePatterns = []string{
+	"permission denied", "access denied", "operation not permitted", "没有权限",
+	"source read timed out", "source unavailable", "源文件暂时不可用",
+	"input/output error", "i/o error", "stale file handle",
+}
+
+var sourceCorruptPatterns = []string{
+	"invalid data", "not a known file format", "unknown file format", "moov atom not found",
+	"could not find codec parameters", "corrupt", "decode failed", "元数据提取失败", "无效数据", "文件损坏",
+}
+
+func failureTextMatchesSQL(expression string, patterns []string) string {
+	parts := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		pattern = strings.ReplaceAll(strings.ToLower(pattern), "'", "''")
+		parts = append(parts, fmt.Sprintf("lower(%s) LIKE '%%%s%%'", expression, pattern))
+	}
+	return "(" + strings.Join(parts, " OR ") + ")"
 }
 
 func (d *DB) DuplicateHashCandidates(ctx context.Context, limit int) ([]model.Asset, error) {

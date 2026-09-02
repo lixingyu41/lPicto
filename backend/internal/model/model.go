@@ -48,6 +48,10 @@ type Folder struct {
 	Depth               int
 	AssetCount          int
 	RecursiveAssetCount int
+	SizeBytes           int64
+	RecursiveSizeBytes  int64
+	CreatedAt           int64
+	ModifiedAt          int64
 	CoverAssetID        *int64
 	UpdatedAt           int64
 }

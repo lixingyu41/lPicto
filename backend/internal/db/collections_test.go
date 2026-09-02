@@ -28,6 +28,87 @@ func TestMissingCollectionExcludesDeletedAssets(t *testing.T) {
 	}
 }
 
+func TestFileHealthCollectionFiltersAreSeparated(t *testing.T) {
+	database := &DB{}
+
+	missingSource, missingWhere, _, ok := database.systemCollectionFilter(SystemCollectionMissing, AssetListOptions{})
+	if !ok || missingSource != "asset_records" || !strings.Contains(missingWhere, "missing = true") {
+		t.Fatalf("missing collection = source %q where %q", missingSource, missingWhere)
+	}
+	if strings.Contains(missingWhere, "media_job") {
+		t.Fatalf("missing collection must not include access or decode failures: %q", missingWhere)
+	}
+
+	accessSource, accessWhere, _, ok := database.systemCollectionFilter(SystemCollectionInaccessible, AssetListOptions{})
+	if !ok || accessSource != "assets" {
+		t.Fatalf("inaccessible collection = source %q where %q", accessSource, accessWhere)
+	}
+	for _, condition := range []string{"permission denied", "没有权限", "media_job"} {
+		if !strings.Contains(accessWhere, condition) {
+			t.Fatalf("inaccessible where = %q, missing %q", accessWhere, condition)
+		}
+	}
+
+	corruptSource, corruptWhere, _, ok := database.systemCollectionFilter(SystemCollectionCorrupt, AssetListOptions{})
+	if !ok || corruptSource != "assets" {
+		t.Fatalf("corrupt collection = source %q where %q", corruptSource, corruptWhere)
+	}
+	for _, condition := range []string{"COALESCE(assets.size,0)=0", "job_type='metadata'", "NOT"} {
+		if !strings.Contains(corruptWhere, condition) {
+			t.Fatalf("corrupt where = %q, missing %q", corruptWhere, condition)
+		}
+	}
+}
+
+func TestFileHealthSystemCollectionsAreDisjoint(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, testDatabaseURL(t, ctx), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	createAsset := func(path string) int64 {
+		asset := testSearchAsset(path, model.MediaTypeImage)
+		asset.Size = 1024
+		id, _, _, err := database.UpsertAsset(ctx, asset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	missingID := createAsset("health/missing.jpg")
+	inaccessibleID := createAsset("health/inaccessible.jpg")
+	corruptID := createAsset("health/corrupt.jpg")
+	healthyID := createAsset("health/healthy.jpg")
+	if _, err := database.MarkMissingRelPaths(ctx, []string{"health/missing.jpg"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Conn().ExecContext(ctx, `INSERT INTO media_job(asset_id,job_type,status,error_text) VALUES($1,'thumb','error','Permission denied') ON CONFLICT(asset_id,job_type) DO UPDATE SET status='error',error_text='Permission denied'`, inaccessibleID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Conn().ExecContext(ctx, `INSERT INTO media_job(asset_id,job_type,status,error_text) VALUES($1,'metadata','error','元数据提取失败') ON CONFLICT(asset_id,job_type) DO UPDATE SET status='error',error_text='元数据提取失败'`, corruptID); err != nil {
+		t.Fatal(err)
+	}
+
+	assertOnly := func(kind string, expectedID int64) {
+		page, err := database.ListSystemCollectionAssets(ctx, kind, AssetListOptions{Page: 1, PageSize: 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Items) != 1 || page.Items[0].ID != expectedID {
+			t.Fatalf("collection %s items = %#v, want only %d", kind, page.Items, expectedID)
+		}
+	}
+	assertOnly(SystemCollectionMissing, missingID)
+	assertOnly(SystemCollectionInaccessible, inaccessibleID)
+	assertOnly(SystemCollectionCorrupt, corruptID)
+	if healthyID == missingID || healthyID == inaccessibleID || healthyID == corruptID {
+		t.Fatal("test assets must be distinct")
+	}
+}
+
 func TestAllCollectionUsesBaseLiveAssetFilter(t *testing.T) {
 	database := &DB{}
 	source, where, _, ok := database.systemCollectionFilter(SystemCollectionAll, AssetListOptions{})

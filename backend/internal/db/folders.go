@@ -286,14 +286,25 @@ func (d *DB) populateFolderStat(ctx context.Context, folder model.Folder) (model
 	recursiveWhere, recursiveArgs := folderAssetScopeSQL(folder.RelPath)
 	countQuery := `SELECT
 COALESCE(SUM(CASE WHEN parent_rel_path = ? THEN 1 ELSE 0 END), 0),
-COUNT(*)
+COUNT(*),
+COALESCE(SUM(CASE WHEN parent_rel_path = ? THEN size ELSE 0 END), 0),
+COALESCE(SUM(size), 0),
+COALESCE(MIN(imported_at), 0),
+COALESCE(MAX(mtime), 0)
 FROM assets WHERE deleted_at IS NULL`
-	args := []any{folder.RelPath}
+	args := []any{folder.RelPath, folder.RelPath}
 	if recursiveWhere != "" {
 		countQuery += " AND " + recursiveWhere
 		args = append(args, recursiveArgs...)
 	}
-	if err := d.conn.QueryRowContext(ctx, countQuery, args...).Scan(&folder.AssetCount, &folder.RecursiveAssetCount); err != nil {
+	if err := d.conn.QueryRowContext(ctx, countQuery, args...).Scan(
+		&folder.AssetCount,
+		&folder.RecursiveAssetCount,
+		&folder.SizeBytes,
+		&folder.RecursiveSizeBytes,
+		&folder.CreatedAt,
+		&folder.ModifiedAt,
+	); err != nil {
 		return model.Folder{}, err
 	}
 	coverQuery := `SELECT id FROM assets WHERE deleted_at IS NULL AND thumb_status = 'ready'`
@@ -334,10 +345,14 @@ func (d *DB) populateFolderStats(ctx context.Context, folders []model.Folder) ([
 	for index := range folders {
 		folders[index].AssetCount = 0
 		folders[index].RecursiveAssetCount = 0
+		folders[index].SizeBytes = 0
+		folders[index].RecursiveSizeBytes = 0
+		folders[index].CreatedAt = 0
+		folders[index].ModifiedAt = 0
 		folders[index].CoverAssetID = nil
 		relIndex[folders[index].RelPath] = index
 	}
-	rows, err := d.conn.QueryContext(ctx, `SELECT id, parent_rel_path, timeline_at, thumb_status FROM assets WHERE deleted_at IS NULL`)
+	rows, err := d.conn.QueryContext(ctx, `SELECT id, parent_rel_path, timeline_at, thumb_status, size, imported_at, mtime FROM assets WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -349,11 +364,15 @@ func (d *DB) populateFolderStats(ctx context.Context, folders []model.Folder) ([
 		var parent string
 		var timelineAt int64
 		var thumbStatus string
-		if err := rows.Scan(&id, &parent, &timelineAt, &thumbStatus); err != nil {
+		var sizeBytes int64
+		var importedAt int64
+		var modifiedAt int64
+		if err := rows.Scan(&id, &parent, &timelineAt, &thumbStatus, &sizeBytes, &importedAt, &modifiedAt); err != nil {
 			return nil, err
 		}
 		if index, ok := relIndex[parent]; ok {
 			folders[index].AssetCount++
+			folders[index].SizeBytes += sizeBytes
 		}
 		for _, rel := range folderAncestorRels(parent) {
 			index, ok := relIndex[rel]
@@ -361,6 +380,13 @@ func (d *DB) populateFolderStats(ctx context.Context, folders []model.Folder) ([
 				continue
 			}
 			folders[index].RecursiveAssetCount++
+			folders[index].RecursiveSizeBytes += sizeBytes
+			if folders[index].CreatedAt == 0 || importedAt < folders[index].CreatedAt {
+				folders[index].CreatedAt = importedAt
+			}
+			if modifiedAt > folders[index].ModifiedAt {
+				folders[index].ModifiedAt = modifiedAt
+			}
 			if thumbStatus != model.StatusReady {
 				continue
 			}

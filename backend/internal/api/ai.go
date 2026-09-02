@@ -8,14 +8,24 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 
+	aiworker "lpicto/backend/internal/ai"
 	"lpicto/backend/internal/db"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/model"
 )
 
 type aiSettingsRequest struct {
-	AutoAnalyze bool `json:"autoAnalyze"`
+	AutoAnalyze  *bool   `json:"autoAnalyze"`
+	ComputeMode  *string `json:"computeMode"`
+	ExternalHost *string `json:"externalHost"`
+	ExternalPort *int    `json:"externalPort"`
+}
+
+type aiSettingsResponse struct {
+	db.AISettings
+	Nodes []aiworker.ComputeNodeStatus `json:"nodes"`
 }
 
 type aiTagMutationRequest struct {
@@ -267,7 +277,7 @@ func (s *Server) aiSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "ai_settings_failed", "读取 AI 设置失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, settings)
+	writeJSON(w, http.StatusOK, s.aiSettingsResponse(r.Context(), settings))
 }
 
 func (s *Server) updateAISettings(w http.ResponseWriter, r *http.Request) {
@@ -276,26 +286,105 @@ func (s *Server) updateAISettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "请求内容无效")
 		return
 	}
-	settings, err := s.db.SetAIAutoAnalyze(r.Context(), payload.AutoAnalyze)
+	current, err := s.db.GetAISettings(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "ai_settings_update_failed", "读取 AI 设置失败")
+		return
+	}
+	autoAnalyze, mode, host, port := current.AutoAnalyze, current.ComputeMode, current.ExternalHost, current.ExternalPort
+	if payload.AutoAnalyze != nil {
+		autoAnalyze = *payload.AutoAnalyze
+	}
+	if payload.ComputeMode != nil {
+		mode = strings.TrimSpace(*payload.ComputeMode)
+	}
+	if payload.ExternalHost != nil {
+		host = strings.TrimSpace(*payload.ExternalHost)
+	}
+	if payload.ExternalPort != nil {
+		port = *payload.ExternalPort
+	}
+	if mode != db.AIComputeModeUbuntu && mode != db.AIComputeModeExternal && mode != db.AIComputeModeDual {
+		writeError(w, http.StatusBadRequest, "ai_compute_mode_invalid", "AI 计算模式无效")
+		return
+	}
+	if port < 1 || port > 65535 {
+		writeError(w, http.StatusBadRequest, "ai_external_port_invalid", "外部 AI 端口必须为 1 到 65535")
+		return
+	}
+	if mode != db.AIComputeModeUbuntu {
+		if _, err := aiworker.ExternalBaseURL(host, port); err != nil {
+			writeError(w, http.StatusBadRequest, "ai_external_address_invalid", err.Error())
+			return
+		}
+	}
+	var settings db.AISettings
+	if payload.AutoAnalyze != nil {
+		settings, err = s.db.SetAISettings(r.Context(), autoAnalyze, mode, host, port)
+	} else {
+		settings, err = s.db.SetAIComputeSettings(r.Context(), mode, host, port)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "ai_settings_update_failed", "保存 AI 设置失败")
 		return
 	}
-	if payload.AutoAnalyze {
+	if payload.AutoAnalyze != nil && autoAnalyze {
 		_ = s.db.EnsureSystemTaskRunning(r.Context(), "ai_analysis")
 		if _, err := s.enqueueAIBackfillNow(r.Context()); err != nil {
 			writeError(w, http.StatusInternalServerError, "ai_enqueue_failed", "启动 AI 分析失败")
 			return
 		}
-	} else if s.jobs != nil {
+	} else if payload.AutoAnalyze != nil && s.jobs != nil {
 		if err := s.jobs.ClearAIQueue(r.Context()); err != nil {
 			writeError(w, http.StatusInternalServerError, "ai_queue_clear_failed", "停止 AI 队列失败")
 			return
 		}
+		s.jobs.CancelActive("ai_analyze")
+		aiworker.PauseAllComputeNodes(r.Context(), settings, s.cfg.AIURL, s.cfg.ExternalAIToken)
 		s.removeQueuedAIStages(r.Context())
 		_ = s.db.FinishSystemTask(r.Context(), "ai_analysis", "stopped", "AI 自动分析已停止")
 	}
-	writeJSON(w, http.StatusOK, settings)
+	writeJSON(w, http.StatusOK, s.aiSettingsResponse(r.Context(), settings))
+}
+
+func (s *Server) testAIComputeNode(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		ExternalHost string `json:"externalHost"`
+		ExternalPort int    `json:"externalPort"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "请求内容无效")
+		return
+	}
+	baseURL, err := aiworker.ExternalBaseURL(payload.ExternalHost, payload.ExternalPort)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "ai_external_address_invalid", err.Error())
+		return
+	}
+	status := aiworker.ProbeComputeNode(r.Context(), aiworker.ComputeNode{ID: db.AIComputeModeExternal, BaseURL: baseURL, External: true, Token: s.cfg.ExternalAIToken})
+	writeJSON(w, http.StatusOK, map[string]any{"node": status})
+}
+
+func (s *Server) aiSettingsResponse(ctx context.Context, settings db.AISettings) aiSettingsResponse {
+	nodes := []aiworker.ComputeNode{
+		{ID: db.AIComputeModeUbuntu, BaseURL: strings.TrimRight(strings.TrimSpace(s.cfg.AIURL), "/")},
+		{ID: db.AIComputeModeExternal, External: true, Token: s.cfg.ExternalAIToken},
+	}
+	if externalURL, err := aiworker.ExternalBaseURL(settings.ExternalHost, settings.ExternalPort); err == nil {
+		nodes[1].BaseURL = externalURL
+	}
+	statuses := make([]aiworker.ComputeNodeStatus, len(nodes))
+	var wait sync.WaitGroup
+	for index := range nodes {
+		index := index
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			statuses[index] = aiworker.ProbeComputeNode(ctx, nodes[index])
+		}()
+	}
+	wait.Wait()
+	return aiSettingsResponse{AISettings: settings, Nodes: statuses}
 }
 
 func (s *Server) runAIManually(w http.ResponseWriter, r *http.Request) {
@@ -311,7 +400,7 @@ func (s *Server) runAIManually(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "ai_enqueue_failed", "启动手动 AI 分析失败")
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": count, "settings": settings})
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "count": count, "settings": s.aiSettingsResponse(r.Context(), settings)})
 }
 
 func (s *Server) stopAIManually(w http.ResponseWriter, r *http.Request) {
@@ -325,10 +414,12 @@ func (s *Server) stopAIManually(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "ai_queue_clear_failed", "停止 AI 队列失败")
 			return
 		}
+		s.jobs.CancelActive("ai_analyze")
 	}
+	aiworker.PauseAllComputeNodes(r.Context(), settings, s.cfg.AIURL, s.cfg.ExternalAIToken)
 	s.removeQueuedAIStages(r.Context())
 	_ = s.db.FinishSystemTask(r.Context(), "ai_analysis", "stopped", "AI 手动分析已停止")
-	writeJSON(w, http.StatusOK, settings)
+	writeJSON(w, http.StatusOK, s.aiSettingsResponse(r.Context(), settings))
 }
 
 func (s *Server) removeQueuedAIStages(ctx context.Context) {

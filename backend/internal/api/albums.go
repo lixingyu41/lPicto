@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/storage"
 	"lpicto/backend/internal/util"
 )
@@ -245,6 +246,10 @@ func (s *Server) albumAnchors(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) albumSourceFolders(w http.ResponseWriter, r *http.Request) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
+		return
+	}
 	parentRel, err := storage.NormalizeRelPath(r.URL.Query().Get("parentRelPath"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_path", "文件夹路径无效")

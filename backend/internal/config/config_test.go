@@ -32,6 +32,18 @@ func TestHWAccelEnvInvalidFallsBack(t *testing.T) {
 	}
 }
 
+func TestResolveStoryboardWorkers(t *testing.T) {
+	if got := ResolveStoryboardWorkers(0, "none"); got != 1 {
+		t.Fatalf("CPU workers = %d, want 1", got)
+	}
+	if got := ResolveStoryboardWorkers(0, "vaapi"); got != 2 {
+		t.Fatalf("VAAPI workers = %d, want 2", got)
+	}
+	if got := ResolveStoryboardWorkers(9, "vaapi"); got != 4 {
+		t.Fatalf("bounded override = %d, want 4", got)
+	}
+}
+
 func TestPhotoRootsEnv(t *testing.T) {
 	first := t.TempDir()
 	second := t.TempDir()

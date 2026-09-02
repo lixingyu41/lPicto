@@ -36,6 +36,12 @@ func TestFolderAssetsRecursiveOptionAndLiveCounts(t *testing.T) {
 	if folder.AssetCount != 1 || folder.RecursiveAssetCount != 2 {
 		t.Fatalf("folder counts = direct %d recursive %d, want 1 and 2", folder.AssetCount, folder.RecursiveAssetCount)
 	}
+	if folder.SizeBytes != 10 || folder.RecursiveSizeBytes != 20 {
+		t.Fatalf("folder sizes = direct %d recursive %d, want 10 and 20", folder.SizeBytes, folder.RecursiveSizeBytes)
+	}
+	if folder.CreatedAt != 10 || folder.ModifiedAt != 10 {
+		t.Fatalf("folder times = created %d modified %d, want 10 and 10", folder.CreatedAt, folder.ModifiedAt)
+	}
 
 	direct, err := database.ListFolderAssets(ctx, folder.ID, AssetListOptions{Page: 1, PageSize: 10, Sort: "filename"})
 	if err != nil {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/media"
 	"lpicto/backend/internal/model"
 )
@@ -44,6 +45,10 @@ type sidecarFile struct {
 }
 
 func (s *Server) assetSidecars(w http.ResponseWriter, r *http.Request) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
+		return
+	}
 	asset, ok := s.assetByParam(w, r)
 	if !ok {
 		return
@@ -58,6 +63,10 @@ func (s *Server) assetSidecars(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) assetSubtitle(w http.ResponseWriter, r *http.Request) {
+	if debugcontrol.ExternalFileAccessPaused() {
+		writeError(w, http.StatusServiceUnavailable, "external_file_access_paused", "调试模式已暂停外置文件访问")
+		return
+	}
 	asset, ok := s.assetByParam(w, r)
 	if !ok {
 		return

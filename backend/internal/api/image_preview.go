@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/model"
 	"lpicto/backend/internal/util"
 )
@@ -20,6 +21,9 @@ type viewerPreviewCall struct {
 }
 
 func (s *Server) ensureViewerPreview(ctx context.Context, asset model.Asset) error {
+	if debugcontrol.BackgroundProcessingPaused() {
+		return debugcontrol.ErrBackgroundProcessingPaused
+	}
 	dest, err := s.store.CachePath("previews", asset.CacheKey, "webp")
 	if err != nil {
 		return err

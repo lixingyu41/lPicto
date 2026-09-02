@@ -13,7 +13,7 @@ export function viewerImageUrl(asset: Asset, priority?: 'current' | 'preload') {
 
 export function preloadViewerAsset(asset: Asset | undefined, priority: FetchPriority = 'auto') {
   if (!asset || asset.mediaType !== 'image') return;
-  const url = viewerImageUrl(asset);
+  const url = viewerImageUrl(asset, priority === 'high' ? 'current' : 'preload');
   if (!url || hoverPreloadedImages.has(url)) return;
   const image = new Image();
   image.decoding = 'async';

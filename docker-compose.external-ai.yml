@@ -1,0 +1,28 @@
+services:
+  ai-external:
+    build:
+      context: .
+      dockerfile: ai/Dockerfile.cuda
+      args:
+        APT_MIRROR: ${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/ubuntu}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    gpus: all
+    environment:
+      - EXTERNAL_AI_TOKEN=${LPICTO_EXTERNAL_AI_TOKEN:?LPICTO_EXTERNAL_AI_TOKEN is required}
+    ports:
+      - "${LPICTO_EXTERNAL_AI_BIND:-0.0.0.0}:${LPICTO_EXTERNAL_AI_PORT:-18090}:8090"
+    read_only: true
+    tmpfs:
+      - /tmp:size=1024m,mode=1777
+    volumes:
+      - type: bind
+        source: ${LPICTO_EXTERNAL_AI_MODELS}
+        target: /models
+        read_only: true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped

@@ -3,6 +3,8 @@ import io
 import json
 import logging
 import os
+import re
+import secrets
 import subprocess
 import tempfile
 import threading
@@ -12,8 +14,9 @@ from pathlib import Path
 import httpx
 import numpy as np
 import onnxruntime as ort
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from PIL import Image, ImageOps
 from transformers import ChineseCLIPProcessor
 
@@ -22,9 +25,10 @@ from media_sampling import sample_ratios
 from tag_hierarchy import attach_tag_hierarchy
 from tag_logic import limit_closeup_candidates, parse_structured_model_analysis, reconcile_closeups_from_description, select_validated_tags
 
-MODEL_DIR = Path("/models/chinese-clip")
-MEDIA_ROOT = Path("/Media").resolve()
-CACHE_ROOT = Path("/cache").resolve()
+MODEL_ROOT = Path(os.getenv("LPICTO_AI_MODEL_ROOT", "/models")).resolve()
+MODEL_DIR = MODEL_ROOT / "chinese-clip"
+MEDIA_ROOT = Path(os.getenv("LPICTO_AI_MEDIA_ROOT", "/Media")).resolve()
+CACHE_ROOT = Path(os.getenv("LPICTO_AI_CACHE_ROOT", "/cache")).resolve()
 TAG_MODEL = "Qwen3-VL-candidates+Chinese-CLIP-validation"
 TAG_MODEL_VERSION = "Qwen-f982a075+Xenova-f2690486-ai-classified-v6"
 DESCRIPTION_MODEL = "Qwen3-VL-8B-Instruct-Q4_K_M"
@@ -37,6 +41,9 @@ LLAMA_LOG = None
 ACTIVE_MEDIA_PROCESSES = set()
 ANALYSIS_EPOCH = 0
 LOGGER = logging.getLogger("lpicto.ai")
+EXTERNAL_AI_TOKEN = os.getenv("EXTERNAL_AI_TOKEN", "").strip()
+SERVICE_ID = "lpicto-ai"
+PROTOCOL_VERSION = 1
 
 ANALYSIS_JSON_SCHEMA = {
     "type": "object",
@@ -65,10 +72,10 @@ ANALYSIS_JSON_SCHEMA = {
 }
 
 LLAMA_COMMAND = [
-    "llama-server", "-m", "/models/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
-    "--mmproj", "/models/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf",
-    "--host", "127.0.0.1", "--port", "8091", "-c", "8192", "-t", "8",
-    "-ngl", "0", "--parallel", "1", "--image-min-tokens", "256", "--image-max-tokens", "512",
+    os.getenv("LLAMA_SERVER_BIN", "llama-server"), "-m", str(MODEL_ROOT / "Qwen3VL-8B-Instruct-Q4_K_M.gguf"),
+    "--mmproj", str(MODEL_ROOT / "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf"),
+    "--host", "127.0.0.1", "--port", "8091", "-c", os.getenv("LLAMA_CONTEXT_SIZE", "8192"), "-t", os.getenv("LLAMA_THREADS", "8"),
+    "-ngl", os.getenv("LLAMA_GPU_LAYERS", "0"), "--parallel", "1", "--image-min-tokens", "256", "--image-max-tokens", "512",
 ]
 
 class AnalyzeRequest(BaseModel):
@@ -79,6 +86,7 @@ class AnalyzeRequest(BaseModel):
     duration: float | None = None
     focus: str = ""
     stagedPath: str = ""
+    sampleRatios: list[float] = Field(default_factory=list)
 
 
 class ModelOutputInvalidError(ValueError):
@@ -96,14 +104,30 @@ def _retry_analysis_prompt(prompt):
 
 
 app = FastAPI(title="lPicto local AI", docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def authorize_external_requests(request: Request, call_next):
+    if request.url.path != "/health" and EXTERNAL_AI_TOKEN:
+        supplied = request.headers.get("X-LPicto-AI-Token", "")
+        if not secrets.compare_digest(supplied, EXTERNAL_AI_TOKEN):
+            return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    return await call_next(request)
+
+
 processor = ChineseCLIPProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
 session_options = ort.SessionOptions()
 session_options.enable_cpu_mem_arena = False
 session_options.enable_mem_pattern = False
+available_providers = ort.get_available_providers()
+requested_provider = os.getenv("LPICTO_AI_ONNX_PROVIDER", "cpu").strip().lower()
+session_providers = ["CPUExecutionProvider"]
+if requested_provider == "cuda" and "CUDAExecutionProvider" in available_providers:
+    session_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 session = ort.InferenceSession(
     str(MODEL_DIR / "onnx/model.onnx"),
     sess_options=session_options,
-    providers=["CPUExecutionProvider"],
+    providers=session_providers,
 )
 input_names = {item.name for item in session.get_inputs()}
 output_names = [item.name for item in session.get_outputs()]
@@ -155,6 +179,27 @@ def _stop_llama():
 def _check_analysis(epoch):
     if PAUSED.is_set() or epoch != ANALYSIS_EPOCH:
         raise RuntimeError("AI analysis paused for media playback")
+
+
+def _llama_gpu_active():
+    try:
+        log_tail = Path("/tmp/llama-server.log").read_bytes()[-262144:].decode("utf-8", errors="ignore")
+    except OSError:
+        return False
+    matches = re.findall(r"offloaded\s+(\d+)/(\d+)\s+layers to GPU", log_tail, flags=re.IGNORECASE)
+    if any(int(offloaded) > 0 for offloaded, _ in matches):
+        return True
+    process = LLAMA_PROCESS
+    if process is None or process.poll() is not None:
+        return False
+    try:
+        for descriptor in (Path("/proc") / str(process.pid) / "fd").iterdir():
+            target = os.readlink(descriptor)
+            if target == "/dev/dxg" or target.startswith("/dev/nvidia"):
+                return True
+    except OSError:
+        pass
+    return False
 
 @app.on_event("startup")
 def start_models():
@@ -245,7 +290,11 @@ def _image_embedding(image):
     return value / np.maximum(np.linalg.norm(value, axis=1, keepdims=True), 1e-12)
 
 def _frame_scores(frames, labels):
-    vectors = np.concatenate([_image_embedding(image) for _, image in frames], axis=0)
+    images = [image for _, image in frames]
+    batch = processor(text=["照片"] * len(images), images=images, return_tensors="np", padding=True)
+    outputs = session.run(None, _onnx_inputs(batch))
+    vectors = _output(outputs, "image_embeds").astype(np.float32)
+    vectors = vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12)
     return vectors @ _text_embeddings(labels).T
 
 def _data_url(image):
@@ -373,7 +422,21 @@ def health():
         response.raise_for_status()
     except Exception as exc:
         raise HTTPException(503, f"description model unavailable: {exc}") from exc
-    return {"status": "ok", "taxonomyCount": len(LABELS), "taxonomyVersion": TAXONOMY_VERSION}
+    return {
+        "status": "ok",
+        "taxonomyCount": len(LABELS),
+        "taxonomyVersion": TAXONOMY_VERSION,
+        "onnxProviders": session.get_providers(),
+        "gpuLayers": int(os.getenv("LLAMA_GPU_LAYERS", "0")),
+        "gpuActive": _llama_gpu_active(),
+    }
+
+@app.get("/ready")
+def ready():
+    result = health()
+    result["service"] = SERVICE_ID
+    result["protocolVersion"] = PROTOCOL_VERSION
+    return result
 
 @app.post("/pause", status_code=202)
 def pause():
@@ -404,14 +467,51 @@ def restart():
 
 @app.post("/analyze")
 def analyze(request: AnalyzeRequest):
+    return _run_analyze(request, None)
+
+
+@app.post("/analyze-bundle")
+def analyze_bundle(metadata: str = Form(...), frames: list[UploadFile] = File(...)):
+    try:
+        request = AnalyzeRequest.model_validate_json(metadata)
+        loaded_frames = _load_uploaded_frames(request, frames)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        for upload in frames:
+            upload.file.close()
+    return _run_analyze(request, loaded_frames)
+
+
+def _load_uploaded_frames(request, uploads):
+    if not 1 <= len(uploads) <= 10:
+        raise ValueError("bundle frame count must be between 1 and 10")
+    if len(request.sampleRatios) != len(uploads):
+        raise ValueError("bundle frame ratios do not match files")
+    loaded = []
+    total = 0
+    for index, upload in enumerate(uploads):
+        remaining = (64 << 20) - total
+        raw = upload.file.read(remaining + 1)
+        total += len(raw)
+        if total > 64 << 20:
+            raise ValueError("bundle exceeds 64 MiB")
+        with Image.open(io.BytesIO(raw)) as image:
+            if image.width > 4096 or image.height > 4096 or image.width * image.height > 16_777_216:
+                raise ValueError("bundle frame dimensions exceed limit")
+            loaded.append((float(request.sampleRatios[index]), ImageOps.exif_transpose(image).convert("RGB").copy()))
+    return loaded
+
+
+def _run_analyze(request, supplied_frames):
     if request.mediaType not in ("image", "video"):
         raise HTTPException(400, "unsupported media type")
+    epoch = ANALYSIS_EPOCH
     try:
-        epoch = ANALYSIS_EPOCH
         _check_analysis(epoch)
         with LOCK:
             _check_analysis(epoch)
-            frames = _load_frames(request)
+            frames = supplied_frames if supplied_frames is not None else _load_frames(request)
             _check_analysis(epoch)
             description, tags = _analysis(frames, request.mediaType, epoch, request.focus)
             palette = _palette(frames)

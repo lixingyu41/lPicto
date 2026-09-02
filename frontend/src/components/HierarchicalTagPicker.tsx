@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ListFilter, Search, X } from 'lucide-react';
-import { api } from '../api/client';
 import type { AITagTreeNode } from '../types/api';
+import { aiTagTreeInvalidatedEvent, loadAITagTree, readAITagTreeFallback } from '../utils/aiTagTreeCache';
 
 interface Props {
   selected: string[];
@@ -14,6 +14,11 @@ interface Props {
 const categoryOrder = ['people', 'action', 'shoes', 'socks', 'clothes', 'closeup'];
 const subjectOrder = ['indoor', 'outdoor', 'count', 'posture', 'activity', 'shoes', 'socks', 'top', 'outerwear', 'dress', 'pants', 'sportswear', 'swimwear', 'hat', 'accessories', 'part', 'object', 'animal', 'nature', 'transport', 'food', 'weather', 'media', 'other'];
 const dimensionOrder = ['type', 'color', 'style', 'state', 'place', 'count', 'part', 'activity', 'posture'];
+const tagNameCollator = new Intl.Collator('zh-CN-u-co-pinyin', { numeric: true, sensitivity: 'base' });
+
+function compareNodeLabels(a: AITagTreeNode, b: AITagTreeNode) {
+  return tagNameCollator.compare(a.label, b.label) || a.id.localeCompare(b.id);
+}
 
 function stableNodeOrder(a: AITagTreeNode, b: AITagTreeNode) {
   const key = (node: AITagTreeNode) => {
@@ -23,14 +28,14 @@ function stableNodeOrder(a: AITagTreeNode, b: AITagTreeNode) {
   const order = a.depth === 1 ? categoryOrder : a.depth === 2 ? subjectOrder : a.depth === 3 ? dimensionOrder : [];
   const ai = order.indexOf(key(a));
   const bi = order.indexOf(key(b));
-  return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi) || a.label.localeCompare(b.label, 'zh-Hans-CN') || a.id.localeCompare(b.id);
+  return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi) || compareNodeLabels(a, b);
 }
 
 export default function HierarchicalTagPicker({ selected, onChange, compact = false, inline = false, searchVisible = true }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(inline);
   const [query, setQuery] = useState('');
-  const [nodes, setNodes] = useState<AITagTreeNode[]>([]);
+  const [nodes, setNodes] = useState<AITagTreeNode[]>(() => readAITagTreeFallback(selected) ?? []);
   const [draft, setDraft] = useState<string[]>(selected);
   const [activeRoot, setActiveRoot] = useState('');
 
@@ -38,15 +43,22 @@ export default function HierarchicalTagPicker({ selected, onChange, compact = fa
     if (!open && !inline) return;
     let live = true;
     setDraft(selected);
-    void api.aiTags('', selected).then((result) => { if (live) setNodes(result.tree ?? []); }).catch(() => { if (live) setNodes([]); });
-    if (inline) return;
+    const cached = readAITagTreeFallback(selected);
+    if (cached) setNodes(cached);
+    const refresh = (force = false) => {
+      void loadAITagTree(selected, force).then((tree) => { if (live) setNodes(tree); }).catch(() => undefined);
+    };
+    refresh();
+    const handleInvalidated = () => refresh(true);
+    window.addEventListener(aiTagTreeInvalidatedEvent, handleInvalidated);
     const close = (event: PointerEvent) => {
       if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
     };
-    document.addEventListener('pointerdown', close);
+    if (!inline) document.addEventListener('pointerdown', close);
     return () => {
       live = false;
-      document.removeEventListener('pointerdown', close);
+      window.removeEventListener(aiTagTreeInvalidatedEvent, handleInvalidated);
+      if (!inline) document.removeEventListener('pointerdown', close);
     };
   }, [inline, open, selected]);
 
@@ -98,6 +110,10 @@ export default function HierarchicalTagPicker({ selected, onChange, compact = fa
     return `${subject.label} · ${node.label}`;
   };
   const selectedLabels = selected.map(compactLabel).filter(Boolean);
+  const orderedDraft = useMemo(
+    () => [...draft].sort((a, b) => tagNameCollator.compare(compactLabel(a), compactLabel(b)) || a.localeCompare(b)),
+    [byId, draft],
+  );
 
   const groups = useMemo(() => {
     const root = byId.get(activeRoot);
@@ -109,18 +125,20 @@ export default function HierarchicalTagPicker({ selected, onChange, compact = fa
         const nested = children.get(dimension.id) ?? [];
         const values = (nested.length > 0 ? nested : [dimension])
           .filter((node) => !normalized || node.label.toLocaleLowerCase().includes(normalized))
-          .sort(stableNodeOrder);
+          .sort(compareNodeLabels);
         return { dimension, values };
       }).filter((dimension) => dimension.values.length > 0 || !normalized);
-      return { subject, dimensions };
-    }).filter((group) => group.dimensions.length > 0 || !normalized);
+      const values = Array.from(new Map(dimensions.flatMap((dimension) => dimension.values).map((node) => [node.id, node])).values())
+        .sort(compareNodeLabels);
+      return { subject, values };
+    }).filter((group) => group.values.length > 0 || !normalized);
   }, [activeRoot, byId, children, query]);
   const manualValues = useMemo(() => {
     if (activeRoot !== 'manual') return [];
     const normalized = query.trim().toLocaleLowerCase();
     return [...(children.get('manual') ?? [])]
       .filter((node) => !normalized || node.label.toLocaleLowerCase().includes(normalized))
-      .sort(stableNodeOrder);
+      .sort(compareNodeLabels);
   }, [activeRoot, children, query]);
   const nodeDisabled = (node: AITagTreeNode) => {
     if (draft.includes(node.id) || node.count > 0) return false;
@@ -139,7 +157,7 @@ export default function HierarchicalTagPicker({ selected, onChange, compact = fa
         <span>已选</span>
         <div>
           {draft.length === 0 && <small>尚未选择</small>}
-          {draft.map((id) => (
+          {orderedDraft.map((id) => (
             <button key={id} type="button" onClick={() => {
               const next = draft.filter((value) => value !== id);
               setDraft(next);
@@ -169,7 +187,7 @@ export default function HierarchicalTagPicker({ selected, onChange, compact = fa
             </div>
             {manualValues.length === 0 && <span className="asset-tag-filter-empty">没有匹配自标</span>}
           </section>
-        ) : groups.map(({ subject, dimensions }) => (
+        ) : groups.map(({ subject, values }) => (
           <section className="compact-tag-group" key={subject.id}>
             <div className="compact-tag-group-title">
               <strong>{subject.label}</strong>
@@ -179,18 +197,13 @@ export default function HierarchicalTagPicker({ selected, onChange, compact = fa
                 </button>
               ) : null}
             </div>
-            {dimensions.map(({ dimension, values }) => (
-              <div className={activeRoot === 'ai:clothing' ? 'compact-tag-dimension' : 'compact-tag-dimension compact'} key={dimension.id}>
-                {activeRoot === 'ai:clothing' && <span>{dimension.label}</span>}
-                <div className="compact-tag-values">
-                  {values.map((node) => (
-                    <button className={draft.includes(node.id) ? 'selected' : ''} disabled={nodeDisabled(node)} key={node.id} type="button" onClick={() => toggle(node)}>
-                      {node.label}<small>{node.count}</small>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ))}
+            <div className="compact-tag-values">
+              {values.map((node) => (
+                <button className={draft.includes(node.id) ? 'selected' : ''} disabled={nodeDisabled(node)} key={node.id} type="button" onClick={() => toggle(node)}>
+                  {node.label}<small>{node.count}</small>
+                </button>
+              ))}
+            </div>
           </section>
         ))}
         {activeRoot !== 'manual' && groups.length === 0 && <span className="asset-tag-filter-empty">没有匹配标签</span>}

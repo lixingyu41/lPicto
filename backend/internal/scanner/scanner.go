@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"lpicto/backend/internal/db"
+	"lpicto/backend/internal/debugcontrol"
 	"lpicto/backend/internal/events"
 	"lpicto/backend/internal/jobs"
 	"lpicto/backend/internal/media"
@@ -270,6 +271,9 @@ func (s *Scanner) RequestThumbnailContinueRoots(reason string, roots []string) C
 }
 
 func (s *Scanner) requestStart(req scanRequest) CommandResult {
+	if debugcontrol.BackgroundProcessingPaused() {
+		return CommandResult{Accepted: false, Paused: true, State: "paused"}
+	}
 	if strings.TrimSpace(req.reason) == "" {
 		req.reason = "manual"
 	}
@@ -320,7 +324,7 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 	var activeStart *scanRequest
 	var pendingStarts []scanRequest
 	startPendingIfReady := func() {
-		if len(pendingStarts) == 0 || done != nil || ctx.Err() != nil {
+		if len(pendingStarts) == 0 || done != nil || ctx.Err() != nil || debugcontrol.BackgroundProcessingPaused() {
 			return
 		}
 		next := pendingStarts[0]
@@ -338,6 +342,10 @@ func (s *Scanner) commandLoop(ctx context.Context) {
 		case cmd := <-s.commands:
 			switch cmd.kind {
 			case scanCommandStart:
+				if debugcontrol.BackgroundProcessingPaused() {
+					cmd.reply <- CommandResult{Accepted: false, Paused: true, State: "paused"}
+					continue
+				}
 				req := cmd.req
 				if done == nil {
 					if len(pendingStarts) > 0 {

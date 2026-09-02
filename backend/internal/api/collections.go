@@ -28,7 +28,7 @@ func (s *Server) collections(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("read system collection count cache failed", "error", err)
 	}
 	for i := range system {
-		if system[i].SystemKind == db.SystemCollectionAll || system[i].SystemKind == db.SystemCollectionAIPending || system[i].SystemKind == db.SystemCollectionAIReady || system[i].SystemKind == db.SystemCollectionAIFailed || system[i].SystemKind == db.SystemCollectionStoryboardReady {
+		if system[i].SystemKind == db.SystemCollectionAll || system[i].SystemKind == db.SystemCollectionMissing || system[i].SystemKind == db.SystemCollectionInaccessible || system[i].SystemKind == db.SystemCollectionCorrupt || system[i].SystemKind == db.SystemCollectionAIPending || system[i].SystemKind == db.SystemCollectionAIReady || system[i].SystemKind == db.SystemCollectionAIFailed || system[i].SystemKind == db.SystemCollectionStoryboardReady {
 			if count, countErr := s.db.CountSystemCollectionAssets(r.Context(), system[i].SystemKind, db.AssetListOptions{Page: 1, PageSize: 1}); countErr == nil {
 				system[i].AssetCount = count
 			}
