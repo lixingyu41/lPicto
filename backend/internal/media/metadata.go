@@ -193,6 +193,42 @@ func StreamKindsFromMetadataJSON(raw string) (hasVideo bool, hasAudio bool, audi
 	return hasVideo, hasAudio, audioCodec
 }
 
+func EmbeddedAuthorsFromMetadataJSON(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var probe ffprobeResult
+	if err := json.Unmarshal([]byte(raw), &probe); err != nil {
+		return nil
+	}
+	authors := make([]string, 0, 2)
+	seen := map[string]struct{}{}
+	addTags := func(tags map[string]string) {
+		for _, wanted := range []string{"artist", "author", "album_artist", "album artist"} {
+			for key, value := range tags {
+				if !strings.EqualFold(strings.TrimSpace(key), wanted) {
+					continue
+				}
+				value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+				normalized := strings.ToLower(value)
+				if value == "" {
+					continue
+				}
+				if _, exists := seen[normalized]; exists {
+					continue
+				}
+				seen[normalized] = struct{}{}
+				authors = append(authors, value)
+			}
+		}
+	}
+	addTags(probe.Format.Tags)
+	for _, stream := range probe.Streams {
+		addTags(stream.Tags)
+	}
+	return authors
+}
+
 func BrowserVideoPlayable(ext, videoCodec, audioCodec string) bool {
 	ext = strings.ToLower(strings.TrimPrefix(ext, "."))
 	videoCodec = strings.ToLower(videoCodec)

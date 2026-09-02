@@ -46,3 +46,30 @@ func TestNFOTimelineAtJSONUsesStoredNFO(t *testing.T) {
 		t.Fatalf("stored nfo timeline = %v, want %d", got, want)
 	}
 }
+
+func TestMergeEmbeddedAuthorsKeepsNFOAuthorsAndReplacesEmbeddedValues(t *testing.T) {
+	info := ParseNFO("movie.nfo", `<movie><writer>NFO Author</writer></movie>`)
+	merged, changed := MergeEmbeddedAuthors(&info, []string{"Video Creator", "nfo author"})
+	if !changed {
+		t.Fatal("expected embedded author merge to change metadata")
+	}
+	if got := merged.Fields["作者"]; got != "NFO Author / Video Creator" {
+		t.Fatalf("merged author field = %q", got)
+	}
+	var artists int
+	for _, group := range merged.Groups {
+		for _, item := range group.Items {
+			if item.Key == "artist" && item.Value == "Video Creator" {
+				artists++
+			}
+		}
+	}
+	if artists != 1 {
+		t.Fatalf("embedded artist entries = %d, want 1", artists)
+	}
+
+	withoutEmbedded, changed := MergeEmbeddedAuthors(merged, nil)
+	if !changed || withoutEmbedded.Fields["作者"] != "NFO Author" {
+		t.Fatalf("authors after embedded removal = %#v", withoutEmbedded.Fields)
+	}
+}

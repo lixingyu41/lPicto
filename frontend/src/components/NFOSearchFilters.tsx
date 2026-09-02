@@ -1,11 +1,11 @@
 import type { NFOFilterField } from '../types/api';
 
 export const nfoFilterFields: Array<{ key: NFOFilterField; label: string; placeholder: string }> = [
-  { key: 'actor', label: 'NFO 演员', placeholder: '输入演员' },
-  { key: 'id', label: 'NFO ID', placeholder: '输入 ID' },
-  { key: 'tag', label: 'NFO 标签/类型', placeholder: '输入标签/类型' },
-  { key: 'title', label: 'NFO 标题', placeholder: '输入标题' },
-  { key: 'year', label: 'NFO 年份', placeholder: '输入年份' },
+  { key: 'actor', label: '元数据 演员', placeholder: '输入演员' },
+  { key: 'id', label: '元数据 ID', placeholder: '输入 ID' },
+  { key: 'tag', label: '元数据 标签/类型', placeholder: '输入标签/类型' },
+  { key: 'title', label: '元数据 标题', placeholder: '输入标题' },
+  { key: 'year', label: '元数据 年份', placeholder: '输入年份' },
 ];
 
 export interface NFOSearchFiltersProps {
@@ -34,8 +34,8 @@ export default function NFOSearchFilters({
         />
       ))}
       <label className="sidebar-field">
-        <span>NFO 全文</span>
-        <input value={nfoQuery} onChange={(event) => onNFOQueryChange(event.target.value)} placeholder="任意 NFO 文本" />
+        <span>元数据全文</span>
+        <input value={nfoQuery} onChange={(event) => onNFOQueryChange(event.target.value)} placeholder="任意元数据文本" />
       </label>
     </>
   );

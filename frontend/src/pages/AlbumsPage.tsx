@@ -265,7 +265,7 @@ export default function AlbumsPage() {
     if (query.trim()) chips.push({ id: 'search', label: `文件名: ${query.trim()}`, onRemove: () => setQuery('') });
     if (aiDescriptionQuery.trim()) chips.push({ id: 'ai-description', label: `AI 描述: ${aiDescriptionQuery.trim()}`, onRemove: () => setAIDescriptionQuery('') });
     const nfoConditions = [nfoQuery, nfoActorQuery, nfoIDQuery, nfoTagQuery, nfoTitleQuery, nfoYearQuery].filter((value) => value.trim()).length;
-    if (nfoConditions > 0) chips.push({ id: 'nfo', label: `NFO ${nfoConditions}`, onRemove: clearNFOSearch });
+    if (nfoConditions > 0) chips.push({ id: 'nfo', label: `元数据 ${nfoConditions}`, onRemove: clearNFOSearch });
     if (resolutionXRange.trim() || resolutionYRange.trim()) chips.push({ id: 'resolution', label: '分辨率', onRemove: () => { setResolutionXRange(''); setResolutionYRange(''); } });
     if (dateFrom || dateTo) chips.push({ id: 'date', label: '时间范围', onRemove: () => { setDateFrom(''); setDateTo(''); } });
     if (durationMin.trim() || durationMax.trim()) chips.push({ id: 'duration', label: '时长', onRemove: () => { setDurationMin(''); setDurationMax(''); } });

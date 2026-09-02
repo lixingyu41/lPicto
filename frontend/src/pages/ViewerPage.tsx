@@ -1719,8 +1719,8 @@ function ViewerSidebarPanel({
       {sidecars?.nfo && (
         <div className="sidebar-nfo">
           <div className="sidebar-nfo-header">
-            <div className="sidebar-control-title">NFO</div>
-            <small>{sidecars.nfo.filename}</small>
+            <div className="sidebar-control-title">元数据</div>
+            {sidecars.nfo.filename && <small>{sidecars.nfo.filename}</small>}
           </div>
           {nfoGroups.length > 0
             ? nfoGroups.map((group) => (

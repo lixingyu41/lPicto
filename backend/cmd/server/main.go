@@ -171,7 +171,19 @@ func runWorker(ctx context.Context, cfg config.Config, database *db.DB, queue *j
 	go superviseAutomaticTasks(ctx, database, queue, logger)
 	go monitorSourceRecovery(ctx, database, scan, sources, logger)
 	go repairVideoDisplayMetadataDimensions(ctx, database, logger)
+	go repairEmbeddedMediaAuthors(ctx, database, logger)
 	aiworker.StartHealthMonitor(ctx, database, cfg.AIURL, cfg.ExternalAIToken, logger)
+}
+
+func repairEmbeddedMediaAuthors(ctx context.Context, database *db.DB, logger *slog.Logger) {
+	updated, err := database.RepairEmbeddedMediaAuthors(ctx)
+	if err != nil {
+		logger.Warn("repair embedded media authors failed", "error", err)
+		return
+	}
+	if updated > 0 {
+		logger.Info("repaired embedded media authors", "count", updated)
+	}
 }
 
 func repairVideoDisplayMetadataDimensions(ctx context.Context, database *db.DB, logger *slog.Logger) {

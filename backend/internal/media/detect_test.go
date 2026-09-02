@@ -110,6 +110,20 @@ func TestStreamKindsFromMetadataJSON(t *testing.T) {
 	}
 }
 
+func TestEmbeddedAuthorsFromMetadataJSON(t *testing.T) {
+	raw := `{"streams":[{"tags":{"AUTHOR":"Second Author"}},{"tags":{"artist":"Channel Name"}}],"format":{"tags":{"ARTIST":" Channel   Name ","album_artist":"Third Author"}}}`
+	got := EmbeddedAuthorsFromMetadataJSON(raw)
+	want := []string{"Channel Name", "Third Author", "Second Author"}
+	if len(got) != len(want) {
+		t.Fatalf("embedded authors = %#v, want %#v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("embedded authors = %#v, want %#v", got, want)
+		}
+	}
+}
+
 func TestUnixTimeParsesNoZoneInLocalLocation(t *testing.T) {
 	previousLocal := time.Local
 	local := time.FixedZone("TEST", 8*60*60)

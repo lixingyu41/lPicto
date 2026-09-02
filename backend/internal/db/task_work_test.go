@@ -3,8 +3,10 @@ package db
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"lpicto/backend/internal/media"
 	"lpicto/backend/internal/model"
 )
 
@@ -139,6 +141,49 @@ func TestRepairVideoDisplayMetadataDimensionsOnlyUpdatesStaleQuarterTurns(t *tes
 	}
 	if stale.Width == nil || stale.Height == nil || *stale.Width != 2160 || *stale.Height != 3840 {
 		t.Fatalf("repaired dimensions = %v x %v, want 2160 x 3840", stale.Width, stale.Height)
+	}
+}
+
+func TestRepairEmbeddedMediaAuthorsMergesWithNFOAuthor(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, testDatabaseURL(t, ctx), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	metadata := `{"format":{"tags":{"ARTIST":"Video Creator"}}}`
+	nfo := `{"filename":"movie.nfo","fields":{"作者":"NFO Author"},"groups":[{"title":"创作","items":[{"key":"writer","label":"作者","value":"NFO Author","copyable":true}]}]}`
+	asset := testSearchAsset("VID/authored.mp4", model.MediaTypeVideo)
+	asset.MetadataJSON = &metadata
+	asset.NFOJSON = &nfo
+	asset.NFOSearchText = stringTestPtr("nfo author")
+	id := insertTaskWorkAsset(t, database, asset)
+
+	updated, err := database.RepairEmbeddedMediaAuthors(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 1 {
+		t.Fatalf("updated records = %d, want 1", updated)
+	}
+	stored, err := database.GetAsset(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := media.ParseNFOJSON(*stored.NFOJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Fields["作者"] != "NFO Author / Video Creator" {
+		t.Fatalf("stored authors = %q", info.Fields["作者"])
+	}
+	if stored.NFOSearchText == nil || !strings.Contains(*stored.NFOSearchText, "video creator") {
+		t.Fatalf("search text = %#v", stored.NFOSearchText)
+	}
+	updated, err = database.RepairEmbeddedMediaAuthors(ctx)
+	if err != nil || updated != 0 {
+		t.Fatalf("second repair = %d, %v; want no-op", updated, err)
 	}
 }
 

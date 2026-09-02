@@ -1825,6 +1825,8 @@ func (st *scanState) processFile(absPath string, info os.FileInfo) {
 		proxyStatus:     proxyStatus,
 		metadataJSON:    metadataJSON,
 		nfoChanged:      nfoChanged,
+		nfoSize:         nfoSignatureSize(nfoSignature),
+		nfoMtime:        nfoSignatureMtime(nfoSignature),
 		hasSubtitle:     hasSubtitle,
 		hasDanmaku:      hasDanmaku,
 		errorText:       errorText,
@@ -1872,7 +1874,10 @@ func (st *scanState) writeAsset(write scanWrite) {
 		s.Logger.Warn("ensure folders failed", "relPath", rel, "error", err)
 		return
 	}
-	nfoJSON, nfoSearchText, nfoTimelineAt, nfoSize, nfoMtime, nfoScanned := st.nfoMetadata(write.absPath, rel, write.nfoChanged)
+	authors := media.EmbeddedAuthorsFromMetadataJSON(write.meta.RawJSON)
+	nfoJSON, nfoSearchText, nfoTimelineAt, nfoSize, nfoMtime, nfoScanned := st.nfoMetadata(
+		write.absPath, rel, write.nfoChanged, write.nfoSize, write.nfoMtime, authors,
+	)
 	importedAt := util.UnixNow()
 	mtime := write.info.ModTime().Unix()
 	timelineAt := media.TimelineAt(write.meta.TakenAt, write.meta.VideoCreatedAt, mtime, importedAt)
@@ -1967,7 +1972,7 @@ func (st *scanState) enqueueDeferredWork() {
 	}
 }
 
-func (st *scanState) nfoMetadata(absPath string, rel string, nfoChanged bool) (*string, *string, *int64, *int64, *int64, bool) {
+func (st *scanState) nfoMetadata(absPath string, rel string, nfoChanged bool, currentNFOSize, currentNFOMtime *int64, embeddedAuthors []string) (*string, *string, *int64, *int64, *int64, bool) {
 	scanNFO := nfoChanged
 	if !scanNFO {
 		nfoJSON, err := st.scanner.DB.AssetNFOJSON(st.ctx, rel)
@@ -1976,12 +1981,26 @@ func (st *scanState) nfoMetadata(absPath string, rel string, nfoChanged bool) (*
 			st.scanner.Logger.Warn("read nfo state failed", "relPath", rel, "error", err)
 			return nil, nil, nil, nil, nil, false
 		}
-		if nfoJSON != nil {
-			return nil, nil, media.NFOTimelineAtJSON(*nfoJSON), nil, nil, false
+		info, err := media.ParseNFOJSON(valueOrEmpty(nfoJSON))
+		if err != nil {
+			st.recordError("解析已存元数据失败", err)
+			st.scanner.Logger.Warn("parse stored nfo metadata failed", "relPath", rel, "error", err)
+			return nil, nil, nil, nil, nil, false
 		}
-	}
-	if !scanNFO {
-		return nil, nil, nil, nil, nil, false
+		merged, changed := media.MergeEmbeddedAuthors(info, embeddedAuthors)
+		if !changed {
+			if nfoJSON != nil {
+				return nil, nil, media.NFOTimelineAtJSON(*nfoJSON), nil, nil, false
+			}
+			return nil, nil, nil, nil, nil, false
+		}
+		mergedJSON, err := media.NFOJSON(*merged)
+		if err != nil {
+			st.recordError("生成合并元数据失败", err)
+			return nil, nil, nil, nil, nil, false
+		}
+		searchText := media.NFOSearchText(*merged)
+		return &mergedJSON, &searchText, media.NFOTimelineAt(*merged), currentNFOSize, currentNFOMtime, true
 	}
 	root, err := st.scanner.Store.RootForPath(absPath)
 	if err != nil {
@@ -2001,6 +2020,7 @@ func (st *scanState) nfoMetadata(absPath string, rel string, nfoChanged bool) (*
 		st.scanner.Logger.Warn("read nfo failed", "relPath", rel, "error", err)
 		return nil, nil, nil, nil, nil, false
 	}
+	info, _ = media.MergeEmbeddedAuthors(info, embeddedAuthors)
 	if info == nil {
 		return nil, nil, nil, nil, nil, true
 	}
@@ -2018,6 +2038,29 @@ func (st *scanState) nfoMetadata(absPath string, rel string, nfoChanged bool) (*
 		nfoMtime = &signature.Mtime
 	}
 	return &nfoJSON, &nfoSearchText, media.NFOTimelineAt(*info), nfoSize, nfoMtime, true
+}
+
+func nfoSignatureSize(signature *media.NFOFileSignature) *int64 {
+	if signature == nil {
+		return nil
+	}
+	value := signature.Size
+	return &value
+}
+
+func nfoSignatureMtime(signature *media.NFOFileSignature) *int64 {
+	if signature == nil {
+		return nil
+	}
+	value := signature.Mtime
+	return &value
+}
+
+func valueOrEmpty(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func (s *Scanner) nfoFileSignature(absPath string) (*media.NFOFileSignature, error) {

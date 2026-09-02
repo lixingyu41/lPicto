@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -94,6 +95,123 @@ func NFOJSON(info NFOInfo) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+func ParseNFOJSON(value string) (*NFOInfo, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	var info NFOInfo
+	if err := json.Unmarshal([]byte(value), &info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+// MergeEmbeddedAuthors presents container artist/author tags as NFO-style
+// authors while retaining their source key so later metadata changes can
+// replace or remove them without touching authors from a sidecar NFO.
+func MergeEmbeddedAuthors(info *NFOInfo, authors []string) (*NFOInfo, bool) {
+	cleanAuthors := make([]string, 0, len(authors))
+	seenAuthors := map[string]struct{}{}
+	for _, author := range authors {
+		author = cleanNFOValue(author)
+		key := strings.ToLower(author)
+		if author == "" {
+			continue
+		}
+		if _, exists := seenAuthors[key]; exists {
+			continue
+		}
+		seenAuthors[key] = struct{}{}
+		cleanAuthors = append(cleanAuthors, author)
+	}
+	if info == nil && len(cleanAuthors) == 0 {
+		return nil, false
+	}
+
+	merged := NFOInfo{Fields: map[string]string{}}
+	if info != nil {
+		merged.Filename = info.Filename
+		merged.Text = info.Text
+		for key, value := range info.Fields {
+			merged.Fields[key] = value
+		}
+		merged.Groups = make([]NFOGroup, len(info.Groups))
+		for index, group := range info.Groups {
+			merged.Groups[index] = NFOGroup{Title: group.Title, Items: append([]NFOField(nil), group.Items...)}
+		}
+	}
+
+	creativeIndex := -1
+	existingAuthors := map[string]struct{}{}
+	for groupIndex := range merged.Groups {
+		group := &merged.Groups[groupIndex]
+		if group.Title == "创作" {
+			creativeIndex = groupIndex
+		}
+		kept := group.Items[:0]
+		for _, item := range group.Items {
+			if strings.EqualFold(strings.TrimSpace(item.Key), "artist") {
+				continue
+			}
+			kept = append(kept, item)
+			if isNFOAuthorField(item) {
+				existingAuthors[strings.ToLower(cleanNFOValue(item.Value))] = struct{}{}
+			}
+		}
+		group.Items = kept
+	}
+	if len(cleanAuthors) > 0 && creativeIndex < 0 {
+		merged.Groups = append(merged.Groups, NFOGroup{Title: "创作"})
+		creativeIndex = len(merged.Groups) - 1
+	}
+	for _, author := range cleanAuthors {
+		key := strings.ToLower(author)
+		if _, exists := existingAuthors[key]; exists {
+			continue
+		}
+		merged.Groups[creativeIndex].Items = append(merged.Groups[creativeIndex].Items, NFOField{
+			Key: "artist", Label: "作者", Value: author, Copyable: true,
+		})
+		existingAuthors[key] = struct{}{}
+	}
+
+	authorValues := make([]string, 0, len(existingAuthors))
+	seenValues := map[string]struct{}{}
+	for _, group := range merged.Groups {
+		for _, item := range group.Items {
+			if !isNFOAuthorField(item) {
+				continue
+			}
+			value := cleanNFOValue(item.Value)
+			key := strings.ToLower(value)
+			if value == "" {
+				continue
+			}
+			if _, exists := seenValues[key]; exists {
+				continue
+			}
+			seenValues[key] = struct{}{}
+			authorValues = append(authorValues, value)
+		}
+	}
+	if len(authorValues) == 0 {
+		delete(merged.Fields, "作者")
+	} else {
+		merged.Fields["作者"] = strings.Join(authorValues, " / ")
+	}
+	for index := len(merged.Groups) - 1; index >= 0; index-- {
+		if len(merged.Groups[index].Items) == 0 {
+			merged.Groups = append(merged.Groups[:index], merged.Groups[index+1:]...)
+		}
+	}
+	return &merged, !reflect.DeepEqual(info, &merged)
+}
+
+func isNFOAuthorField(item NFOField) bool {
+	key := strings.ToLower(strings.TrimSpace(item.Key))
+	return key == "writer" || key == "artist" || strings.TrimSpace(item.Label) == "作者"
 }
 
 func NFOSearchText(info NFOInfo) string {

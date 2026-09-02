@@ -2,9 +2,11 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
+	"lpicto/backend/internal/media"
 	"lpicto/backend/internal/model"
 	"lpicto/backend/internal/util"
 )
@@ -293,6 +295,82 @@ WHERE ma.id=repairs.id
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// RepairEmbeddedMediaAuthors backfills container artist/author tags into the
+// same searchable metadata document used by NFO fields. It operates entirely
+// on stored ffprobe JSON and never opens source media.
+func (d *DB) RepairEmbeddedMediaAuthors(ctx context.Context) (int64, error) {
+	rows, err := d.conn.QueryContext(ctx, `
+SELECT id,metadata_json::text,nfo_json::text
+FROM media_asset
+WHERE deleted_at IS NULL AND metadata_json IS NOT NULL
+  AND (
+    EXISTS (
+      SELECT 1
+      FROM jsonb_each_text(COALESCE(metadata_json->'format'->'tags','{}'::jsonb)) AS tag
+      WHERE lower(tag.key) IN ('artist','author','album_artist','album artist')
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(COALESCE(metadata_json->'streams','[]'::jsonb)) AS stream
+      CROSS JOIN LATERAL jsonb_each_text(COALESCE(stream->'tags','{}'::jsonb)) AS tag
+      WHERE lower(tag.key) IN ('artist','author','album_artist','album artist')
+    )
+  )`)
+	if err != nil {
+		return 0, err
+	}
+	type repair struct {
+		id         int64
+		nfoJSON    string
+		searchText string
+	}
+	repairs := make([]repair, 0)
+	for rows.Next() {
+		var id int64
+		var metadataJSON string
+		var storedNFO sql.NullString
+		if err := rows.Scan(&id, &metadataJSON, &storedNFO); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		info, err := media.ParseNFOJSON(storedNFO.String)
+		if err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("parse stored metadata for asset %d: %w", id, err)
+		}
+		merged, changed := media.MergeEmbeddedAuthors(info, media.EmbeddedAuthorsFromMetadataJSON(metadataJSON))
+		if !changed || merged == nil {
+			continue
+		}
+		value, err := media.NFOJSON(*merged)
+		if err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("marshal merged metadata for asset %d: %w", id, err)
+		}
+		repairs = append(repairs, repair{id: id, nfoJSON: value, searchText: media.NFOSearchText(*merged)})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	var updated int64
+	for _, item := range repairs {
+		result, err := d.conn.ExecContext(ctx, `
+UPDATE media_asset SET nfo_json=?::jsonb,nfo_search_text=?,updated_at=now()
+WHERE id=?`, item.nfoJSON, item.searchText, item.id)
+		if err != nil {
+			return updated, err
+		}
+		count, _ := result.RowsAffected()
+		updated += count
+	}
+	return updated, nil
 }
 
 func (d *DB) RetryFailedMetadataPathsForRoots(ctx context.Context, roots []string) ([]string, error) {

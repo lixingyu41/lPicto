@@ -144,7 +144,20 @@ func (s *Server) nfoForAsset(asset model.Asset) (*NFODTO, error) {
 	if err != nil {
 		return nil, err
 	}
-	return media.ReadNFOForAsset(assetPath, root.Path, maxNFOBytes)
+	info, err := media.ReadNFOForAsset(assetPath, root.Path, maxNFOBytes)
+	if err != nil {
+		return nil, err
+	}
+	authors := media.EmbeddedAuthorsFromMetadataJSON(valueOrEmpty(asset.MetadataJSON))
+	merged, _ := media.MergeEmbeddedAuthors(info, authors)
+	return merged, nil
+}
+
+func valueOrEmpty(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func (s *Server) subtitleFiles(asset model.Asset) ([]sidecarFile, error) {
