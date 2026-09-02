@@ -352,6 +352,9 @@ func (s *Server) startClearAllAssetsCleanup() bool {
 		if err == nil {
 			s.removeDeletedAssetCaches(deleted)
 			err = s.db.RefreshFolders(context.Background())
+			if err == nil {
+				s.publishFolderTreeChanged()
+			}
 		}
 		s.cleanupMu.Lock()
 		defer s.cleanupMu.Unlock()

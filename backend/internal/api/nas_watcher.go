@@ -196,6 +196,7 @@ func (s *Server) nasWatcherEvents(w http.ResponseWriter, r *http.Request) {
 		if _, err := s.db.RefreshSystemCollectionCounts(r.Context()); err != nil && s.logger != nil {
 			s.logger.Warn("refresh system collection counts after NAS remove event failed", "error", err)
 		}
+		s.refreshFoldersAfterDelete(0, "", "nas_watcher_remove")
 	}
 	upsertPaths := sortedKeys(upserts)
 	if len(recoveryRoots) > 0 {

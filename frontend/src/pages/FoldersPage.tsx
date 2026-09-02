@@ -10,7 +10,7 @@ import PressPreviewOverlay from '../components/PressPreviewOverlay';
 import { SidebarFilterIconRow, SidebarMediaTypeList, SidebarOrientationFilter, SidebarRatingFilter, SidebarSelect } from '../components/SidebarControls';
 import { CompactSortControls, isSortKey } from '../components/SortControls';
 import { api } from '../api/client';
-import { useAssetReadyEvents } from '../hooks/useAssetReadyEvents';
+import { useLibraryEvents } from '../hooks/useAssetReadyEvents';
 import { usePagedLoader } from '../hooks/usePagedLoader';
 import { usePersistentPageState } from '../hooks/usePersistentPageState';
 import { useWaterfallGridState } from '../hooks/useWaterfallGridState';
@@ -102,6 +102,7 @@ export default function FoldersPage() {
   const [tree, setTree] = useState<Folder[]>(() => folderTreeCache ?? []);
   const [treeLoading, setTreeLoading] = useState(folderTreeCache === null);
   const [treeError, setTreeError] = useState('');
+  const [treeRefreshRevision, setTreeRefreshRevision] = useState(0);
   const [currentId, setCurrentId] = useViewerAwareMediaState(initialStateRef.current.currentId);
   const [current, setCurrent] = useState<Folder | null>(null);
   const [sort, setSort] = useViewerAwareMediaState<SortKey>(initialStateRef.current.sort);
@@ -153,6 +154,23 @@ export default function FoldersPage() {
     saveFolderSortPreference(folderSort);
   }, [folderSort]);
 
+  const treeRefreshTimerRef = useRef<number | null>(null);
+  const scheduleFolderTreeRefresh = useCallback(() => {
+    if (treeRefreshTimerRef.current !== null) {
+      window.clearTimeout(treeRefreshTimerRef.current);
+    }
+    treeRefreshTimerRef.current = window.setTimeout(() => {
+      treeRefreshTimerRef.current = null;
+      setTreeRefreshRevision((value) => value + 1);
+    }, 750);
+  }, []);
+
+  useEffect(() => () => {
+    if (treeRefreshTimerRef.current !== null) {
+      window.clearTimeout(treeRefreshTimerRef.current);
+    }
+  }, []);
+
   useEffect(() => {
     let live = true;
     async function loadTree() {
@@ -182,7 +200,7 @@ export default function FoldersPage() {
     return () => {
       live = false;
     };
-  }, []);
+  }, [requestedFolderRelPath, treeRefreshRevision]);
 
   useEffect(() => {
     let live = true;
@@ -235,7 +253,7 @@ export default function FoldersPage() {
   const selectAllAssetIds = useCallback(async () => (
     await api.folderSelection(currentId, sort, query, includeSubfolders, serverGroup, activeRating, orientation, type, undefined, serializeTagFilters(tagFilters))
   ).assetIds, [activeRating, currentId, includeSubfolders, orientation, query, serverGroup, sort, tagFilters, type]);
-  const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
+  const { items, hasMore, hasPrevious, loading, error, loadMore, loadPrevious, reset, jumpToPage, mutateItems } = usePagedLoader<Asset>(loadAssets, [
     currentId,
     groupMode,
     includeSubfolders,
@@ -284,7 +302,43 @@ export default function FoldersPage() {
 
   const handleAssetReady = useCallback((asset: Asset) => mergeReadyAssets([asset]), [mergeReadyAssets]);
   const handleAssetDeleted = useCallback((event: AssetDeletedEvent) => mutateItems((value) => removeAssetById(value, event.id)), [mutateItems]);
-  const eventsConnected = useAssetReadyEvents(handleAssetReady, [handleAssetReady, handleAssetDeleted], handleAssetDeleted);
+  const handleFolderTreeChanged = useCallback(() => {
+    scheduleFolderTreeRefresh();
+    reset();
+  }, [reset, scheduleFolderTreeRefresh]);
+  const eventsConnected = useLibraryEvents(
+    { onAssetReady: handleAssetReady, onAssetDeleted: handleAssetDeleted, onFolderTreeChanged: handleFolderTreeChanged },
+    [handleAssetReady, handleAssetDeleted, handleFolderTreeChanged],
+  );
+  const eventsConnectedOnceRef = useRef(false);
+  const eventsPreviouslyConnectedRef = useRef(false);
+
+  useEffect(() => {
+    if (eventsConnected && eventsConnectedOnceRef.current && !eventsPreviouslyConnectedRef.current) {
+      handleFolderTreeChanged();
+    }
+    if (eventsConnected) eventsConnectedOnceRef.current = true;
+    eventsPreviouslyConnectedRef.current = eventsConnected;
+  }, [eventsConnected, handleFolderTreeChanged]);
+
+  useEffect(() => {
+    const refreshVisiblePage = () => {
+      if (document.visibilityState !== 'visible') return;
+      scheduleFolderTreeRefresh();
+    };
+    window.addEventListener('focus', refreshVisiblePage);
+    document.addEventListener('visibilitychange', refreshVisiblePage);
+    return () => {
+      window.removeEventListener('focus', refreshVisiblePage);
+      document.removeEventListener('visibilitychange', refreshVisiblePage);
+    };
+  }, [scheduleFolderTreeRefresh]);
+
+  useEffect(() => {
+    if (eventsConnected) return undefined;
+    const timer = window.setInterval(scheduleFolderTreeRefresh, 30000);
+    return () => window.clearInterval(timer);
+  }, [eventsConnected, scheduleFolderTreeRefresh]);
 
   useEffect(() => {
     if (eventsConnected || !current || resolvingRequestedFolder) return undefined;
@@ -442,6 +496,19 @@ export default function FoldersPage() {
     },
     [activeRating, groupMode, includeSubfolders, location, navigate, orientation, query, sort, tagFilters, type],
   );
+
+  useEffect(() => {
+    if (!current || treeLoading || tree.length === 0) return;
+    const refreshedCurrent = tree.find((folder) => folder.relPath === current.relPath);
+    if (refreshedCurrent) {
+      if (refreshedCurrent !== current) setCurrent(refreshedCurrent);
+      return;
+    }
+    const fallback = tree
+      .filter((folder) => current.relPath.startsWith(`${folder.relPath}/`))
+      .sort((a, b) => b.depth - a.depth)[0] ?? tree.find((folder) => folder.depth === 0);
+    if (fallback) selectFolder(fallback);
+  }, [current, selectFolder, tree, treeLoading]);
 
   useEffect(() => {
     const nextGroupMode = normalizeAssetGroupModeForSort(groupMode, sort);

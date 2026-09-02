@@ -664,6 +664,12 @@ func (s *Scanner) publishStatus() {
 	s.Events.Publish(events.Event{Type: "scan_status", Payload: status})
 }
 
+func (s *Scanner) publishFolderTreeChanged() {
+	if s.Events != nil {
+		s.Events.Publish(events.Event{Type: "folder_tree_changed"})
+	}
+}
+
 func nextStatusRevision() int64 {
 	return time.Now().UnixNano()
 }
@@ -830,6 +836,8 @@ func (s *Scanner) run(ctx context.Context, req scanRequest) {
 	if err := s.DB.RefreshFolders(ctx); err != nil {
 		counts.recordError("更新文件夹统计失败", err)
 		logger.Warn("refresh folders failed", "error", err)
+	} else {
+		s.publishFolderTreeChanged()
 	}
 	s.updateProgressPhase("finished")
 	status := "finished"
@@ -944,6 +952,8 @@ func (s *Scanner) runReconcile(ctx context.Context, runID int64, scanRoots []str
 	if err := s.DB.RefreshFolders(ctx); err != nil {
 		counts.recordError("更新文件夹统计失败", err)
 		logger.Warn("refresh folders after reconciliation failed", "error", err)
+	} else {
+		s.publishFolderTreeChanged()
 	}
 	status := "finished"
 	if counts.errors > 0 {

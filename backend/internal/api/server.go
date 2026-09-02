@@ -472,6 +472,8 @@ func (s *Server) eventStream(w http.ResponseWriter, r *http.Request) {
 				"relPath":  asset.RelPath,
 				"cacheKey": asset.CacheKey,
 			})
+		case "folder_tree_changed":
+			data = []byte("{}")
 		default:
 			continue
 		}
@@ -481,6 +483,12 @@ func (s *Server) eventStream(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, "event: %s\n", event.Type)
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
+	}
+}
+
+func (s *Server) publishFolderTreeChanged() {
+	if s.events != nil {
+		s.events.Publish(events.Event{Type: "folder_tree_changed"})
 	}
 }
 
@@ -1515,7 +1523,9 @@ func (s *Server) markDeletedAsset(ctx context.Context, asset model.Asset, reason
 		}()
 		if err := s.db.RefreshFolders(context.Background()); err != nil {
 			s.logger.Warn("refresh folders after asset deletion failed", "assetID", asset.ID, "relPath", asset.RelPath, "reason", reason, "error", err)
+			return
 		}
+		s.publishFolderTreeChanged()
 	}()
 	return true
 }

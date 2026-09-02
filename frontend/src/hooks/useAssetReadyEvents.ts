@@ -1,20 +1,22 @@
 import { useEffect, useState, type DependencyList } from 'react';
 import type { Asset, AssetDeletedEvent, ScanStatus } from '../types/api';
 
-interface AssetEventHandlers {
+export interface LibraryEventHandlers {
   onAssetReady?: (asset: Asset) => void;
   onAssetDeleted?: (event: AssetDeletedEvent) => void;
+  onFolderTreeChanged?: () => void;
+  onScanStatus?: (status: ScanStatus) => void;
 }
 
 export function useAssetReadyEvents(onAssetReady: (asset: Asset) => void, deps: DependencyList, onAssetDeleted?: (event: AssetDeletedEvent) => void) {
-  return useAssetEvents({ onAssetReady, onAssetDeleted }, deps);
+  return useLibraryEvents({ onAssetReady, onAssetDeleted }, deps);
 }
 
 export function useAssetDeletedEvents(onAssetDeleted: (event: AssetDeletedEvent) => void, deps: DependencyList) {
-  return useAssetEvents({ onAssetDeleted }, deps);
+  return useLibraryEvents({ onAssetDeleted }, deps);
 }
 
-function useAssetEvents(handlers: AssetEventHandlers, deps: DependencyList) {
+export function useLibraryEvents(handlers: LibraryEventHandlers, deps: DependencyList) {
   const [connected, setConnected] = useState(false);
 
   useEffect(() => {
@@ -43,36 +45,13 @@ function useAssetEvents(handlers: AssetEventHandlers, deps: DependencyList) {
         // Ignore malformed events from a stale connection.
       }
     });
-    source.addEventListener('error', () => {
-      if (!closed) setConnected(false);
-    });
-    return () => {
-      closed = true;
-      setConnected(false);
-      source.close();
-    };
-  }, deps);
-
-  return connected;
-}
-
-export function useScanStatusEvents(onScanStatus: (status: ScanStatus) => void, deps: DependencyList) {
-  const [connected, setConnected] = useState(false);
-
-  useEffect(() => {
-    if (typeof EventSource === 'undefined') {
-      setConnected(false);
-      return undefined;
-    }
-    let closed = false;
-    const source = new EventSource('/api/events');
-    source.addEventListener('open', () => {
-      if (!closed) setConnected(true);
+    source.addEventListener('folder_tree_changed', () => {
+      if (!closed) handlers.onFolderTreeChanged?.();
     });
     source.addEventListener('scan_status', (event) => {
-      if (closed) return;
+      if (closed || !handlers.onScanStatus) return;
       try {
-        onScanStatus(JSON.parse((event as MessageEvent).data) as ScanStatus);
+        handlers.onScanStatus(JSON.parse((event as MessageEvent).data) as ScanStatus);
       } catch {
         // Ignore malformed events from a stale connection.
       }
@@ -88,4 +67,8 @@ export function useScanStatusEvents(onScanStatus: (status: ScanStatus) => void, 
   }, deps);
 
   return connected;
+}
+
+export function useScanStatusEvents(onScanStatus: (status: ScanStatus) => void, deps: DependencyList) {
+  return useLibraryEvents({ onScanStatus }, deps);
 }

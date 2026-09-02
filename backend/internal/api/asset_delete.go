@@ -127,9 +127,13 @@ func (s *Server) purgeAssetRecords(ctx context.Context, assetIDs []int64, refres
 			s.logger.Warn("refresh system collection counts after record deletion failed", "error", err)
 		}
 		go func() {
-			if err := s.db.RefreshFolders(context.Background()); err != nil && s.logger != nil {
-				s.logger.Warn("refresh folders after record deletion failed", "error", err)
+			if err := s.db.RefreshFolders(context.Background()); err != nil {
+				if s.logger != nil {
+					s.logger.Warn("refresh folders after record deletion failed", "error", err)
+				}
+				return
 			}
+			s.publishFolderTreeChanged()
 		}()
 	}
 	return result, nil
@@ -657,7 +661,9 @@ func (s *Server) refreshFoldersAfterDelete(assetID int64, relPath string, reason
 		defer func() { <-s.folderRefreshSem }()
 		if err := s.db.RefreshFolders(context.Background()); err != nil {
 			s.logger.Warn("refresh folders after asset deletion failed", "assetID", assetID, "relPath", relPath, "reason", reason, "error", err)
+			return
 		}
+		s.publishFolderTreeChanged()
 	}()
 }
 
