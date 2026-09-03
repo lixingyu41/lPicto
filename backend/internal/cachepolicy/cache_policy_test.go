@@ -63,6 +63,23 @@ func TestPinnedEntrySurvivesCapacitySweep(t *testing.T) {
 	}
 }
 
+func TestPinnedEmptyDirectorySurvivesAbandonedCleanup(t *testing.T) {
+	root := t.TempDir()
+	manager := New(root, nil)
+	path := filepath.Join(root, "ai-staging", "asset.stage.d")
+	release := manager.Pin(path)
+	defer release()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.CleanupAbandoned(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("pinned staging directory was removed while preparing output: %v", err)
+	}
+}
+
 func TestClearPreservesCompletedThumbnailsPostersAndStoryboards(t *testing.T) {
 	root := t.TempDir()
 	manager := New(root, nil)

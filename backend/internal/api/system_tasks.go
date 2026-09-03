@@ -794,6 +794,8 @@ func readableTaskError(reason string) string {
 		} else {
 			message = "无法读取视频数据，文件可能损坏或未完整写入"
 		}
+	case strings.Contains(raw, "/cache/ai-staging/") && strings.Contains(raw, "unable to open for write"):
+		message = "AI 输入缓存写入失败"
 	case strings.Contains(raw, "permission denied"):
 		message = "没有权限读取媒体文件"
 	case strings.Contains(raw, "no such file"), strings.Contains(raw, "not found"):

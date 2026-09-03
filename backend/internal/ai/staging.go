@@ -53,6 +53,11 @@ func (s Stager) Prepare(ctx context.Context, asset model.Asset) (*db.AIStage, er
 		return nil, err
 	}
 	dir := base + ".d"
+	releaseStage := func() {}
+	if s.Policy != nil {
+		releaseStage = s.Policy.Pin(dir)
+	}
+	defer releaseStage()
 	_ = os.RemoveAll(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err

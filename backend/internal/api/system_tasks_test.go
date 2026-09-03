@@ -161,6 +161,7 @@ func TestTaskFailureTranslatesKnownServiceErrors(t *testing.T) {
 		"ai_media: AI service 500: model_output_invalid: bad json":                              "AI 模型输出格式错误，已自动重新生成 1 次",
 		"ai_media: ffmpeg returned non-zero exit status 69":                                     "无法从该媒体提取 AI 分析画面",
 		"ai_media: Output file #0 does not contain any stream":                                  "媒体中没有可供 AI 分析的视频画面",
+		"vipsthumbnail: /cache/ai-staging/ab/example.stage.d/00.jpg: unable to open for write; unix error: No such file or directory": "AI 输入缓存写入失败",
 	}
 	for input, want := range cases {
 		if got := readableTaskError(input); got != want {
