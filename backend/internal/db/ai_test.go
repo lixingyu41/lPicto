@@ -343,6 +343,43 @@ func TestAIBackfillContinuesAfterVideoOnlyPilot(t *testing.T) {
 	}
 }
 
+func TestAIBackfillPrioritizesPreparedStagesAcrossBatchChanges(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var stagedID int64
+	var stagedCacheKey string
+	for i := 0; i < 81; i++ {
+		assetID, _, _, err := database.UpsertAsset(ctx, testSearchAsset(fmt.Sprintf("stage-priority-%02d.jpg", i), model.MediaTypeImage))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			asset, err := database.GetAsset(ctx, assetID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stagedID = assetID
+			stagedCacheKey = asset.CacheKey
+		}
+	}
+	if err := database.UpsertAIStage(ctx, AIStage{
+		AssetID: stagedID, CacheKey: stagedCacheKey, State: "ready", StagePath: "ai-staging/prepared/stage.d", SizeBytes: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := database.AIBackfillBatch(ctx, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 80 || items[0].AssetID != stagedID {
+		t.Fatalf("prepared stage must remain in the next backfill batch: first=%#v count=%d", items[0], len(items))
+	}
+}
+
 func TestAIFailureStopsRetryingAtAutomaticLimit(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, filepath.Join(t.TempDir(), "lpicto.db"), filepath.Join("..", "..", "migrations"))

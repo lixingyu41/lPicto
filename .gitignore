@@ -9,6 +9,7 @@ frontend/tsconfig.tsbuildinfo
 *.db-wal
 data/
 cache/
+artifacts/
 .agents/
 .codex/
 lpicto-deploy.tgz

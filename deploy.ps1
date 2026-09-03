@@ -321,6 +321,7 @@ try {
         './.git',
         './data',
         './cache',
+        './artifacts',
         './frontend/node_modules',
         './frontend/dist',
         './frontend/tsconfig.tsbuildinfo',

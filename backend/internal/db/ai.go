@@ -441,12 +441,16 @@ WHERE ma.deleted_at IS NULL AND EXISTS (SELECT 1 FROM file_instance fi WHERE fi.
 	if pilotImages < pilotImageTarget || pilotVideos < pilotVideoTarget {
 		missingImages := max(0, pilotImageTarget-pilotImages)
 		missingVideos := max(0, pilotVideoTarget-pilotVideos)
-		rows, err := d.conn.QueryContext(ctx, `(SELECT ma.id,ma.cache_key,fi.rel_path,ma.sort_time FROM media_asset ma
-JOIN LATERAL (SELECT rel_path FROM file_instance WHERE asset_id=ma.id AND missing=false ORDER BY last_seen_at DESC,id DESC LIMIT 1) fi ON true
-LEFT JOIN asset_ai_result r ON r.asset_id=ma.id WHERE ma.deleted_at IS NULL AND ma.media_type=1 AND (r.asset_id IS NULL OR r.input_cache_key<>ma.cache_key OR r.status='pending') ORDER BY ma.sort_time DESC,ma.id DESC LIMIT ?)
-UNION ALL (SELECT ma.id,ma.cache_key,fi.rel_path,ma.sort_time FROM media_asset ma
-JOIN LATERAL (SELECT rel_path FROM file_instance WHERE asset_id=ma.id AND missing=false ORDER BY last_seen_at DESC,id DESC LIMIT 1) fi ON true
-LEFT JOIN asset_ai_result r ON r.asset_id=ma.id WHERE ma.deleted_at IS NULL AND ma.media_type=2 AND (r.asset_id IS NULL OR r.input_cache_key<>ma.cache_key OR r.status='pending') ORDER BY ma.sort_time DESC,ma.id DESC LIMIT ?) ORDER BY sort_time DESC`, missingImages, missingVideos)
+		rows, err := d.conn.QueryContext(ctx, `(SELECT ma.id,ma.cache_key,fi.rel_path,ma.sort_time,(stage.asset_id IS NOT NULL) AS stage_ready FROM media_asset ma
+		JOIN LATERAL (SELECT rel_path FROM file_instance WHERE asset_id=ma.id AND missing=false ORDER BY last_seen_at DESC,id DESC LIMIT 1) fi ON true
+		LEFT JOIN asset_ai_result r ON r.asset_id=ma.id
+		LEFT JOIN asset_ai_stage stage ON stage.asset_id=ma.id AND stage.cache_key=ma.cache_key AND stage.state='ready'
+		WHERE ma.deleted_at IS NULL AND ma.media_type=1 AND (r.asset_id IS NULL OR r.input_cache_key<>ma.cache_key OR r.status='pending') ORDER BY stage_ready DESC,ma.sort_time DESC,ma.id DESC LIMIT ?)
+		UNION ALL (SELECT ma.id,ma.cache_key,fi.rel_path,ma.sort_time,(stage.asset_id IS NOT NULL) AS stage_ready FROM media_asset ma
+		JOIN LATERAL (SELECT rel_path FROM file_instance WHERE asset_id=ma.id AND missing=false ORDER BY last_seen_at DESC,id DESC LIMIT 1) fi ON true
+		LEFT JOIN asset_ai_result r ON r.asset_id=ma.id
+		LEFT JOIN asset_ai_stage stage ON stage.asset_id=ma.id AND stage.cache_key=ma.cache_key AND stage.state='ready'
+		WHERE ma.deleted_at IS NULL AND ma.media_type=2 AND (r.asset_id IS NULL OR r.input_cache_key<>ma.cache_key OR r.status='pending') ORDER BY stage_ready DESC,ma.sort_time DESC,ma.id DESC LIMIT ?) ORDER BY stage_ready DESC,sort_time DESC`, missingImages, missingVideos)
 		if err != nil {
 			return nil, err
 		}
@@ -455,7 +459,8 @@ LEFT JOIN asset_ai_result r ON r.asset_id=ma.id WHERE ma.deleted_at IS NULL AND 
 		for rows.Next() {
 			var item AIBackfillItem
 			var timeline time.Time
-			if err := rows.Scan(&item.AssetID, &item.CacheKey, &item.RelPath, &timeline); err != nil {
+			var stageReady bool
+			if err := rows.Scan(&item.AssetID, &item.CacheKey, &item.RelPath, &timeline, &stageReady); err != nil {
 				return nil, err
 			}
 			items = append(items, item)
@@ -463,10 +468,11 @@ LEFT JOIN asset_ai_result r ON r.asset_id=ma.id WHERE ma.deleted_at IS NULL AND 
 		return items, rows.Err()
 	}
 	rows, err := d.conn.QueryContext(ctx, `SELECT ma.id,ma.cache_key,fi.rel_path FROM media_asset ma
-JOIN LATERAL (SELECT rel_path FROM file_instance WHERE asset_id=ma.id AND missing=false ORDER BY last_seen_at DESC,id DESC LIMIT 1) fi ON true
-LEFT JOIN asset_ai_result r ON r.asset_id=ma.id
-WHERE ma.deleted_at IS NULL AND ma.media_type IN (1,2) AND (r.asset_id IS NULL OR r.input_cache_key<>ma.cache_key OR r.status='pending')
-ORDER BY ma.sort_time DESC,ma.id DESC LIMIT ?`, limit)
+	JOIN LATERAL (SELECT rel_path FROM file_instance WHERE asset_id=ma.id AND missing=false ORDER BY last_seen_at DESC,id DESC LIMIT 1) fi ON true
+	LEFT JOIN asset_ai_result r ON r.asset_id=ma.id
+	LEFT JOIN asset_ai_stage stage ON stage.asset_id=ma.id AND stage.cache_key=ma.cache_key AND stage.state='ready'
+	WHERE ma.deleted_at IS NULL AND ma.media_type IN (1,2) AND (r.asset_id IS NULL OR r.input_cache_key<>ma.cache_key OR r.status='pending')
+	ORDER BY (stage.asset_id IS NOT NULL) DESC,ma.sort_time DESC,ma.id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
